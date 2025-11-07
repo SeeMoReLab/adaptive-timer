@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+import "google/protobuf/empty.proto";
+
+// Represents the current state
+message State {
+    uint32 processed_transactions = 1;
+    float avg_message_delay = 2;
+    float max_message_delay = 3;
+    float min_message_delay = 4;
+    float std_message_delay = 5;
+}
+
+// Represents the action (timer suggestion)
+message Action {
+    uint32 timeout_milliseconds = 1;
+}
+
+// Feedback to update the model
+message Feedback {
+    string prediction_id = 1; // unique id to link feedback
+    float reward = 2;
+}
+
+// Response to a prediction request
+message Prediction {
+    string prediction_id = 1; // unique id to link feedback
+    Action action = 2;
+}
+
+service LearningAgent {
+  // Predict the next action for a given state
+  rpc Predict(State) returns (Prediction);
+
+  // Send feedback to update the model
+  rpc Learn(Feedback) returns (google.protobuf.Empty);
+
+  // Reset the agent's internal state/model
+  rpc Reset(google.protobuf.Empty) returns (google.protobuf.Empty);
+}

@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package adaptive_timer;
+
+import "google/protobuf/empty.proto";
+
+// Injection message to trigger artificial conditions on a distributed node.
+message FailureInjection {
+  bool fail = 1; // whether this node should simulate a failure
+  repeated uint32 ignore_nodes = 2; // nodes to keep exempt during a dark attack
+  repeated NodeDelayConfig delays = 3; // per-node delay
+}
+
+message NodeDelayConfig {
+  uint32 node_id = 1;
+  map<string, DelayBounds> delays = 2; // map of message type to delay bounds
+}
+
+message DelayBounds {
+  int32 min_ms = 1;
+  int32 max_ms = 2;
+}
+
+service InjectionService {
+  rpc InjectFailure(FailureInjection) returns (google.protobuf.Empty);
+}

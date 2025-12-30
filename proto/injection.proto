@@ -21,6 +21,12 @@ message DelayBounds {
   int32 max_ms = 2;
 }
 
+// Response message for GetLeader RPC
+message GetLeaderResponse {
+  uint32 leader_id = 1;
+}
+
 service InjectionService {
   rpc InjectFailure(FailureInjection) returns (google.protobuf.Empty);
+  rpc GetLeader(google.protobuf.Empty) returns (GetLeaderResponse);
 }

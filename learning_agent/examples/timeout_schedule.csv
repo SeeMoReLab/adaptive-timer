@@ -1,5 +1,4 @@
 # time_s,timeout_ms
 # At t=0s use 750ms, switch to 1100ms after 10s, then 900ms after 30s.
-0,750
-10,1100
-30,900
+0,200
+65,300

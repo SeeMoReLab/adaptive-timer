@@ -1,4 +1,5 @@
 import argparse
+from concurrent import futures
 import threading
 import time
 import uuid
@@ -77,6 +78,8 @@ class ScheduledLearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         timeout_ms = self._current_timeout_ms()
         prediction_id = str(uuid.uuid4())
 
+        print("Scheduled agent returning timeout:", timeout_ms, "ms")
+
         return agent_pb2.Prediction(
             prediction_id=prediction_id,
             action=agent_pb2.Action(timeout_milliseconds=timeout_ms),
@@ -141,7 +144,7 @@ class ScheduledLearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         return schedule
 
 
-def serve(host: str = "0.0.0.0", port: int = 50051):
+def serve(host: str = "0.0.0.0", port: int = 50050):
     """Start the gRPC server."""
 
     # TODO: automate n_features input
@@ -157,7 +160,7 @@ def serve(host: str = "0.0.0.0", port: int = 50051):
     server.wait_for_termination()
 
 
-def serve_with_schedule(schedule_path: str, host: str = "0.0.0.0", port: int = 50051):
+def serve_with_schedule(schedule_path: str, host: str = "0.0.0.0", port: int = 50050):
     """Start the gRPC server using a schedule-driven LearningAgentServicer."""
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -177,8 +180,8 @@ def main():
     parser.add_argument(
         "--port",
         type=int,
-        default=50051,
-        help="Port to bind the server (default: 50051)",
+        default=50050,
+        help="Port to bind the server (default: 50050)",
     )
     parser.add_argument(
         "--schedule-file",

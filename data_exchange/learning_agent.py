@@ -53,7 +53,7 @@ def get_replay_buffer_length(experiences_y):
 
 def init_quadratic_experience_buffer(experiences_X, experiences_y):
     # read all csv files in the checkpoint folder in sequence according to their timestamp
-    folder_path = "checkpoint/" 
+    folder_path = os.path.join(os.getcwd(), "data_exchange/checkpoint/" )
     files = sorted([f for f in os.listdir(folder_path) if f.endswith(".csv")])
 
     # initialize the experience buffer (the order of training data is preserved)
@@ -507,7 +507,7 @@ def run_agent(agent_stub):
         return
 
     # create the csv file for debugging and offline training
-    folder_name = "data/"
+    folder_name = "data_exchange/data/"
     if not os.path.exists(folder_name):
         os.makedirs(folder_name)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

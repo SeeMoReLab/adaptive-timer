@@ -8,7 +8,7 @@ import logging
 class BaseAggregator(ABC):
     """Handles the conversion between Protobufs and Numpy for aggregation."""
     
-    def aggregate(self, states: Dict[str, agent_pb2.State]) -> agent_pb2.State:
+    def aggregate(self, states: Dict[int, agent_pb2.State]) -> agent_pb2.State:
         data = np.array([
             [
                 float(s.processed_transactions),
@@ -39,9 +39,6 @@ class MedianAggregator(BaseAggregator):
         return np.median(data, axis=0)
 
 class WeightedMedianAggregator(BaseAggregator):
-    def __init__(self, weights: List[float]):
-        self.weights = np.array(weights, dtype=np.float32)
-
     def _calculate(self, data: np.ndarray, indices: List[int]) -> np.ndarray:
         curr_weight = self.weights[indices]
         if len(data) != len(curr_weight):

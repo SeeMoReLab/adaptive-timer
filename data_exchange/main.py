@@ -29,7 +29,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self.aggregator = aggregator 
         self._quorum_size = quorum_size
         self._condition = threading.Condition()
-        self._states: Dict[str, agent_pb2.State] = {}
+        self._states: Dict[int, agent_pb2.State] = {}
         self._consensus_states: agent_pb2.State = None
 
 

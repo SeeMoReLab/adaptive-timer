@@ -51,3 +51,6 @@ coverage.xml
 
 # Windows
 Thumbs.db
+
+# Other files to ignore
+config/keys/

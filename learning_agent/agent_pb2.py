@@ -25,21 +25,30 @@ _sym_db = _symbol_database.Default()
 from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0b\x61gent.proto\x1a\x1bgoogle/protobuf/empty.proto\"\x93\x01\n\x05State\x12\x1e\n\x16processed_transactions\x18\x01 \x01(\r\x12\x19\n\x11\x61vg_message_delay\x18\x02 \x01(\x02\x12\x19\n\x11max_message_delay\x18\x03 \x01(\x02\x12\x19\n\x11min_message_delay\x18\x04 \x01(\x02\x12\x19\n\x11std_message_delay\x18\x05 \x01(\x02\"&\n\x06\x41\x63tion\x12\x1c\n\x14timeout_milliseconds\x18\x01 \x01(\r\"1\n\x08\x46\x65\x65\x64\x62\x61\x63k\x12\x15\n\rprediction_id\x18\x01 \x01(\t\x12\x0e\n\x06reward\x18\x02 \x01(\x02\"<\n\nPrediction\x12\x15\n\rprediction_id\x18\x01 \x01(\t\x12\x17\n\x06\x61\x63tion\x18\x02 \x01(\x0b\x32\x07.Action2\x94\x01\n\rLearningAgent\x12\x1e\n\x07Predict\x12\x06.State\x1a\x0b.Prediction\x12*\n\x05Learn\x12\t.Feedback\x1a\x16.google.protobuf.Empty\x12\x37\n\x05Reset\x12\x16.google.protobuf.Empty\x1a\x16.google.protobuf.Emptyb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0b\x61gent.proto\x1a\x1bgoogle/protobuf/empty.proto\"\x94\x01\n\x06Report\x12\x1e\n\x16processed_transactions\x18\x02 \x01(\r\x12\x19\n\x11\x61vg_message_delay\x18\x03 \x01(\x02\x12\x19\n\x11max_message_delay\x18\x04 \x01(\x02\x12\x19\n\x11min_message_delay\x18\x05 \x01(\x02\x12\x19\n\x11std_message_delay\x18\x06 \x01(\x02\"[\n\x0bReportLocal\x12\x0f\n\x07node_id\x18\x01 \x01(\r\x12\x0f\n\x07\x65pisode\x18\x02 \x01(\r\x12\x17\n\x06report\x18\x03 \x01(\x0b\x32\x07.Report\x12\x11\n\tsignature\x18\x04 \x01(\x0c\"=\n\x0bReportBatch\x12\x0f\n\x07\x65pisode\x18\x01 \x01(\r\x12\x1d\n\x07reports\x18\x02 \x03(\x0b\x32\x0c.ReportLocal\"\'\n\x07Timeout\x12\x1c\n\x14timeout_milliseconds\x18\x02 \x01(\r\"!\n\x0eTimeoutRequest\x12\x0f\n\x07\x65pisode\x18\x01 \x01(\r\"\xbf\x01\n\rTimeoutStatus\x12\x0f\n\x07\x65pisode\x18\x01 \x01(\r\x12%\n\x06status\x18\x02 \x01(\x0e\x32\x15.TimeoutStatus.Status\x12\x1e\n\x07timeout\x18\x03 \x01(\x0b\x32\x08.TimeoutH\x00\x88\x01\x01\"J\n\x06Status\x12\x16\n\x12STATUS_UNSPECIFIED\x10\x00\x12\x10\n\x0cNOT_RECEIVED\x10\x01\x12\x0b\n\x07PENDING\x10\x02\x12\t\n\x05READY\x10\x03\x42\n\n\x08_timeout2F\n\tConsensus\x12\x39\n\x11SubmitReportBatch\x12\x0c.ReportBatch\x1a\x16.google.protobuf.Empty2\x9a\x02\n\rLearningAgent\x12\x32\n\nSendReport\x12\x0c.ReportLocal\x1a\x16.google.protobuf.Empty\x12-\n\nGetTimeout\x12\x0f.TimeoutRequest\x1a\x0e.TimeoutStatus\x12\x33\n\x0bShareReport\x12\x0c.ReportLocal\x1a\x16.google.protobuf.Empty\x12\x38\n\x10\x44\x65liverConsensus\x12\x0c.ReportBatch\x1a\x16.google.protobuf.Empty\x12\x37\n\x05Reset\x12\x16.google.protobuf.Empty\x1a\x16.google.protobuf.EmptyB\x12\n\x0e\x62\x66tsmart.rlrpcP\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'agent_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
-  DESCRIPTOR._loaded_options = None
-  _globals['_STATE']._serialized_start=45
-  _globals['_STATE']._serialized_end=192
-  _globals['_ACTION']._serialized_start=194
-  _globals['_ACTION']._serialized_end=232
-  _globals['_FEEDBACK']._serialized_start=234
-  _globals['_FEEDBACK']._serialized_end=283
-  _globals['_PREDICTION']._serialized_start=285
-  _globals['_PREDICTION']._serialized_end=345
-  _globals['_LEARNINGAGENT']._serialized_start=348
-  _globals['_LEARNINGAGENT']._serialized_end=496
+  _globals['DESCRIPTOR']._loaded_options = None
+  _globals['DESCRIPTOR']._serialized_options = b'\n\016bftsmart.rlrpcP\001'
+  _globals['_REPORT']._serialized_start=45
+  _globals['_REPORT']._serialized_end=193
+  _globals['_REPORTLOCAL']._serialized_start=195
+  _globals['_REPORTLOCAL']._serialized_end=286
+  _globals['_REPORTBATCH']._serialized_start=288
+  _globals['_REPORTBATCH']._serialized_end=349
+  _globals['_TIMEOUT']._serialized_start=351
+  _globals['_TIMEOUT']._serialized_end=390
+  _globals['_TIMEOUTREQUEST']._serialized_start=392
+  _globals['_TIMEOUTREQUEST']._serialized_end=425
+  _globals['_TIMEOUTSTATUS']._serialized_start=428
+  _globals['_TIMEOUTSTATUS']._serialized_end=619
+  _globals['_TIMEOUTSTATUS_STATUS']._serialized_start=533
+  _globals['_TIMEOUTSTATUS_STATUS']._serialized_end=607
+  _globals['_CONSENSUS']._serialized_start=621
+  _globals['_CONSENSUS']._serialized_end=691
+  _globals['_LEARNINGAGENT']._serialized_start=694
+  _globals['_LEARNINGAGENT']._serialized_end=976
 # @@protoc_insertion_point(module_scope)

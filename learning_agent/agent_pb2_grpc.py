@@ -26,8 +26,9 @@ if _version_not_supported:
     )
 
 
-class LearningAgentStub(object):
-    """Missing associated documentation comment in .proto file."""
+class ConsensusStub(object):
+    """Consensus service
+    """
 
     def __init__(self, channel):
         """Constructor.
@@ -35,14 +36,100 @@ class LearningAgentStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.Predict = channel.unary_unary(
-                '/LearningAgent/Predict',
-                request_serializer=agent__pb2.State.SerializeToString,
-                response_deserializer=agent__pb2.Prediction.FromString,
+        self.SubmitReportBatch = channel.unary_unary(
+                '/Consensus/SubmitReportBatch',
+                request_serializer=agent__pb2.ReportBatch.SerializeToString,
+                response_deserializer=google_dot_protobuf_dot_empty__pb2.Empty.FromString,
                 _registered_method=True)
-        self.Learn = channel.unary_unary(
-                '/LearningAgent/Learn',
-                request_serializer=agent__pb2.Feedback.SerializeToString,
+
+
+class ConsensusServicer(object):
+    """Consensus service
+    """
+
+    def SubmitReportBatch(self, request, context):
+        """Submit a batch of signed reports for consensus
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_ConsensusServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'SubmitReportBatch': grpc.unary_unary_rpc_method_handler(
+                    servicer.SubmitReportBatch,
+                    request_deserializer=agent__pb2.ReportBatch.FromString,
+                    response_serializer=google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'Consensus', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('Consensus', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class Consensus(object):
+    """Consensus service
+    """
+
+    @staticmethod
+    def SubmitReportBatch(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/Consensus/SubmitReportBatch',
+            agent__pb2.ReportBatch.SerializeToString,
+            google_dot_protobuf_dot_empty__pb2.Empty.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+
+class LearningAgentStub(object):
+    """Learning agent service
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.SendReport = channel.unary_unary(
+                '/LearningAgent/SendReport',
+                request_serializer=agent__pb2.ReportLocal.SerializeToString,
+                response_deserializer=google_dot_protobuf_dot_empty__pb2.Empty.FromString,
+                _registered_method=True)
+        self.GetTimeout = channel.unary_unary(
+                '/LearningAgent/GetTimeout',
+                request_serializer=agent__pb2.TimeoutRequest.SerializeToString,
+                response_deserializer=agent__pb2.TimeoutStatus.FromString,
+                _registered_method=True)
+        self.ShareReport = channel.unary_unary(
+                '/LearningAgent/ShareReport',
+                request_serializer=agent__pb2.ReportLocal.SerializeToString,
+                response_deserializer=google_dot_protobuf_dot_empty__pb2.Empty.FromString,
+                _registered_method=True)
+        self.DeliverConsensus = channel.unary_unary(
+                '/LearningAgent/DeliverConsensus',
+                request_serializer=agent__pb2.ReportBatch.SerializeToString,
                 response_deserializer=google_dot_protobuf_dot_empty__pb2.Empty.FromString,
                 _registered_method=True)
         self.Reset = channel.unary_unary(
@@ -53,17 +140,32 @@ class LearningAgentStub(object):
 
 
 class LearningAgentServicer(object):
-    """Missing associated documentation comment in .proto file."""
+    """Learning agent service
+    """
 
-    def Predict(self, request, context):
-        """Predict the next action for a given state
+    def SendReport(self, request, context):
+        """Send a report to the agent (status via gRPC error codes if rejected)
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def Learn(self, request, context):
-        """Send feedback to update the model
+    def GetTimeout(self, request, context):
+        """Poll for timeout recommendation for a previously accepted report
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ShareReport(self, request, context):
+        """Share a report with other agents
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeliverConsensus(self, request, context):
+        """Receive the final agreed reports from consensus
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -79,14 +181,24 @@ class LearningAgentServicer(object):
 
 def add_LearningAgentServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'Predict': grpc.unary_unary_rpc_method_handler(
-                    servicer.Predict,
-                    request_deserializer=agent__pb2.State.FromString,
-                    response_serializer=agent__pb2.Prediction.SerializeToString,
+            'SendReport': grpc.unary_unary_rpc_method_handler(
+                    servicer.SendReport,
+                    request_deserializer=agent__pb2.ReportLocal.FromString,
+                    response_serializer=google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
             ),
-            'Learn': grpc.unary_unary_rpc_method_handler(
-                    servicer.Learn,
-                    request_deserializer=agent__pb2.Feedback.FromString,
+            'GetTimeout': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetTimeout,
+                    request_deserializer=agent__pb2.TimeoutRequest.FromString,
+                    response_serializer=agent__pb2.TimeoutStatus.SerializeToString,
+            ),
+            'ShareReport': grpc.unary_unary_rpc_method_handler(
+                    servicer.ShareReport,
+                    request_deserializer=agent__pb2.ReportLocal.FromString,
+                    response_serializer=google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
+            ),
+            'DeliverConsensus': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeliverConsensus,
+                    request_deserializer=agent__pb2.ReportBatch.FromString,
                     response_serializer=google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
             ),
             'Reset': grpc.unary_unary_rpc_method_handler(
@@ -103,10 +215,11 @@ def add_LearningAgentServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class LearningAgent(object):
-    """Missing associated documentation comment in .proto file."""
+    """Learning agent service
+    """
 
     @staticmethod
-    def Predict(request,
+    def SendReport(request,
             target,
             options=(),
             channel_credentials=None,
@@ -119,9 +232,9 @@ class LearningAgent(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/LearningAgent/Predict',
-            agent__pb2.State.SerializeToString,
-            agent__pb2.Prediction.FromString,
+            '/LearningAgent/SendReport',
+            agent__pb2.ReportLocal.SerializeToString,
+            google_dot_protobuf_dot_empty__pb2.Empty.FromString,
             options,
             channel_credentials,
             insecure,
@@ -133,7 +246,7 @@ class LearningAgent(object):
             _registered_method=True)
 
     @staticmethod
-    def Learn(request,
+    def GetTimeout(request,
             target,
             options=(),
             channel_credentials=None,
@@ -146,8 +259,62 @@ class LearningAgent(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/LearningAgent/Learn',
-            agent__pb2.Feedback.SerializeToString,
+            '/LearningAgent/GetTimeout',
+            agent__pb2.TimeoutRequest.SerializeToString,
+            agent__pb2.TimeoutStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ShareReport(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/LearningAgent/ShareReport',
+            agent__pb2.ReportLocal.SerializeToString,
+            google_dot_protobuf_dot_empty__pb2.Empty.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeliverConsensus(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/LearningAgent/DeliverConsensus',
+            agent__pb2.ReportBatch.SerializeToString,
             google_dot_protobuf_dot_empty__pb2.Empty.FromString,
             options,
             channel_credentials,

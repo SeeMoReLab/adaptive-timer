@@ -18,12 +18,22 @@ from models import (
     FeatureExtractor,
     LinearTorchModel,
     ReportFeatureExtractor,
+    ScheduledTimeoutModel,
     TensorModel,
     TimeoutActionDecoder,
 )
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+
+
+def _parse_bool(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in ("true", "1", "yes", "y", "on"):
+        return True
+    if lowered in ("false", "0", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
 @dataclass(frozen=True)
@@ -159,7 +169,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         peers: List[HostEntry],
         key_dir: Path,
         collect_wait_s: float,
-        mode: str,
+        sharing: bool,
         model: TensorModel,
         feature_extractor: FeatureExtractor[agent_pb2.Report],
         action_decoder: ActionDecoder[agent_pb2.Timeout],
@@ -171,7 +181,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
     ):
         self.node_id = node_id
         self._collect_wait_s = collect_wait_s
-        self._mode = mode
+        self._sharing = sharing
         self._model = model
         self._feature_extractor = feature_extractor
         self._action_decoder = action_decoder
@@ -194,7 +204,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 self._trusted_public_keys = load_trusted_public_keys(key_dir)
 
         self._peer_stubs: Dict[int, agent_pb2_grpc.LearningAgentStub] = {}
-        if self._mode == "data-share":
+        if self._sharing:
             for peer in peers:
                 if peer.node_id == node_id:
                     continue
@@ -252,7 +262,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._local_accepted_episode = local_report.episode
             self._received_episodes.add(local_report.episode)
 
-            if self._mode == "local-only":
+            if not self._sharing:
                 timeout = self._predict_timeout_locked(local_report.report)
                 self._timeouts_by_episode[local_report.episode] = timeout
             else:
@@ -266,7 +276,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         return empty_pb2.Empty()
 
     def ShareReport(self, request: agent_pb2.ReportLocal, context) -> empty_pb2.Empty:
-        if self._mode != "data-share":
+        if not self._sharing:
             return empty_pb2.Empty()
         if not self._verify_report(request):
             return empty_pb2.Empty()
@@ -497,15 +507,16 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
 def serve(
     node_id: int,
     hosts_config: Path,
-    key_dir: Path,
+    key_dir: Optional[Path],
     collect_wait_ms: int,
-    mode: str,
+    sharing: bool,
     share_timeout_ms: Optional[int],
     consensus_timeout_ms: Optional[int],
     host: str,
     port: Optional[int],
     signing_enabled: bool,
-    use_default_keys: bool,
+    model_type: str,
+    schedule_file: Optional[Path],
 ):
     peers = load_hosts_config(hosts_config)
     entry = next((peer for peer in peers if peer.node_id == node_id), None)
@@ -518,22 +529,33 @@ def serve(
         None if consensus_timeout_ms is None else consensus_timeout_ms / 1000.0
     )
 
+    use_default_keys = key_dir is None
+    effective_key_dir = key_dir if key_dir is not None else Path(".")
+
     consensus_stub = None
-    if mode == "data-share":
+    if sharing:
         consensus_channel = grpc.insecure_channel(
             f"{entry.host}:{entry.consensus_port}"
         )
         consensus_stub = agent_pb2_grpc.ConsensusStub(consensus_channel)
 
-    model = LinearTorchModel(n_features=5, lr=0.05)
+    if model_type == "linear":
+        model = LinearTorchModel(n_features=5, lr=0.05)
+    elif model_type == "scheduled":
+        if schedule_file is None:
+            raise ValueError("--schedule-file is required when --model-type=scheduled")
+        model = ScheduledTimeoutModel.from_csv(schedule_file)
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
+
     feature_extractor = ReportFeatureExtractor()
     action_decoder = TimeoutActionDecoder(min_timeout_ms=0)
     servicer = LearningAgentServicer(
         node_id=node_id,
         peers=peers,
-        key_dir=key_dir,
+        key_dir=effective_key_dir,
         collect_wait_s=collect_wait_ms / 1000.0,
-        mode=mode,
+        sharing=sharing,
         model=model,
         feature_extractor=feature_extractor,
         action_decoder=action_decoder,
@@ -573,8 +595,8 @@ def main():
     parser.add_argument(
         "--key-dir",
         type=Path,
-        default=Path("config/keys"),
-        help="Directory for ECDSA key material.",
+        default=None,
+        help="Directory for ECDSA key material. If omitted, built-in default key is used.",
     )
     parser.add_argument(
         "--collect-wait-ms",
@@ -595,27 +617,16 @@ def main():
         help="Timeout (ms) for SubmitReportBatch RPCs.",
     )
     parser.add_argument(
-        "--mode",
-        type=str,
-        choices=("data-share", "local-only"),
-        default="data-share",
-        help="data-share: broadcast and submit for consensus; local-only: predict locally.",
+        "--sharing",
+        type=_parse_bool,
+        default=False,
+        help="Enable data sharing with peers: true or false (default false).",
     )
     parser.add_argument(
-        "--use-default-keys",
-        action="store_true",
-        help="Use the built-in default ECDSA key pair for signing and verification.",
-    )
-    signing_group = parser.add_mutually_exclusive_group()
-    signing_group.add_argument(
-        "--enable-signing",
-        action="store_true",
-        help="Enable signing and verification (default).",
-    )
-    signing_group.add_argument(
-        "--disable-signing",
-        action="store_true",
-        help="Disable signing and verification.",
+        "--signing",
+        type=_parse_bool,
+        default=True,
+        help="Enable signing and verification: true or false (default true).",
     )
     parser.add_argument(
         "--host",
@@ -629,22 +640,34 @@ def main():
         default=None,
         help="Override port to bind the server (defaults to hosts config entry).",
     )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        choices=("linear", "scheduled"),
+        default="linear",
+        help="linear: learned linear model; scheduled: timeout from a time-based schedule CSV.",
+    )
+    parser.add_argument(
+        "--schedule-file",
+        type=Path,
+        default=None,
+        help="Path to schedule CSV (time_s,timeout_ms). Required when --model-type=scheduled.",
+    )
     args = parser.parse_args()
-
-    signing_enabled = not args.disable_signing
 
     serve(
         node_id=args.node_id,
         hosts_config=args.hosts_config,
         key_dir=args.key_dir,
         collect_wait_ms=args.collect_wait_ms,
-        mode=args.mode,
+        sharing=args.sharing,
         share_timeout_ms=args.share_timeout_ms,
         consensus_timeout_ms=args.consensus_timeout_ms,
         host=args.host,
         port=args.port,
-        signing_enabled=signing_enabled,
-        use_default_keys=args.use_default_keys,
+        signing_enabled=args.signing,
+        model_type=args.model_type,
+        schedule_file=args.schedule_file,
     )
 
 

@@ -49,7 +49,7 @@ class WeightedMedianAggregate(BaseAggregate):
     
         return np.median(np.column_stack(weighted_node), axis=1)
     
-class Aggregator:
+class AggregatorAgent:
     def __init__(self, function: str = "median", **kwargs) -> None:
         self.function = function
         self.weight = kwargs.get('weight', 1)

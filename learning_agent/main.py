@@ -4,7 +4,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 import grpc
 from google.protobuf import empty_pb2
@@ -14,17 +14,24 @@ import agent_pb2_grpc
 from online import OnlineAgent
 from converter import GRPCTorchConverter
 from models import LinearTorchModel
+from aggregator import AggregatorAgent
+
 
 
 class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
     """Implementation of the LearningAgent gRPC service."""
 
-    def __init__(self, agent: OnlineAgent):
+    def __init__(self, agent: OnlineAgent, aggregator: AggregatorAgent, quorum_size:int):
         """
         Args:
             agent: an instance of OnlineAgent.
         """
         self.agent = agent
+        self._quorum_size = quorum_size
+        self._condition = threading.Condition()
+        self._states: Dict[int, agent_pb2.State] = {}
+        self.aggregator = aggregator
+
 
     def Predict(self, request: agent_pb2.State, context) -> agent_pb2.Prediction:
         """
@@ -33,9 +40,23 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         """
 
         # TODO: run consensus on state here
-        print("Received state for prediction:", request)
+        metadata = dict(context.invocation_metadata())
+        node_id = int(metadata.get('replica-id'))
 
-        pred_id, action = self.agent.predict(request)
+        with self._condition:
+            print(f"Received state for prediction from Node {node_id}: {request}")
+            self._states[node_id] = request
+
+            if len(self._states) >= self._quorum_size:
+                print(f"Node {node_id} reached quorum\n ")
+                self._condition.notify_all()         
+
+            while len(self._states) < self._quorum_size:
+                print(f"Node {node_id} waiting")
+                self._condition.wait()
+        
+        consensus_state = self.aggregator.consensus_state(states =  self._states, node_id = node_id)     
+        pred_id, action = self.agent.predict(consensus_state)
 
         return agent_pb2.Prediction(
             prediction_id = pred_id,
@@ -144,16 +165,19 @@ class ScheduledLearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         return schedule
 
 
-def serve(host: str = "0.0.0.0", port: int = 50050):
+def serve(host: str = "0.0.0.0", port: int = 50050, malicious_count: int = 2, function: str = "median", weight: int = 3):
     """Start the gRPC server."""
 
     # TODO: automate n_features input
     model = LinearTorchModel(n_features=5, lr=0.05)
     converter = GRPCTorchConverter()
     agent = OnlineAgent(converter=converter, model=model)
+    
+    aggregator = AggregatorAgent(function=function, weight=weight)
+    quorum_size = 2*malicious_count+1
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    agent_pb2_grpc.add_LearningAgentServicer_to_server(LearningAgentServicer(agent), server)
+    agent_pb2_grpc.add_LearningAgentServicer_to_server(LearningAgentServicer(agent=agent, aggregator=aggregator, quorum_size=quorum_size), server)
     server.add_insecure_port(f"{host}:{port}")
     server.start()
     print(f"LearningAgent server running at {host}:{port}")
@@ -183,6 +207,23 @@ def main():
         default=50050,
         help="Port to bind the server (default: 50050)",
     )
+
+    parser.add_argument(
+        "--malicious-nodes",
+        "-m",
+        type=int,
+        default=1,
+        help="Number of malicious nodes (default: 1)",
+    )
+
+    parser.add_argument(
+        "--function",
+        "-f",
+        type=str,
+        default="median",
+        help="Selected function for Aggregate (default: median)",
+    )
+
     parser.add_argument(
         "--schedule-file",
         type=str,
@@ -193,7 +234,7 @@ def main():
     if args.schedule_file and Path(args.schedule_file).is_file():
         serve_with_schedule(args.schedule_file, port=args.port)
     else:
-        serve(port=args.port)
+        serve(port=args.port, malicious_count=args.malicious_nodes, function = args.function)
 
 
 if __name__ == "__main__":

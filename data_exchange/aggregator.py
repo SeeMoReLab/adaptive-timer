@@ -5,21 +5,19 @@ import agent_pb2
 
 import logging
 
-class BaseAggregator(ABC):
-    """Handles the conversion between Protobufs and Numpy for aggregation."""
-    
-    def aggregate(self, states: Dict[int, agent_pb2.State]) -> agent_pb2.State:
-        data = np.array([
-            [
-                float(s.processed_transactions),
-                s.avg_message_delay,
-                s.max_message_delay,
-                s.min_message_delay,
-                s.std_message_delay
-            ] for k, s in states.items()
-        ], dtype=np.float32)
 
-        aggregated_values = self._calculate(data, indices = list(states.keys()))
+class BaseAggregate(ABC):    
+    def aggregate(self, node_id:int, states: Dict[int, agent_pb2.State]) -> agent_pb2.State:
+        data = {k: np.array([
+                    float(s.processed_transactions),
+                    s.avg_message_delay,
+                    s.max_message_delay,
+                    s.min_message_delay,
+                    s.std_message_delay
+                ]) for k, s in states.items()
+        }
+
+        aggregated_values = self._calculate(data, node_id=node_id)
 
         return agent_pb2.State(
             processed_transactions=int(aggregated_values[0]),
@@ -30,27 +28,48 @@ class BaseAggregator(ABC):
         )
 
     @abstractmethod
-    def _calculate(self, data: np.ndarray, **kwargs) -> np.ndarray:
-        """Core mathematical logic implemented by subclasses."""
+    def _calculate(self, data: Dict[int, np.array], **kwargs) -> np.ndarray:
         pass
 
-class MedianAggregator(BaseAggregator):
-    def _calculate(self, data: np.ndarray, **kwargs) -> np.ndarray:
-        return np.median(data, axis=0)
+class MedianAggregate(BaseAggregate):
+    def _calculate(self, data: Dict[int, np.array], **kwargs) -> np.ndarray:
 
-class WeightedMedianAggregator(BaseAggregator):
-    def _calculate(self, data: np.ndarray, indices: List[int]) -> np.ndarray:
-        curr_weight = self.weights[indices]
-        if len(data) != len(curr_weight):
-            raise ValueError(f"Data length ({len(data)}) must match weights ({len(self.weights)})")
-            
-        result = np.empty(data.shape[1], dtype=data.dtype)
-        for i in range(data.shape[1]):
-            column = data[:, i]
-            sorter = np.argsort(column)
-            
-            cumsum = np.cumsum(curr_weight[sorter])
-            cutoff = curr_weight.sum() / 2.0
-            idx = np.searchsorted(cumsum, cutoff)
-            result[i] = column[sorter][idx]
-        return result
+        return np.median(np.column_stack(list(data.values())), axis=1)
+
+class WeightedMedianAggregate(BaseAggregate):
+    def __init__(self, weights: int):
+        self.weights = weights
+
+    def _calculate(self, data: Dict[int, agent_pb2.State], node_id: int) -> np.ndarray:
+        if node_id not in data.keys():
+            raise ValueError(f"[Node:] {node_id} not in states")
+        
+        others = [arr for k, arr in data.items() if k != node_id]
+        weighted_node = ([data[node_id]] * self.weights) + others
+    
+        return np.median(np.column_stack(weighted_node), axis=1)
+    
+class Aggregator:
+    def __init__(self, function: str = "median", **kwargs) -> None:
+        self.function = function
+        self.weight = kwargs.get('weight', 1)
+        self.__refresh_strategy()
+
+    def set_function(self, function: str):
+        self.function = function
+        self.__refresh_strategy()
+    
+    def set_weight(self, weight: int):
+        self.weight = weight
+        self.__refresh_strategy()
+
+    def consensus_state(self, node_id:int, states: Dict[int, agent_pb2.State]) -> agent_pb2.State:
+        return self.aggregator.aggregate(node_id, states)
+
+    def __refresh_strategy(self):
+        if self.function == "median":
+            self.aggregator = MedianAggregate()
+        elif self.function == "weighted_median":
+            self.aggregator = WeightedMedianAggregate(weights=self.weight)
+        else:
+            raise ValueError(f"Unknown aggregator function: {self.function}")

@@ -48,6 +48,7 @@ def run_client(client_id: int, port: int, is_malicious: bool, id:str)->None:
         min_message_delay=avg_delay - np.random.uniform(0.01, 0.05),
         std_message_delay=np.random.uniform(0.001, 0.02),
     )
+
     logging.info(f"Client {client_id} requesting prediction...")
 
     predict = client.predict(state)

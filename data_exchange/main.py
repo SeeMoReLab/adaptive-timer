@@ -13,7 +13,7 @@ from google.protobuf import empty_pb2
 
 import agent_pb2
 import agent_pb2_grpc
-from aggregator import MedianAggregator, WeightedMedianAggregator
+from aggregator import Aggregator
 import random
 
 
@@ -30,7 +30,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._quorum_size = quorum_size
         self._condition = threading.Condition()
         self._states: Dict[int, agent_pb2.State] = {}
-        self._consensus_states: agent_pb2.State = None
+        # self._consensus_states: agent_pb2.State = None
 
 
     def Predict(self, request: agent_pb2.State, context) -> agent_pb2.Prediction:
@@ -42,13 +42,21 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         # TODO: run consensus on state here
         pid = str(uuid.uuid4())
         metadata = dict(context.invocation_metadata())
-        sender_id = int(metadata.get('replica-id'))
+        node_id = int(metadata.get('replica-id'))
         with self._condition:
-            logging.info(f"Received state for from Replica {sender_id}: {request}")
-            self.__consensus_state(sender_id, request)
-            
-       
-        logging.info(f"Replica {sender_id} Aggregated state: {self._consensus_states}\n ")
+            logging.info(f"Received state for from Replica {node_id}: {request}")
+            self._states[node_id] = request
+
+            if len(self._states) >= self._quorum_size:
+                logging.info(f"Replica {node_id} reached quorum\n ")
+                self._condition.notify_all()         
+
+            while len(self._states) < self._quorum_size:
+                logging.info(f"Replica {node_id} waiting")
+                self._condition.wait()
+                
+        self._consensus_states = self.aggregator.consensus_state(states =  self._states, node_id = node_id)     
+        logging.info(f"Replica {node_id} Aggregated state: {self._consensus_states}\n ")
         # pred_id, action = self.agent.predict(consensus_state)
 
         return agent_pb2.Prediction(
@@ -68,27 +76,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         return empty_pb2.Empty()
 
     def Reset(self, request: empty_pb2.Empty, context) -> empty_pb2.Empty:
-        self._states.clear()
         return empty_pb2.Empty()
-    
-    def __consensus_state(self, sender_id: int, request: agent_pb2.State) -> agent_pb2.State:
-        if self._consensus_states is not None:
-            return self._consensus_states
-        
-        self._states[sender_id] = request
-
-        if len(self._states) >= self._quorum_size and self._consensus_states is None:
-            logging.info(f"Replica {sender_id} reached quorum\n ")
-            self._consensus_states = self.aggregator.aggregate(self._states)
-            self._states.clear()
-            self._condition.notify_all()
-
-        while self._consensus_states is None:
-            logging.info(f"Replica {sender_id} waiting")
-            self._condition.wait()
-
-        return self._consensus_states
-
 
 
 def serve(host: str = "0.0.0.0", port: int = 50050, malicious_count: int = 3, function: str = "median"):
@@ -98,13 +86,9 @@ def serve(host: str = "0.0.0.0", port: int = 50050, malicious_count: int = 3, fu
     QUORUM = 2*malicious_count+1
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    aggregator = Aggregator(function=function, weight=3)
 
-    if function == "median":
-        agg = MedianAggregator()
-    elif function == "weighted_median":
-        agg = WeightedMedianAggregator(weights=[random.random() for _ in range(N)])
-
-    agent_pb2_grpc.add_LearningAgentServicer_to_server(LearningAgentServicer(None, aggregator=agg, quorum_size=QUORUM), server)
+    agent_pb2_grpc.add_LearningAgentServicer_to_server(LearningAgentServicer(None, aggregator= aggregator, quorum_size=QUORUM), server)
     server.add_insecure_port(f"{host}:{port}")
     server.start()
     logging.info(f"LearningAgent server running at {host}:{port} using {function} aggregator")

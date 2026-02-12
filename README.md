@@ -4,6 +4,6 @@ To run the program with example scheduled results: `python learning_agent/main.p
 ## Data Exchange
 To run the example experiment aggregation:
 
-`python data_exchange/main.py --m 2 --f median`
+`python learning_agent/main.py --malicious-nodes 2 --function weighted_median`
 
-`python data_exchange/client.py --m 2`
+`python learning_agent/multi_client.py --malicious-nodes 2`

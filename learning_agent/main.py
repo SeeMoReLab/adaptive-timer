@@ -245,6 +245,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._received_episodes: Set[int] = set()
         self._pending_episodes: Set[int] = set()
         self._timeouts_by_episode: Dict[int, agent_pb2.Timeout] = {}
+        self._features_by_episode: Dict[int, torch.Tensor] = {}
 
     def SendReport(self, request: agent_pb2.ReportLocal, context) -> empty_pb2.Empty:
         local_report = agent_pb2.ReportLocal(
@@ -275,7 +276,9 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._received_episodes.add(local_report.episode)
 
             if not self._sharing:
-                timeout = self._predict_timeout_locked(local_report.state)
+                timeout = self._predict_timeout_locked(
+                    local_report.episode, local_report.state
+                )
                 self._timeouts_by_episode[local_report.episode] = timeout
             else:
                 self._pending_episodes.add(local_report.episode)
@@ -342,7 +345,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._pending_episodes.discard(request.episode)
             self._received_episodes.add(request.episode)
 
-            timeout = self._predict_timeout_locked(median_report)
+            timeout = self._predict_timeout_locked(request.episode, median_report)
             self._timeouts_by_episode[request.episode] = timeout
 
         return empty_pb2.Empty()
@@ -379,6 +382,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._received_episodes.clear()
             self._pending_episodes.clear()
             self._timeouts_by_episode.clear()
+            self._features_by_episode.clear()
             self._current_episode = 0
             self._local_accepted_episode = None
         return empty_pb2.Empty()
@@ -515,6 +519,14 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             return
 
         feedback = request.reward
+        features = self._features_by_episode.get(feedback.episode)
+        if features is None:
+            print(
+                "[learning] skipped reward update "
+                f"(episode={feedback.episode}): no stored features for episode"
+            )
+            return
+
         timeout_ms = int(feedback.timeout_used.timeout_milliseconds)
         try:
             action_index = timeout_ms_to_index(timeout_ms)
@@ -523,9 +535,10 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             return
 
         engineered_reward = reward_engineering(feedback.report.processed_transactions)
-        features = self._feature_extractor.featurize(feedback.report)
         action = torch.tensor(float(action_index), dtype=torch.float32)
         self._model.update_model(features, action, engineered_reward)
+        # Reward for this episode has been consumed.
+        self._features_by_episode.pop(feedback.episode, None)
         print(
             "[learning] applied reward update "
             f"(episode={feedback.episode}, timeout_ms={timeout_ms}, "
@@ -533,8 +546,11 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             f"reward={engineered_reward:.2f})"
         )
 
-    def _predict_timeout_locked(self, report: agent_pb2.Report) -> agent_pb2.Timeout:
+    def _predict_timeout_locked(
+        self, episode: int, report: agent_pb2.Report
+    ) -> agent_pb2.Timeout:
         features = self._feature_extractor.featurize(report)
+        self._features_by_episode[episode] = features.detach().clone()
         action = self._model.predict_action(features)
         return self._action_decoder.decode(action)
 

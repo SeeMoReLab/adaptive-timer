@@ -48,13 +48,6 @@ def timeout_index_to_ms(index: int) -> int:
     return TIMEOUT_VALUES_MS[index]
 
 
-def nearest_timeout_index(timeout_ms: float) -> int:
-    return min(
-        range(len(TIMEOUT_VALUES_MS)),
-        key=lambda idx: abs(TIMEOUT_VALUES_MS[idx] - timeout_ms),
-    )
-
-
 class FeatureExtractor(Generic[S], ABC):
     """Converts an input state into a tensor for model consumption."""
 
@@ -128,11 +121,15 @@ class LinearTorchModel(TensorModel):
     def update_model(
         self, features: torch.Tensor, action: torch.Tensor, reward: float
     ) -> None:
-        del action
-        target_index = nearest_timeout_index(reward)
+        target_index = int(round(float(action.item())))
+        target_index = max(0, min(target_index, len(TIMEOUT_VALUES_MS) - 1))
         logits = torch.mv(self.weights, features).unsqueeze(0)
         target = torch.tensor([target_index], dtype=torch.long)
-        loss = F.cross_entropy(logits, target)
+        # Policy-gradient style weighting using throughput-shaped reward.
+        reward_scale = max(float(reward), 0.0) / 1000.0
+        if reward_scale <= 0.0:
+            return
+        loss = F.cross_entropy(logits, target) * reward_scale
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()

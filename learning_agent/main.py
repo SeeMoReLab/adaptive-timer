@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import grpc
 from google.protobuf import empty_pb2
+import torch
 
 import agent_pb2
 import agent_pb2_grpc
@@ -21,6 +22,7 @@ from models import (
     ScheduledTimeoutModel,
     TensorModel,
     TimeoutActionDecoder,
+    timeout_ms_to_index,
 )
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -34,6 +36,14 @@ def _parse_bool(value: str) -> bool:
     if lowered in ("false", "0", "no", "n", "off"):
         return False
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+def reward_engineering(throughput: int) -> float:
+    """Quadratic shaping below 1000, linear above (prior-work style)."""
+    value = float(max(0, throughput))
+    if value < 1000.0:
+        return (value / 1000.0) ** 2 * 1000.0
+    return value
 
 
 @dataclass(frozen=True)
@@ -240,11 +250,13 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         local_report = agent_pb2.ReportLocal(
             node_id=self.node_id,
             episode=request.episode,
-            report=request.report,
+            state=request.state,
         )
 
         signed_report: Optional[agent_pb2.ReportLocal] = None
         with self._lock:
+            self._apply_reward_update_locked(request)
+
             if local_report.episode < self._current_episode:
                 context.abort(
                     grpc.StatusCode.OUT_OF_RANGE,
@@ -263,7 +275,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._received_episodes.add(local_report.episode)
 
             if not self._sharing:
-                timeout = self._predict_timeout_locked(local_report.report)
+                timeout = self._predict_timeout_locked(local_report.state)
                 self._timeouts_by_episode[local_report.episode] = timeout
             else:
                 self._pending_episodes.add(local_report.episode)
@@ -303,7 +315,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
 
         print(f"[episode {request.episode}] consensus batch {len(request.reports)} reports")
         for report in request.reports:
-            local = report.report
+            local = report.state
             print(
                 f"node={report.node_id} "
                 f"processed={local.processed_transactions} "
@@ -474,21 +486,21 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         processed = int(
             round(
                 statistics.median(
-                    [entry.report.processed_transactions for entry in reports]
+                    [entry.state.processed_transactions for entry in reports]
                 )
             )
         )
         avg_delay = statistics.median(
-            [entry.report.avg_message_delay for entry in reports]
+            [entry.state.avg_message_delay for entry in reports]
         )
         max_delay = statistics.median(
-            [entry.report.max_message_delay for entry in reports]
+            [entry.state.max_message_delay for entry in reports]
         )
         min_delay = statistics.median(
-            [entry.report.min_message_delay for entry in reports]
+            [entry.state.min_message_delay for entry in reports]
         )
         std_delay = statistics.median(
-            [entry.report.std_message_delay for entry in reports]
+            [entry.state.std_message_delay for entry in reports]
         )
         return agent_pb2.Report(
             processed_transactions=processed,
@@ -496,6 +508,29 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             max_message_delay=max_delay,
             min_message_delay=min_delay,
             std_message_delay=std_delay,
+        )
+
+    def _apply_reward_update_locked(self, request: agent_pb2.ReportLocal) -> None:
+        if not request.HasField("reward"):
+            return
+
+        feedback = request.reward
+        timeout_ms = int(feedback.timeout_used.timeout_milliseconds)
+        try:
+            action_index = timeout_ms_to_index(timeout_ms)
+        except ValueError as exc:
+            print(f"[learning] skipped reward for episode {feedback.episode}: {exc}")
+            return
+
+        engineered_reward = reward_engineering(feedback.report.processed_transactions)
+        features = self._feature_extractor.featurize(feedback.report)
+        action = torch.tensor(float(action_index), dtype=torch.float32)
+        self._model.update_model(features, action, engineered_reward)
+        print(
+            "[learning] applied reward update "
+            f"(episode={feedback.episode}, timeout_ms={timeout_ms}, "
+            f"throughput={feedback.report.processed_transactions}, "
+            f"reward={engineered_reward:.2f})"
         )
 
     def _predict_timeout_locked(self, report: agent_pb2.Report) -> agent_pb2.Timeout:

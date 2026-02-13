@@ -1,13 +1,15 @@
 import argparse
 import random
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import grpc
 from google.protobuf import empty_pb2
 
 import agent_pb2
 import agent_pb2_grpc
+
+TIMEOUT_OPTIONS_MS = (200, 500, 2000)
 
 
 class LearningAgentClient:
@@ -26,6 +28,7 @@ class LearningAgentClient:
         max_message_delay: float,
         min_message_delay: float,
         std_message_delay: float,
+        reward: Optional[agent_pb2.Reward] = None,
     ) -> None:
         report = agent_pb2.Report(
             processed_transactions=processed_transactions,
@@ -37,8 +40,10 @@ class LearningAgentClient:
         local_report = agent_pb2.ReportLocal(
             node_id=node_id,
             episode=episode,
-            report=report,
+            state=report,
         )
+        if reward is not None:
+            local_report.reward.CopyFrom(reward)
         self.stub.SendReport(local_report)
 
     def get_timeout(self, episode: int) -> agent_pb2.TimeoutStatus:
@@ -106,6 +111,14 @@ def main() -> None:
         action="store_true",
         help="Only query timeout status for the episode; do not send a report.",
     )
+    parser.add_argument(
+        "--reward",
+        action="store_true",
+        help=(
+            "Attach a randomized reward payload using a random timeout from "
+            f"{TIMEOUT_OPTIONS_MS}."
+        ),
+    )
     args = parser.parse_args()
 
     hosts = _load_hosts_config(args.hosts_config)
@@ -127,6 +140,17 @@ def main() -> None:
     else:
         rng = random.Random(args.seed)
         report = _random_report(rng)
+        reward = None
+        if args.reward:
+            reward_report = _random_report(rng)
+            reward_timeout = agent_pb2.Timeout(
+                timeout_milliseconds=rng.choice(TIMEOUT_OPTIONS_MS)
+            )
+            reward = agent_pb2.Reward(
+                episode=max(0, args.episode - 1),
+                report=reward_report,
+                timeout_used=reward_timeout,
+            )
         client.send_report(
             node_id=args.node_id,
             episode=args.episode,
@@ -135,8 +159,16 @@ def main() -> None:
             max_message_delay=report.max_message_delay,
             min_message_delay=report.min_message_delay,
             std_message_delay=report.std_message_delay,
+            reward=reward,
         )
-        print("Report sent.")
+        if reward is None:
+            print("Report sent.")
+        else:
+            print(
+                "Report sent with reward:",
+                f"episode={reward.episode}",
+                f"timeout_used={reward.timeout_used.timeout_milliseconds}ms",
+            )
     client.close()
 
 

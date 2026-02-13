@@ -1,0 +1,3 @@
+[submodule "bft-smart"]
+	path = bft-smart
+	url = https://github.com/SeeMoReLab/bft-smart.git

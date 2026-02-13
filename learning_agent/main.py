@@ -549,7 +549,7 @@ def serve(
         raise ValueError(f"Unsupported model type: {model_type}")
 
     feature_extractor = ReportFeatureExtractor()
-    action_decoder = TimeoutActionDecoder(min_timeout_ms=0)
+    action_decoder = TimeoutActionDecoder()
     servicer = LearningAgentServicer(
         node_id=node_id,
         peers=peers,

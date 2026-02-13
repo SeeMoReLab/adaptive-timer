@@ -29,6 +29,7 @@ python learning_agent/main.py --node-id 0 --sharing true
 ```
 
 To use a scheduled timeout model from a CSV (`time_s,timeout_ms`):
+Allowed timeout values are `200`, `500`, and `2000` milliseconds.
 
 ```bash
 python learning_agent/main.py \
@@ -55,3 +56,9 @@ If you change `proto/agent.proto`, regenerate Python stubs:
 ```bash
 bash compile_proto.sh
 ```
+
+TODO:
+
+- Test feeding data to linear model
+- Make systems.config generation script and read from `consensus.config` and `data_exchange.config` instead of `system.config`
+- Try running end to end

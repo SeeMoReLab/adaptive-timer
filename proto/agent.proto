@@ -7,19 +7,27 @@ import "google/protobuf/empty.proto";
 
 // Represents the current state
 message Report {
-    uint32 processed_transactions = 2;
-    float avg_message_delay = 3;
-    float max_message_delay = 4;
-    float min_message_delay = 5;
-    float std_message_delay = 6;
+    uint32 processed_transactions = 1;
+    float avg_message_delay = 2;
+    float max_message_delay = 3;
+    float min_message_delay = 4;
+    float std_message_delay = 5;
 }
 
 // Represents the local state
 message ReportLocal {
     uint32 node_id = 1;
     uint32 episode = 2;
-    Report report = 3;
-    bytes signature = 4;
+    Report state = 3;
+    optional Reward reward = 4;
+    bytes signature = 5;
+}
+
+// Reward for a prior episode, sent alongside the next report
+message Reward {
+    uint32 episode = 1;
+    Report report = 2;
+    Timeout timeout_used = 3;
 }
 
 // Batch of signed reports submitted for consensus

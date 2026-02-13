@@ -1,5 +1,6 @@
 import argparse
 import base64
+import csv
 import re
 import statistics
 import threading
@@ -188,6 +189,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         consensus_timeout_s: Optional[float],
         signing_enabled: bool,
         use_default_keys: bool,
+        dataset_csv: Optional[Path],
     ):
         self.node_id = node_id
         self._collect_wait_s = collect_wait_s
@@ -245,7 +247,63 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._received_episodes: Set[int] = set()
         self._pending_episodes: Set[int] = set()
         self._timeouts_by_episode: Dict[int, agent_pb2.Timeout] = {}
-        self._features_by_episode: Dict[int, torch.Tensor] = {}
+        self._state_by_episode: Dict[int, agent_pb2.Report] = {}
+        self._dataset_handle = None
+        self._dataset_writer = None
+        self._setup_dataset_csv(dataset_csv)
+
+    def _setup_dataset_csv(self, dataset_csv: Optional[Path]) -> None:
+        if dataset_csv is None:
+            return
+
+        dataset_csv.parent.mkdir(parents=True, exist_ok=True)
+        write_header = not dataset_csv.exists() or dataset_csv.stat().st_size == 0
+        self._dataset_handle = dataset_csv.open("a", newline="")
+        self._dataset_writer = csv.writer(self._dataset_handle)
+        if write_header:
+            self._dataset_writer.writerow(
+                [
+                    "reward_episode",
+                    "report_node_id",
+                    "processed_transactions",
+                    "avg_message_delay",
+                    "max_message_delay",
+                    "min_message_delay",
+                    "std_message_delay",
+                    "timeout_used_ms",
+                    "reward",
+                    "matched_episode_features",
+                ]
+            )
+            self._dataset_handle.flush()
+
+    def _log_reward_row_locked(
+        self,
+        report_node_id: int,
+        feedback: agent_pb2.Reward,
+        matched_state: Optional[agent_pb2.Report],
+    ) -> None:
+        if self._dataset_writer is None or self._dataset_handle is None:
+            return
+
+        matched = matched_state is not None
+        report = matched_state
+        self._dataset_writer.writerow(
+            [
+                feedback.episode,
+                report_node_id,
+                "" if report is None else report.processed_transactions,
+                "" if report is None else report.avg_message_delay,
+                "" if report is None else report.max_message_delay,
+                "" if report is None else report.min_message_delay,
+                "" if report is None else report.std_message_delay,
+                feedback.timeout_used.timeout_milliseconds,
+                feedback.report.processed_transactions,
+                int(matched),
+            ]
+        )
+        # Flush every row to keep memory usage minimal and avoid data loss.
+        self._dataset_handle.flush()
 
     def SendReport(self, request: agent_pb2.ReportLocal, context) -> empty_pb2.Empty:
         local_report = agent_pb2.ReportLocal(
@@ -382,7 +440,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._received_episodes.clear()
             self._pending_episodes.clear()
             self._timeouts_by_episode.clear()
-            self._features_by_episode.clear()
+            self._state_by_episode.clear()
             self._current_episode = 0
             self._local_accepted_episode = None
         return empty_pb2.Empty()
@@ -519,11 +577,16 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             return
 
         feedback = request.reward
-        features = self._features_by_episode.get(feedback.episode)
-        if features is None:
+        matched_state = self._state_by_episode.get(feedback.episode)
+        self._log_reward_row_locked(
+            report_node_id=request.node_id,
+            feedback=feedback,
+            matched_state=matched_state,
+        )
+        if matched_state is None:
             print(
                 "[learning] skipped reward update "
-                f"(episode={feedback.episode}): no stored features for episode"
+                f"(episode={feedback.episode}): no stored state for episode"
             )
             return
 
@@ -535,10 +598,11 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             return
 
         engineered_reward = reward_engineering(feedback.report.processed_transactions)
+        features = self._feature_extractor.featurize(matched_state)
         action = torch.tensor(float(action_index), dtype=torch.float32)
         self._model.update_model(features, action, engineered_reward)
         # Reward for this episode has been consumed.
-        self._features_by_episode.pop(feedback.episode, None)
+        self._state_by_episode.pop(feedback.episode, None)
         print(
             "[learning] applied reward update "
             f"(episode={feedback.episode}, timeout_ms={timeout_ms}, "
@@ -549,8 +613,10 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
     def _predict_timeout_locked(
         self, episode: int, report: agent_pb2.Report
     ) -> agent_pb2.Timeout:
+        cached_report = agent_pb2.Report()
+        cached_report.CopyFrom(report)
+        self._state_by_episode[episode] = cached_report
         features = self._feature_extractor.featurize(report)
-        self._features_by_episode[episode] = features.detach().clone()
         action = self._model.predict_action(features)
         return self._action_decoder.decode(action)
 
@@ -568,6 +634,7 @@ def serve(
     signing_enabled: bool,
     model_type: str,
     schedule_file: Optional[Path],
+    dataset_csv: Optional[Path],
 ):
     peers = load_hosts_config(hosts_config)
     entry = next((peer for peer in peers if peer.node_id == node_id), None)
@@ -615,6 +682,7 @@ def serve(
         consensus_timeout_s=consensus_timeout_s,
         signing_enabled=signing_enabled,
         use_default_keys=use_default_keys,
+        dataset_csv=dataset_csv,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -704,6 +772,15 @@ def main():
         default=None,
         help="Path to schedule CSV (time_s,timeout_ms). Required when --model-type=scheduled.",
     )
+    parser.add_argument(
+        "--dataset-csv",
+        type=Path,
+        default=None,
+        help=(
+            "Optional CSV output path for reward-labeled samples. "
+            "Appends one row per received reward and flushes every row."
+        ),
+    )
     args = parser.parse_args()
 
     serve(
@@ -719,6 +796,7 @@ def main():
         signing_enabled=args.signing,
         model_type=args.model_type,
         schedule_file=args.schedule_file,
+        dataset_csv=args.dataset_csv,
     )
 
 

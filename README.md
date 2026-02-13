@@ -39,6 +39,14 @@ python learning_agent/main.py \
   --schedule-file learning_agent/examples/timeout_schedule.csv
 ```
 
+To log reward-labeled samples for offline train/test (generic, any model type):
+
+```bash
+python learning_agent/main.py \
+  --node-id 0 \
+  --dataset-csv scripts/tmp/reward_dataset_node0.csv
+```
+
 ### Send a Report
 
 The client sends a randomized report for the chosen node and episode. It reads the target address from `config/hosts.config`. Use `GetTimeout` to poll for status.

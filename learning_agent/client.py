@@ -100,6 +100,36 @@ def _random_report(rng: random.Random) -> agent_pb2.Report:
     )
 
 
+def _print_sent_payload(
+    node_id: int,
+    episode: int,
+    report: agent_pb2.Report,
+    reward: Optional[agent_pb2.Reward],
+) -> None:
+    print(
+        "Sent ReportLocal:",
+        f"node_id={node_id}",
+        f"episode={episode}",
+        f"state.processed_transactions={report.processed_transactions}",
+        f"state.avg_message_delay={report.avg_message_delay:.6f}",
+        f"state.max_message_delay={report.max_message_delay:.6f}",
+        f"state.min_message_delay={report.min_message_delay:.6f}",
+        f"state.std_message_delay={report.std_message_delay:.6f}",
+    )
+    if reward is None:
+        return
+    print(
+        "Sent Reward:",
+        f"reward.episode={reward.episode}",
+        f"reward.timeout_used_ms={reward.timeout_used.timeout_milliseconds}",
+        f"reward.report.processed_transactions={reward.report.processed_transactions}",
+        f"reward.report.avg_message_delay={reward.report.avg_message_delay:.6f}",
+        f"reward.report.max_message_delay={reward.report.max_message_delay:.6f}",
+        f"reward.report.min_message_delay={reward.report.min_message_delay:.6f}",
+        f"reward.report.std_message_delay={reward.report.std_message_delay:.6f}",
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="LearningAgent client")
     parser.add_argument("--hosts-config", type=Path, default=Path("config/hosts.config"))
@@ -142,12 +172,14 @@ def main() -> None:
         report = _random_report(rng)
         reward = None
         if args.reward:
+            if args.episode <= 0:
+                raise ValueError("--reward requires --episode >= 1")
             reward_report = _random_report(rng)
             reward_timeout = agent_pb2.Timeout(
                 timeout_milliseconds=rng.choice(TIMEOUT_OPTIONS_MS)
             )
             reward = agent_pb2.Reward(
-                episode=max(0, args.episode - 1),
+                episode=args.episode - 1,
                 report=reward_report,
                 timeout_used=reward_timeout,
             )
@@ -161,14 +193,12 @@ def main() -> None:
             std_message_delay=report.std_message_delay,
             reward=reward,
         )
-        if reward is None:
-            print("Report sent.")
-        else:
-            print(
-                "Report sent with reward:",
-                f"episode={reward.episode}",
-                f"timeout_used={reward.timeout_used.timeout_milliseconds}ms",
-            )
+        _print_sent_payload(
+            node_id=args.node_id,
+            episode=args.episode,
+            report=report,
+            reward=reward,
+        )
     client.close()
 
 

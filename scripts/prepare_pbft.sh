@@ -19,6 +19,7 @@ DATAEXCHANGE_DIR="${DST_LIBRARY_DIR}/dataexchange"
 MODE="local"
 F=1
 N=1
+SINGLE_NODE_CLOUDLAB=0
 CLOUDLAB_IP_FILE="${CLOUDLAB_IP_FILE_DEFAULT}"
 CLOUDLAB_IP_FILE_SET=0
 
@@ -37,6 +38,7 @@ Notes:
   - In cloudlab mode, n is derived from cloudlab_ip_file:
     n = (3f + 1) / (m - 1), where m is the number of non-empty, non-comment lines.
   - Server id i maps to node(i / n + 1).
+  - If cloudlab_ip_file only includes node0, all replicas use 127.0.0.1 on node0.
 EOF_USAGE
 }
 
@@ -111,6 +113,7 @@ generate_hosts_config() {
   local port4_base="$7"
   local port5_base="$8"
   local port6_base="$9"
+  local single_node_cloudlab="${10}"
 
   local tmp_hosts
   local server_id
@@ -124,6 +127,9 @@ generate_hosts_config() {
 
   for ((server_id = 0; server_id < num_servers; server_id++)); do
     if [[ "${mode}" == "local" ]]; then
+      ip="127.0.0.1"
+      slot="${server_id}"
+    elif [[ "${single_node_cloudlab}" == "1" ]]; then
       ip="127.0.0.1"
       slot="${server_id}"
     else
@@ -238,20 +244,26 @@ if [[ "${MODE}" == "cloudlab" ]]; then
   fi
 
   MACHINE_COUNT="$(awk '/^[[:space:]]*#/ || NF == 0 { next } { count++ } END { print count + 0 }' "${CLOUDLAB_IP_FILE}")"
-  if (( MACHINE_COUNT < 2 )); then
-    echo "CloudLab IP file must include at least node0 plus one server node: ${CLOUDLAB_IP_FILE}" >&2
+  if (( MACHINE_COUNT < 1 )); then
+    echo "CloudLab IP file is empty: ${CLOUDLAB_IP_FILE}" >&2
     exit 1
   fi
 
-  SERVER_MACHINES=$((MACHINE_COUNT - 1))
-  if (( NUM_SERVERS % SERVER_MACHINES != 0 )); then
-    echo "CloudLab size check failed: (3f + 1) must be divisible by (m - 1)." >&2
-    echo "  m=${MACHINE_COUNT}, f=${F}" >&2
-    echo "  3f + 1 = ${NUM_SERVERS}, m - 1 = ${SERVER_MACHINES}" >&2
-    exit 1
-  fi
+  if (( MACHINE_COUNT == 1 )); then
+    SINGLE_NODE_CLOUDLAB=1
+    N="${NUM_SERVERS}"
+    echo "Single-node CloudLab mode detected: using 127.0.0.1 for all replicas."
+  else
+    SERVER_MACHINES=$((MACHINE_COUNT - 1))
+    if (( NUM_SERVERS % SERVER_MACHINES != 0 )); then
+      echo "CloudLab size check failed: (3f + 1) must be divisible by (m - 1)." >&2
+      echo "  m=${MACHINE_COUNT}, f=${F}" >&2
+      echo "  3f + 1 = ${NUM_SERVERS}, m - 1 = ${SERVER_MACHINES}" >&2
+      exit 1
+    fi
 
-  N=$((NUM_SERVERS / SERVER_MACHINES))
+    N=$((NUM_SERVERS / SERVER_MACHINES))
+  fi
 fi
 
 echo "Building library distribution via gradlew installDist..."
@@ -319,7 +331,8 @@ generate_hosts_config \
   11000 \
   10000 \
   50000 \
-  55000
+  55000 \
+  "${SINGLE_NODE_CLOUDLAB}"
 
 generate_hosts_config \
   "${DATAEXCHANGE_DIR}/hosts.config" \
@@ -330,7 +343,8 @@ generate_hosts_config \
   21000 \
   20000 \
   50000 \
-  55000
+  55000 \
+  "${SINGLE_NODE_CLOUDLAB}"
 
 echo "Generated configs under: ${DST_LIBRARY_DIR}"
 echo "Mode=${MODE}, f=${F}, n=${N}, servers=${NUM_SERVERS}"

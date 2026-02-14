@@ -1,0 +1,28 @@
+[
+  {
+    "time": 2,
+    "alive": [0, 1, 2],
+    "ignore_nodes": [
+      {
+        "src_node": 0,
+        "ignored": [1, 2, 3]
+      }
+    ],
+    "delay_config": [
+      {
+        "src_node": 0,
+        "message_type": "write",
+        "targets": [
+          {
+            "target_node": 1,
+            "delay_bounds": {"min_delay": 10, "max_delay": 20}
+          },
+          {
+            "target_node": 2,
+            "delay_bounds": {"min_delay": 10, "max_delay": 20}
+          }
+        ]
+      }
+    ]
+  }
+]

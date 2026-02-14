@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Extract CloudLab SSH targets from a manifest XML file.
 
-Output format per node:
+Output file format per line:
     [node name] [ssh hostname] [ssh username]
 """
 
 import argparse
 import sys
+from pathlib import Path
 import xml.etree.ElementTree as ET
+
+
+DEFAULT_OUTPUT_PATH = (
+    Path(__file__).resolve().parents[1] / "tmp" / "cloudlab_ssh_targets.txt"
+)
 
 
 def local_name(tag: str) -> str:
@@ -55,6 +61,12 @@ def parse_manifest(manifest_path: str, username: str) -> list[tuple[str, str, st
     return rows
 
 
+def write_rows(output_path: Path, rows: list[tuple[str, str, str]]) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_lines = [f"{node} {hostname} {username}" for node, hostname, username in rows]
+    output_path.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Extract [node name] [ssh hostname] [ssh username] from a CloudLab manifest."
@@ -67,7 +79,12 @@ def main() -> int:
     parser.add_argument(
         "--username",
         required=True,
-        help="SSH username to print in output.",
+        help="SSH username to include in output.",
+    )
+    parser.add_argument(
+        "--output",
+        default=str(DEFAULT_OUTPUT_PATH),
+        help="Destination file for extracted targets (default: scripts/tmp/cloudlab_ssh_targets.txt).",
     )
     args = parser.parse_args()
 
@@ -85,8 +102,15 @@ def main() -> int:
         return 1
 
     rows.sort(key=lambda row: row[0])
-    for node, hostname, username in rows:
-        print(f"{node} {hostname} {username}")
+
+    output_path = Path(args.output)
+    try:
+        write_rows(output_path, rows)
+    except OSError as exc:
+        print(f"error: failed to write output file {output_path}: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"wrote {len(rows)} ssh targets to {output_path}")
     return 0
 
 

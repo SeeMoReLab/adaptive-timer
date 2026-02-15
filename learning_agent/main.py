@@ -1,9 +1,12 @@
 import argparse
 import base64
 import csv
+import random
 import re
 import statistics
 import threading
+import time
+import xml.etree.ElementTree as ET
 from concurrent import futures
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +56,91 @@ class HostEntry:
     host: str
     agent_port: int
     consensus_port: int
+
+
+@dataclass(frozen=True)
+class AgentInjectionPhase:
+    at_time_s: float
+    dirty_report_replica_ids: Set[int]
+    ignore_report_replica_ids: Set[int]
+
+
+def _parse_required_int(parent: ET.Element, tag: str) -> int:
+    node = parent.find(tag)
+    if node is None or node.text is None:
+        raise ValueError(f"Missing required tag <{tag}>")
+    try:
+        return int(node.text.strip())
+    except ValueError as exc:
+        raise ValueError(f"Invalid integer in <{tag}>: {node.text!r}") from exc
+
+
+def load_agent_injection_schedule(path: Path) -> List[AgentInjectionPhase]:
+    root = ET.parse(path).getroot()
+    phase_nodes = root.findall("./phases/phase")
+    if not phase_nodes:
+        raise ValueError(f"No <phase> entries found in {path}")
+
+    has_at_time = any(node.find("atTime") is not None for node in phase_nodes)
+    phases: List[AgentInjectionPhase] = []
+    cumulative_start = 0.0
+
+    for index, phase_node in enumerate(phase_nodes):
+        if has_at_time:
+            if phase_node.find("atTime") is not None:
+                at_time_s = float(_parse_required_int(phase_node, "atTime"))
+            else:
+                at_time_s = float(_parse_required_int(phase_node, "time"))
+        else:
+            at_time_s = cumulative_start
+            duration_s = float(_parse_required_int(phase_node, "time"))
+            if duration_s < 0:
+                raise ValueError("Legacy phase duration <time> must be >= 0")
+            cumulative_start += duration_s
+
+        if at_time_s < 0:
+            raise ValueError("Phase trigger time must be >= 0")
+        if index > 0 and at_time_s < phases[index - 1].at_time_s:
+            raise ValueError("Phases must be non-decreasing by trigger time")
+
+        dirty_ids: Set[int] = set()
+        for node in phase_node.findall("./agent/dirtyReport/replicas/id"):
+            if node.text is None:
+                continue
+            raw = node.text.strip()
+            try:
+                dirty_ids.add(int(raw))
+            except ValueError as exc:
+                raise ValueError(f"Invalid dirtyReport replica id: {raw!r}") from exc
+
+        ignore_ids: Set[int] = set()
+        for node in phase_node.findall("./agent/ignoreReport/replicas/id"):
+            if node.text is None:
+                continue
+            raw = node.text.strip()
+            try:
+                ignore_ids.add(int(raw))
+            except ValueError as exc:
+                raise ValueError(f"Invalid ignoreReport replica id: {raw!r}") from exc
+
+        phases.append(
+            AgentInjectionPhase(
+                at_time_s=at_time_s,
+                dirty_report_replica_ids=dirty_ids,
+                ignore_report_replica_ids=ignore_ids,
+            )
+        )
+
+    if not has_at_time:
+        print("[injection] no <atTime> found; using legacy duration semantics from <time>")
+
+    return phases
+
+
+def _compute_start_monotonic(start_unix_ms: Optional[int]) -> float:
+    if start_unix_ms is None:
+        return time.monotonic()
+    return time.monotonic() + ((start_unix_ms / 1000.0) - time.time())
 
 
 def load_hosts_config(path: Path) -> List[HostEntry]:
@@ -190,6 +278,8 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         signing_enabled: bool,
         use_default_keys: bool,
         dataset_csv: Optional[Path],
+        agent_injection_schedule: Optional[List[AgentInjectionPhase]],
+        injection_start_unix_ms: Optional[int],
     ):
         self.node_id = node_id
         self._collect_wait_s = collect_wait_s
@@ -238,6 +328,12 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
 
         self._threshold = compute_threshold(len(peers))
         self._lock = threading.Lock()
+        self._rng = random.Random(node_id + 1)
+        self._agent_injection_schedule = (
+            list(agent_injection_schedule) if agent_injection_schedule else []
+        )
+        self._injection_start_mono = _compute_start_monotonic(injection_start_unix_ms)
+        self._active_injection_phase_index = -1
         self._current_episode = 0
         self._local_accepted_episode: Optional[int] = None
         self._reports_by_episode: Dict[int, Dict[int, agent_pb2.ReportLocal]] = {}
@@ -277,6 +373,66 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             )
             self._dataset_handle.flush()
 
+    def _active_agent_injection_flags_locked(self) -> Tuple[bool, bool]:
+        if not self._agent_injection_schedule:
+            return False, False
+
+        elapsed_s = max(0.0, time.monotonic() - self._injection_start_mono)
+        active_index = -1
+        for idx, phase in enumerate(self._agent_injection_schedule):
+            if elapsed_s >= phase.at_time_s:
+                active_index = idx
+            else:
+                break
+
+        if active_index != self._active_injection_phase_index:
+            if active_index >= 0:
+                phase = self._agent_injection_schedule[active_index]
+                dirty_active = self.node_id in phase.dirty_report_replica_ids
+                ignore_active = self.node_id in phase.ignore_report_replica_ids
+                print(
+                    "[injection] active phase "
+                    f"idx={active_index} at_time={phase.at_time_s:g}s "
+                    f"(elapsed={elapsed_s:.3f}s, dirty_report={dirty_active}, "
+                    f"ignore_report={ignore_active})"
+                )
+            else:
+                print(
+                    "[injection] no active phase yet "
+                    f"(elapsed={elapsed_s:.3f}s)"
+                )
+            self._active_injection_phase_index = active_index
+
+        if active_index < 0:
+            return False, False
+
+        phase = self._agent_injection_schedule[active_index]
+        return (
+            self.node_id in phase.dirty_report_replica_ids,
+            self.node_id in phase.ignore_report_replica_ids,
+        )
+
+    def _dirty_state(self, state: agent_pb2.Report) -> agent_pb2.Report:
+        max_delay = max(
+            float(state.max_message_delay),
+            float(state.avg_message_delay),
+            float(state.min_message_delay),
+            1.0,
+        )
+        dirty_min = self._rng.uniform(0.0, max_delay * 1.5)
+        dirty_avg = self._rng.uniform(dirty_min, max_delay * 2.0 + 1.0)
+        dirty_max = self._rng.uniform(dirty_avg, max_delay * 3.0 + 1.0)
+        dirty_std = self._rng.uniform(0.0, max(dirty_max - dirty_min, 1e-3))
+        baseline_processed = max(int(state.processed_transactions), 1)
+        dirty_processed = self._rng.randint(0, baseline_processed * 3)
+        return agent_pb2.Report(
+            processed_transactions=dirty_processed,
+            avg_message_delay=float(dirty_avg),
+            max_message_delay=float(dirty_max),
+            min_message_delay=float(dirty_min),
+            std_message_delay=float(dirty_std),
+        )
+
     def _log_reward_row_locked(
         self,
         report_node_id: int,
@@ -315,6 +471,13 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         signed_report: Optional[agent_pb2.ReportLocal] = None
         with self._lock:
             self._apply_reward_update_locked(request)
+            dirty_active, _ = self._active_agent_injection_flags_locked()
+            if dirty_active:
+                local_report.state.CopyFrom(self._dirty_state(local_report.state))
+                print(
+                    "[injection] dirtyReport applied "
+                    f"(node={self.node_id}, episode={local_report.episode})"
+                )
 
             if local_report.episode < self._current_episode:
                 context.abort(
@@ -476,6 +639,13 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             if not reports_for_episode:
                 return
             snapshot = list(reports_for_episode.values())
+            _, ignore_active = self._active_agent_injection_flags_locked()
+            if ignore_active and len(snapshot) > self._threshold:
+                snapshot = sorted(snapshot, key=lambda item: item.node_id)[: self._threshold]
+                print(
+                    "[injection] ignoreReport applied "
+                    f"(node={self.node_id}, episode={episode}, kept={len(snapshot)})"
+                )
             self._submitted_episodes.add(episode)
             self._reports_by_episode.pop(episode, None)
             self._timers_by_episode.pop(episode, None)
@@ -635,6 +805,8 @@ def serve(
     model_type: str,
     schedule_file: Optional[Path],
     dataset_csv: Optional[Path],
+    failure_spec: Optional[Path],
+    injection_start_unix_ms: Optional[int],
 ):
     peers = load_hosts_config(hosts_config)
     entry = next((peer for peer in peers if peer.node_id == node_id), None)
@@ -668,6 +840,14 @@ def serve(
 
     feature_extractor = ReportFeatureExtractor()
     action_decoder = TimeoutActionDecoder()
+    agent_injection_schedule = (
+        load_agent_injection_schedule(failure_spec) if failure_spec is not None else None
+    )
+    if agent_injection_schedule:
+        print(
+            "[injection] loaded schedule "
+            f"(phases={len(agent_injection_schedule)}, start_unix_ms={injection_start_unix_ms})"
+        )
     servicer = LearningAgentServicer(
         node_id=node_id,
         peers=peers,
@@ -683,6 +863,8 @@ def serve(
         signing_enabled=signing_enabled,
         use_default_keys=use_default_keys,
         dataset_csv=dataset_csv,
+        agent_injection_schedule=agent_injection_schedule,
+        injection_start_unix_ms=injection_start_unix_ms,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -781,6 +963,25 @@ def main():
             "Appends one row per received reward and flushes every row."
         ),
     )
+    parser.add_argument(
+        "--failure-spec",
+        type=Path,
+        default=None,
+        help=(
+            "Optional failure spec XML path. "
+            "If set, learning-agent injections use <agent><dirtyReport> and "
+            "<agent><ignoreReport> schedules."
+        ),
+    )
+    parser.add_argument(
+        "--injection-start-unix-ms",
+        type=int,
+        default=None,
+        help=(
+            "Optional epoch start time in milliseconds for injection schedule. "
+            "If omitted, schedule starts when the server starts."
+        ),
+    )
     args = parser.parse_args()
 
     serve(
@@ -797,6 +998,8 @@ def main():
         model_type=args.model_type,
         schedule_file=args.schedule_file,
         dataset_csv=args.dataset_csv,
+        failure_spec=args.failure_spec,
+        injection_start_unix_ms=args.injection_start_unix_ms,
     )
 
 

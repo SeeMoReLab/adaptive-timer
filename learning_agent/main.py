@@ -22,6 +22,8 @@ from models import (
     ActionDecoder,
     FeatureExtractor,
     LinearTorchModel,
+    REPORT_FEATURE_DIM,
+    REPORT_FEATURE_FIELD_NAMES,
     ReportFeatureExtractor,
     ScheduledTimeoutModel,
     TensorModel,
@@ -279,7 +281,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         use_default_keys: bool,
         dataset_csv: Optional[Path],
         agent_injection_schedule: Optional[List[AgentInjectionPhase]],
-        injection_start_unix_ms: Optional[int],
+        injection_start_mono: float,
     ):
         self.node_id = node_id
         self._collect_wait_s = collect_wait_s
@@ -332,7 +334,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._agent_injection_schedule = (
             list(agent_injection_schedule) if agent_injection_schedule else []
         )
-        self._injection_start_mono = _compute_start_monotonic(injection_start_unix_ms)
+        self._injection_start_mono = injection_start_mono
         self._active_injection_phase_index = -1
         self._current_episode = 0
         self._local_accepted_episode: Optional[int] = None
@@ -361,12 +363,8 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 [
                     "reward_episode",
                     "report_node_id",
-                    "processed_transactions",
-                    "avg_message_delay",
-                    "max_message_delay",
-                    "min_message_delay",
-                    "std_message_delay",
-                    "timeout_used_ms",
+                    *REPORT_FEATURE_FIELD_NAMES,
+                    "timeout_milliseconds_used",
                     "reward",
                     "matched_episode_features",
                 ]
@@ -425,13 +423,58 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         dirty_std = self._rng.uniform(0.0, max(dirty_max - dirty_min, 1e-3))
         baseline_processed = max(int(state.processed_transactions), 1)
         dirty_processed = self._rng.randint(0, baseline_processed * 3)
-        return agent_pb2.Report(
-            processed_transactions=dirty_processed,
-            avg_message_delay=float(dirty_avg),
-            max_message_delay=float(dirty_max),
-            min_message_delay=float(dirty_min),
-            std_message_delay=float(dirty_std),
+        dirty_report = agent_pb2.Report()
+        dirty_report.CopyFrom(state)
+        dirty_report.processed_transactions = dirty_processed
+        dirty_report.avg_message_delay = float(dirty_avg)
+        dirty_report.max_message_delay = float(dirty_max)
+        dirty_report.min_message_delay = float(dirty_min)
+        dirty_report.std_message_delay = float(dirty_std)
+        p95_upper = max(float(dirty_report.avg_message_delay), float(dirty_report.max_message_delay) * 1.2)
+        dirty_report.p95_message_delay = float(
+            self._rng.uniform(float(dirty_report.avg_message_delay), p95_upper)
         )
+        p99_upper = max(float(dirty_report.p95_message_delay), float(dirty_report.max_message_delay) * 1.5)
+        dirty_report.p99_message_delay = float(
+            self._rng.uniform(float(dirty_report.p95_message_delay), p99_upper)
+        )
+        dirty_report.throughput_tps = float(
+            max(0.0, float(state.throughput_tps) * self._rng.uniform(0.4, 1.8))
+        )
+        dirty_report.timeout_violation_rate = float(
+            min(1.0, max(0.0, float(state.timeout_violation_rate) + self._rng.uniform(-0.1, 0.2)))
+        )
+        dirty_report.no_op_rate = float(
+            min(1.0, max(0.0, float(state.no_op_rate) + self._rng.uniform(-0.1, 0.2)))
+        )
+        dirty_report.avg_batch_size = float(
+            max(0.0, float(state.avg_batch_size) * self._rng.uniform(0.4, 1.6))
+        )
+        dirty_report.p95_batch_size = float(
+            max(
+                float(dirty_report.avg_batch_size),
+                float(state.p95_batch_size) * self._rng.uniform(0.4, 1.8),
+            )
+        )
+        dirty_report.leader_change_count = self._rng.randint(
+            0, max(int(state.leader_change_count), 1) * 3
+        )
+        dirty_report.regency_change_count = self._rng.randint(
+            0, max(int(state.regency_change_count), 1) * 3
+        )
+        dirty_report.avg_propose_delay = float(
+            max(0.0, float(state.avg_propose_delay) * self._rng.uniform(0.4, 2.0))
+        )
+        dirty_report.avg_write_delay = float(
+            max(0.0, float(state.avg_write_delay) * self._rng.uniform(0.4, 2.0))
+        )
+        dirty_report.avg_accept_delay = float(
+            max(0.0, float(state.avg_accept_delay) * self._rng.uniform(0.4, 2.0))
+        )
+        dirty_report.avg_post_decision_delay = float(
+            max(0.0, float(state.avg_post_decision_delay) * self._rng.uniform(0.4, 2.0))
+        )
+        return dirty_report
 
     def _log_reward_row_locked(
         self,
@@ -444,16 +487,17 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
 
         matched = matched_state is not None
         report = matched_state
+        report_values = (
+            [getattr(report, field_name) for field_name in REPORT_FEATURE_FIELD_NAMES]
+            if report is not None
+            else [""] * REPORT_FEATURE_DIM
+        )
         self._dataset_writer.writerow(
             [
                 feedback.episode,
                 report_node_id,
-                "" if report is None else report.processed_transactions,
-                "" if report is None else report.avg_message_delay,
-                "" if report is None else report.max_message_delay,
-                "" if report is None else report.min_message_delay,
-                "" if report is None else report.std_message_delay,
-                feedback.timeout_used.timeout_milliseconds,
+                *report_values,
+                feedback.timeout_milliseconds_used,
                 feedback.report.processed_transactions,
                 int(matched),
             ]
@@ -715,24 +759,31 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 print(f"ShareReport to node {peer_id} failed: {exc}")
 
     def _median_report(self, reports: List[agent_pb2.ReportLocal]) -> agent_pb2.Report:
-        processed = int(
-            round(
-                statistics.median(
-                    [entry.state.processed_transactions for entry in reports]
-                )
-            )
+        processed = int(round(statistics.median([entry.state.processed_transactions for entry in reports])))
+        avg_delay = float(statistics.median([entry.state.avg_message_delay for entry in reports]))
+        max_delay = float(statistics.median([entry.state.max_message_delay for entry in reports]))
+        min_delay = float(statistics.median([entry.state.min_message_delay for entry in reports]))
+        std_delay = float(statistics.median([entry.state.std_message_delay for entry in reports]))
+        p95_delay = float(statistics.median([entry.state.p95_message_delay for entry in reports]))
+        p99_delay = float(statistics.median([entry.state.p99_message_delay for entry in reports]))
+        throughput_tps = float(statistics.median([entry.state.throughput_tps for entry in reports]))
+        timeout_violation_rate = float(
+            statistics.median([entry.state.timeout_violation_rate for entry in reports])
         )
-        avg_delay = statistics.median(
-            [entry.state.avg_message_delay for entry in reports]
+        no_op_rate = float(statistics.median([entry.state.no_op_rate for entry in reports]))
+        avg_batch_size = float(statistics.median([entry.state.avg_batch_size for entry in reports]))
+        p95_batch_size = float(statistics.median([entry.state.p95_batch_size for entry in reports]))
+        leader_change_count = int(
+            round(statistics.median([entry.state.leader_change_count for entry in reports]))
         )
-        max_delay = statistics.median(
-            [entry.state.max_message_delay for entry in reports]
+        regency_change_count = int(
+            round(statistics.median([entry.state.regency_change_count for entry in reports]))
         )
-        min_delay = statistics.median(
-            [entry.state.min_message_delay for entry in reports]
-        )
-        std_delay = statistics.median(
-            [entry.state.std_message_delay for entry in reports]
+        avg_propose_delay = float(statistics.median([entry.state.avg_propose_delay for entry in reports]))
+        avg_write_delay = float(statistics.median([entry.state.avg_write_delay for entry in reports]))
+        avg_accept_delay = float(statistics.median([entry.state.avg_accept_delay for entry in reports]))
+        avg_post_decision_delay = float(
+            statistics.median([entry.state.avg_post_decision_delay for entry in reports])
         )
         return agent_pb2.Report(
             processed_transactions=processed,
@@ -740,6 +791,19 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             max_message_delay=max_delay,
             min_message_delay=min_delay,
             std_message_delay=std_delay,
+            p95_message_delay=p95_delay,
+            p99_message_delay=p99_delay,
+            throughput_tps=throughput_tps,
+            timeout_violation_rate=timeout_violation_rate,
+            no_op_rate=no_op_rate,
+            avg_batch_size=avg_batch_size,
+            p95_batch_size=p95_batch_size,
+            leader_change_count=leader_change_count,
+            regency_change_count=regency_change_count,
+            avg_propose_delay=avg_propose_delay,
+            avg_write_delay=avg_write_delay,
+            avg_accept_delay=avg_accept_delay,
+            avg_post_decision_delay=avg_post_decision_delay,
         )
 
     def _apply_reward_update_locked(self, request: agent_pb2.ReportLocal) -> None:
@@ -760,7 +824,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             )
             return
 
-        timeout_ms = int(feedback.timeout_used.timeout_milliseconds)
+        timeout_ms = int(feedback.timeout_milliseconds_used)
         try:
             action_index = timeout_ms_to_index(timeout_ms)
         except ValueError as exc:
@@ -818,6 +882,7 @@ def serve(
     consensus_timeout_s = (
         None if consensus_timeout_ms is None else consensus_timeout_ms / 1000.0
     )
+    start_mono = _compute_start_monotonic(injection_start_unix_ms)
 
     use_default_keys = key_dir is None
     effective_key_dir = key_dir if key_dir is not None else Path(".")
@@ -830,11 +895,13 @@ def serve(
         consensus_stub = agent_pb2_grpc.ConsensusStub(consensus_channel)
 
     if model_type == "linear":
-        model = LinearTorchModel(n_features=5, lr=0.05)
+        model = LinearTorchModel(n_features=REPORT_FEATURE_DIM, lr=0.05)
     elif model_type == "scheduled":
         if schedule_file is None:
             raise ValueError("--schedule-file is required when --model-type=scheduled")
-        model = ScheduledTimeoutModel.from_csv(schedule_file)
+        model = ScheduledTimeoutModel.from_csv(
+            schedule_file, start_monotonic=start_mono
+        )
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 
@@ -864,7 +931,7 @@ def serve(
         use_default_keys=use_default_keys,
         dataset_csv=dataset_csv,
         agent_injection_schedule=agent_injection_schedule,
-        injection_start_unix_ms=injection_start_unix_ms,
+        injection_start_mono=start_mono,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -978,8 +1045,9 @@ def main():
         type=int,
         default=None,
         help=(
-            "Optional epoch start time in milliseconds for injection schedule. "
-            "If omitted, schedule starts when the server starts."
+            "Optional epoch start time in milliseconds for injection schedule "
+            "and scheduled timeout model timeline. If omitted, both start when "
+            "the server starts."
         ),
     )
     args = parser.parse_args()

@@ -100,25 +100,197 @@
                 </ignoreReport>
             </agent>
         </phase>
+
+        <!-- Base case -->
         <phase>
             <atTime>10</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
-                
+
                 <global>
                     <delayMs>0</delayMs>
                     <lossPct>0</lossPct>
                 </global>
-
-                <sources>
-                    <source>
-                        <src>0</src>
-                        <delayMs>50</delayMs>
-                        <lossPct>0</lossPct>
-                    </source>
-                </sources>
             </network>
+        </phase>
+
+        <!-- Small proposal delay -->
+        <phase>
+            <atTime>40</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>0</delayMs>
+                    <lossPct>0</lossPct>
+                </global>
+            </network>
+
+            <pbft>
+                <proposalDelay>
+                    <replicas>
+                        <replica>
+                            <id>0</id>
+                            <delayMs>500</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+
+        <!-- Large proposal delay -->
+        <phase>
+            <atTime>70</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>0</delayMs>
+                    <lossPct>0</lossPct>
+                </global>
+            </network>
+
+            <pbft>
+                <proposalDelay>
+                    <replicas>
+                        <replica>
+                            <id>0</id>
+                            <delayMs>1500</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+
+        <!-- Small network delay -->
+        <phase>
+            <atTime>100</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>100</delayMs>
+                    <lossPct>0</lossPct>
+                </global>
+            </network>
+        </phase>
+
+        <!-- Small network delay + small proposal delay -->
+        <phase>
+            <atTime>130</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>100</delayMs>
+                    <lossPct>0</lossPct>
+                </global>
+            </network>
+
+            <pbft>
+                <proposalDelay>
+                    <replicas>
+                        <replica>
+                            <id>0</id>
+                            <delayMs>500</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+
+        <!-- Small network delay + large proposal delay -->
+        <phase>
+            <atTime>160</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>100</delayMs>
+                    <lossPct>0</lossPct>
+                </global>
+            </network>
+
+            <pbft>
+                <proposalDelay>
+                    <replicas>
+                        <replica>
+                            <id>0</id>
+                            <delayMs>1500</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+
+        <!-- Large network delay -->
+        <phase>
+            <atTime>190</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>300</delayMs>
+                    <lossPct>0</lossPct>
+                </global>
+            </network>
+        </phase>
+
+        <!-- Large network delay + small proposal delay -->
+        <phase>
+            <atTime>220</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>300</delayMs>
+                    <lossPct>0</lossPct>
+                </global>
+            </network>
+
+            <pbft>
+                <proposalDelay>
+                    <replicas>
+                        <replica>
+                            <id>0</id>
+                            <delayMs>500</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+
+        <!-- Large network delay + large proposal delay -->
+        <phase>
+            <atTime>250</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>300</delayMs>
+                    <lossPct>0</lossPct>
+                </global>
+            </network>
+
+            <pbft>
+                <proposalDelay>
+                    <replicas>
+                        <replica>
+                            <id>0</id>
+                            <delayMs>1500</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
         </phase>
     </phases>
 </failureSpec>

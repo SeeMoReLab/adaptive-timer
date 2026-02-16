@@ -8,6 +8,7 @@ PREPARE_SCRIPT="${REPO_ROOT}/scripts/prepare_pbft.sh"
 PREPARED_LIBRARY_DIR="${REPO_ROOT}/scripts/tmp/library"
 LOCAL_TMP_DIR="${REPO_ROOT}/scripts/local/tmp"
 LOCAL_LIBRARY_DIR="${LOCAL_TMP_DIR}/library"
+LEARNING_AGENT_SRC_DIR="${REPO_ROOT}/learning_agent"
 OUTPUT_LOCAL="${LOCAL_TMP_DIR}/output.txt"
 APPLIER_PATH="${REPO_ROOT}/scripts/apply_network_failures.py"
 
@@ -16,6 +17,7 @@ F=1
 EXPERIMENT_TIME_S=60
 CLIENT_START_DELAY_S=10
 START_OFFSET_AFTER_CLIENT_LAUNCH_S=10
+DATASET_ENABLED=0
 
 OVERLAY_OCTET_A=10
 OVERLAY_OCTET_B=251
@@ -36,7 +38,7 @@ cleanup() {
     if [[ -n "${sessions}" ]]; then
       while read -r session_name; do
         [[ -z "${session_name}" ]] && continue
-        if [[ "${session_name}" == pbft_server_* || "${session_name}" == pbft_applier_* || "${session_name}" == pbft_client ]]; then
+        if [[ "${session_name}" == pbft_server_* || "${session_name}" == pbft_applier_* || "${session_name}" == pbft_agent_* || "${session_name}" == pbft_client ]]; then
           tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
         fi
       done <<< "${sessions}"
@@ -143,15 +145,27 @@ wait_for_server_endpoints_or_fail() {
 
 usage() {
   cat <<EOF
-Usage: $0 [normal|heuristic|learning|sharing] [-f <fault_tolerance>] [-t <experiment_seconds>]
+Usage: $0 [normal|heuristic|learning|sharing|scheduled] [--dataset] [-f <fault_tolerance>] [-t <experiment_seconds>]
 
 Arguments:
-  mode              Optional; one of normal|heuristic|learning|sharing (default: normal).
+  mode              Optional; one of normal|heuristic|learning|sharing|scheduled (default: normal).
 
 Flags:
+  --dataset         Collect per-replica learning-agent dataset CSVs as agentN.csv.
   -f <int>          Fault tolerance f passed to prepare_pbft.sh (default: 1).
   -t <int>          Seconds to run experiment before stopping tmux sessions (default: 60).
 EOF
+}
+
+mode_enables_learning_agent() {
+  case "$1" in
+    heuristic|learning|sharing|scheduled)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 while [[ $# -gt 0 ]]; do
@@ -178,7 +192,11 @@ while [[ $# -gt 0 ]]; do
       EXPERIMENT_TIME_S="${2}"
       shift 2
       ;;
-    normal|heuristic|learning|sharing)
+    --dataset)
+      DATASET_ENABLED=1
+      shift
+      ;;
+    normal|heuristic|learning|sharing|scheduled)
       MODE="$1"
       shift
       ;;
@@ -224,7 +242,26 @@ if ! sudo -n true >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Selected mode: ${MODE} (no mode-specific behavior yet)"
+if ! mode_enables_learning_agent "${MODE}"; then
+  LEARNING_AGENT_ENABLED=0
+else
+  LEARNING_AGENT_ENABLED=1
+fi
+SERVER_LEARNING_FLAG=""
+AGENT_SHARING_FLAG=""
+AGENT_MODEL_ARGS=""
+if (( LEARNING_AGENT_ENABLED == 1 )); then
+  SERVER_LEARNING_FLAG="--learning"
+fi
+if [[ "${MODE}" == "sharing" ]]; then
+  AGENT_SHARING_FLAG="--sharing true"
+fi
+if [[ "${MODE}" == "scheduled" ]]; then
+  AGENT_MODEL_ARGS="--model-type scheduled --schedule-file learning_agent/config/schedule.csv"
+fi
+
+echo "Selected mode: ${MODE}"
+echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (dataset=${DATASET_ENABLED})"
 echo "Preparing PBFT configs in local mode with f=${F}..."
 "${PREPARE_SCRIPT}" local -f "${F}"
 
@@ -232,11 +269,23 @@ if [[ ! -d "${PREPARED_LIBRARY_DIR}" ]]; then
   echo "Prepared library directory not found: ${PREPARED_LIBRARY_DIR}" >&2
   exit 1
 fi
+if (( LEARNING_AGENT_ENABLED == 1 )) && [[ ! -d "${LEARNING_AGENT_SRC_DIR}" ]]; then
+  echo "learning_agent directory not found: ${LEARNING_AGENT_SRC_DIR}" >&2
+  exit 1
+fi
 
 echo "Staging local runtime library under ${LOCAL_LIBRARY_DIR}..."
 mkdir -p "${LOCAL_TMP_DIR}"
 rm -rf "${LOCAL_LIBRARY_DIR}"
 cp -a "${PREPARED_LIBRARY_DIR}" "${LOCAL_LIBRARY_DIR}"
+if (( LEARNING_AGENT_ENABLED == 1 )); then
+  rm -rf "${LOCAL_LIBRARY_DIR}/learning_agent"
+  cp -a "${LEARNING_AGENT_SRC_DIR}" "${LOCAL_LIBRARY_DIR}/learning_agent"
+fi
+if [[ "${MODE}" == "scheduled" ]] && [[ ! -f "${LOCAL_LIBRARY_DIR}/learning_agent/config/schedule.csv" ]]; then
+  echo "Scheduled mode requires ${LOCAL_LIBRARY_DIR}/learning_agent/config/schedule.csv" >&2
+  exit 1
+fi
 
 NUM_SERVERS="$(
   awk -F= '
@@ -331,6 +380,41 @@ if (( applier_start_failed != 0 )); then
   exit 1
 fi
 
+if (( LEARNING_AGENT_ENABLED == 1 )); then
+  echo "Starting learning-agent replicas..."
+  agent_start_failed=0
+  for ((n = 0; n < replicas_per_machine; n++)); do
+    replica_id="${n}"
+    ns_name="pbft-r${replica_id}"
+    session_name="pbft_agent_${replica_id}"
+    agent_log="${LOCAL_LIBRARY_DIR}/agent_${replica_id}.log"
+    dataset_args=""
+    if (( DATASET_ENABLED == 1 )); then
+      rm -f "${LOCAL_LIBRARY_DIR}/agent${replica_id}.csv"
+      dataset_args="--dataset-csv agent${replica_id}.csv"
+    fi
+    tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
+    : > "${agent_log}"
+    tmux new-session -d -s "${session_name}" \
+      "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${LOCAL_LIBRARY_DIR}\" && exec python3 learning_agent/main.py --node-id ${replica_id} --hosts-config \"${LOCAL_LIBRARY_DIR}/smallbank/hosts.config\" --failure-spec \"${LOCAL_LIBRARY_DIR}/config/failure_spec.xml\" --injection-start-unix-ms ${START_UNIX_MS} ${AGENT_SHARING_FLAG} ${AGENT_MODEL_ARGS} ${dataset_args}' > \"${agent_log}\" 2>&1"
+  done
+  sleep 2
+  for ((n = 0; n < replicas_per_machine; n++)); do
+    replica_id="${n}"
+    session_name="pbft_agent_${replica_id}"
+    if ! tmux has-session -t "${session_name}" 2>/dev/null; then
+      echo "Learning-agent session exited early: ${session_name}" >&2
+      echo "Last learning-agent log lines (replica ${replica_id}):" >&2
+      tail -n 60 "${LOCAL_LIBRARY_DIR}/agent_${replica_id}.log" >&2 || true
+      agent_start_failed=1
+    fi
+  done
+  if (( agent_start_failed != 0 )); then
+    echo "One or more learning agents failed to stay up." >&2
+    exit 1
+  fi
+fi
+
 echo "Starting PBFT servers..."
 server_start_failed=0
 server_launch_epoch_s="$(date +%s)"
@@ -342,7 +426,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   : > "${server_log}"
   tmux new-session -d -s "${session_name}" \
-    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${LOCAL_LIBRARY_DIR}\" && exec bash smartrun.sh bftsmart.demo.smallbank.SmallBankServer ${replica_id} --config-dir smallbank${n} --failure-start-unix-ms ${START_UNIX_MS} --failure-spec config/failure_spec.xml' > \"${server_log}\" 2>&1"
+    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${LOCAL_LIBRARY_DIR}\" && exec bash smartrun.sh bftsmart.demo.smallbank.SmallBankServer ${replica_id} --config-dir smallbank${n} --failure-start-unix-ms ${START_UNIX_MS} --failure-spec config/failure_spec.xml ${SERVER_LEARNING_FLAG}' > \"${server_log}\" 2>&1"
 done
 sleep 2
 for ((n = 0; n < replicas_per_machine; n++)); do
@@ -389,7 +473,7 @@ sessions="$(tmux ls -F '#S' 2>/dev/null || true)"
 if [[ -n "${sessions}" ]]; then
   while read -r session_name; do
     [[ -z "${session_name}" ]] && continue
-    if [[ "${session_name}" == pbft_server_* || "${session_name}" == pbft_applier_* || "${session_name}" == pbft_client ]]; then
+    if [[ "${session_name}" == pbft_server_* || "${session_name}" == pbft_applier_* || "${session_name}" == pbft_agent_* || "${session_name}" == pbft_client ]]; then
       tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
     fi
   done <<< "${sessions}"
@@ -402,4 +486,20 @@ if [[ -f "${LOCAL_LIBRARY_DIR}/output.txt" ]]; then
   echo "Done. Client output saved to ${OUTPUT_LOCAL}."
 else
   echo "Client output not found: ${LOCAL_LIBRARY_DIR}/output.txt" >&2
+fi
+
+if (( LEARNING_AGENT_ENABLED == 1 )) && (( DATASET_ENABLED == 1 )); then
+  echo "Collecting learning-agent dataset CSVs..."
+  for ((n = 0; n < replicas_per_machine; n++)); do
+    replica_id="${n}"
+    src_csv="${LOCAL_LIBRARY_DIR}/agent${replica_id}.csv"
+    dst_csv="${LOCAL_TMP_DIR}/agent${replica_id}.csv"
+    rm -f "${dst_csv}"
+    if [[ -f "${src_csv}" ]]; then
+      cp -a "${src_csv}" "${dst_csv}"
+      echo "  - copied ${dst_csv}"
+    else
+      echo "  - missing dataset for replica ${replica_id}: ${src_csv}" >&2
+    fi
+  done
 fi

@@ -7,6 +7,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PREPARE_SCRIPT="${REPO_ROOT}/scripts/prepare_pbft.sh"
 TARGETS_FILE_DEFAULT="${REPO_ROOT}/scripts/cloudlab/tmp/cloudlab_ssh_targets.txt"
 LIBRARY_DIR="${REPO_ROOT}/scripts/tmp/library"
+LEARNING_AGENT_SRC_DIR="${REPO_ROOT}/learning_agent"
+PAYLOAD_DIR="${REPO_ROOT}/scripts/tmp/cloudlab_payload"
 LOCAL_ZIP="${REPO_ROOT}/scripts/tmp/library.zip"
 APPLIER_LOCAL_PATH="${REPO_ROOT}/scripts/apply_network_failures.py"
 
@@ -18,11 +20,23 @@ EXPERIMENT_TIME_S=60
 CLIENT_START_DELAY_S=10
 START_OFFSET_AFTER_CLIENT_LAUNCH_S=10
 OUTPUT_LOCAL="${REPO_ROOT}/scripts/cloudlab/tmp/output.txt"
+DATASET_ENABLED=0
 OVERLAY_OCTET_A=10
 OVERLAY_OCTET_B=250
 OVERLAY_MASK_BITS=24
 OVERLAY_BRIDGE_NAME="br-pbft"
 OVERLAY_HOST_OFFSET=10
+
+mode_enables_learning_agent() {
+  case "$1" in
+    heuristic|learning|sharing|scheduled)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
 
 rewrite_hosts_for_namespaces() {
   local hosts_file="$1"
@@ -61,16 +75,95 @@ rewrite_hosts_for_namespaces() {
   mv "${tmp_hosts}" "${hosts_file}"
 }
 
+collect_server_endpoints() {
+  local hosts_file="$1"
+  awk '
+    /^[[:space:]]*#/ || NF == 0 { next }
+    NF >= 3 { print $1, $2, $3 }
+  ' "${hosts_file}"
+}
+
+wait_for_server_endpoints_from_node0_or_fail() {
+  local node0_host="$1"
+  local node0_user="$2"
+  local hosts_file="$3"
+  local deadline_epoch_s="$4"
+  local endpoints
+  local last_unready=""
+
+  endpoints="$(collect_server_endpoints "${hosts_file}")"
+  if [[ -z "${endpoints}" ]]; then
+    echo "No server endpoints found in ${hosts_file}" >&2
+    return 1
+  fi
+
+  while (( $(date +%s) < deadline_epoch_s )); do
+    local all_ready=1
+    local unready=""
+    while read -r replica_id replica_ip replica_port; do
+      [[ -z "${replica_id}" ]] && continue
+      if ! ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" \
+        "timeout 1 bash -c 'exec 3<>/dev/tcp/${replica_ip}/${replica_port}'" >/dev/null 2>&1; then
+        all_ready=0
+        unready+="${replica_id}@${replica_ip}:${replica_port} "
+      fi
+    done <<< "${endpoints}"
+
+    if (( all_ready == 1 )); then
+      return 0
+    fi
+
+    last_unready="${unready}"
+    sleep 1
+  done
+
+  echo "Timed out waiting for server ports to become reachable from node0." >&2
+  if [[ -n "${last_unready}" ]]; then
+    echo "Still unreachable: ${last_unready}" >&2
+  fi
+  return 1
+}
+
+dump_remote_server_logs() {
+  local lines="${1:-80}"
+  for i in "${!server_nodes[@]}"; do
+    local node="${server_nodes[$i]}"
+    local host="${server_hosts[$i]}"
+    local user="${server_users[$i]}"
+    local machine_idx="${i}"
+    echo "===== ${node} server logs =====" >&2
+    ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${replicas_per_server_machine}" "${machine_idx}" "${lines}" <<'REMOTE' >&2 || true
+set -euo pipefail
+
+replicas_per_machine="$1"
+machine_idx="$2"
+lines="$3"
+
+for ((n = 0; n < replicas_per_machine; n++)); do
+  replica_id=$((machine_idx * replicas_per_machine + n))
+  log_path="$HOME/library/server_${replica_id}.log"
+  echo "--- replica ${replica_id} (${log_path}) ---"
+  if [[ -f "${log_path}" ]]; then
+    tail -n "${lines}" "${log_path}" || true
+  else
+    echo "(missing log file)"
+  fi
+done
+REMOTE
+  done
+}
+
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|heuristic|learning|sharing] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
-  mode              Optional; one of normal|heuristic|learning|sharing (default: normal).
+  mode              Optional; one of normal|heuristic|learning|sharing|scheduled (default: normal).
   targets_file      Optional path to cloudlab SSH targets file.
 
 Flags:
+  --dataset         Collect per-replica learning-agent dataset CSVs as agentN.csv.
   -f <int>          Fault tolerance f passed to prepare_pbft.sh (default: 1).
   -t <int>          Seconds to run experiment before stopping tmux sessions (default: 60).
 EOF
@@ -110,7 +203,11 @@ while [[ $# -gt 0 ]]; do
       EXPERIMENT_TIME_S="${2}"
       shift 2
       ;;
-    normal|heuristic|learning|sharing)
+    --dataset)
+      DATASET_ENABLED=1
+      shift
+      ;;
+    normal|heuristic|learning|sharing|scheduled)
       MODE="$1"
       shift
       ;;
@@ -161,12 +258,22 @@ if [[ ! -f "${TARGETS_FILE}" ]]; then
   exit 1
 fi
 
-echo "Selected mode: ${MODE} (no mode-specific behavior yet)"
+if ! mode_enables_learning_agent "${MODE}"; then
+  LEARNING_AGENT_ENABLED=0
+else
+  LEARNING_AGENT_ENABLED=1
+fi
+echo "Selected mode: ${MODE}"
+echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (dataset=${DATASET_ENABLED})"
 echo "Preparing PBFT configs in cloudlab mode with f=${F}..."
 "${PREPARE_SCRIPT}" cloudlab -f "${F}"
 
 if [[ ! -d "${LIBRARY_DIR}" ]]; then
   echo "Prepared library directory not found: ${LIBRARY_DIR}" >&2
+  exit 1
+fi
+if [[ ! -d "${LEARNING_AGENT_SRC_DIR}" ]]; then
+  echo "learning_agent directory not found: ${LEARNING_AGENT_SRC_DIR}" >&2
   exit 1
 fi
 
@@ -257,15 +364,19 @@ rewrite_hosts_for_namespaces "${LIBRARY_DIR}/dataexchange/hosts.config" "${repli
 
 mkdir -p "$(dirname "${LOCAL_ZIP}")"
 rm -f "${LOCAL_ZIP}"
-trap 'rm -f "${LOCAL_ZIP}"' EXIT
+rm -rf "${PAYLOAD_DIR}"
+mkdir -p "${PAYLOAD_DIR}"
+trap 'rm -f "${LOCAL_ZIP}"; rm -rf "${PAYLOAD_DIR}"' EXIT
 
-echo "Creating temporary library zip..."
+echo "Creating temporary CloudLab payload zip (library + learning_agent)..."
+cp -a "${LIBRARY_DIR}" "${PAYLOAD_DIR}/library"
+cp -a "${LEARNING_AGENT_SRC_DIR}" "${PAYLOAD_DIR}/learning_agent"
 (
-  cd "$(dirname "${LIBRARY_DIR}")"
-  zip -qr "${LOCAL_ZIP}" "$(basename "${LIBRARY_DIR}")"
+  cd "${PAYLOAD_DIR}"
+  zip -qr "${LOCAL_ZIP}" library learning_agent
 )
 
-echo "Copying library zip to all CloudLab nodes and materializing per-role directories (parallel)..."
+echo "Copying payload zip to all CloudLab nodes and materializing per-role directories (parallel)..."
 pids=()
 nodes=()
 
@@ -307,6 +418,7 @@ trap cleanup EXIT
 
 shopt -s nullglob
 rm -rf "$HOME/library"
+rm -rf "$HOME/learning_agent"
 rm -rf "$HOME"/smallbank[0-9]*
 rm -rf "$HOME"/dataexchange[0-9]*
 shopt -u nullglob
@@ -328,13 +440,19 @@ else
   exit 1
 fi
 
-template_dir="$tmp_extract_dir/library"
-if [[ ! -d "$template_dir" ]]; then
-  echo "library directory not found after extraction on $(hostname): $template_dir" >&2
+library_template="$tmp_extract_dir/library"
+learning_agent_template="$tmp_extract_dir/learning_agent"
+if [[ ! -d "$library_template" ]]; then
+  echo "library directory not found after extraction on $(hostname): $library_template" >&2
+  exit 1
+fi
+if [[ ! -d "$learning_agent_template" ]]; then
+  echo "learning_agent directory not found after extraction on $(hostname): $learning_agent_template" >&2
   exit 1
 fi
 
-cp -a "$template_dir" "$HOME/library"
+cp -a "$library_template" "$HOME/library"
+cp -a "$learning_agent_template" "$HOME/learning_agent"
 cp -a "$applier_path" "$HOME/library/apply_network_failures.py"
 chmod +x "$HOME/library/apply_network_failures.py"
 
@@ -342,6 +460,23 @@ if [[ ! -d "$HOME/library/smallbank" || ! -d "$HOME/library/dataexchange" ]]; th
   echo "smallbank/dataexchange directories missing under $HOME/library on $(hostname)" >&2
   exit 1
 fi
+if [[ ! -f "$HOME/learning_agent/main.py" ]]; then
+  echo "learning_agent/main.py missing under $HOME/learning_agent on $(hostname)" >&2
+  exit 1
+fi
+if [[ ! -f "$HOME/learning_agent/requirements.txt" ]]; then
+  echo "learning_agent/requirements.txt missing under $HOME/learning_agent on $(hostname)" >&2
+  exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 not found on $(hostname); cannot install learning agent requirements" >&2
+  exit 1
+fi
+if ! python3 -m pip --version >/dev/null 2>&1; then
+  echo "python3 -m pip is unavailable on $(hostname)" >&2
+  exit 1
+fi
+PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --user -r "$HOME/learning_agent/requirements.txt"
 
 if (( create_client == 1 )); then
   rm -rf "$HOME/library/client"
@@ -431,6 +566,15 @@ server_node_names=("$@")
 bridge_ip="${overlay_a}.${overlay_b}.$((machine_idx + 1)).1"
 local_subnet="${overlay_a}.${overlay_b}.$((machine_idx + 1)).0/${overlay_mask}"
 
+# Ensure local hostname resolves without DNS (required by Java InetAddress.getLocalHost()).
+local_fqdn="$(hostname -f 2>/dev/null || hostname)"
+local_short="$(hostname -s 2>/dev/null || hostname)"
+if ! getent hosts "${local_fqdn}" >/dev/null 2>&1; then
+  if ! grep -Eq "(^|[[:space:]])${local_fqdn}([[:space:]]|$)" /etc/hosts; then
+    echo "127.0.1.1 ${local_fqdn} ${local_short}" | sudo -n tee -a /etc/hosts >/dev/null
+  fi
+fi
+
 # Clean stale namespaces from previous runs.
 existing_ns="$(ip netns list | awk '/^pbft-r[0-9]+/ {print $1}')"
 if [[ -n "${existing_ns}" ]]; then
@@ -440,11 +584,20 @@ if [[ -n "${existing_ns}" ]]; then
   done
 fi
 
+# Clean stale host-side veth interfaces from prior failed runs.
+stale_veths="$(ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*//' | awk '/^vh[0-9]+$/')"
+if [[ -n "${stale_veths}" ]]; then
+  printf '%s\n' "${stale_veths}" | while read -r if_name; do
+    [[ -z "${if_name}" ]] && continue
+    sudo -n ip link del "${if_name}" >/dev/null 2>&1 || true
+  done
+fi
+
 # Recreate bridge for deterministic state.
 sudo -n ip link set "${bridge_name}" down >/dev/null 2>&1 || true
 sudo -n ip link del "${bridge_name}" type bridge >/dev/null 2>&1 || true
 sudo -n ip link add name "${bridge_name}" type bridge
-sudo -n ip addr add "${bridge_ip}/${overlay_mask}" dev "${bridge_name}"
+sudo -n ip addr replace "${bridge_ip}/${overlay_mask}" dev "${bridge_name}"
 sudo -n ip link set "${bridge_name}" up
 sudo -n sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
@@ -455,6 +608,8 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   ns_if="vn${replica_id}"
   ns_ip="${overlay_a}.${overlay_b}.$((machine_idx + 1)).$((host_offset + n))"
 
+  sudo -n ip netns del "${ns_name}" >/dev/null 2>&1 || true
+  sudo -n ip link del "${host_if}" >/dev/null 2>&1 || true
   sudo -n ip netns add "${ns_name}"
   sudo -n ip link add "${host_if}" type veth peer name "${ns_if}"
   sudo -n ip link set "${ns_if}" netns "${ns_name}"
@@ -462,7 +617,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   sudo -n ip link set "${host_if}" up
 
   sudo -n ip netns exec "${ns_name}" ip link set lo up
-  sudo -n ip netns exec "${ns_name}" ip addr add "${ns_ip}/${overlay_mask}" dev "${ns_if}"
+  sudo -n ip netns exec "${ns_name}" ip addr replace "${ns_ip}/${overlay_mask}" dev "${ns_if}"
   sudo -n ip netns exec "${ns_name}" ip link set "${ns_if}" up
   sudo -n ip netns exec "${ns_name}" ip route replace default via "${bridge_ip}"
 done
@@ -588,20 +743,114 @@ if (( applier_start_failed != 0 )); then
   exit 1
 fi
 
+if (( LEARNING_AGENT_ENABLED == 1 )); then
+  echo "Starting learning-agent replicas in tmux..."
+  agent_start_failed=0
+  for i in "${!server_nodes[@]}"; do
+    node="${server_nodes[$i]}"
+    host="${server_hosts[$i]}"
+    user="${server_users[$i]}"
+    machine_idx="${i}"
+
+    if ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${replicas_per_server_machine}" "${machine_idx}" "${START_UNIX_MS}" "${MODE}" "${DATASET_ENABLED}" <<'REMOTE'
+set -euo pipefail
+
+replicas_per_machine="$1"
+machine_idx="$2"
+start_unix_ms="$3"
+mode="$4"
+dataset_enabled="$5"
+
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "tmux not found on $(hostname)" >&2
+  exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 not found on $(hostname)" >&2
+  exit 1
+fi
+if [[ ! -f "$HOME/learning_agent/main.py" ]]; then
+  echo "learning agent missing on $(hostname): $HOME/learning_agent/main.py" >&2
+  exit 1
+fi
+if [[ ! -f "$HOME/library/smallbank/hosts.config" ]]; then
+  echo "hosts config missing on $(hostname): $HOME/library/smallbank/hosts.config" >&2
+  exit 1
+fi
+if [[ "${mode}" == "scheduled" ]] && [[ ! -f "$HOME/learning_agent/config/schedule.csv" ]]; then
+  echo "Scheduled mode requires $HOME/learning_agent/config/schedule.csv on $(hostname)" >&2
+  exit 1
+fi
+
+agent_mode_args=""
+if [[ "${mode}" == "sharing" ]]; then
+  agent_mode_args="--sharing true"
+elif [[ "${mode}" == "scheduled" ]]; then
+  agent_mode_args="--model-type scheduled --schedule-file learning_agent/config/schedule.csv"
+fi
+
+for ((n = 0; n < replicas_per_machine; n++)); do
+  replica_id=$((machine_idx * replicas_per_machine + n))
+  ns_name="pbft-r${replica_id}"
+  session_name="pbft_agent_${replica_id}"
+  agent_log="$HOME/library/agent_${replica_id}.log"
+  dataset_args=""
+  if [[ "${dataset_enabled}" == "1" ]]; then
+    rm -f "$HOME/agent${replica_id}.csv"
+    dataset_args="--dataset-csv agent${replica_id}.csv"
+  fi
+  tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
+  tmux new-session -d -s "${session_name}" \
+    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"$HOME\" && exec python3 learning_agent/main.py --node-id ${replica_id} --hosts-config \"$HOME/library/smallbank/hosts.config\" --failure-spec \"$HOME/library/config/failure_spec.xml\" --injection-start-unix-ms ${start_unix_ms} ${agent_mode_args} ${dataset_args}' > \"${agent_log}\" 2>&1"
+done
+
+sleep 2
+for ((n = 0; n < replicas_per_machine; n++)); do
+  replica_id=$((machine_idx * replicas_per_machine + n))
+  session_name="pbft_agent_${replica_id}"
+  if ! tmux has-session -t "${session_name}" 2>/dev/null; then
+    echo "Learning-agent session exited early on $(hostname): ${session_name}" >&2
+    tail -n 60 "$HOME/library/agent_${replica_id}.log" >&2 || true
+    exit 1
+  fi
+done
+REMOTE
+    then
+      echo "  - ${node}: learning agents started"
+    else
+      echo "  - ${node}: failed to start learning agents" >&2
+      agent_start_failed=1
+    fi
+  done
+  if (( agent_start_failed != 0 )); then
+    echo "Learning-agent start failed on one or more nodes." >&2
+    exit 1
+  fi
+fi
+
 echo "Starting PBFT server replicas in tmux..."
 start_failed=0
+server_launch_epoch_s="$(date +%s)"
 for i in "${!server_nodes[@]}"; do
   node="${server_nodes[$i]}"
   host="${server_hosts[$i]}"
   user="${server_users[$i]}"
   machine_idx="${i}"
 
-  if ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${replicas_per_server_machine}" "${machine_idx}" "${START_UNIX_MS}" <<'REMOTE'
+  if ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${replicas_per_server_machine}" "${machine_idx}" "${START_UNIX_MS}" "${LEARNING_AGENT_ENABLED}" "${OVERLAY_OCTET_A}" "${OVERLAY_OCTET_B}" "${OVERLAY_HOST_OFFSET}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
 machine_idx="$2"
 start_unix_ms="$3"
+learning_enabled="$4"
+overlay_a="$5"
+overlay_b="$6"
+overlay_host_offset="$7"
+server_learning_flag=""
+if [[ "${learning_enabled}" == "1" ]]; then
+  server_learning_flag="--learning"
+fi
 
 if ! command -v tmux >/dev/null 2>&1; then
   echo "tmux not found on $(hostname)" >&2
@@ -617,13 +866,37 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   replica_id=$((machine_idx * replicas_per_machine + n))
   ns_name="pbft-r${replica_id}"
   session_name="pbft_server_${replica_id}"
+  server_log="$HOME/library/server_${replica_id}.log"
+  bind_ip="${overlay_a}.${overlay_b}.$((machine_idx + 1)).$((overlay_host_offset + n))"
+  config_path="$HOME/library/smallbank${n}/system.config"
   if ! ip netns list | awk '{print $1}' | grep -qx "${ns_name}"; then
     echo "Namespace missing on $(hostname): ${ns_name}" >&2
     exit 1
   fi
+  if [[ ! -f "${config_path}" ]]; then
+    echo "Missing config file on $(hostname): ${config_path}" >&2
+    exit 1
+  fi
+  if grep -Eq '^[[:space:]]*system\.communication\.bindaddress[[:space:]]*=' "${config_path}"; then
+    sed -E -i "s|^[[:space:]]*system\.communication\.bindaddress[[:space:]]*=.*$|system.communication.bindaddress = ${bind_ip}|" "${config_path}"
+  else
+    echo "system.communication.bindaddress = ${bind_ip}" >> "${config_path}"
+  fi
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
+  : > "${server_log}"
   tmux new-session -d -s "${session_name}" \
-    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"$HOME/library\" && bash smartrun.sh bftsmart.demo.smallbank.SmallBankServer ${replica_id} --config-dir smallbank${n} --failure-start-unix-ms ${start_unix_ms} --failure-spec config/failure_spec.xml'"
+    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"$HOME/library\" && exec bash smartrun.sh bftsmart.demo.smallbank.SmallBankServer ${replica_id} --config-dir smallbank${n} --failure-start-unix-ms ${start_unix_ms} --failure-spec config/failure_spec.xml ${server_learning_flag}' > \"${server_log}\" 2>&1"
+done
+
+sleep 2
+for ((n = 0; n < replicas_per_machine; n++)); do
+  replica_id=$((machine_idx * replicas_per_machine + n))
+  session_name="pbft_server_${replica_id}"
+  if ! tmux has-session -t "${session_name}" 2>/dev/null; then
+    echo "Server session exited early on $(hostname): ${session_name}" >&2
+    tail -n 80 "$HOME/library/server_${replica_id}.log" >&2 || true
+    exit 1
+  fi
 done
 REMOTE
   then
@@ -636,11 +909,21 @@ done
 
 if (( start_failed != 0 )); then
   echo "Server start failed on one or more nodes." >&2
+  dump_remote_server_logs 120
+  exit 1
+fi
+
+client_delay_deadline="$((server_launch_epoch_s + CLIENT_START_DELAY_S))"
+if ! wait_for_server_endpoints_from_node0_or_fail "${node0_host}" "${node0_user}" "${LIBRARY_DIR}/smallbank/hosts.config" "${client_delay_deadline}"; then
+  dump_remote_server_logs 120
   exit 1
 fi
 
 echo "Waiting ${CLIENT_START_DELAY_S}s before starting client..."
-sleep "${CLIENT_START_DELAY_S}"
+remaining_client_delay="$((client_delay_deadline - $(date +%s)))"
+if (( remaining_client_delay > 0 )); then
+  sleep "${remaining_client_delay}"
+fi
 
 echo "Starting client on node0 in tmux..."
 ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" "bash -s" -- "${START_UNIX_MS}" <<'REMOTE'
@@ -687,7 +970,7 @@ fi
 
 printf '%s\n' "${sessions}" | while read -r session_name; do
   [[ -z "${session_name}" ]] && continue
-  if [[ "${session_name}" == pbft_server_* || "${session_name}" == pbft_applier_* || "${session_name}" == pbft_client ]]; then
+  if [[ "${session_name}" == pbft_server_* || "${session_name}" == pbft_applier_* || "${session_name}" == pbft_agent_* || "${session_name}" == pbft_client ]]; then
     tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   fi
 done
@@ -784,6 +1067,37 @@ mkdir -p "$(dirname "${OUTPUT_LOCAL}")"
 rm -f "${OUTPUT_LOCAL}"
 echo "Fetching client output to ${OUTPUT_LOCAL}..."
 scp "${SSH_OPTS[@]}" "${node0_user}@${node0_host}:~/library/output.txt" "${OUTPUT_LOCAL}"
+
+if (( LEARNING_AGENT_ENABLED == 1 )) && (( DATASET_ENABLED == 1 )); then
+  echo "Fetching learning-agent dataset CSVs..."
+  dataset_fetch_failed=0
+  for i in "${!server_nodes[@]}"; do
+    node="${server_nodes[$i]}"
+    host="${server_hosts[$i]}"
+    user="${server_users[$i]}"
+    machine_idx="${i}"
+    for ((n = 0; n < replicas_per_server_machine; n++)); do
+      replica_id=$((machine_idx * replicas_per_server_machine + n))
+      remote_csv_path="\$HOME/agent${replica_id}.csv"
+      remote_csv_rel="agent${replica_id}.csv"
+      local_csv="$(dirname "${OUTPUT_LOCAL}")/agent${replica_id}.csv"
+      rm -f "${local_csv}"
+      if ssh "${SSH_OPTS[@]}" "${user}@${host}" "test -f ${remote_csv_path}"; then
+        if scp "${SSH_OPTS[@]}" "${user}@${host}:${remote_csv_rel}" "${local_csv}"; then
+          echo "  - copied agent${replica_id}.csv from ${node}"
+        else
+          echo "  - failed to copy agent${replica_id}.csv from ${node}" >&2
+          dataset_fetch_failed=1
+        fi
+      else
+        echo "  - missing agent${replica_id}.csv on ${node}" >&2
+      fi
+    done
+  done
+  if (( dataset_fetch_failed != 0 )); then
+    echo "Some dataset files could not be fetched." >&2
+  fi
+fi
 
 if (( stop_failed != 0 )); then
   echo "Some nodes reported tmux stop issues; output was still collected." >&2

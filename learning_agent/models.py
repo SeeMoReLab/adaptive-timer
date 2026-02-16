@@ -3,7 +3,7 @@ import csv
 from enum import IntEnum
 import time
 from pathlib import Path
-from typing import Dict, Generic, List, Tuple, TypeVar
+from typing import Dict, Generic, List, Optional, Tuple, TypeVar
 
 import torch
 import torch.nn.functional as F
@@ -15,20 +15,42 @@ A = TypeVar("A")  # generic action type
 
 
 class TimeoutOption(IntEnum):
-    TIMEOUT_200_MS = 200
-    TIMEOUT_500_MS = 500
-    TIMEOUT_2000_MS = 2000
+    TIMEOUT_300_MS = 300
+    TIMEOUT_600_MS = 600
+    TIMEOUT_1800_MS = 1800
 
 
 TIMEOUT_OPTIONS: Tuple[TimeoutOption, ...] = (
-    TimeoutOption.TIMEOUT_200_MS,
-    TimeoutOption.TIMEOUT_500_MS,
-    TimeoutOption.TIMEOUT_2000_MS,
+    TimeoutOption.TIMEOUT_300_MS,
+    TimeoutOption.TIMEOUT_600_MS,
+    TimeoutOption.TIMEOUT_1800_MS,
 )
 TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(int(option) for option in TIMEOUT_OPTIONS)
 TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
     value_ms: idx for idx, value_ms in enumerate(TIMEOUT_VALUES_MS)
 }
+
+REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
+    "processed_transactions",
+    "avg_message_delay",
+    "max_message_delay",
+    "min_message_delay",
+    "std_message_delay",
+    "p95_message_delay",
+    "p99_message_delay",
+    "throughput_tps",
+    "timeout_violation_rate",
+    "no_op_rate",
+    "avg_batch_size",
+    "p95_batch_size",
+    "leader_change_count",
+    "regency_change_count",
+    "avg_propose_delay",
+    "avg_write_delay",
+    "avg_accept_delay",
+    "avg_post_decision_delay",
+)
+REPORT_FEATURE_DIM = len(REPORT_FEATURE_FIELD_NAMES)
 
 
 def timeout_ms_to_index(timeout_ms: int) -> int:
@@ -46,6 +68,29 @@ def timeout_index_to_ms(index: int) -> int:
     if index >= len(TIMEOUT_VALUES_MS):
         return TIMEOUT_VALUES_MS[-1]
     return TIMEOUT_VALUES_MS[index]
+
+
+def report_to_feature_values(state: agent_pb2.Report) -> List[float]:
+    return [
+        float(state.processed_transactions),
+        float(state.avg_message_delay),
+        float(state.max_message_delay),
+        float(state.min_message_delay),
+        float(state.std_message_delay),
+        float(state.p95_message_delay),
+        float(state.p99_message_delay),
+        float(state.throughput_tps),
+        float(state.timeout_violation_rate),
+        float(state.no_op_rate),
+        float(state.avg_batch_size),
+        float(state.p95_batch_size),
+        float(state.leader_change_count),
+        float(state.regency_change_count),
+        float(state.avg_propose_delay),
+        float(state.avg_write_delay),
+        float(state.avg_accept_delay),
+        float(state.avg_post_decision_delay),
+    ]
 
 
 class FeatureExtractor(Generic[S], ABC):
@@ -84,13 +129,7 @@ class TensorModel(ABC):
 
 class ReportFeatureExtractor(FeatureExtractor[agent_pb2.Report]):
     def featurize(self, state: agent_pb2.Report) -> torch.Tensor:
-        features = [
-            float(state.processed_transactions),
-            state.avg_message_delay,
-            state.max_message_delay,
-            state.min_message_delay,
-            state.std_message_delay,
-        ]
+        features = report_to_feature_values(state)
         return torch.tensor(features, dtype=torch.float32)
 
 
@@ -141,17 +180,23 @@ class LinearTorchModel(TensorModel):
 class ScheduledTimeoutModel(TensorModel):
     """Returns timeout option indices from a time-based schedule."""
 
-    def __init__(self, schedule: List[Tuple[float, int]]):
+    def __init__(
+        self, schedule: List[Tuple[float, int]], start_monotonic: Optional[float] = None
+    ):
         if not schedule:
             raise ValueError("Schedule must contain at least one entry.")
         self._schedule = sorted(schedule, key=lambda entry: entry[0])
         if self._schedule[0][0] < 0:
             raise ValueError("Schedule times must be >= 0 seconds.")
-        self._start_time = time.monotonic()
+        self._start_time = (
+            time.monotonic() if start_monotonic is None else float(start_monotonic)
+        )
         self._active_row = -1
 
     @classmethod
-    def from_csv(cls, path: Path) -> "ScheduledTimeoutModel":
+    def from_csv(
+        cls, path: Path, start_monotonic: Optional[float] = None
+    ) -> "ScheduledTimeoutModel":
         schedule: List[Tuple[float, int]] = []
         with path.open("r", newline="") as handle:
             reader = csv.reader(handle)
@@ -180,7 +225,11 @@ class ScheduledTimeoutModel(TensorModel):
                 schedule.append((time_s, option_index))
         if not schedule:
             raise ValueError(f"No schedule entries found in {path}.")
-        return cls(schedule)
+        return cls(schedule, start_monotonic=start_monotonic)
+
+    def set_start_monotonic(self, start_monotonic: float) -> None:
+        self._start_time = float(start_monotonic)
+        self._active_row = -1
 
     def _current_option_index(self) -> int:
         elapsed_s = time.monotonic() - self._start_time

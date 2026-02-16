@@ -9,7 +9,7 @@ from google.protobuf import empty_pb2
 import agent_pb2
 import agent_pb2_grpc
 
-TIMEOUT_OPTIONS_MS = (200, 500, 2000)
+TIMEOUT_OPTIONS_MS = (300, 600, 1800)
 
 
 class LearningAgentClient:
@@ -29,6 +29,20 @@ class LearningAgentClient:
         min_message_delay: float,
         std_message_delay: float,
         reward: Optional[agent_pb2.Reward] = None,
+        *,
+        p95_message_delay: float = 0.0,
+        p99_message_delay: float = 0.0,
+        throughput_tps: float = 0.0,
+        timeout_violation_rate: float = 0.0,
+        no_op_rate: float = 0.0,
+        avg_batch_size: float = 0.0,
+        p95_batch_size: float = 0.0,
+        leader_change_count: int = 0,
+        regency_change_count: int = 0,
+        avg_propose_delay: float = 0.0,
+        avg_write_delay: float = 0.0,
+        avg_accept_delay: float = 0.0,
+        avg_post_decision_delay: float = 0.0,
     ) -> None:
         report = agent_pb2.Report(
             processed_transactions=processed_transactions,
@@ -36,6 +50,19 @@ class LearningAgentClient:
             max_message_delay=max_message_delay,
             min_message_delay=min_message_delay,
             std_message_delay=std_message_delay,
+            p95_message_delay=p95_message_delay,
+            p99_message_delay=p99_message_delay,
+            throughput_tps=throughput_tps,
+            timeout_violation_rate=timeout_violation_rate,
+            no_op_rate=no_op_rate,
+            avg_batch_size=avg_batch_size,
+            p95_batch_size=p95_batch_size,
+            leader_change_count=leader_change_count,
+            regency_change_count=regency_change_count,
+            avg_propose_delay=avg_propose_delay,
+            avg_write_delay=avg_write_delay,
+            avg_accept_delay=avg_accept_delay,
+            avg_post_decision_delay=avg_post_decision_delay,
         )
         local_report = agent_pb2.ReportLocal(
             node_id=node_id,
@@ -91,12 +118,38 @@ def _random_report(rng: random.Random) -> agent_pb2.Report:
     max_delay = rng.uniform(min_delay, min_delay + rng.uniform(0.01, 0.2))
     avg_delay = rng.uniform(min_delay, max_delay)
     std_delay = rng.uniform(0.0005, max(0.001, (max_delay - min_delay) / 2))
+    p95_delay = rng.uniform(avg_delay, max(avg_delay, max_delay * 1.2))
+    p99_delay = rng.uniform(p95_delay, max(p95_delay, max_delay * 1.5))
+    throughput_tps = processed_transactions / rng.uniform(0.5, 5.0)
+    timeout_violation_rate = rng.uniform(0.0, 0.2)
+    no_op_rate = rng.uniform(0.0, 0.1)
+    avg_batch_size = rng.uniform(1.0, 200.0)
+    p95_batch_size = rng.uniform(avg_batch_size, max(avg_batch_size, avg_batch_size * 1.5))
+    leader_change_count = rng.randint(0, 8)
+    regency_change_count = rng.randint(0, 8)
+    avg_propose_delay = rng.uniform(0.0, avg_delay)
+    avg_write_delay = rng.uniform(0.0, avg_delay)
+    avg_accept_delay = rng.uniform(0.0, avg_delay)
+    avg_post_decision_delay = rng.uniform(0.0, avg_delay)
     return agent_pb2.Report(
         processed_transactions=processed_transactions,
         avg_message_delay=avg_delay,
         max_message_delay=max_delay,
         min_message_delay=min_delay,
         std_message_delay=std_delay,
+        p95_message_delay=p95_delay,
+        p99_message_delay=p99_delay,
+        throughput_tps=throughput_tps,
+        timeout_violation_rate=timeout_violation_rate,
+        no_op_rate=no_op_rate,
+        avg_batch_size=avg_batch_size,
+        p95_batch_size=p95_batch_size,
+        leader_change_count=leader_change_count,
+        regency_change_count=regency_change_count,
+        avg_propose_delay=avg_propose_delay,
+        avg_write_delay=avg_write_delay,
+        avg_accept_delay=avg_accept_delay,
+        avg_post_decision_delay=avg_post_decision_delay,
     )
 
 
@@ -115,13 +168,16 @@ def _print_sent_payload(
         f"state.max_message_delay={report.max_message_delay:.6f}",
         f"state.min_message_delay={report.min_message_delay:.6f}",
         f"state.std_message_delay={report.std_message_delay:.6f}",
+        f"state.throughput_tps={report.throughput_tps:.2f}",
+        f"state.timeout_violation_rate={report.timeout_violation_rate:.4f}",
+        f"state.no_op_rate={report.no_op_rate:.4f}",
     )
     if reward is None:
         return
     print(
         "Sent Reward:",
         f"reward.episode={reward.episode}",
-        f"reward.timeout_used_ms={reward.timeout_used.timeout_milliseconds}",
+        f"reward.timeout_milliseconds_used={reward.timeout_milliseconds_used}",
         f"reward.report.processed_transactions={reward.report.processed_transactions}",
         f"reward.report.avg_message_delay={reward.report.avg_message_delay:.6f}",
         f"reward.report.max_message_delay={reward.report.max_message_delay:.6f}",
@@ -175,13 +231,10 @@ def main() -> None:
             if args.episode <= 0:
                 raise ValueError("--reward requires --episode >= 1")
             reward_report = _random_report(rng)
-            reward_timeout = agent_pb2.Timeout(
-                timeout_milliseconds=rng.choice(TIMEOUT_OPTIONS_MS)
-            )
             reward = agent_pb2.Reward(
                 episode=args.episode - 1,
                 report=reward_report,
-                timeout_used=reward_timeout,
+                timeout_milliseconds_used=rng.choice(TIMEOUT_OPTIONS_MS),
             )
         client.send_report(
             node_id=args.node_id,
@@ -192,6 +245,19 @@ def main() -> None:
             min_message_delay=report.min_message_delay,
             std_message_delay=report.std_message_delay,
             reward=reward,
+            p95_message_delay=report.p95_message_delay,
+            p99_message_delay=report.p99_message_delay,
+            throughput_tps=report.throughput_tps,
+            timeout_violation_rate=report.timeout_violation_rate,
+            no_op_rate=report.no_op_rate,
+            avg_batch_size=report.avg_batch_size,
+            p95_batch_size=report.p95_batch_size,
+            leader_change_count=report.leader_change_count,
+            regency_change_count=report.regency_change_count,
+            avg_propose_delay=report.avg_propose_delay,
+            avg_write_delay=report.avg_write_delay,
+            avg_accept_delay=report.avg_accept_delay,
+            avg_post_decision_delay=report.avg_post_decision_delay,
         )
         _print_sent_payload(
             node_id=args.node_id,

@@ -25,7 +25,7 @@ _sym_db = _symbol_database.Default()
 from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0b\x61gent.proto\x1a\x1bgoogle/protobuf/empty.proto\"\x94\x01\n\x06Report\x12\x1e\n\x16processed_transactions\x18\x01 \x01(\r\x12\x19\n\x11\x61vg_message_delay\x18\x02 \x01(\x02\x12\x19\n\x11max_message_delay\x18\x03 \x01(\x02\x12\x19\n\x11min_message_delay\x18\x04 \x01(\x02\x12\x19\n\x11std_message_delay\x18\x05 \x01(\x02\"\x83\x01\n\x0bReportLocal\x12\x0f\n\x07node_id\x18\x01 \x01(\r\x12\x0f\n\x07\x65pisode\x18\x02 \x01(\r\x12\x16\n\x05state\x18\x03 \x01(\x0b\x32\x07.Report\x12\x1c\n\x06reward\x18\x04 \x01(\x0b\x32\x07.RewardH\x00\x88\x01\x01\x12\x11\n\tsignature\x18\x05 \x01(\x0c\x42\t\n\x07_reward\"R\n\x06Reward\x12\x0f\n\x07\x65pisode\x18\x01 \x01(\r\x12\x17\n\x06report\x18\x02 \x01(\x0b\x32\x07.Report\x12\x1e\n\x0ctimeout_used\x18\x03 \x01(\x0b\x32\x08.Timeout\"=\n\x0bReportBatch\x12\x0f\n\x07\x65pisode\x18\x01 \x01(\r\x12\x1d\n\x07reports\x18\x02 \x03(\x0b\x32\x0c.ReportLocal\"\'\n\x07Timeout\x12\x1c\n\x14timeout_milliseconds\x18\x02 \x01(\r\"!\n\x0eTimeoutRequest\x12\x0f\n\x07\x65pisode\x18\x01 \x01(\r\"\xbf\x01\n\rTimeoutStatus\x12\x0f\n\x07\x65pisode\x18\x01 \x01(\r\x12%\n\x06status\x18\x02 \x01(\x0e\x32\x15.TimeoutStatus.Status\x12\x1e\n\x07timeout\x18\x03 \x01(\x0b\x32\x08.TimeoutH\x00\x88\x01\x01\"J\n\x06Status\x12\x16\n\x12STATUS_UNSPECIFIED\x10\x00\x12\x10\n\x0cNOT_RECEIVED\x10\x01\x12\x0b\n\x07PENDING\x10\x02\x12\t\n\x05READY\x10\x03\x42\n\n\x08_timeout2F\n\tConsensus\x12\x39\n\x11SubmitReportBatch\x12\x0c.ReportBatch\x1a\x16.google.protobuf.Empty2\x9a\x02\n\rLearningAgent\x12\x32\n\nSendReport\x12\x0c.ReportLocal\x1a\x16.google.protobuf.Empty\x12-\n\nGetTimeout\x12\x0f.TimeoutRequest\x1a\x0e.TimeoutStatus\x12\x33\n\x0bShareReport\x12\x0c.ReportLocal\x1a\x16.google.protobuf.Empty\x12\x38\n\x10\x44\x65liverConsensus\x12\x0c.ReportBatch\x1a\x16.google.protobuf.Empty\x12\x37\n\x05Reset\x12\x16.google.protobuf.Empty\x1a\x16.google.protobuf.EmptyB\x12\n\x0e\x62\x66tsmart.rlrpcP\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0b\x61gent.proto\x1a\x1bgoogle/protobuf/empty.proto\"\xf0\x03\n\x06Report\x12\x1e\n\x16processed_transactions\x18\x01 \x01(\r\x12\x19\n\x11\x61vg_message_delay\x18\x02 \x01(\x02\x12\x19\n\x11max_message_delay\x18\x03 \x01(\x02\x12\x19\n\x11min_message_delay\x18\x04 \x01(\x02\x12\x19\n\x11std_message_delay\x18\x05 \x01(\x02\x12\x19\n\x11p95_message_delay\x18\x06 \x01(\x02\x12\x19\n\x11p99_message_delay\x18\x07 \x01(\x02\x12\x16\n\x0ethroughput_tps\x18\x08 \x01(\x02\x12\x1e\n\x16timeout_violation_rate\x18\t \x01(\x02\x12\x12\n\nno_op_rate\x18\n \x01(\x02\x12\x16\n\x0e\x61vg_batch_size\x18\x0b \x01(\x02\x12\x16\n\x0ep95_batch_size\x18\x0c \x01(\x02\x12\x1b\n\x13leader_change_count\x18\r \x01(\r\x12\x1c\n\x14regency_change_count\x18\x0e \x01(\r\x12\x19\n\x11\x61vg_propose_delay\x18\x0f \x01(\x02\x12\x17\n\x0f\x61vg_write_delay\x18\x10 \x01(\x02\x12\x18\n\x10\x61vg_accept_delay\x18\x11 \x01(\x02\x12\x1f\n\x17\x61vg_post_decision_delay\x18\x12 \x01(\x02\"\x83\x01\n\x0bReportLocal\x12\x0f\n\x07node_id\x18\x01 \x01(\r\x12\x0f\n\x07\x65pisode\x18\x02 \x01(\r\x12\x16\n\x05state\x18\x03 \x01(\x0b\x32\x07.Report\x12\x1c\n\x06reward\x18\x04 \x01(\x0b\x32\x07.RewardH\x00\x88\x01\x01\x12\x11\n\tsignature\x18\x05 \x01(\x0c\x42\t\n\x07_reward\"U\n\x06Reward\x12\x0f\n\x07\x65pisode\x18\x01 \x01(\r\x12\x17\n\x06report\x18\x02 \x01(\x0b\x32\x07.Report\x12!\n\x19timeout_milliseconds_used\x18\x03 \x01(\x05\"=\n\x0bReportBatch\x12\x0f\n\x07\x65pisode\x18\x01 \x01(\r\x12\x1d\n\x07reports\x18\x02 \x03(\x0b\x32\x0c.ReportLocal\"\'\n\x07Timeout\x12\x1c\n\x14timeout_milliseconds\x18\x02 \x01(\r\"!\n\x0eTimeoutRequest\x12\x0f\n\x07\x65pisode\x18\x01 \x01(\r\"\xbf\x01\n\rTimeoutStatus\x12\x0f\n\x07\x65pisode\x18\x01 \x01(\r\x12%\n\x06status\x18\x02 \x01(\x0e\x32\x15.TimeoutStatus.Status\x12\x1e\n\x07timeout\x18\x03 \x01(\x0b\x32\x08.TimeoutH\x00\x88\x01\x01\"J\n\x06Status\x12\x16\n\x12STATUS_UNSPECIFIED\x10\x00\x12\x10\n\x0cNOT_RECEIVED\x10\x01\x12\x0b\n\x07PENDING\x10\x02\x12\t\n\x05READY\x10\x03\x42\n\n\x08_timeout2F\n\tConsensus\x12\x39\n\x11SubmitReportBatch\x12\x0c.ReportBatch\x1a\x16.google.protobuf.Empty2\x9a\x02\n\rLearningAgent\x12\x32\n\nSendReport\x12\x0c.ReportLocal\x1a\x16.google.protobuf.Empty\x12-\n\nGetTimeout\x12\x0f.TimeoutRequest\x1a\x0e.TimeoutStatus\x12\x33\n\x0bShareReport\x12\x0c.ReportLocal\x1a\x16.google.protobuf.Empty\x12\x38\n\x10\x44\x65liverConsensus\x12\x0c.ReportBatch\x1a\x16.google.protobuf.Empty\x12\x37\n\x05Reset\x12\x16.google.protobuf.Empty\x1a\x16.google.protobuf.EmptyB\x12\n\x0e\x62\x66tsmart.rlrpcP\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -34,23 +34,23 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['DESCRIPTOR']._loaded_options = None
   _globals['DESCRIPTOR']._serialized_options = b'\n\016bftsmart.rlrpcP\001'
   _globals['_REPORT']._serialized_start=45
-  _globals['_REPORT']._serialized_end=193
-  _globals['_REPORTLOCAL']._serialized_start=196
-  _globals['_REPORTLOCAL']._serialized_end=327
-  _globals['_REWARD']._serialized_start=329
-  _globals['_REWARD']._serialized_end=411
-  _globals['_REPORTBATCH']._serialized_start=413
-  _globals['_REPORTBATCH']._serialized_end=474
-  _globals['_TIMEOUT']._serialized_start=476
-  _globals['_TIMEOUT']._serialized_end=515
-  _globals['_TIMEOUTREQUEST']._serialized_start=517
-  _globals['_TIMEOUTREQUEST']._serialized_end=550
-  _globals['_TIMEOUTSTATUS']._serialized_start=553
-  _globals['_TIMEOUTSTATUS']._serialized_end=744
-  _globals['_TIMEOUTSTATUS_STATUS']._serialized_start=658
-  _globals['_TIMEOUTSTATUS_STATUS']._serialized_end=732
-  _globals['_CONSENSUS']._serialized_start=746
-  _globals['_CONSENSUS']._serialized_end=816
-  _globals['_LEARNINGAGENT']._serialized_start=819
-  _globals['_LEARNINGAGENT']._serialized_end=1101
+  _globals['_REPORT']._serialized_end=541
+  _globals['_REPORTLOCAL']._serialized_start=544
+  _globals['_REPORTLOCAL']._serialized_end=675
+  _globals['_REWARD']._serialized_start=677
+  _globals['_REWARD']._serialized_end=762
+  _globals['_REPORTBATCH']._serialized_start=764
+  _globals['_REPORTBATCH']._serialized_end=825
+  _globals['_TIMEOUT']._serialized_start=827
+  _globals['_TIMEOUT']._serialized_end=866
+  _globals['_TIMEOUTREQUEST']._serialized_start=868
+  _globals['_TIMEOUTREQUEST']._serialized_end=901
+  _globals['_TIMEOUTSTATUS']._serialized_start=904
+  _globals['_TIMEOUTSTATUS']._serialized_end=1095
+  _globals['_TIMEOUTSTATUS_STATUS']._serialized_start=1009
+  _globals['_TIMEOUTSTATUS_STATUS']._serialized_end=1083
+  _globals['_CONSENSUS']._serialized_start=1097
+  _globals['_CONSENSUS']._serialized_end=1167
+  _globals['_LEARNINGAGENT']._serialized_start=1170
+  _globals['_LEARNINGAGENT']._serialized_end=1452
 # @@protoc_insertion_point(module_scope)

@@ -36,7 +36,7 @@ python learning_agent/main.py \
   --node-id 0 \
   --sharing false \
   --model-type scheduled \
-  --schedule-file learning_agent/examples/timeout_schedule.csv
+  --schedule-file learning_agent/config/schedule.csv
 ```
 
 To log reward-labeled samples for offline train/test (generic, any model type):

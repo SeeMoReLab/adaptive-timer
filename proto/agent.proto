@@ -12,6 +12,19 @@ message Report {
     float max_message_delay = 3;
     float min_message_delay = 4;
     float std_message_delay = 5;
+    float p95_message_delay = 6;
+    float p99_message_delay = 7;
+    float throughput_tps = 8;
+    float timeout_violation_rate = 9;
+    float no_op_rate = 10;
+    float avg_batch_size = 11;
+    float p95_batch_size = 12;
+    uint32 leader_change_count = 13;
+    uint32 regency_change_count = 14;
+    float avg_propose_delay = 15;
+    float avg_write_delay = 16;
+    float avg_accept_delay = 17;
+    float avg_post_decision_delay = 18;
 }
 
 // Represents the local state
@@ -27,7 +40,7 @@ message ReportLocal {
 message Reward {
     uint32 episode = 1;
     Report report = 2;
-    Timeout timeout_used = 3;
+    int32 timeout_milliseconds_used = 3;
 }
 
 // Batch of signed reports submitted for consensus

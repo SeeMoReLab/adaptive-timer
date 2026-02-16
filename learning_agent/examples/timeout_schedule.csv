@@ -1,6 +1,0 @@
-# time_s,timeout_ms
-# Valid timeout_ms options: 200, 500, 2000
-0,200
-10,500
-20,2000
-30,200

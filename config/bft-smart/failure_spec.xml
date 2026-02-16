@@ -100,5 +100,25 @@
                 </ignoreReport>
             </agent>
         </phase>
+        <phase>
+            <atTime>10</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                
+                <global>
+                    <delayMs>0</delayMs>
+                    <lossPct>0</lossPct>
+                </global>
+
+                <sources>
+                    <source>
+                        <src>0</src>
+                        <delayMs>50</delayMs>
+                        <lossPct>0</lossPct>
+                    </source>
+                </sources>
+            </network>
+        </phase>
     </phases>
 </failureSpec>

@@ -5,9 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 PREPARE_SCRIPT="${REPO_ROOT}/scripts/prepare_pbft.sh"
-TARGETS_FILE_DEFAULT="${REPO_ROOT}/scripts/tmp/cloudlab_ssh_targets.txt"
+TARGETS_FILE_DEFAULT="${REPO_ROOT}/scripts/cloudlab/tmp/cloudlab_ssh_targets.txt"
 LIBRARY_DIR="${REPO_ROOT}/scripts/tmp/library"
 LOCAL_ZIP="${REPO_ROOT}/scripts/tmp/library.zip"
+APPLIER_LOCAL_PATH="${REPO_ROOT}/scripts/apply_network_failures.py"
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new)
 MODE="normal"
@@ -15,7 +16,50 @@ F=1
 TARGETS_FILE="${TARGETS_FILE_DEFAULT}"
 EXPERIMENT_TIME_S=60
 CLIENT_START_DELAY_S=10
-OUTPUT_LOCAL="${REPO_ROOT}/scripts/tmp/output.txt"
+START_OFFSET_AFTER_CLIENT_LAUNCH_S=10
+OUTPUT_LOCAL="${REPO_ROOT}/scripts/cloudlab/tmp/output.txt"
+OVERLAY_OCTET_A=10
+OVERLAY_OCTET_B=250
+OVERLAY_MASK_BITS=24
+OVERLAY_BRIDGE_NAME="br-pbft"
+OVERLAY_HOST_OFFSET=10
+
+rewrite_hosts_for_namespaces() {
+  local hosts_file="$1"
+  local replicas_per_machine="$2"
+  local tmp_hosts
+
+  if [[ ! -f "${hosts_file}" ]]; then
+    echo "Hosts file not found for namespace rewrite: ${hosts_file}" >&2
+    return 1
+  fi
+
+  tmp_hosts="$(mktemp)"
+  awk \
+    -v rpm="${replicas_per_machine}" \
+    -v oa="${OVERLAY_OCTET_A}" \
+    -v ob="${OVERLAY_OCTET_B}" \
+    -v host_offset="${OVERLAY_HOST_OFFSET}" '
+    BEGIN {
+      OFS = " "
+      if (rpm < 1) {
+        print "Invalid replicas_per_machine for rewrite: " rpm > "/dev/stderr"
+        exit 1
+      }
+    }
+    /^[[:space:]]*#/ || NF == 0 { print; next }
+    NF < 6 { print; next }
+    {
+      replica_id = $1 + 0
+      machine_idx = int(replica_id / rpm)
+      slot = replica_id % rpm
+      ip = sprintf("%d.%d.%d.%d", oa, ob, machine_idx + 1, host_offset + slot)
+      $2 = ip
+      print $1, $2, $3, $4, $5, $6
+    }
+  ' "${hosts_file}" > "${tmp_hosts}"
+  mv "${tmp_hosts}" "${hosts_file}"
+}
 
 usage() {
   cat <<EOF
@@ -105,6 +149,10 @@ SSH_OPTS+=(-i "${LOCAL_SSH_KEY_PATH}" -o IdentitiesOnly=yes)
 
 if [[ ! -x "${PREPARE_SCRIPT}" ]]; then
   echo "prepare_pbft.sh not found or not executable: ${PREPARE_SCRIPT}" >&2
+  exit 1
+fi
+if [[ ! -f "${APPLIER_LOCAL_PATH}" ]]; then
+  echo "Network applier script not found: ${APPLIER_LOCAL_PATH}" >&2
   exit 1
 fi
 
@@ -203,6 +251,10 @@ if (( ${#server_nodes[@]} < 1 )); then
   exit 1
 fi
 
+echo "Rewriting hosts configs for per-replica namespace IPs..."
+rewrite_hosts_for_namespaces "${LIBRARY_DIR}/smallbank/hosts.config" "${replicas_per_server_machine}"
+rewrite_hosts_for_namespaces "${LIBRARY_DIR}/dataexchange/hosts.config" "${replicas_per_server_machine}"
+
 mkdir -p "$(dirname "${LOCAL_ZIP}")"
 rm -f "${LOCAL_ZIP}"
 trap 'rm -f "${LOCAL_ZIP}"' EXIT
@@ -233,18 +285,22 @@ for i in "${!targets_nodes[@]}"; do
 
   (
     remote_zip="/tmp/library_payload_$$.zip"
+    remote_applier="/tmp/apply_network_failures_$$.py"
     scp "${SSH_OPTS[@]}" "${LOCAL_ZIP}" "${user}@${host}:${remote_zip}"
+    scp "${SSH_OPTS[@]}" "${APPLIER_LOCAL_PATH}" "${user}@${host}:${remote_applier}"
 
-    ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${remote_zip}" "${replica_count}" "${create_client}" <<'REMOTE'
+    ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${remote_zip}" "${remote_applier}" "${replica_count}" "${create_client}" <<'REMOTE'
 set -euo pipefail
 
 zip_path="$1"
-replica_count="$2"
-create_client="$3"
+applier_path="$2"
+replica_count="$3"
+create_client="$4"
 tmp_extract_dir="$HOME/.library_extract_$$"
 
 cleanup() {
   rm -f "$zip_path"
+  rm -f "$applier_path"
   rm -rf "$tmp_extract_dir"
 }
 trap cleanup EXIT
@@ -279,6 +335,8 @@ if [[ ! -d "$template_dir" ]]; then
 fi
 
 cp -a "$template_dir" "$HOME/library"
+cp -a "$applier_path" "$HOME/library/apply_network_failures.py"
+chmod +x "$HOME/library/apply_network_failures.py"
 
 if [[ ! -d "$HOME/library/smallbank" || ! -d "$HOME/library/dataexchange" ]]; then
   echo "smallbank/dataexchange directories missing under $HOME/library on $(hostname)" >&2
@@ -318,6 +376,218 @@ fi
 
 rm -f "${LOCAL_ZIP}"
 
+echo "Checking passwordless sudo availability for namespace setup..."
+sudo_check_failed=0
+for i in "${!targets_nodes[@]}"; do
+  node="${targets_nodes[$i]}"
+  host="${targets_hosts[$i]}"
+  user="${targets_users[$i]}"
+
+  if ssh "${SSH_OPTS[@]}" "${user}@${host}" "sudo -n true" >/dev/null 2>&1; then
+    echo "  - ${node}: sudo -n OK"
+  else
+    echo "  - ${node}: sudo -n FAILED" >&2
+    sudo_check_failed=1
+  fi
+done
+if (( sudo_check_failed != 0 )); then
+  echo "Namespace setup requires passwordless sudo on all targets." >&2
+  echo "Verify with: ssh <node> 'sudo -n true'" >&2
+  exit 1
+fi
+
+echo "Setting up per-replica network namespaces on server nodes..."
+ns_setup_failed=0
+server_machine_count="${#server_nodes[@]}"
+for i in "${!server_nodes[@]}"; do
+  node="${server_nodes[$i]}"
+  host="${server_hosts[$i]}"
+  user="${server_users[$i]}"
+  machine_idx="${i}"
+
+  if ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- \
+    "${replicas_per_server_machine}" \
+    "${machine_idx}" \
+    "${server_machine_count}" \
+    "${OVERLAY_OCTET_A}" \
+    "${OVERLAY_OCTET_B}" \
+    "${OVERLAY_MASK_BITS}" \
+    "${OVERLAY_BRIDGE_NAME}" \
+    "${OVERLAY_HOST_OFFSET}" \
+    "${server_nodes[@]}" <<'REMOTE'
+set -euo pipefail
+
+replicas_per_machine="$1"
+machine_idx="$2"
+server_machine_count="$3"
+overlay_a="$4"
+overlay_b="$5"
+overlay_mask="$6"
+bridge_name="$7"
+host_offset="$8"
+shift 8
+server_node_names=("$@")
+
+bridge_ip="${overlay_a}.${overlay_b}.$((machine_idx + 1)).1"
+local_subnet="${overlay_a}.${overlay_b}.$((machine_idx + 1)).0/${overlay_mask}"
+
+# Clean stale namespaces from previous runs.
+existing_ns="$(ip netns list | awk '/^pbft-r[0-9]+/ {print $1}')"
+if [[ -n "${existing_ns}" ]]; then
+  printf '%s\n' "${existing_ns}" | while read -r ns_name; do
+    [[ -z "${ns_name}" ]] && continue
+    sudo -n ip netns del "${ns_name}" >/dev/null 2>&1 || true
+  done
+fi
+
+# Recreate bridge for deterministic state.
+sudo -n ip link set "${bridge_name}" down >/dev/null 2>&1 || true
+sudo -n ip link del "${bridge_name}" type bridge >/dev/null 2>&1 || true
+sudo -n ip link add name "${bridge_name}" type bridge
+sudo -n ip addr add "${bridge_ip}/${overlay_mask}" dev "${bridge_name}"
+sudo -n ip link set "${bridge_name}" up
+sudo -n sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+for ((n = 0; n < replicas_per_machine; n++)); do
+  replica_id=$((machine_idx * replicas_per_machine + n))
+  ns_name="pbft-r${replica_id}"
+  host_if="vh${replica_id}"
+  ns_if="vn${replica_id}"
+  ns_ip="${overlay_a}.${overlay_b}.$((machine_idx + 1)).$((host_offset + n))"
+
+  sudo -n ip netns add "${ns_name}"
+  sudo -n ip link add "${host_if}" type veth peer name "${ns_if}"
+  sudo -n ip link set "${ns_if}" netns "${ns_name}"
+  sudo -n ip link set "${host_if}" master "${bridge_name}"
+  sudo -n ip link set "${host_if}" up
+
+  sudo -n ip netns exec "${ns_name}" ip link set lo up
+  sudo -n ip netns exec "${ns_name}" ip addr add "${ns_ip}/${overlay_mask}" dev "${ns_if}"
+  sudo -n ip netns exec "${ns_name}" ip link set "${ns_if}" up
+  sudo -n ip netns exec "${ns_name}" ip route replace default via "${bridge_ip}"
+done
+
+# Route to other namespace subnets through corresponding server hosts.
+for ((peer_idx = 0; peer_idx < server_machine_count; peer_idx++)); do
+  if (( peer_idx == machine_idx )); then
+    continue
+  fi
+  subnet="${overlay_a}.${overlay_b}.$((peer_idx + 1)).0/${overlay_mask}"
+  gw_name="${server_node_names[$peer_idx]}"
+  gw_ip="$(getent ahostsv4 "${gw_name}" | awk 'NR==1 {print $1}')"
+  if [[ -z "${gw_ip}" ]]; then
+    gw_ip="${gw_name}"
+  fi
+  sudo -n ip route replace "${subnet}" via "${gw_ip}"
+done
+
+echo "Configured ${replicas_per_machine} namespaces on $(hostname) in ${local_subnet}."
+REMOTE
+  then
+    echo "  - ${node}: namespaces ready"
+  else
+    echo "  - ${node}: namespace setup failed" >&2
+    ns_setup_failed=1
+  fi
+done
+
+if (( ns_setup_failed != 0 )); then
+  echo "Namespace setup failed on one or more server nodes." >&2
+  exit 1
+fi
+
+if (( machine_count > 1 )); then
+  echo "Configuring client host routes on node0..."
+  if ! ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" "bash -s" -- \
+    "${server_machine_count}" \
+    "${OVERLAY_OCTET_A}" \
+    "${OVERLAY_OCTET_B}" \
+    "${OVERLAY_MASK_BITS}" \
+    "${server_nodes[@]}" <<'REMOTE'
+set -euo pipefail
+
+server_machine_count="$1"
+overlay_a="$2"
+overlay_b="$3"
+overlay_mask="$4"
+shift 4
+server_node_names=("$@")
+
+for ((peer_idx = 0; peer_idx < server_machine_count; peer_idx++)); do
+  subnet="${overlay_a}.${overlay_b}.$((peer_idx + 1)).0/${overlay_mask}"
+  gw_name="${server_node_names[$peer_idx]}"
+  gw_ip="$(getent ahostsv4 "${gw_name}" | awk 'NR==1 {print $1}')"
+  if [[ -z "${gw_ip}" ]]; then
+    gw_ip="${gw_name}"
+  fi
+  sudo -n ip route replace "${subnet}" via "${gw_ip}"
+done
+REMOTE
+  then
+    echo "  - node0: client routes configured"
+  else
+    echo "  - node0: failed to configure client routes" >&2
+    exit 1
+  fi
+fi
+
+# Shared experiment/failure start time:
+# - wait 10s after server launch before starting client
+# - then start benchmark/failures at +10s after client launch
+START_UNIX_MS="$(( ($(date +%s) + CLIENT_START_DELAY_S + START_OFFSET_AFTER_CLIENT_LAUNCH_S) * 1000 ))"
+echo "Using shared start_unix_ms=${START_UNIX_MS}"
+
+echo "Starting network failure appliers in tmux..."
+applier_start_failed=0
+for i in "${!server_nodes[@]}"; do
+  node="${server_nodes[$i]}"
+  host="${server_hosts[$i]}"
+  user="${server_users[$i]}"
+  machine_idx="${i}"
+
+  if ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${replicas_per_server_machine}" "${machine_idx}" "${START_UNIX_MS}" <<'REMOTE'
+set -euo pipefail
+
+replicas_per_machine="$1"
+machine_idx="$2"
+start_unix_ms="$3"
+
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "tmux not found on $(hostname)" >&2
+  exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 not found on $(hostname)" >&2
+  exit 1
+fi
+if [[ ! -f "$HOME/library/apply_network_failures.py" ]]; then
+  echo "applier missing on $(hostname): $HOME/library/apply_network_failures.py" >&2
+  exit 1
+fi
+
+for ((n = 0; n < replicas_per_machine; n++)); do
+  replica_id=$((machine_idx * replicas_per_machine + n))
+  ns_name="pbft-r${replica_id}"
+  interface_name="vn${replica_id}"
+  session_name="pbft_applier_${replica_id}"
+  tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
+  tmux new-session -d -s "${session_name}" \
+    "cd \"$HOME/library\" && python3 \"$HOME/library/apply_network_failures.py\" --failure-spec \"$HOME/library/config/failure_spec.xml\" --hosts-config \"$HOME/library/smallbank/hosts.config\" --replica-id ${replica_id} --netns ${ns_name} --interface ${interface_name} --start-unix-ms ${start_unix_ms} > \"$HOME/library/applier_${replica_id}.log\" 2>&1"
+done
+REMOTE
+  then
+    echo "  - ${node}: appliers started"
+  else
+    echo "  - ${node}: failed to start appliers" >&2
+    applier_start_failed=1
+  fi
+done
+
+if (( applier_start_failed != 0 )); then
+  echo "Applier start failed on one or more nodes." >&2
+  exit 1
+fi
+
 echo "Starting PBFT server replicas in tmux..."
 start_failed=0
 for i in "${!server_nodes[@]}"; do
@@ -326,11 +596,12 @@ for i in "${!server_nodes[@]}"; do
   user="${server_users[$i]}"
   machine_idx="${i}"
 
-  if ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${replicas_per_server_machine}" "${machine_idx}" <<'REMOTE'
+  if ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${replicas_per_server_machine}" "${machine_idx}" "${START_UNIX_MS}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
 machine_idx="$2"
+start_unix_ms="$3"
 
 if ! command -v tmux >/dev/null 2>&1; then
   echo "tmux not found on $(hostname)" >&2
@@ -344,10 +615,15 @@ fi
 
 for ((n = 0; n < replicas_per_machine; n++)); do
   replica_id=$((machine_idx * replicas_per_machine + n))
+  ns_name="pbft-r${replica_id}"
   session_name="pbft_server_${replica_id}"
+  if ! ip netns list | awk '{print $1}' | grep -qx "${ns_name}"; then
+    echo "Namespace missing on $(hostname): ${ns_name}" >&2
+    exit 1
+  fi
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   tmux new-session -d -s "${session_name}" \
-    "cd \"$HOME/library\" && bash smartrun.sh bftsmart.demo.smallbank.SmallBankServer ${replica_id} smallbank${n}"
+    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"$HOME/library\" && bash smartrun.sh bftsmart.demo.smallbank.SmallBankServer ${replica_id} --config-dir smallbank${n} --failure-start-unix-ms ${start_unix_ms} --failure-spec config/failure_spec.xml'"
 done
 REMOTE
   then
@@ -367,8 +643,10 @@ echo "Waiting ${CLIENT_START_DELAY_S}s before starting client..."
 sleep "${CLIENT_START_DELAY_S}"
 
 echo "Starting client on node0 in tmux..."
-ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" "bash -s" <<'REMOTE'
+ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" "bash -s" -- "${START_UNIX_MS}" <<'REMOTE'
 set -euo pipefail
+
+start_unix_ms="$1"
 
 if ! command -v tmux >/dev/null 2>&1; then
   echo "tmux not found on $(hostname)" >&2
@@ -382,7 +660,7 @@ fi
 
 tmux kill-session -t pbft_client >/dev/null 2>&1 || true
 tmux new-session -d -s pbft_client \
-  "cd \"$HOME/library\" && bash smartrun.sh bftsmart.demo.smallbank.SmallBankClient client --create --execute > output.txt 2>&1"
+  "cd \"$HOME/library\" && bash smartrun.sh bftsmart.demo.smallbank.SmallBankClient --config-dir client --create --execute --start-unix-ms ${start_unix_ms} > output.txt 2>&1"
 REMOTE
 
 echo "Experiment running for ${EXPERIMENT_TIME_S}s..."
@@ -409,7 +687,7 @@ fi
 
 printf '%s\n' "${sessions}" | while read -r session_name; do
   [[ -z "${session_name}" ]] && continue
-  if [[ "${session_name}" == pbft_server_* || "${session_name}" == pbft_client ]]; then
+  if [[ "${session_name}" == pbft_server_* || "${session_name}" == pbft_applier_* || "${session_name}" == pbft_client ]]; then
     tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   fi
 done
@@ -422,6 +700,86 @@ REMOTE
   fi
 done
 
+echo "Tearing down namespace network setup..."
+teardown_failed=0
+server_machine_count="${#server_nodes[@]}"
+for i in "${!server_nodes[@]}"; do
+  node="${server_nodes[$i]}"
+  host="${server_hosts[$i]}"
+  user="${server_users[$i]}"
+  machine_idx="${i}"
+
+  if ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- \
+    "${machine_idx}" \
+    "${server_machine_count}" \
+    "${OVERLAY_OCTET_A}" \
+    "${OVERLAY_OCTET_B}" \
+    "${OVERLAY_MASK_BITS}" \
+    "${OVERLAY_BRIDGE_NAME}" <<'REMOTE'
+set -euo pipefail
+
+machine_idx="$1"
+server_machine_count="$2"
+overlay_a="$3"
+overlay_b="$4"
+overlay_mask="$5"
+bridge_name="$6"
+
+# Drop routes to peer namespace subnets.
+for ((peer_idx = 0; peer_idx < server_machine_count; peer_idx++)); do
+  if (( peer_idx == machine_idx )); then
+    continue
+  fi
+  subnet="${overlay_a}.${overlay_b}.$((peer_idx + 1)).0/${overlay_mask}"
+  sudo -n ip route del "${subnet}" >/dev/null 2>&1 || true
+done
+
+# Delete replica namespaces.
+existing_ns="$(ip netns list | awk '/^pbft-r[0-9]+/ {print $1}')"
+if [[ -n "${existing_ns}" ]]; then
+  printf '%s\n' "${existing_ns}" | while read -r ns_name; do
+    [[ -z "${ns_name}" ]] && continue
+    sudo -n ip netns del "${ns_name}" >/dev/null 2>&1 || true
+  done
+fi
+
+sudo -n ip link set "${bridge_name}" down >/dev/null 2>&1 || true
+sudo -n ip link del "${bridge_name}" type bridge >/dev/null 2>&1 || true
+REMOTE
+  then
+    echo "  - ${node}: namespace teardown complete"
+  else
+    echo "  - ${node}: namespace teardown failed" >&2
+    teardown_failed=1
+  fi
+done
+
+if (( machine_count > 1 )); then
+  if ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" "bash -s" -- \
+    "${server_machine_count}" \
+    "${OVERLAY_OCTET_A}" \
+    "${OVERLAY_OCTET_B}" \
+    "${OVERLAY_MASK_BITS}" <<'REMOTE'
+set -euo pipefail
+
+server_machine_count="$1"
+overlay_a="$2"
+overlay_b="$3"
+overlay_mask="$4"
+
+for ((peer_idx = 0; peer_idx < server_machine_count; peer_idx++)); do
+  subnet="${overlay_a}.${overlay_b}.$((peer_idx + 1)).0/${overlay_mask}"
+  sudo -n ip route del "${subnet}" >/dev/null 2>&1 || true
+done
+REMOTE
+  then
+    echo "  - node0: client routes cleared"
+  else
+    echo "  - node0: failed to clear client routes" >&2
+    teardown_failed=1
+  fi
+fi
+
 mkdir -p "$(dirname "${OUTPUT_LOCAL}")"
 rm -f "${OUTPUT_LOCAL}"
 echo "Fetching client output to ${OUTPUT_LOCAL}..."
@@ -429,6 +787,9 @@ scp "${SSH_OPTS[@]}" "${node0_user}@${node0_host}:~/library/output.txt" "${OUTPU
 
 if (( stop_failed != 0 )); then
   echo "Some nodes reported tmux stop issues; output was still collected." >&2
+fi
+if (( teardown_failed != 0 )); then
+  echo "Some nodes reported namespace teardown issues." >&2
 fi
 
 echo "Done. Client output saved to ${OUTPUT_LOCAL}."

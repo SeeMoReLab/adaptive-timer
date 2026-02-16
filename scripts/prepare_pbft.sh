@@ -10,7 +10,7 @@ SRC_LIBRARY_DIR="${BFT_SMART_DIR}/build/install/library"
 SRC_CONFIG_DIR="${REPO_ROOT}/config/bft-smart"
 TMP_DIR="${SCRIPT_DIR}/tmp"
 DST_LIBRARY_DIR="${TMP_DIR}/library"
-CLOUDLAB_IP_FILE_DEFAULT="${TMP_DIR}/cloudlab_ip.txt"
+CLOUDLAB_IP_FILE_DEFAULT="${SCRIPT_DIR}/cloudlab/tmp/cloudlab_ip.txt"
 
 DST_CONFIG_DIR="${DST_LIBRARY_DIR}/config"
 SMALLBANK_DIR="${DST_LIBRARY_DIR}/smallbank"
@@ -286,7 +286,6 @@ rm -rf "${DST_CONFIG_DIR}" "${SMALLBANK_DIR}" "${DATAEXCHANGE_DIR}"
 mkdir -p "${DST_CONFIG_DIR}"
 cp -a "${SRC_CONFIG_DIR}/." "${DST_CONFIG_DIR}"
 rm -f \
-  "${DST_CONFIG_DIR}/injection.json" \
   "${DST_CONFIG_DIR}/smallbank.xml" \
   "${DST_CONFIG_DIR}/hosts.config" \
   "${DST_CONFIG_DIR}/shards.config" \
@@ -295,13 +294,13 @@ rm -f \
 HOSTS_CONFIG_SRC="${SRC_CONFIG_DIR}/hosts.config"
 SYSTEM_CONFIG_SRC="${SRC_CONFIG_DIR}/system.config"
 SMALLBANK_CONFIG_SRC="${SRC_CONFIG_DIR}/smallbank.xml"
-INJECTION_CONFIG_SRC="${SRC_CONFIG_DIR}/injection.json"
+FAILURE_SPEC_SRC="${SRC_CONFIG_DIR}/failure_spec.xml"
 
 for required_file in \
   "${HOSTS_CONFIG_SRC}" \
   "${SYSTEM_CONFIG_SRC}" \
   "${SMALLBANK_CONFIG_SRC}" \
-  "${INJECTION_CONFIG_SRC}"; do
+  "${FAILURE_SPEC_SRC}"; do
   if [[ ! -f "${required_file}" ]]; then
     echo "Required config file not found: ${required_file}" >&2
     exit 1
@@ -313,7 +312,6 @@ mkdir -p "${SMALLBANK_DIR}" "${DATAEXCHANGE_DIR}"
 cp -a "${HOSTS_CONFIG_SRC}" "${SMALLBANK_DIR}/hosts.config"
 cp -a "${SYSTEM_CONFIG_SRC}" "${SMALLBANK_DIR}/system.config"
 cp -a "${SMALLBANK_CONFIG_SRC}" "${SMALLBANK_DIR}/smallbank.xml"
-cp -a "${INJECTION_CONFIG_SRC}" "${SMALLBANK_DIR}/injection.json"
 
 cp -a "${HOSTS_CONFIG_SRC}" "${DATAEXCHANGE_DIR}/hosts.config"
 cp -a "${SYSTEM_CONFIG_SRC}" "${DATAEXCHANGE_DIR}/system.config"

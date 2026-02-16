@@ -190,35 +190,23 @@ def _load_hosts(hosts_config: Path) -> Dict[int, HostEntry]:
     return entries
 
 
-def _resolve_interface(preferred: str | None, sample_dest_ip: str | None) -> str:
-    if preferred:
-        return preferred
-
-    if sample_dest_ip:
-        try:
-            output = subprocess.check_output(
-                ["ip", "route", "get", sample_dest_ip], text=True
-            )
-            match = re.search(r"\bdev\s+(\S+)", output)
-            if match:
-                return match.group(1)
-        except subprocess.CalledProcessError:
-            pass
-
-    output = subprocess.check_output(["ip", "route", "show", "default"], text=True)
-    for line in output.splitlines():
-        match = re.search(r"\bdev\s+(\S+)", line)
-        if match:
-            return match.group(1)
-    raise RuntimeError("Unable to determine network interface. Use --interface.")
+def _prepend_netns(cmd: List[str], netns: str | None) -> List[str]:
+    if not netns:
+        return cmd
+    return ["ip", "netns", "exec", netns] + cmd
 
 
 def _run_command(
-    cmd: List[str], *, use_sudo: bool, dry_run: bool, check: bool = True
+    cmd: List[str],
+    *,
+    use_sudo: bool,
+    dry_run: bool,
+    check: bool = True,
+    netns: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    full_cmd = cmd
+    full_cmd = _prepend_netns(cmd, netns)
     if use_sudo and os.geteuid() != 0:
-        full_cmd = ["sudo", "-n"] + cmd
+        full_cmd = ["sudo", "-n"] + _prepend_netns(cmd, netns)
 
     if dry_run:
         _log("DRY RUN: " + " ".join(full_cmd))
@@ -233,12 +221,59 @@ def _run_command(
     )
 
 
-def _clear_tc(interface: str, *, tc_bin: str, use_sudo: bool, dry_run: bool) -> None:
+def _resolve_interface(
+    preferred: str | None,
+    sample_dest_ip: str | None,
+    *,
+    use_sudo: bool,
+    netns: str | None,
+) -> str:
+    if preferred:
+        return preferred
+
+    if sample_dest_ip:
+        try:
+            output = _run_command(
+                ["ip", "route", "get", sample_dest_ip],
+                use_sudo=use_sudo,
+                dry_run=False,
+                check=True,
+                netns=netns,
+            ).stdout
+            match = re.search(r"\bdev\s+(\S+)", output)
+            if match:
+                return match.group(1)
+        except subprocess.CalledProcessError:
+            pass
+
+    output = _run_command(
+        ["ip", "route", "show", "default"],
+        use_sudo=use_sudo,
+        dry_run=False,
+        check=True,
+        netns=netns,
+    ).stdout
+    for line in output.splitlines():
+        match = re.search(r"\bdev\s+(\S+)", line)
+        if match:
+            return match.group(1)
+    raise RuntimeError("Unable to determine network interface. Use --interface.")
+
+
+def _clear_tc(
+    interface: str,
+    *,
+    tc_bin: str,
+    use_sudo: bool,
+    dry_run: bool,
+    netns: str | None,
+) -> None:
     _run_command(
         [tc_bin, "qdisc", "del", "dev", interface, "root"],
         use_sudo=use_sudo,
         dry_run=dry_run,
         check=False,
+        netns=netns,
     )
 
 
@@ -284,6 +319,7 @@ def _apply_phase(
     link_rate: str,
     use_sudo: bool,
     dry_run: bool,
+    netns: str | None,
 ) -> None:
     ip_faults = _build_ip_faults(phase, src_replica_id, hosts)
     _log(
@@ -291,7 +327,13 @@ def _apply_phase(
         f"on {interface}; rules={len(ip_faults)}"
     )
 
-    _clear_tc(interface, tc_bin=tc_bin, use_sudo=use_sudo, dry_run=dry_run)
+    _clear_tc(
+        interface,
+        tc_bin=tc_bin,
+        use_sudo=use_sudo,
+        dry_run=dry_run,
+        netns=netns,
+    )
 
     _run_command(
         [
@@ -309,6 +351,7 @@ def _apply_phase(
         ],
         use_sudo=use_sudo,
         dry_run=dry_run,
+        netns=netns,
     )
     _run_command(
         [
@@ -329,6 +372,7 @@ def _apply_phase(
         ],
         use_sudo=use_sudo,
         dry_run=dry_run,
+        netns=netns,
     )
 
     for rule_idx, (dst_ip, fault) in enumerate(sorted(ip_faults.items()), start=1):
@@ -352,6 +396,7 @@ def _apply_phase(
             ],
             use_sudo=use_sudo,
             dry_run=dry_run,
+            netns=netns,
         )
         _run_command(
             [
@@ -372,6 +417,7 @@ def _apply_phase(
             ],
             use_sudo=use_sudo,
             dry_run=dry_run,
+            netns=netns,
         )
         _run_command(
             [
@@ -396,6 +442,7 @@ def _apply_phase(
             ],
             use_sudo=use_sudo,
             dry_run=dry_run,
+            netns=netns,
         )
 
 
@@ -444,6 +491,12 @@ def main() -> int:
         help="Network interface device (auto-detected if omitted).",
     )
     parser.add_argument(
+        "--netns",
+        type=str,
+        default=None,
+        help="Optional network namespace name to run tc/ip commands in.",
+    )
+    parser.add_argument(
         "--start-unix-ms",
         type=int,
         default=None,
@@ -489,13 +542,19 @@ def main() -> int:
         (entry.ip for rid, entry in sorted(hosts.items()) if rid != args.replica_id),
         None,
     )
-    interface = _resolve_interface(args.interface, sample_dest_ip)
     use_sudo = not args.no_sudo
+    interface = _resolve_interface(
+        args.interface,
+        sample_dest_ip,
+        use_sudo=use_sudo,
+        netns=args.netns,
+    )
     start_mono = _compute_start_mono(args.start_unix_ms)
 
     _log(
         "Starting network applier "
-        f"(replica_id={args.replica_id}, interface={interface}, phases={len(phases)})"
+        f"(replica_id={args.replica_id}, netns={args.netns or 'host'}, "
+        f"interface={interface}, phases={len(phases)})"
     )
 
     for idx, phase in enumerate(phases):
@@ -513,11 +572,18 @@ def main() -> int:
             link_rate=args.link_rate,
             use_sudo=use_sudo,
             dry_run=args.dry_run,
+            netns=args.netns,
         )
 
     if args.teardown_at_end:
         _log("Tearing down tc rules at end.")
-        _clear_tc(interface, tc_bin=args.tc_bin, use_sudo=use_sudo, dry_run=args.dry_run)
+        _clear_tc(
+            interface,
+            tc_bin=args.tc_bin,
+            use_sudo=use_sudo,
+            dry_run=args.dry_run,
+            netns=args.netns,
+        )
     else:
         _log("Completed schedule; final phase remains active.")
 
@@ -527,6 +593,17 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+    except subprocess.CalledProcessError as exc:
+        cmd_text = " ".join(str(part) for part in exc.cmd)
+        print(
+            f"ERROR: command failed with exit code {exc.returncode}: {cmd_text}",
+            file=sys.stderr,
+        )
+        if exc.stderr:
+            print(f"stderr: {exc.stderr.strip()}", file=sys.stderr)
+        if exc.stdout:
+            print(f"stdout: {exc.stdout.strip()}", file=sys.stderr)
+        raise SystemExit(1)
+    except (ValueError, RuntimeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         raise SystemExit(1)

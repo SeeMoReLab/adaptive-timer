@@ -2,9 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_TARGETS_FILE="${SCRIPT_DIR}/../tmp/cloudlab_ssh_targets.txt"
-IP_OUTPUT_FILE="${SCRIPT_DIR}/../tmp/cloudlab_ip.txt"
-NODE0_KEY_PATH="${NODE0_KEY_PATH:-~/.ssh/cloudlab_node0_ed25519}"
+DEFAULT_TARGETS_FILE="${SCRIPT_DIR}/tmp/cloudlab_ssh_targets.txt"
+IP_OUTPUT_FILE="${SCRIPT_DIR}/tmp/cloudlab_ip.txt"
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new)
 
 usage() {
@@ -17,8 +16,7 @@ Options:
 
 Environment:
   LOCAL_SSH_KEY_PATH  Alternative to the positional private_key_path.
-  IP_OUTPUT_FILE      Output file for node IPs from first hostname -I entry (default: scripts/tmp/cloudlab_ip.txt).
-  NODE0_KEY_PATH      Key path created on node0 for node0->peer SSH.
+  IP_OUTPUT_FILE      Output file for node IPs from first hostname -I entry (default: scripts/cloudlab/tmp/cloudlab_ip.txt).
 EOF
 }
 
@@ -58,9 +56,8 @@ SSH_OPTS+=(-i "${LOCAL_SSH_KEY_PATH}" -o IdentitiesOnly=yes)
 
 tmp_peers="$(mktemp)"
 tmp_all_nodes="$(mktemp)"
-tmp_pubkey="$(mktemp)"
 tmp_ips="$(mktemp)"
-trap 'rm -f "${tmp_peers}" "${tmp_all_nodes}" "${tmp_pubkey}" "${tmp_ips}"' EXIT
+trap 'rm -f "${tmp_peers}" "${tmp_all_nodes}" "${tmp_ips}"' EXIT
 
 node0_host=""
 node0_user=""
@@ -97,129 +94,7 @@ else
 fi
 
 if (( has_peers == 1 )); then
-  echo "Generating a fresh SSH key on node0 (${node0_user}@${node0_host})..."
-  node0_pubkey_raw="$(
-    ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" "bash -s" -- "${NODE0_KEY_PATH}" <<'REMOTE'
-set -euo pipefail
-
-key_path="$1"
-key_path="${key_path/#\~/$HOME}"
-pub_path="${key_path}.pub"
-
-mkdir -p "$HOME/.ssh"
-chmod 700 "$HOME/.ssh"
-
-rm -f "$key_path" "$pub_path"
-ssh-keygen -q -t ed25519 -N "" -f "$key_path" -C "cloudlab-node0-$(hostname)-$(date +%Y%m%d%H%M%S)"
-chmod 600 "$key_path"
-chmod 644 "$pub_path"
-
-cat "$pub_path"
-REMOTE
-  )"
-  node0_pubkey="$(
-    printf '%s\n' "${node0_pubkey_raw}" | awk '
-      /^ssh-(ed25519|rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519|sk-ecdsa-sha2-nistp256)/ {
-        print
-        exit
-      }
-    '
-  )"
-
-  if [[ -z "${node0_pubkey}" ]]; then
-    echo "Failed to parse a valid SSH public key from node0 output." >&2
-    echo "Raw output from node0 was:" >&2
-    printf '%s\n' "${node0_pubkey_raw}" >&2
-    exit 1
-  fi
-  printf '%s\n' "${node0_pubkey}" > "${tmp_pubkey}"
-
-  echo "Installing node0 public key on peer nodes..."
-  while read -r node host user; do
-    echo "  - ${node} (${user}@${host})"
-    remote_pubkey_path="/tmp/cloudlab_node0_key_${node}.pub"
-    scp "${SSH_OPTS[@]}" "${tmp_pubkey}" "${user}@${host}:${remote_pubkey_path}"
-
-    ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${remote_pubkey_path}" <<'REMOTE'
-set -euo pipefail
-
-pubkey_path="${1:-}"
-if [[ -z "${pubkey_path}" || ! -f "${pubkey_path}" ]]; then
-  echo "Public key file missing on peer: ${pubkey_path:-<empty>}" >&2
-  exit 1
-fi
-pubkey="$(cat "$pubkey_path")"
-
-mkdir -p "$HOME/.ssh"
-chmod 700 "$HOME/.ssh"
-touch "$HOME/.ssh/authorized_keys"
-chmod 600 "$HOME/.ssh/authorized_keys"
-
-if ! grep -qxF "$pubkey" "$HOME/.ssh/authorized_keys"; then
-  printf '%s\n' "$pubkey" >> "$HOME/.ssh/authorized_keys"
-fi
-
-grep -qxF "$pubkey" "$HOME/.ssh/authorized_keys"
-rm -f "$pubkey_path"
-REMOTE
-  done < "${tmp_peers}"
-
-  echo "Updating node0 SSH config for peer hosts..."
-  ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" "bash -s" -- "${NODE0_KEY_PATH}" <<REMOTE
-set -euo pipefail
-
-key_path="\$1"
-key_path="\${key_path/#\\~/\$HOME}"
-config_file="\$HOME/.ssh/config"
-tmp_config="\$(mktemp)"
-peer_list="\$(mktemp)"
-
-trap 'rm -f "\$tmp_config" "\$peer_list"' EXIT
-
-mkdir -p "\$HOME/.ssh"
-chmod 700 "\$HOME/.ssh"
-
-cat > "\$peer_list" <<'PEERS'
-$(cat "${tmp_peers}")
-PEERS
-
-if [[ -f "\$config_file" ]]; then
-  awk '
-    BEGIN {skip=0}
-    /^# BEGIN CLOUDLAB NODE0 PEERS\$/ {skip=1; next}
-    /^# END CLOUDLAB NODE0 PEERS\$/ {skip=0; next}
-    skip==0 {print}
-  ' "\$config_file" > "\$tmp_config"
-else
-  : > "\$tmp_config"
-fi
-
-{
-  echo "# BEGIN CLOUDLAB NODE0 PEERS"
-  while read -r node host user; do
-    [[ -z "\${node:-}" ]] && continue
-    cat <<EOF
-Host \$node \$host
-    HostName \$host
-    User \$user
-    IdentityFile \$key_path
-    IdentitiesOnly yes
-    StrictHostKeyChecking accept-new
-
-EOF
-  done < "\$peer_list"
-  echo "# END CLOUDLAB NODE0 PEERS"
-} >> "\$tmp_config"
-
-chmod 600 "\$tmp_config"
-mv "\$tmp_config" "\$config_file"
-REMOTE
-
-  echo "Verifying node0 can SSH to peer nodes..."
-  while read -r node host user; do
-    ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" "ssh -o BatchMode=yes ${node} true"
-    echo "  - ${node}: OK"
-  done < "${tmp_peers}"
+  echo "Multi-node targets detected; skipping node0->peer SSH bootstrap."
 fi
 
 echo "Installing Java 17 and pip on all nodes in parallel..."
@@ -262,38 +137,24 @@ if [[ "${install_failed}" -ne 0 ]]; then
   exit 1
 fi
 
-if (( has_peers == 1 )); then
-  echo "Collecting node IPs (first entry from hostname -I)..."
-  node0_ip="$(
-    ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" \
-      "hostname -I | awk '{print \$1}'"
-  )"
-  if [[ -z "${node0_ip}" ]]; then
-    echo "Could not determine IP for node0" >&2
-    exit 1
-  fi
-  printf 'node0 %s\n' "${node0_ip}" > "${tmp_ips}"
-
+if (( has_peers == 0 )); then
+  echo "Single-node mode: writing node0 IP as 127.0.0.1."
+  printf 'node0 127.0.0.1\n' > "${tmp_ips}"
+else
+  echo "Collecting node IPs directly from each node (first entry from hostname -I)..."
   while read -r node host user; do
-    peer_ip="$(
-      ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" "bash -s" -- "${node}" <<'REMOTE'
-set -euo pipefail
-peer="$1"
-ssh -o BatchMode=yes "$peer" \
-  "hostname -I | awk '{print \$1}'"
-REMOTE
+    node_ip="$(
+      ssh "${SSH_OPTS[@]}" "${user}@${host}" \
+        "hostname -I | awk '{print \$1}'"
     )"
 
-    if [[ -z "${peer_ip}" ]]; then
+    if [[ -z "${node_ip}" ]]; then
       echo "Could not determine IP for ${node}" >&2
       exit 1
     fi
 
-    printf '%s %s\n' "${node}" "${peer_ip}" >> "${tmp_ips}"
-  done < "${tmp_peers}"
-else
-  echo "Single-node mode: writing node0 IP as 127.0.0.1."
-  printf 'node0 127.0.0.1\n' > "${tmp_ips}"
+    printf '%s %s\n' "${node}" "${node_ip}" >> "${tmp_ips}"
+  done < "${tmp_all_nodes}"
 fi
 
 mkdir -p "$(dirname "${IP_OUTPUT_FILE}")"
@@ -301,6 +162,3 @@ mv "${tmp_ips}" "${IP_OUTPUT_FILE}"
 echo "Wrote node IPs to ${IP_OUTPUT_FILE}"
 
 echo "Done."
-if (( has_peers == 1 )); then
-  echo "From node0 you can now SSH peers via: ssh node1 (or ssh <peer-hostname>)"
-fi

@@ -12,7 +12,7 @@ import xml.etree.ElementTree as ET
 
 
 DEFAULT_OUTPUT_PATH = (
-    Path(__file__).resolve().parents[1] / "tmp" / "cloudlab_ssh_targets.txt"
+    Path(__file__).resolve().parent / "tmp" / "cloudlab_ssh_targets.txt"
 )
 
 
@@ -84,7 +84,7 @@ def main() -> int:
     parser.add_argument(
         "--output",
         default=str(DEFAULT_OUTPUT_PATH),
-        help="Destination file for extracted targets (default: scripts/tmp/cloudlab_ssh_targets.txt).",
+        help="Destination file for extracted targets (default: scripts/cloudlab/tmp/cloudlab_ssh_targets.txt).",
     )
     args = parser.parse_args()
 

@@ -65,6 +65,81 @@ If you change `proto/agent.proto`, regenerate Python stubs:
 bash compile_proto.sh
 ```
 
+## PBFT Run
+
+These scripts run SmallBank PBFT with:
+- per-replica network namespaces,
+- one network fault applier process per replica (`scripts/apply_network_failures.py`),
+- synchronized start time for client and failure schedule.
+
+Failure spec source is `config/bft-smart/failure_spec.xml` (packaged to `library/config/failure_spec.xml`).
+
+### Local (Single Machine)
+
+Requirements:
+- Ubuntu with `sudo -n` available (passwordless sudo),
+- `tmux`, `python3`, `iproute2`, `tc`,
+- Java/Gradle toolchain for `scripts/prepare_pbft.sh`.
+
+Run:
+
+```bash
+bash scripts/local/run_pbft.sh -f 1 -t 60
+```
+
+Optional mode (currently informational only):
+
+```bash
+bash scripts/local/run_pbft.sh normal -f 1 -t 120
+```
+
+Outputs:
+- client output: `scripts/local/tmp/output.txt`
+- staged runtime library: `scripts/local/tmp/library`
+- per-replica applier logs: `scripts/local/tmp/library/applier_<replica_id>.log`
+
+The script always tears down tmux sessions and namespaces on exit.
+
+### CloudLab
+
+1. Extract SSH targets from manifest (example username: `myuser`):
+
+```bash
+python scripts/cloudlab/extract_ssh_targets.py \
+  --manifest scripts/cloudlab/cloudlab.manifest \
+  --username myuser
+```
+
+This writes `scripts/cloudlab/tmp/cloudlab_ssh_targets.txt` by default.
+
+2. Install dependencies and collect CloudLab node IP mapping:
+
+```bash
+bash scripts/cloudlab/setup.sh ~/.ssh/<cloudlab_private_key>
+```
+
+This writes `scripts/cloudlab/tmp/cloudlab_ip.txt`.
+
+3. Run PBFT:
+
+```bash
+bash scripts/cloudlab/run_pbft.sh ~/.ssh/<cloudlab_private_key> -f 1 -t 60
+```
+
+Optional mode (currently informational only):
+
+```bash
+bash scripts/cloudlab/run_pbft.sh ~/.ssh/<cloudlab_private_key> normal -f 1 -t 120
+```
+
+Outputs:
+- local collected client output: `scripts/cloudlab/tmp/output.txt`
+- remote per-replica applier logs: `~/library/applier_<replica_id>.log` on server nodes
+
+Notes:
+- CloudLab run also requires passwordless `sudo -n` on target nodes (for namespaces/routes/tc).
+- The runner handles namespace setup, per-replica applier launch, server/client launch, and teardown.
+
 TODO:
 
 - Test feeding data to linear model

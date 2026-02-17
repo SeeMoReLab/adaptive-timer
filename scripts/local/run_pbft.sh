@@ -11,10 +11,19 @@ LOCAL_LIBRARY_DIR="${LOCAL_TMP_DIR}/library"
 LEARNING_AGENT_SRC_DIR="${REPO_ROOT}/learning_agent"
 OUTPUT_LOCAL="${LOCAL_TMP_DIR}/output.txt"
 APPLIER_PATH="${REPO_ROOT}/scripts/apply_network_failures.py"
+RUN_AS_USER="${SUDO_USER:-${USER:-}}"
+RUN_AS_HOME="${HOME}"
+if [[ -n "${RUN_AS_USER}" ]]; then
+  resolved_home="$(getent passwd "${RUN_AS_USER}" 2>/dev/null | cut -d: -f6 || true)"
+  if [[ -n "${resolved_home}" ]]; then
+    RUN_AS_HOME="${resolved_home}"
+  fi
+fi
+USER_PYENV_ROOT="${PYENV_ROOT:-${RUN_AS_HOME}/.pyenv}"
 
 MODE="normal"
 F=1
-EXPERIMENT_TIME_S=60
+EXPERIMENT_TIME_S=300
 CLIENT_START_DELAY_S=10
 START_OFFSET_AFTER_CLIENT_LAUNCH_S=10
 DATASET_ENABLED=0
@@ -250,14 +259,39 @@ fi
 SERVER_LEARNING_FLAG=""
 AGENT_SHARING_FLAG=""
 AGENT_MODEL_ARGS=""
+AGENT_PYTHON_BIN="python3"
 if (( LEARNING_AGENT_ENABLED == 1 )); then
   SERVER_LEARNING_FLAG="--learning"
+  # Resolve a concrete interpreter path before entering sudo/netns.
+  if [[ -x "${USER_PYENV_ROOT}/versions/timer/bin/python3" ]]; then
+    AGENT_PYTHON_BIN="${USER_PYENV_ROOT}/versions/timer/bin/python3"
+  elif [[ -x "${USER_PYENV_ROOT}/versions/timer/bin/python" ]]; then
+    AGENT_PYTHON_BIN="${USER_PYENV_ROOT}/versions/timer/bin/python"
+  elif command -v pyenv >/dev/null 2>&1; then
+    pyenv_timer_python="$(PYENV_VERSION=timer pyenv which python3 2>/dev/null || true)"
+    if [[ -n "${pyenv_timer_python}" && -x "${pyenv_timer_python}" ]]; then
+      AGENT_PYTHON_BIN="${pyenv_timer_python}"
+    fi
+  fi
 fi
 if [[ "${MODE}" == "sharing" ]]; then
   AGENT_SHARING_FLAG="--sharing true"
 fi
 if [[ "${MODE}" == "scheduled" ]]; then
   AGENT_MODEL_ARGS="--model-type scheduled --schedule-file learning_agent/config/schedule.csv"
+fi
+
+if (( LEARNING_AGENT_ENABLED == 1 )); then
+  if ! "${AGENT_PYTHON_BIN}" -c "import grpc" >/dev/null 2>&1; then
+    echo "Selected learning-agent interpreter is missing grpc: ${AGENT_PYTHON_BIN}" >&2
+    echo "Resolver context: RUN_AS_USER=${RUN_AS_USER:-<unset>}, RUN_AS_HOME=${RUN_AS_HOME}, USER_PYENV_ROOT=${USER_PYENV_ROOT}" >&2
+    echo "Candidate timer interpreters checked:" >&2
+    echo "  - ${USER_PYENV_ROOT}/versions/timer/bin/python3" >&2
+    echo "  - ${USER_PYENV_ROOT}/versions/timer/bin/python" >&2
+    echo "Install dependencies into that interpreter and retry." >&2
+    exit 1
+  fi
+  echo "Learning-agent interpreter: ${AGENT_PYTHON_BIN}"
 fi
 
 echo "Selected mode: ${MODE}"
@@ -396,7 +430,7 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
     tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
     : > "${agent_log}"
     tmux new-session -d -s "${session_name}" \
-      "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${LOCAL_LIBRARY_DIR}\" && exec python3 learning_agent/main.py --node-id ${replica_id} --hosts-config \"${LOCAL_LIBRARY_DIR}/smallbank/hosts.config\" --failure-spec \"${LOCAL_LIBRARY_DIR}/config/failure_spec.xml\" --injection-start-unix-ms ${START_UNIX_MS} ${AGENT_SHARING_FLAG} ${AGENT_MODEL_ARGS} ${dataset_args}' > \"${agent_log}\" 2>&1"
+      "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${LOCAL_LIBRARY_DIR}\" && echo \"[DEBUG] netns launch context\" && echo \"[DEBUG] whoami:\" && id -un && echo \"[DEBUG] pwd:\" && pwd && echo \"[DEBUG] python_bin: ${AGENT_PYTHON_BIN}\" && \"${AGENT_PYTHON_BIN}\" -c \"import sys; print(\\\"[DEBUG] sys.executable=\\\" + sys.executable)\" && \"${AGENT_PYTHON_BIN}\" -c \"import grpc; print(\\\"[DEBUG] grpc import ok\\\")\" && exec \"${AGENT_PYTHON_BIN}\" learning_agent/main.py --node-id ${replica_id} --hosts-config \"${LOCAL_LIBRARY_DIR}/smallbank/hosts.config\" --failure-spec \"${LOCAL_LIBRARY_DIR}/config/failure_spec.xml\" --injection-start-unix-ms ${START_UNIX_MS} ${AGENT_SHARING_FLAG} ${AGENT_MODEL_ARGS} ${dataset_args}' > \"${agent_log}\" 2>&1"
   done
   sleep 2
   for ((n = 0; n < replicas_per_machine; n++)); do

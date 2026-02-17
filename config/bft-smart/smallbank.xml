@@ -14,7 +14,7 @@
     <works>
         <work>
             <!-- Duration in seconds -->
-            <time>30</time>
+            <time>280</time>
 
             <!-- Number of terminals active in this phase -->
             <terminals>100</terminals>

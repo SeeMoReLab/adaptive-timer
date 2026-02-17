@@ -55,7 +55,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 print(f"Node {node_id} waiting")
                 self._condition.wait()
         
-        consensus_state = self.aggregator.consensus_state(states =  self._states, node_id = node_id)     
+        consensus_state = self.aggregator.consensus_state(states = self._states, node_id = node_id)     
         pred_id, action = self.agent.predict(consensus_state)
 
         return agent_pb2.Prediction(

@@ -3,8 +3,6 @@ from typing import List, Dict
 import numpy as np
 import agent_pb2
 
-import logging
-
 
 class BaseAggregate(ABC):    
     def aggregate(self, node_id:int, states: Dict[int, agent_pb2.State]) -> agent_pb2.State:
@@ -33,8 +31,7 @@ class BaseAggregate(ABC):
 
 class MedianAggregate(BaseAggregate):
     def _calculate(self, data: Dict[int, np.array], **kwargs) -> np.ndarray:
-
-        return np.median(np.column_stack(list(data.values())), axis=1)
+        return np.median(np.stack(list(data.values())), axis=0)
 
 class WeightedMedianAggregate(BaseAggregate):
     def __init__(self, weights: int):
@@ -47,7 +44,7 @@ class WeightedMedianAggregate(BaseAggregate):
         others = [arr for k, arr in data.items() if k != node_id]
         weighted_node = ([data[node_id]] * self.weights) + others
     
-        return np.median(np.column_stack(weighted_node), axis=1)
+        return np.median(np.stack(weighted_node), axis=0)
     
 class AggregatorAgent:
     def __init__(self, function: str = "median", **kwargs) -> None:

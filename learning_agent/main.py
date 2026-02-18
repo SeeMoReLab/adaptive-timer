@@ -3,7 +3,6 @@ import base64
 import csv
 import random
 import re
-import statistics
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -18,6 +17,7 @@ import torch
 
 import agent_pb2
 import agent_pb2_grpc
+from aggregator import BaseAggregator, MedianAggregator, WeightedMedianAggregator
 from models import (
     ActionDecoder,
     FeatureExtractor,
@@ -274,6 +274,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         model: TensorModel,
         feature_extractor: FeatureExtractor[agent_pb2.Report],
         action_decoder: ActionDecoder[agent_pb2.Timeout],
+        aggregator: BaseAggregator,
         consensus_stub: Optional[agent_pb2_grpc.ConsensusStub],
         share_timeout_s: Optional[float],
         consensus_timeout_s: Optional[float],
@@ -289,6 +290,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._model = model
         self._feature_extractor = feature_extractor
         self._action_decoder = action_decoder
+        self._aggregator = aggregator
         self._consensus_stub = consensus_stub
         self._share_timeout_s = share_timeout_s
         self._consensus_timeout_s = consensus_timeout_s
@@ -610,7 +612,9 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 f"std_delay={local.std_message_delay:.6f}"
             )
 
-        median_report = self._median_report(request.reports)
+        aggregated_report = self._aggregator.aggregate(
+            node_id=self.node_id, report_batch=request
+        )
         with self._lock:
             if request.episode in self._finalized_episodes:
                 return empty_pb2.Empty()
@@ -627,7 +631,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._pending_episodes.discard(request.episode)
             self._received_episodes.add(request.episode)
 
-            timeout = self._predict_timeout_locked(request.episode, median_report)
+            timeout = self._predict_timeout_locked(request.episode, aggregated_report)
             self._timeouts_by_episode[request.episode] = timeout
 
         return empty_pb2.Empty()
@@ -783,54 +787,6 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             except grpc.RpcError as exc:
                 print(f"ShareReport to node {peer_id} failed: {exc}")
 
-    def _median_report(self, reports: List[agent_pb2.ReportLocal]) -> agent_pb2.Report:
-        processed = int(round(statistics.median([entry.state.processed_transactions for entry in reports])))
-        avg_delay = float(statistics.median([entry.state.avg_message_delay for entry in reports]))
-        max_delay = float(statistics.median([entry.state.max_message_delay for entry in reports]))
-        min_delay = float(statistics.median([entry.state.min_message_delay for entry in reports]))
-        std_delay = float(statistics.median([entry.state.std_message_delay for entry in reports]))
-        p95_delay = float(statistics.median([entry.state.p95_message_delay for entry in reports]))
-        p99_delay = float(statistics.median([entry.state.p99_message_delay for entry in reports]))
-        throughput_tps = float(statistics.median([entry.state.throughput_tps for entry in reports]))
-        timeout_violation_rate = float(
-            statistics.median([entry.state.timeout_violation_rate for entry in reports])
-        )
-        no_op_rate = float(statistics.median([entry.state.no_op_rate for entry in reports]))
-        avg_batch_size = float(statistics.median([entry.state.avg_batch_size for entry in reports]))
-        p95_batch_size = float(statistics.median([entry.state.p95_batch_size for entry in reports]))
-        leader_change_count = int(
-            round(statistics.median([entry.state.leader_change_count for entry in reports]))
-        )
-        regency_change_count = int(
-            round(statistics.median([entry.state.regency_change_count for entry in reports]))
-        )
-        avg_propose_delay = float(statistics.median([entry.state.avg_propose_delay for entry in reports]))
-        avg_write_delay = float(statistics.median([entry.state.avg_write_delay for entry in reports]))
-        avg_accept_delay = float(statistics.median([entry.state.avg_accept_delay for entry in reports]))
-        avg_post_decision_delay = float(
-            statistics.median([entry.state.avg_post_decision_delay for entry in reports])
-        )
-        return agent_pb2.Report(
-            processed_transactions=processed,
-            avg_message_delay=avg_delay,
-            max_message_delay=max_delay,
-            min_message_delay=min_delay,
-            std_message_delay=std_delay,
-            p95_message_delay=p95_delay,
-            p99_message_delay=p99_delay,
-            throughput_tps=throughput_tps,
-            timeout_violation_rate=timeout_violation_rate,
-            no_op_rate=no_op_rate,
-            avg_batch_size=avg_batch_size,
-            p95_batch_size=p95_batch_size,
-            leader_change_count=leader_change_count,
-            regency_change_count=regency_change_count,
-            avg_propose_delay=avg_propose_delay,
-            avg_write_delay=avg_write_delay,
-            avg_accept_delay=avg_accept_delay,
-            avg_post_decision_delay=avg_post_decision_delay,
-        )
-
     def _apply_reward_update_locked(self, request: agent_pb2.ReportLocal) -> None:
         if not request.HasField("reward"):
             return
@@ -897,6 +853,8 @@ def serve(
     port: Optional[int],
     signing_enabled: bool,
     model_type: str,
+    aggregate_function: str,
+    aggregate_weight: int,
     schedule_file: Optional[Path],
     dataset_csv: Optional[Path],
     failure_spec: Optional[Path],
@@ -937,6 +895,13 @@ def serve(
 
     feature_extractor = ReportFeatureExtractor()
     action_decoder = TimeoutActionDecoder()
+    if aggregate_function == "median":
+        aggregator: BaseAggregator = MedianAggregator()
+    elif aggregate_function == "weighted_median":
+        aggregator = WeightedMedianAggregator(weights=aggregate_weight)
+    else:
+        raise ValueError(f"Unsupported aggregation function: {aggregate_function}")
+
     agent_injection_schedule = (
         load_agent_injection_schedule(failure_spec) if failure_spec is not None else None
     )
@@ -954,6 +919,7 @@ def serve(
         model=model,
         feature_extractor=feature_extractor,
         action_decoder=action_decoder,
+        aggregator=aggregator,
         consensus_stub=consensus_stub,
         share_timeout_s=share_timeout_s,
         consensus_timeout_s=consensus_timeout_s,
@@ -1045,6 +1011,22 @@ def main():
         default="linear",
         help="linear: learned linear model; scheduled: timeout from a time-based schedule CSV.",
     )
+
+    parser.add_argument(
+        "--function",
+        "-f",
+        type=str,
+        choices=("median", "weighted_median"),
+        default="median",
+        help="Aggregation function to use (default: median)",
+    )
+    parser.add_argument(
+        "--function-weight",
+        type=int,
+        default=3,
+        help="Weight multiplier for local node when using weighted_median (default: 3).",
+    )
+
     parser.add_argument(
         "--schedule-file",
         type=Path,
@@ -1094,6 +1076,8 @@ def main():
         port=args.port,
         signing_enabled=args.signing,
         model_type=args.model_type,
+        aggregate_function=args.function,
+        aggregate_weight=args.function_weight,
         schedule_file=args.schedule_file,
         dataset_csv=args.dataset_csv,
         failure_spec=args.failure_spec,

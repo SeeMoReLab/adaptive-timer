@@ -1,4 +1,5 @@
 cryptography
 grpcio
 grpcio-tools
+numpy
 torch

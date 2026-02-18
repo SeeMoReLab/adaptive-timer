@@ -415,22 +415,34 @@ if (( applier_start_failed != 0 )); then
 fi
 
 if (( LEARNING_AGENT_ENABLED == 1 )); then
-  echo "Starting learning-agent replicas..."
+  echo "Starting learning-agent replicas (parallel)..."
   agent_start_failed=0
+  agent_start_pids=()
+  agent_start_replicas=()
   for ((n = 0; n < replicas_per_machine; n++)); do
-    replica_id="${n}"
-    ns_name="pbft-r${replica_id}"
-    session_name="pbft_agent_${replica_id}"
-    agent_log="${LOCAL_LIBRARY_DIR}/agent_${replica_id}.log"
-    dataset_args=""
-    if (( DATASET_ENABLED == 1 )); then
-      rm -f "${LOCAL_LIBRARY_DIR}/agent${replica_id}.csv"
-      dataset_args="--dataset-csv agent${replica_id}.csv"
+    (
+      replica_id="${n}"
+      ns_name="pbft-r${replica_id}"
+      session_name="pbft_agent_${replica_id}"
+      agent_log="${LOCAL_LIBRARY_DIR}/agent_${replica_id}.log"
+      dataset_args=""
+      if (( DATASET_ENABLED == 1 )); then
+        rm -f "${LOCAL_LIBRARY_DIR}/agent${replica_id}.csv"
+        dataset_args="--dataset-csv agent${replica_id}.csv"
+      fi
+      tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
+      : > "${agent_log}"
+      tmux new-session -d -s "${session_name}" \
+        "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${LOCAL_LIBRARY_DIR}\" && echo \"[DEBUG] netns launch context\" && echo \"[DEBUG] whoami:\" && id -un && echo \"[DEBUG] pwd:\" && pwd && echo \"[DEBUG] python_bin: ${AGENT_PYTHON_BIN}\" && \"${AGENT_PYTHON_BIN}\" -c \"import sys; print(\\\"[DEBUG] sys.executable=\\\" + sys.executable)\" && \"${AGENT_PYTHON_BIN}\" -c \"import grpc; print(\\\"[DEBUG] grpc import ok\\\")\" && exec \"${AGENT_PYTHON_BIN}\" learning_agent/main.py --node-id ${replica_id} --hosts-config \"${LOCAL_LIBRARY_DIR}/smallbank/hosts.config\" --failure-spec \"${LOCAL_LIBRARY_DIR}/config/failure_spec.xml\" --injection-start-unix-ms ${START_UNIX_MS} ${AGENT_SHARING_FLAG} ${AGENT_MODEL_ARGS} ${dataset_args}' > \"${agent_log}\" 2>&1"
+    ) &
+    agent_start_pids+=("$!")
+    agent_start_replicas+=("${n}")
+  done
+  for i in "${!agent_start_pids[@]}"; do
+    if ! wait "${agent_start_pids[$i]}"; then
+      echo "Failed to launch learning-agent session for replica ${agent_start_replicas[$i]}" >&2
+      agent_start_failed=1
     fi
-    tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
-    : > "${agent_log}"
-    tmux new-session -d -s "${session_name}" \
-      "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${LOCAL_LIBRARY_DIR}\" && echo \"[DEBUG] netns launch context\" && echo \"[DEBUG] whoami:\" && id -un && echo \"[DEBUG] pwd:\" && pwd && echo \"[DEBUG] python_bin: ${AGENT_PYTHON_BIN}\" && \"${AGENT_PYTHON_BIN}\" -c \"import sys; print(\\\"[DEBUG] sys.executable=\\\" + sys.executable)\" && \"${AGENT_PYTHON_BIN}\" -c \"import grpc; print(\\\"[DEBUG] grpc import ok\\\")\" && exec \"${AGENT_PYTHON_BIN}\" learning_agent/main.py --node-id ${replica_id} --hosts-config \"${LOCAL_LIBRARY_DIR}/smallbank/hosts.config\" --failure-spec \"${LOCAL_LIBRARY_DIR}/config/failure_spec.xml\" --injection-start-unix-ms ${START_UNIX_MS} ${AGENT_SHARING_FLAG} ${AGENT_MODEL_ARGS} ${dataset_args}' > \"${agent_log}\" 2>&1"
   done
   sleep 2
   for ((n = 0; n < replicas_per_machine; n++)); do
@@ -449,18 +461,30 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
   fi
 fi
 
-echo "Starting PBFT servers..."
+echo "Starting PBFT servers (parallel)..."
 server_start_failed=0
 server_launch_epoch_s="$(date +%s)"
+server_start_pids=()
+server_start_replicas=()
 for ((n = 0; n < replicas_per_machine; n++)); do
-  replica_id="${n}"
-  ns_name="pbft-r${replica_id}"
-  session_name="pbft_server_${replica_id}"
-  server_log="${LOCAL_LIBRARY_DIR}/server_${replica_id}.log"
-  tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
-  : > "${server_log}"
-  tmux new-session -d -s "${session_name}" \
-    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${LOCAL_LIBRARY_DIR}\" && exec bash smartrun.sh bftsmart.demo.smallbank.SmallBankServer ${replica_id} --config-dir smallbank${n} --failure-start-unix-ms ${START_UNIX_MS} --failure-spec config/failure_spec.xml ${SERVER_LEARNING_FLAG}' > \"${server_log}\" 2>&1"
+  (
+    replica_id="${n}"
+    ns_name="pbft-r${replica_id}"
+    session_name="pbft_server_${replica_id}"
+    server_log="${LOCAL_LIBRARY_DIR}/server_${replica_id}.log"
+    tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
+    : > "${server_log}"
+    tmux new-session -d -s "${session_name}" \
+      "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${LOCAL_LIBRARY_DIR}\" && exec bash smartrun.sh bftsmart.demo.smallbank.SmallBankServer ${replica_id} --config-dir smallbank${n} --failure-start-unix-ms ${START_UNIX_MS} --failure-spec config/failure_spec.xml ${SERVER_LEARNING_FLAG}' > \"${server_log}\" 2>&1"
+  ) &
+  server_start_pids+=("$!")
+  server_start_replicas+=("${n}")
+done
+for i in "${!server_start_pids[@]}"; do
+  if ! wait "${server_start_pids[$i]}"; then
+    echo "Failed to launch PBFT server session for replica ${server_start_replicas[$i]}" >&2
+    server_start_failed=1
+  fi
 done
 sleep 2
 for ((n = 0; n < replicas_per_machine; n++)); do
@@ -499,8 +523,27 @@ tmux kill-session -t pbft_client >/dev/null 2>&1 || true
 tmux new-session -d -s pbft_client \
   "cd \"${LOCAL_LIBRARY_DIR}\" && bash smartrun.sh bftsmart.demo.smallbank.SmallBankClient --config-dir client --create --execute --start-unix-ms ${START_UNIX_MS} > output.txt 2>&1"
 
-echo "Experiment running for ${EXPERIMENT_TIME_S}s..."
-sleep "${EXPERIMENT_TIME_S}"
+EXPERIMENT_END_UNIX_MS="$((START_UNIX_MS + EXPERIMENT_TIME_S * 1000))"
+EXPERIMENT_END_EPOCH_S="$((EXPERIMENT_END_UNIX_MS / 1000))"
+echo "Experiment deadline unix_ms=${EXPERIMENT_END_UNIX_MS} (start_unix_ms + ${EXPERIMENT_TIME_S}s)"
+
+while true; do
+  now_epoch_s="$(date +%s)"
+  remaining_experiment_s="$((EXPERIMENT_END_EPOCH_S - now_epoch_s))"
+  if (( remaining_experiment_s <= 0 )); then
+    echo "Experiment deadline reached."
+    break
+  fi
+
+  remaining_minutes="$(((remaining_experiment_s + 59) / 60))"
+  echo "Time left until experiment deadline: ${remaining_experiment_s}s (~${remaining_minutes}m)"
+
+  sleep_s=300
+  if (( remaining_experiment_s < sleep_s )); then
+    sleep_s="${remaining_experiment_s}"
+  fi
+  sleep "${sleep_s}"
+done
 
 echo "Stopping tmux sessions..."
 sessions="$(tmux ls -F '#S' 2>/dev/null || true)"

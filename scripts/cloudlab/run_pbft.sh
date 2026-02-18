@@ -21,6 +21,7 @@ CLIENT_START_DELAY_S=10
 START_OFFSET_AFTER_CLIENT_LAUNCH_S=20
 OUTPUT_LOCAL="${REPO_ROOT}/scripts/cloudlab/tmp/output.txt"
 DATASET_ENABLED=0
+LOG_ENABLED=0
 OVERLAY_OCTET_A=10
 OVERLAY_OCTET_B=250
 OVERLAY_MASK_BITS=24
@@ -158,7 +159,7 @@ REMOTE
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -167,6 +168,7 @@ Arguments:
 
 Flags:
   --dataset         Collect per-replica learning-agent dataset CSVs as agentN.csv.
+  --log             Download per-replica server logs to scripts/cloudlab/tmp/server_logs/.
   -f <int>          Fault tolerance f passed to prepare_pbft.sh (default: 1).
   -t <int>          Seconds to run experiment before stopping tmux sessions (default: 60).
 EOF
@@ -208,6 +210,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dataset)
       DATASET_ENABLED=1
+      shift
+      ;;
+    --log)
+      LOG_ENABLED=1
       shift
       ;;
     normal|heuristic|learning|sharing|scheduled)
@@ -267,7 +273,7 @@ else
   LEARNING_AGENT_ENABLED=1
 fi
 echo "Selected mode: ${MODE}"
-echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (dataset=${DATASET_ENABLED})"
+echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (dataset=${DATASET_ENABLED}, log=${LOG_ENABLED})"
 echo "Preparing PBFT configs in cloudlab mode with f=${F}..."
 "${PREPARE_SCRIPT}" cloudlab -f "${F}"
 
@@ -820,15 +826,18 @@ if (( applier_start_failed != 0 )); then
 fi
 
 if (( LEARNING_AGENT_ENABLED == 1 )); then
-  echo "Starting learning-agent replicas in tmux..."
+  echo "Starting learning-agent replicas in tmux (parallel)..."
   agent_start_failed=0
+  agent_start_pids=()
+  agent_start_nodes=()
   for i in "${!server_nodes[@]}"; do
     node="${server_nodes[$i]}"
     host="${server_hosts[$i]}"
     user="${server_users[$i]}"
     machine_idx="${i}"
 
-    if ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${replicas_per_server_machine}" "${machine_idx}" "${START_UNIX_MS}" "${MODE}" "${DATASET_ENABLED}" <<'REMOTE'
+    (
+      ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${replicas_per_server_machine}" "${machine_idx}" "${START_UNIX_MS}" "${MODE}" "${DATASET_ENABLED}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
@@ -891,7 +900,14 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   fi
 done
 REMOTE
-    then
+    ) &
+    agent_start_pids+=("$!")
+    agent_start_nodes+=("${node}")
+  done
+  for i in "${!agent_start_pids[@]}"; do
+    pid="${agent_start_pids[$i]}"
+    node="${agent_start_nodes[$i]}"
+    if wait "${pid}"; then
       echo "  - ${node}: learning agents started"
     else
       echo "  - ${node}: failed to start learning agents" >&2
@@ -904,15 +920,19 @@ REMOTE
   fi
 fi
 
-echo "Starting PBFT server replicas in tmux..."
+echo "Starting PBFT server replicas in tmux (parallel)..."
 start_failed=0
+server_start_pids=()
+server_start_nodes=()
+
 for i in "${!server_nodes[@]}"; do
   node="${server_nodes[$i]}"
   host="${server_hosts[$i]}"
   user="${server_users[$i]}"
   machine_idx="${i}"
 
-  if ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${replicas_per_server_machine}" "${machine_idx}" "${START_UNIX_MS}" "${LEARNING_AGENT_ENABLED}" "${OVERLAY_OCTET_A}" "${OVERLAY_OCTET_B}" "${OVERLAY_HOST_OFFSET}" <<'REMOTE'
+  (
+    ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${replicas_per_server_machine}" "${machine_idx}" "${START_UNIX_MS}" "${LEARNING_AGENT_ENABLED}" "${OVERLAY_OCTET_A}" "${OVERLAY_OCTET_B}" "${OVERLAY_HOST_OFFSET}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
@@ -974,7 +994,15 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   fi
 done
 REMOTE
-  then
+  ) &
+  server_start_pids+=("$!")
+  server_start_nodes+=("${node}")
+done
+
+for i in "${!server_start_pids[@]}"; do
+  pid="${server_start_pids[$i]}"
+  node="${server_start_nodes[$i]}"
+  if wait "${pid}"; then
     echo "  - ${node}: servers started"
   else
     echo "  - ${node}: failed to start servers" >&2
@@ -1022,8 +1050,27 @@ tmux new-session -d -s pbft_client \
   "cd \"$HOME/library\" && bash smartrun.sh bftsmart.demo.smallbank.SmallBankClient --config-dir client --create --execute --start-unix-ms ${start_unix_ms} > output.txt 2>&1"
 REMOTE
 
-echo "Experiment running for ${EXPERIMENT_TIME_S}s..."
-sleep "${EXPERIMENT_TIME_S}"
+EXPERIMENT_END_UNIX_MS="$((START_UNIX_MS + EXPERIMENT_TIME_S * 1000))"
+EXPERIMENT_END_EPOCH_S="$((EXPERIMENT_END_UNIX_MS / 1000))"
+echo "Experiment deadline unix_ms=${EXPERIMENT_END_UNIX_MS} (start_unix_ms + ${EXPERIMENT_TIME_S}s)"
+
+while true; do
+  now_epoch_s="$(date +%s)"
+  remaining_experiment_s="$((EXPERIMENT_END_EPOCH_S - now_epoch_s))"
+  if (( remaining_experiment_s <= 0 )); then
+    echo "Experiment deadline reached."
+    break
+  fi
+
+  remaining_minutes="$(((remaining_experiment_s + 59) / 60))"
+  echo "Time left until experiment deadline: ${remaining_experiment_s}s (~${remaining_minutes}m)"
+
+  sleep_s=300
+  if (( remaining_experiment_s < sleep_s )); then
+    sleep_s="${remaining_experiment_s}"
+  fi
+  sleep "${sleep_s}"
+done
 
 echo "Stopping PBFT tmux sessions on all nodes..."
 stop_failed=0
@@ -1143,6 +1190,41 @@ mkdir -p "$(dirname "${OUTPUT_LOCAL}")"
 rm -f "${OUTPUT_LOCAL}"
 echo "Fetching client output to ${OUTPUT_LOCAL}..."
 scp "${SSH_OPTS[@]}" "${node0_user}@${node0_host}:~/library/output.txt" "${OUTPUT_LOCAL}"
+
+if (( LOG_ENABLED == 1 )); then
+  SERVER_LOGS_LOCAL_DIR="${REPO_ROOT}/scripts/cloudlab/tmp/server_logs"
+  echo "Fetching server logs to ${SERVER_LOGS_LOCAL_DIR}..."
+  rm -rf "${SERVER_LOGS_LOCAL_DIR}"
+  mkdir -p "${SERVER_LOGS_LOCAL_DIR}"
+  log_fetch_failed=0
+  for i in "${!server_nodes[@]}"; do
+    node="${server_nodes[$i]}"
+    host="${server_hosts[$i]}"
+    user="${server_users[$i]}"
+    machine_idx="${i}"
+    for ((n = 0; n < replicas_per_server_machine; n++)); do
+      replica_id=$((machine_idx * replicas_per_server_machine + n))
+      remote_log_path="\$HOME/library/server_${replica_id}.log"
+      remote_log_rel="library/server_${replica_id}.log"
+      local_log="${SERVER_LOGS_LOCAL_DIR}/server_${replica_id}.log"
+      rm -f "${local_log}"
+      if ssh "${SSH_OPTS[@]}" "${user}@${host}" "test -f ${remote_log_path}"; then
+        if scp "${SSH_OPTS[@]}" "${user}@${host}:${remote_log_rel}" "${local_log}"; then
+          echo "  - copied server_${replica_id}.log from ${node}"
+        else
+          echo "  - failed to copy server_${replica_id}.log from ${node}" >&2
+          log_fetch_failed=1
+        fi
+      else
+        echo "  - missing server_${replica_id}.log on ${node}" >&2
+        log_fetch_failed=1
+      fi
+    done
+  done
+  if (( log_fetch_failed != 0 )); then
+    echo "Some server logs could not be fetched." >&2
+  fi
+fi
 
 if (( LEARNING_AGENT_ENABLED == 1 )) && (( DATASET_ENABLED == 1 )); then
   echo "Fetching learning-agent dataset CSVs..."

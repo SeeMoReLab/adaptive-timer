@@ -346,6 +346,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._pending_episodes: Set[int] = set()
         self._timeouts_by_episode: Dict[int, agent_pb2.Timeout] = {}
         self._state_by_episode: Dict[int, agent_pb2.Report] = {}
+        self._phase_by_episode: Dict[int, int] = {}
         self._dataset_handle = None
         self._dataset_writer = None
         self._setup_dataset_csv(dataset_csv)
@@ -362,6 +363,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._dataset_writer.writerow(
                 [
                     "reward_episode",
+                    "phase",
                     "report_node_id",
                     *REPORT_FEATURE_FIELD_NAMES,
                     "timeout_milliseconds_used",
@@ -375,17 +377,15 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         if not self._agent_injection_schedule:
             return False, False
 
+        active_index = self._current_injection_phase_index_locked()
         elapsed_s = max(0.0, time.monotonic() - self._injection_start_mono)
-        active_index = -1
-        for idx, phase in enumerate(self._agent_injection_schedule):
-            if elapsed_s >= phase.at_time_s:
-                active_index = idx
-            else:
-                break
+        if active_index < 0:
+            phase = None
+        else:
+            phase = self._agent_injection_schedule[active_index]
 
         if active_index != self._active_injection_phase_index:
-            if active_index >= 0:
-                phase = self._agent_injection_schedule[active_index]
+            if phase is not None:
                 dirty_active = self.node_id in phase.dirty_report_replica_ids
                 ignore_active = self.node_id in phase.ignore_report_replica_ids
                 print(
@@ -401,14 +401,25 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 )
             self._active_injection_phase_index = active_index
 
-        if active_index < 0:
+        if phase is None:
             return False, False
 
-        phase = self._agent_injection_schedule[active_index]
         return (
             self.node_id in phase.dirty_report_replica_ids,
             self.node_id in phase.ignore_report_replica_ids,
         )
+
+    def _current_injection_phase_index_locked(self) -> int:
+        if not self._agent_injection_schedule:
+            return -1
+        elapsed_s = max(0.0, time.monotonic() - self._injection_start_mono)
+        active_index = -1
+        for idx, phase in enumerate(self._agent_injection_schedule):
+            if elapsed_s >= phase.at_time_s:
+                active_index = idx
+            else:
+                break
+        return active_index
 
     def _dirty_state(self, state: agent_pb2.Report) -> agent_pb2.Report:
         max_delay = max(
@@ -478,6 +489,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
 
     def _log_reward_row_locked(
         self,
+        phase: int,
         report_node_id: int,
         feedback: agent_pb2.Reward,
         matched_state: Optional[agent_pb2.Report],
@@ -495,6 +507,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._dataset_writer.writerow(
             [
                 feedback.episode,
+                phase,
                 report_node_id,
                 *report_values,
                 feedback.timeout_milliseconds_used,
@@ -652,6 +665,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._pending_episodes.clear()
             self._timeouts_by_episode.clear()
             self._state_by_episode.clear()
+            self._phase_by_episode.clear()
             self._current_episode = 0
             self._local_accepted_episode = None
         return empty_pb2.Empty()
@@ -823,7 +837,9 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
 
         feedback = request.reward
         matched_state = self._state_by_episode.get(feedback.episode)
+        phase = self._phase_by_episode.get(feedback.episode, -1)
         self._log_reward_row_locked(
+            phase=phase,
             report_node_id=request.node_id,
             feedback=feedback,
             matched_state=matched_state,
@@ -833,6 +849,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 "[learning] skipped reward update "
                 f"(episode={feedback.episode}): no stored state for episode"
             )
+            self._phase_by_episode.pop(feedback.episode, None)
             return
 
         timeout_ms = int(feedback.timeout_milliseconds_used)
@@ -848,6 +865,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._model.update_model(features, action, engineered_reward)
         # Reward for this episode has been consumed.
         self._state_by_episode.pop(feedback.episode, None)
+        self._phase_by_episode.pop(feedback.episode, None)
         print(
             "[learning] applied reward update "
             f"(episode={feedback.episode}, timeout_ms={timeout_ms}, "
@@ -861,6 +879,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         cached_report = agent_pb2.Report()
         cached_report.CopyFrom(report)
         self._state_by_episode[episode] = cached_report
+        self._phase_by_episode[episode] = self._current_injection_phase_index_locked()
         features = self._feature_extractor.featurize(report)
         action = self._model.predict_action(features)
         return self._action_decoder.decode(action)

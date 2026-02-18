@@ -181,7 +181,7 @@
 
         <!-- Small network delay + small proposal delay -->
         <phase>
-            <atTime>130</atTime>
+            <atTime>400</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -206,7 +206,7 @@
 
         <!-- Small network delay + large proposal delay -->
         <phase>
-            <atTime>160</atTime>
+            <atTime>700</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -231,7 +231,7 @@
 
         <!-- Large network delay -->
         <phase>
-            <atTime>190</atTime>
+            <atTime>1000</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -245,7 +245,7 @@
 
         <!-- Large network delay + small proposal delay -->
         <phase>
-            <atTime>220</atTime>
+            <atTime>1600</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -270,7 +270,7 @@
 
         <!-- Large network delay + large proposal delay -->
         <phase>
-            <atTime>250</atTime>
+            <atTime>2200</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>

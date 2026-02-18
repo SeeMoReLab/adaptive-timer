@@ -16,9 +16,9 @@ SSH_OPTS=(-o StrictHostKeyChecking=accept-new)
 MODE="normal"
 F=1
 TARGETS_FILE="${TARGETS_FILE_DEFAULT}"
-EXPERIMENT_TIME_S=60
+EXPERIMENT_TIME_S=300
 CLIENT_START_DELAY_S=10
-START_OFFSET_AFTER_CLIENT_LAUNCH_S=10
+START_OFFSET_AFTER_CLIENT_LAUNCH_S=20
 OUTPUT_LOCAL="${REPO_ROOT}/scripts/cloudlab/tmp/output.txt"
 DATASET_ENABLED=0
 OVERLAY_OCTET_A=10
@@ -97,7 +97,7 @@ wait_for_server_endpoints_from_node0_or_fail() {
     return 1
   fi
 
-  while (( $(date +%s) < deadline_epoch_s )); do
+  while true; do
     local all_ready=1
     local unready=""
     while read -r replica_id replica_ip replica_port; do
@@ -114,10 +114,13 @@ wait_for_server_endpoints_from_node0_or_fail() {
     fi
 
     last_unready="${unready}"
+    if (( $(date +%s) >= deadline_epoch_s )); then
+      break
+    fi
     sleep 1
   done
 
-  echo "Timed out waiting for server ports to become reachable from node0." >&2
+  echo "Timed out waiting for server ports to become reachable from ${node0_host}." >&2
   if [[ -n "${last_unready}" ]]; then
     echo "Still unreachable: ${last_unready}" >&2
   fi
@@ -358,6 +361,37 @@ if (( ${#server_nodes[@]} < 1 )); then
   exit 1
 fi
 
+is_ipv4_literal() {
+  local value="$1"
+  [[ "${value}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+echo "Resolving server gateway IPs for cross-node routes..."
+server_gateway_ips=()
+for i in "${!server_nodes[@]}"; do
+  node="${server_nodes[$i]}"
+  host="${server_hosts[$i]}"
+  user="${server_users[$i]}"
+  gateway_ip=""
+
+  if is_ipv4_literal "${host}"; then
+    gateway_ip="${host}"
+  else
+    gateway_ip="$(
+      ssh "${SSH_OPTS[@]}" "${user}@${host}" \
+        "hostname -I | awk '{print \$1}'" 2>/dev/null || true
+    )"
+  fi
+
+  if ! is_ipv4_literal "${gateway_ip}"; then
+    echo "Failed to resolve gateway IP for ${node} (${user}@${host})." >&2
+    exit 1
+  fi
+
+  server_gateway_ips+=("${gateway_ip}")
+  echo "  - ${node}: ${gateway_ip}"
+done
+
 echo "Rewriting hosts configs for per-replica namespace IPs..."
 rewrite_hosts_for_namespaces "${LIBRARY_DIR}/smallbank/hosts.config" "${replicas_per_server_machine}"
 rewrite_hosts_for_namespaces "${LIBRARY_DIR}/dataexchange/hosts.config" "${replicas_per_server_machine}"
@@ -468,15 +502,6 @@ if [[ ! -f "$HOME/learning_agent/requirements.txt" ]]; then
   echo "learning_agent/requirements.txt missing under $HOME/learning_agent on $(hostname)" >&2
   exit 1
 fi
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "python3 not found on $(hostname); cannot install learning agent requirements" >&2
-  exit 1
-fi
-if ! python3 -m pip --version >/dev/null 2>&1; then
-  echo "python3 -m pip is unavailable on $(hostname)" >&2
-  exit 1
-fi
-PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --user -r "$HOME/learning_agent/requirements.txt"
 
 if (( create_client == 1 )); then
   rm -rf "$HOME/library/client"
@@ -549,7 +574,7 @@ for i in "${!server_nodes[@]}"; do
     "${OVERLAY_MASK_BITS}" \
     "${OVERLAY_BRIDGE_NAME}" \
     "${OVERLAY_HOST_OFFSET}" \
-    "${server_nodes[@]}" <<'REMOTE'
+    "${server_gateway_ips[@]}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
@@ -561,7 +586,7 @@ overlay_mask="$6"
 bridge_name="$7"
 host_offset="$8"
 shift 8
-server_node_names=("$@")
+server_gateway_ips=("$@")
 
 bridge_ip="${overlay_a}.${overlay_b}.$((machine_idx + 1)).1"
 local_subnet="${overlay_a}.${overlay_b}.$((machine_idx + 1)).0/${overlay_mask}"
@@ -628,12 +653,11 @@ for ((peer_idx = 0; peer_idx < server_machine_count; peer_idx++)); do
     continue
   fi
   subnet="${overlay_a}.${overlay_b}.$((peer_idx + 1)).0/${overlay_mask}"
-  gw_name="${server_node_names[$peer_idx]}"
-  gw_ip="$(getent ahostsv4 "${gw_name}" | awk 'NR==1 {print $1}')"
-  if [[ -z "${gw_ip}" ]]; then
-    gw_ip="${gw_name}"
+  gw_ip="${server_gateway_ips[$peer_idx]}"
+  if ! sudo -n ip route replace "${subnet}" via "${gw_ip}"; then
+    echo "Failed route replace on $(hostname): subnet=${subnet} gw=${gw_ip}" >&2
+    exit 1
   fi
-  sudo -n ip route replace "${subnet}" via "${gw_ip}"
 done
 
 echo "Configured ${replicas_per_machine} namespaces on $(hostname) in ${local_subnet}."
@@ -653,12 +677,13 @@ fi
 
 if (( machine_count > 1 )); then
   echo "Configuring client host routes on node0..."
-  if ! ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" "bash -s" -- \
+  if ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" "bash -s" -- \
     "${server_machine_count}" \
     "${OVERLAY_OCTET_A}" \
     "${OVERLAY_OCTET_B}" \
     "${OVERLAY_MASK_BITS}" \
-    "${server_nodes[@]}" <<'REMOTE'
+    "${server_nodes[@]}" \
+    "${server_hosts[@]}" <<'REMOTE'
 set -euo pipefail
 
 server_machine_count="$1"
@@ -666,16 +691,67 @@ overlay_a="$2"
 overlay_b="$3"
 overlay_mask="$4"
 shift 4
-server_node_names=("$@")
+
+server_nodes=()
+for ((i = 0; i < server_machine_count; i++)); do
+  if [[ $# -lt 1 ]]; then
+    echo "Invalid route setup arguments on node0." >&2
+    exit 1
+  fi
+  server_nodes+=("$1")
+  shift
+done
+
+server_hosts=()
+for ((i = 0; i < server_machine_count; i++)); do
+  if [[ $# -lt 1 ]]; then
+    echo "Invalid route setup arguments on node0." >&2
+    exit 1
+  fi
+  server_hosts+=("$1")
+  shift
+done
+
+is_ipv4_literal() {
+  local value="$1"
+  [[ "${value}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
 
 for ((peer_idx = 0; peer_idx < server_machine_count; peer_idx++)); do
+  peer_node="${server_nodes[$peer_idx]}"
+  peer_host="${server_hosts[$peer_idx]}"
   subnet="${overlay_a}.${overlay_b}.$((peer_idx + 1)).0/${overlay_mask}"
-  gw_name="${server_node_names[$peer_idx]}"
-  gw_ip="$(getent ahostsv4 "${gw_name}" | awk 'NR==1 {print $1}')"
-  if [[ -z "${gw_ip}" ]]; then
-    gw_ip="${gw_name}"
+  gw_ip=""
+
+  # Prefer CloudLab node aliases (node1, node2, ...) because they typically
+  # resolve to the experiment-network address visible from node0.
+  if [[ -n "${peer_node}" ]]; then
+    gw_ip="$(getent ahostsv4 "${peer_node}" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
   fi
-  sudo -n ip route replace "${subnet}" via "${gw_ip}"
+  if ! is_ipv4_literal "${gw_ip}"; then
+    if is_ipv4_literal "${peer_host}"; then
+      gw_ip="${peer_host}"
+    else
+      gw_ip="$(getent ahostsv4 "${peer_host}" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
+    fi
+  fi
+
+  if ! is_ipv4_literal "${gw_ip}"; then
+    echo "Failed to resolve gateway IP on node0 for peer=${peer_node} host=${peer_host}" >&2
+    exit 1
+  fi
+
+  # Retry with explicit device+onlink when strict nexthop validation rejects
+  # the plain route form on some CloudLab network layouts.
+  if ! sudo -n ip route replace "${subnet}" via "${gw_ip}"; then
+    route_get="$(ip -4 route get "${gw_ip}" 2>/dev/null | head -n1 || true)"
+    route_dev="$(awk '{for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }}' <<< "${route_get}")"
+    if [[ -n "${route_dev}" ]] && sudo -n ip route replace "${subnet}" via "${gw_ip}" dev "${route_dev}" onlink; then
+      continue
+    fi
+    echo "Failed route replace on node0: subnet=${subnet} gw=${gw_ip} peer=${peer_node} host=${peer_host}" >&2
+    exit 1
+  fi
 done
 REMOTE
   then
@@ -830,7 +906,6 @@ fi
 
 echo "Starting PBFT server replicas in tmux..."
 start_failed=0
-server_launch_epoch_s="$(date +%s)"
 for i in "${!server_nodes[@]}"; do
   node="${server_nodes[$i]}"
   host="${server_hosts[$i]}"
@@ -913,7 +988,8 @@ if (( start_failed != 0 )); then
   exit 1
 fi
 
-client_delay_deadline="$((server_launch_epoch_s + CLIENT_START_DELAY_S))"
+# Start readiness probing window from "now" so it cannot expire before first probe.
+client_delay_deadline="$(( $(date +%s) + CLIENT_START_DELAY_S ))"
 if ! wait_for_server_endpoints_from_node0_or_fail "${node0_host}" "${node0_user}" "${LIBRARY_DIR}/smallbank/hosts.config" "${client_delay_deadline}"; then
   dump_remote_server_logs 120
   exit 1

@@ -2,8 +2,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 DEFAULT_TARGETS_FILE="${SCRIPT_DIR}/tmp/cloudlab_ssh_targets.txt"
 IP_OUTPUT_FILE="${SCRIPT_DIR}/tmp/cloudlab_ip.txt"
+LEARNING_AGENT_REQUIREMENTS="${REPO_ROOT}/learning_agent/requirements.txt"
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new)
 
 usage() {
@@ -86,6 +88,10 @@ if [[ -z "${node0_host}" || -z "${node0_user}" ]]; then
   echo "Could not find node0 entry in ${TARGETS_FILE}" >&2
   exit 1
 fi
+if [[ ! -f "${LEARNING_AGENT_REQUIREMENTS}" ]]; then
+  echo "learning_agent requirements not found: ${LEARNING_AGENT_REQUIREMENTS}" >&2
+  exit 1
+fi
 
 if [[ -s "${tmp_peers}" ]]; then
   has_peers=1
@@ -134,6 +140,49 @@ done
 
 if [[ "${install_failed}" -ne 0 ]]; then
   echo "Dependency installation failed on one or more nodes." >&2
+  exit 1
+fi
+
+echo "Installing learning-agent Python requirements on all nodes in parallel..."
+pids=()
+nodes=()
+while read -r node host user; do
+  (
+    remote_req_path="/tmp/learning_agent_requirements.txt"
+    ssh "${SSH_OPTS[@]}" "${user}@${host}" \
+      "cat > \"${remote_req_path}\"" < "${LEARNING_AGENT_REQUIREMENTS}"
+    ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${remote_req_path}" <<'REMOTE'
+set -euo pipefail
+
+requirements_path="$1"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 not found on $(hostname)" >&2
+  exit 1
+fi
+if ! python3 -m pip --version >/dev/null 2>&1; then
+  echo "python3 -m pip not found on $(hostname)" >&2
+  exit 1
+fi
+PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --user -r "${requirements_path}"
+rm -f "${requirements_path}"
+REMOTE
+  ) &
+  pids+=("$!")
+  nodes+=("${node}")
+done < "${tmp_all_nodes}"
+
+pip_failed=0
+for i in "${!pids[@]}"; do
+  if wait "${pids[$i]}"; then
+    echo "  - ${nodes[$i]}: pip requirements installed"
+  else
+    echo "  - ${nodes[$i]}: pip requirements install failed" >&2
+    pip_failed=1
+  fi
+done
+
+if [[ "${pip_failed}" -ne 0 ]]; then
+  echo "Python requirements installation failed on one or more nodes." >&2
   exit 1
 fi
 

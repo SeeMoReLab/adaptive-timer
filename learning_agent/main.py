@@ -541,6 +541,10 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._received_episodes.add(local_report.episode)
 
             if not self._sharing:
+                print(
+                    f"[episode {local_report.episode}] accepted valid local report "
+                    f"from node={self.node_id} (sharing=off)"
+                )
                 timeout = self._predict_timeout_locked(
                     local_report.episode, local_report.state
                 )
@@ -652,19 +656,25 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._local_accepted_episode = None
         return empty_pb2.Empty()
 
-    def _store_report_locked(self, report: agent_pb2.ReportLocal) -> None:
+    def _store_report_locked(self, report: agent_pb2.ReportLocal) -> bool:
         if report.episode in self._finalized_episodes:
-            return
+            return False
         if report.episode in self._submitted_episodes:
-            return
+            return False
 
         reports_for_episode = self._reports_by_episode.setdefault(report.episode, {})
         if report.node_id in reports_for_episode:
-            return
+            return False
         reports_for_episode[report.node_id] = report
+        reports_collected = len(reports_for_episode)
+
+        print(
+            f"[episode {report.episode}] accepted valid report "
+            f"from node={report.node_id} ({reports_collected}/{self._threshold})"
+        )
 
         if (
-            len(reports_for_episode) >= self._threshold
+            reports_collected >= self._threshold
             and report.episode not in self._timers_by_episode
             and report.episode not in self._submitted_episodes
         ):
@@ -674,6 +684,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._timers_by_episode[report.episode] = timer
             timer.daemon = True
             timer.start()
+        return True
 
     def _finalize_episode(self, episode: int) -> None:
         with self._lock:

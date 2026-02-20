@@ -15,6 +15,10 @@
 
     <schemaVersion>2</schemaVersion>
     <replicaIdType>global</replicaIdType>
+    <!-- Warm-up period in seconds: no failure behavior is active during this time. -->
+    <warmUpTime>0</warmUpTime>
+    <!-- Force leader failure / view-change interval in seconds, starting after warm-up. -->
+    <leaderFailureInterval>300</leaderFailureInterval>
 
     <phases>
         <phase>

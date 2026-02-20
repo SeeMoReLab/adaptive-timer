@@ -30,27 +30,106 @@ TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
     value_ms: idx for idx, value_ms in enumerate(TIMEOUT_VALUES_MS)
 }
 
-REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
-    "processed_transactions",
-    "avg_message_delay",
-    "max_message_delay",
-    "min_message_delay",
-    "std_message_delay",
-    "p95_message_delay",
-    "p99_message_delay",
+PBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
+    "total_transactions",
+    "total_consensus_instances",
+    "avg_consensus_latency_ms",
+    "p95_consensus_latency_ms",
+    "p99_consensus_latency_ms",
     "throughput_tps",
     "timeout_violation_rate",
-    "no_op_rate",
     "avg_batch_size",
     "p95_batch_size",
     "leader_change_count",
     "regency_change_count",
-    "avg_propose_delay",
-    "avg_write_delay",
-    "avg_accept_delay",
-    "avg_post_decision_delay",
+    "phase_propose_avg_delay_ms",
+    "phase_propose_p95_delay_ms",
+    "phase_write_avg_delay_ms",
+    "phase_write_p95_delay_ms",
+    "phase_accept_avg_delay_ms",
+    "phase_accept_p95_delay_ms",
+    "phase_post_decision_avg_delay_ms",
+    "phase_post_decision_p95_delay_ms",
 )
-REPORT_FEATURE_DIM = len(REPORT_FEATURE_FIELD_NAMES)
+TWO_PC_OVER_PBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
+    "total_transactions",
+    "single_shard_transactions",
+    "cross_shard_transactions",
+    "prepare_ok_count",
+    "prepare_fail_count",
+    "commit_ok_count",
+    "abort_count",
+    "in_doubt_count",
+    "prepare_timeout_count",
+    "commit_timeout_unknown_outcome_count",
+    "abort_best_effort_timeout_count",
+    "lock_contention_count",
+    "prepare_timeout_rate",
+    "abort_rate",
+    "commit_rate",
+    "lock_contention_rate",
+    "avg_end_to_end_latency_ms",
+    "p95_end_to_end_latency_ms",
+    "p99_end_to_end_latency_ms",
+    "avg_prepare_latency_ms",
+    "p95_prepare_latency_ms",
+    "avg_commit_latency_ms",
+    "p95_commit_latency_ms",
+    "avg_lock_wait_ms",
+    "p95_lock_wait_ms",
+    "avg_lock_hold_ms",
+    "p95_lock_hold_ms",
+    "reason_prepare_lock_busy_count",
+    "reason_prepare_validation_fail_count",
+    "reason_prepare_timeout_count",
+    "reason_prepare_other_count",
+    "reason_commit_timeout_unknown_outcome_count",
+    "reason_abort_best_effort_timeout_count",
+    "reason_other_count",
+)
+SBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
+    "total_transactions",
+    "total_consensus_instances",
+    "avg_consensus_latency_ms",
+    "p95_consensus_latency_ms",
+    "p99_consensus_latency_ms",
+    "throughput_tps",
+    "timeout_violation_rate",
+    "avg_batch_size",
+    "p95_batch_size",
+    "leader_change_count",
+    "regency_change_count",
+)
+
+
+def _protocol_name(protocol: int) -> str:
+    try:
+        return agent_pb2.Protocol.Name(protocol)
+    except ValueError:
+        return f"UNKNOWN({protocol})"
+
+
+def _validate_protocol(protocol: int) -> int:
+    if protocol not in (
+        agent_pb2.PROTOCOL_PBFT,
+        agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT,
+        agent_pb2.PROTOCOL_SBFT,
+    ):
+        raise ValueError(f"Unsupported protocol: {_protocol_name(protocol)}")
+    return int(protocol)
+
+
+def get_report_feature_field_names(protocol: int) -> Tuple[str, ...]:
+    protocol = _validate_protocol(protocol)
+    if protocol == agent_pb2.PROTOCOL_PBFT:
+        return PBFT_REPORT_FEATURE_FIELD_NAMES
+    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+        return TWO_PC_OVER_PBFT_REPORT_FEATURE_FIELD_NAMES
+    return SBFT_REPORT_FEATURE_FIELD_NAMES
+
+
+def get_report_feature_dim(protocol: int) -> int:
+    return len(get_report_feature_field_names(protocol))
 
 
 def timeout_ms_to_index(timeout_ms: int) -> int:
@@ -70,27 +149,126 @@ def timeout_index_to_ms(index: int) -> int:
     return TIMEOUT_VALUES_MS[index]
 
 
-def report_to_feature_values(state: agent_pb2.Report) -> List[float]:
-    return [
-        float(state.processed_transactions),
-        float(state.avg_message_delay),
-        float(state.max_message_delay),
-        float(state.min_message_delay),
-        float(state.std_message_delay),
-        float(state.p95_message_delay),
-        float(state.p99_message_delay),
-        float(state.throughput_tps),
-        float(state.timeout_violation_rate),
-        float(state.no_op_rate),
-        float(state.avg_batch_size),
-        float(state.p95_batch_size),
-        float(state.leader_change_count),
-        float(state.regency_change_count),
-        float(state.avg_propose_delay),
-        float(state.avg_write_delay),
-        float(state.avg_accept_delay),
-        float(state.avg_post_decision_delay),
-    ]
+def _two_pc_pair_to_index(election_timeout_ms: int, prepare_timeout_ms: int) -> int:
+    election_idx = timeout_ms_to_index(election_timeout_ms)
+    prepare_idx = timeout_ms_to_index(prepare_timeout_ms)
+    return election_idx * len(TIMEOUT_VALUES_MS) + prepare_idx
+
+
+def _two_pc_index_to_pair(index: int) -> Tuple[int, int]:
+    total = len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS)
+    bounded = max(0, min(index, total - 1))
+    election_idx = bounded // len(TIMEOUT_VALUES_MS)
+    prepare_idx = bounded % len(TIMEOUT_VALUES_MS)
+    return timeout_index_to_ms(election_idx), timeout_index_to_ms(prepare_idx)
+
+
+def _sbft_triple_to_index(
+    election_timeout_ms: int, slow_path_timeout_ms: int, batch_timeout_ms: int
+) -> int:
+    election_idx = timeout_ms_to_index(election_timeout_ms)
+    slow_idx = timeout_ms_to_index(slow_path_timeout_ms)
+    batch_idx = timeout_ms_to_index(batch_timeout_ms)
+    base = len(TIMEOUT_VALUES_MS)
+    return (election_idx * base * base) + (slow_idx * base) + batch_idx
+
+
+def _sbft_index_to_triple(index: int) -> Tuple[int, int, int]:
+    base = len(TIMEOUT_VALUES_MS)
+    total = base * base * base
+    bounded = max(0, min(index, total - 1))
+    election_idx = bounded // (base * base)
+    rem = bounded % (base * base)
+    slow_idx = rem // base
+    batch_idx = rem % base
+    return (
+        timeout_index_to_ms(election_idx),
+        timeout_index_to_ms(slow_idx),
+        timeout_index_to_ms(batch_idx),
+    )
+
+
+def get_action_space_size(protocol: int) -> int:
+    protocol = _validate_protocol(protocol)
+    if protocol == agent_pb2.PROTOCOL_PBFT:
+        return len(TIMEOUT_VALUES_MS)
+    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+        return len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS)
+    return len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS)
+
+
+def report_to_feature_values(protocol: int, state: object) -> List[float]:
+    protocol = _validate_protocol(protocol)
+    fields = get_report_feature_field_names(protocol)
+    return [float(getattr(state, field_name)) for field_name in fields]
+
+
+def timeout_to_action_index(protocol: int, timeout_used: object) -> int:
+    protocol = _validate_protocol(protocol)
+    if protocol == agent_pb2.PROTOCOL_PBFT:
+        timeout_msg = timeout_used
+        return timeout_ms_to_index(int(timeout_msg.election_timeout_milliseconds))
+    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+        timeout_msg = timeout_used
+        return _two_pc_pair_to_index(
+            int(timeout_msg.election_timeout_milliseconds),
+            int(timeout_msg.prepare_timeout_milliseconds),
+        )
+
+    timeout_msg = timeout_used
+    return _sbft_triple_to_index(
+        int(timeout_msg.election_timeout_milliseconds),
+        int(timeout_msg.slow_path_timeout_milliseconds),
+        int(timeout_msg.batch_timeout_milliseconds),
+    )
+
+
+def action_index_to_timeout(protocol: int, index: int) -> agent_pb2.Timeout:
+    protocol = _validate_protocol(protocol)
+    if protocol == agent_pb2.PROTOCOL_PBFT:
+        timeout_ms = timeout_index_to_ms(index)
+        return agent_pb2.Timeout(
+            pbft=agent_pb2.PbftTimeout(election_timeout_milliseconds=timeout_ms)
+        )
+    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+        election_timeout_ms, prepare_timeout_ms = _two_pc_index_to_pair(index)
+        return agent_pb2.Timeout(
+            two_pc_over_pbft=agent_pb2.TwoPcOverPbftTimeout(
+                election_timeout_milliseconds=election_timeout_ms,
+                prepare_timeout_milliseconds=prepare_timeout_ms,
+            )
+        )
+
+    election_timeout_ms, slow_path_timeout_ms, batch_timeout_ms = _sbft_index_to_triple(
+        index
+    )
+    return agent_pb2.Timeout(
+        sbft=agent_pb2.SbftTimeout(
+            election_timeout_milliseconds=election_timeout_ms,
+            slow_path_timeout_milliseconds=slow_path_timeout_ms,
+            batch_timeout_milliseconds=batch_timeout_ms,
+        )
+    )
+
+
+def describe_action(protocol: int, index: int) -> str:
+    protocol = _validate_protocol(protocol)
+    if protocol == agent_pb2.PROTOCOL_PBFT:
+        return f"election_timeout_ms={timeout_index_to_ms(index)}"
+    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+        election_timeout_ms, prepare_timeout_ms = _two_pc_index_to_pair(index)
+        return (
+            f"election_timeout_ms={election_timeout_ms}, "
+            f"prepare_timeout_ms={prepare_timeout_ms}"
+        )
+    election_timeout_ms, slow_path_timeout_ms, batch_timeout_ms = _sbft_index_to_triple(
+        index
+    )
+    return (
+        f"election_timeout_ms={election_timeout_ms}, "
+        f"slow_path_timeout_ms={slow_path_timeout_ms}, "
+        f"batch_timeout_ms={batch_timeout_ms}"
+    )
 
 
 class FeatureExtractor(Generic[S], ABC):
@@ -127,31 +305,37 @@ class TensorModel(ABC):
         pass
 
 
-class ReportFeatureExtractor(FeatureExtractor[agent_pb2.Report]):
-    def featurize(self, state: agent_pb2.Report) -> torch.Tensor:
-        features = report_to_feature_values(state)
+class ProtocolReportFeatureExtractor(FeatureExtractor[object]):
+    def __init__(self, protocol: int):
+        self._protocol = _validate_protocol(protocol)
+
+    def featurize(self, state: object) -> torch.Tensor:
+        features = report_to_feature_values(self._protocol, state)
         return torch.tensor(features, dtype=torch.float32)
 
 
-class TimeoutActionDecoder(ActionDecoder[agent_pb2.Timeout]):
-    """Decodes model output into one of the fixed timeout options."""
+class ProtocolTimeoutActionDecoder(ActionDecoder[agent_pb2.Timeout]):
+    """Decodes model output into a protocol-specific timeout action."""
+
+    def __init__(self, protocol: int):
+        self._protocol = _validate_protocol(protocol)
 
     def decode(self, action: torch.Tensor) -> agent_pb2.Timeout:
         if action.numel() == 1:
             option_index = int(round(float(action.item())))
         else:
             option_index = int(torch.argmax(action).item())
-        timeout_ms = timeout_index_to_ms(option_index)
-        return agent_pb2.Timeout(timeout_milliseconds=timeout_ms)
+        return action_index_to_timeout(self._protocol, option_index)
 
 
 class LinearTorchModel(TensorModel):
-    """Linear classifier over the discrete timeout options."""
+    """Linear classifier over protocol-specific discrete timeout options."""
 
-    def __init__(self, n_features: int, lr: float = 0.01):
-        self.weights = torch.zeros(
-            (len(TIMEOUT_VALUES_MS), n_features), requires_grad=True
-        )
+    def __init__(self, action_dim: int, n_features: int, lr: float = 0.01):
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        self._action_dim = int(action_dim)
+        self.weights = torch.zeros((self._action_dim, n_features), requires_grad=True)
         self.optimizer = torch.optim.SGD([self.weights], lr=lr)
 
     def predict_action(self, features: torch.Tensor) -> torch.Tensor:
@@ -161,10 +345,9 @@ class LinearTorchModel(TensorModel):
         self, features: torch.Tensor, action: torch.Tensor, reward: float
     ) -> None:
         target_index = int(round(float(action.item())))
-        target_index = max(0, min(target_index, len(TIMEOUT_VALUES_MS) - 1))
+        target_index = max(0, min(target_index, self._action_dim - 1))
         logits = torch.mv(self.weights, features).unsqueeze(0)
         target = torch.tensor([target_index], dtype=torch.long)
-        # Policy-gradient style weighting using throughput-shaped reward.
         reward_scale = max(float(reward), 0.0) / 1000.0
         if reward_scale <= 0.0:
             return
@@ -178,11 +361,15 @@ class LinearTorchModel(TensorModel):
 
 
 class ScheduledTimeoutModel(TensorModel):
-    """Returns timeout option indices from a time-based schedule."""
+    """Returns protocol-specific timeout option indices from a time-based schedule."""
 
     def __init__(
-        self, schedule: List[Tuple[float, int]], start_monotonic: Optional[float] = None
+        self,
+        protocol: int,
+        schedule: List[Tuple[float, int]],
+        start_monotonic: Optional[float] = None,
     ):
+        self._protocol = _validate_protocol(protocol)
         if not schedule:
             raise ValueError("Schedule must contain at least one entry.")
         self._schedule = sorted(schedule, key=lambda entry: entry[0])
@@ -195,8 +382,12 @@ class ScheduledTimeoutModel(TensorModel):
 
     @classmethod
     def from_csv(
-        cls, path: Path, start_monotonic: Optional[float] = None
+        cls,
+        protocol: int,
+        path: Path,
+        start_monotonic: Optional[float] = None,
     ) -> "ScheduledTimeoutModel":
+        protocol = _validate_protocol(protocol)
         schedule: List[Tuple[float, int]] = []
         with path.open("r", newline="") as handle:
             reader = csv.reader(handle)
@@ -206,26 +397,55 @@ class ScheduledTimeoutModel(TensorModel):
                 first = row[0].strip()
                 if not first or first.startswith("#"):
                     continue
-                if len(row) < 2:
-                    raise ValueError(
-                        f"Invalid schedule at line {lineno}: expected 2 columns time_s,timeout_ms."
-                    )
                 try:
                     time_s = float(first)
-                    timeout_ms = int(row[1].strip())
                 except ValueError as exc:
                     raise ValueError(
-                        f"Invalid schedule values at line {lineno}: {row}"
+                        f"Invalid schedule time at line {lineno}: {row}"
                     ) from exc
                 if time_s < 0:
                     raise ValueError(
                         f"Invalid schedule at line {lineno}: time_s must be >= 0."
                     )
-                option_index = timeout_ms_to_index(timeout_ms)
+
+                if protocol == agent_pb2.PROTOCOL_PBFT:
+                    if len(row) < 2:
+                        raise ValueError(
+                            f"Invalid PBFT schedule at line {lineno}: expected 2 columns time_s,election_timeout_ms."
+                        )
+                    timeout_ms = int(row[1].strip())
+                    option_index = timeout_ms_to_index(timeout_ms)
+                elif protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+                    if len(row) < 3:
+                        raise ValueError(
+                            "Invalid 2PC-over-PBFT schedule at line "
+                            f"{lineno}: expected 3 columns "
+                            "time_s,election_timeout_ms,prepare_timeout_ms."
+                        )
+                    election_timeout_ms = int(row[1].strip())
+                    prepare_timeout_ms = int(row[2].strip())
+                    option_index = _two_pc_pair_to_index(
+                        election_timeout_ms, prepare_timeout_ms
+                    )
+                else:
+                    if len(row) < 4:
+                        raise ValueError(
+                            "Invalid SBFT schedule at line "
+                            f"{lineno}: expected 4 columns "
+                            "time_s,election_timeout_ms,slow_path_timeout_ms,batch_timeout_ms."
+                        )
+                    election_timeout_ms = int(row[1].strip())
+                    slow_path_timeout_ms = int(row[2].strip())
+                    batch_timeout_ms = int(row[3].strip())
+                    option_index = _sbft_triple_to_index(
+                        election_timeout_ms,
+                        slow_path_timeout_ms,
+                        batch_timeout_ms,
+                    )
                 schedule.append((time_s, option_index))
         if not schedule:
             raise ValueError(f"No schedule entries found in {path}.")
-        return cls(schedule, start_monotonic=start_monotonic)
+        return cls(protocol, schedule, start_monotonic=start_monotonic)
 
     def set_start_monotonic(self, start_monotonic: float) -> None:
         self._start_time = float(start_monotonic)
@@ -243,10 +463,10 @@ class ScheduledTimeoutModel(TensorModel):
                 break
         if active_row != self._active_row:
             switch_time_s, active_option_index = self._schedule[active_row]
-            timeout_ms = timeout_index_to_ms(active_option_index)
             print(
                 "[scheduled-model] active schedule: "
-                f"time_s>={switch_time_s:g}, timeout_ms={timeout_ms}"
+                f"time_s>={switch_time_s:g}, "
+                f"{describe_action(self._protocol, active_option_index)}"
             )
             self._active_row = active_row
         return option_index

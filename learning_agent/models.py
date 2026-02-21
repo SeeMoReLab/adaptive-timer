@@ -4,6 +4,9 @@ from enum import IntEnum
 import time
 from pathlib import Path
 from typing import Dict, Generic, List, Optional, Tuple, TypeVar
+import random
+import copy
+from tqdm import tqdm
 
 import torch
 import torch.nn.functional as F
@@ -270,6 +273,34 @@ def describe_action(protocol: int, index: int) -> str:
         f"batch_timeout_ms={batch_timeout_ms}"
     )
 
+def produce_dataloader(features: List[agent_pb2.Report], actions: List[torch.Tensor], rewards:List[float], batch_size:int, eval_ratio: float)->Tuple['DatasetLoader', 'DatasetLoader']:
+    num_samples = len(features)
+    indices = list(range(num_samples))
+    random.shuffle(indices)
+
+    split_idx = int(num_samples * (1-eval_ratio))
+
+    train_indices = indices[:split_idx]
+    eval_indices = indices[split_idx:]
+
+    train_loader = DatasetLoader(
+        features=[features[i] for i in train_indices],
+        actions=[actions[i] for i in train_indices],
+        rewards=[rewards[i] for i in train_indices],
+        batch_size=batch_size,
+        shuffle=True
+    )
+
+    eval_loader = DatasetLoader(
+        features=[features[i] for i in eval_indices],
+        actions=[actions[i] for i in eval_indices],
+        rewards=[rewards[i] for i in eval_indices],
+        batch_size=batch_size,
+        shuffle=False
+    )
+
+    return train_loader, eval_loader
+
 
 class FeatureExtractor(Generic[S], ABC):
     """Converts an input state into a tensor for model consumption."""
@@ -304,6 +335,24 @@ class TensorModel(ABC):
     def reset_model(self) -> None:
         pass
 
+class RewardTransformer(ABC):
+    """Converts throughput result into float reward."""
+
+    @abstractmethod
+    def transform(self, throughput: int) -> float:
+        pass
+
+class BaseLoader(ABC):
+    """Dataset Loader"""
+
+    @abstractmethod
+    def __iter__(self)-> 'BaseLoader':
+        pass
+
+    @abstractmethod
+    def __next__(self) -> Dict[str, torch.Tensor]:
+        pass
+
 
 class ProtocolReportFeatureExtractor(FeatureExtractor[object]):
     def __init__(self, protocol: int):
@@ -327,6 +376,50 @@ class ProtocolTimeoutActionDecoder(ActionDecoder[agent_pb2.Timeout]):
             option_index = int(torch.argmax(action).item())
         return action_index_to_timeout(self._protocol, option_index)
 
+class QuadraticRewardScaler(RewardTransformer):
+    """Quadratic shaping below 1000, linear above. Prior work"""
+
+    @classmethod
+    def transform(self,throughput: int) -> float:
+        value = float(max(0, throughput))
+        if value < 1000.0:
+            return (value / 1000.0) ** 2 * 1000.0
+        return value
+
+class DatasetLoader(BaseLoader):
+    """Training dataset loader"""
+    def __init__(self, 
+        features: List[agent_pb2.Report], actions:List[torch.Tensor], rewards:List[float], batch_size:Optional[int] = 1, shuffle:Optional[bool] = False
+    )->None:
+        self.features = features
+        self.actions = actions
+        self.rewards = rewards
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.all_indices = list(range(len(self.features)))
+
+    def __iter__(self) -> 'DatasetLoader':
+        self.current_indices = list(self.all_indices)
+
+        if self.shuffle:
+            random.shuffle(self.current_indices)
+
+        self.cursor = 0
+        return self
+    
+    def __next__(self) -> Dict[str, torch.Tensor]:
+        if self.cursor >= len(self.current_indices):
+            raise StopIteration
+        
+        batch_idx = self.current_indices[self.cursor : self.cursor + self.batch_size]
+        self.cursor += self.batch_size
+        
+        return {
+            "features": torch.tensor([report_to_feature_values(self.features[i]) for i in batch_idx], dtype=torch.float32),
+            "actions": torch.tensor([self.actions[i] for i in batch_idx], dtype=torch.float32),
+            "rewards": torch.tensor([self.rewards[i] for i in batch_idx], dtype=torch.float32)
+        }
+            
 
 class LinearTorchModel(TensorModel):
     """Linear classifier over protocol-specific discrete timeout options."""
@@ -341,25 +434,121 @@ class LinearTorchModel(TensorModel):
     def predict_action(self, features: torch.Tensor) -> torch.Tensor:
         return torch.mv(self.weights, features)
 
+
     def update_model(
-        self, features: torch.Tensor, action: torch.Tensor, reward: float
+        self, features: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor, backward: bool = True
     ) -> None:
-        target_index = int(round(float(action.item())))
-        target_index = max(0, min(target_index, self._action_dim - 1))
-        logits = torch.mv(self.weights, features).unsqueeze(0)
-        target = torch.tensor([target_index], dtype=torch.long)
-        reward_scale = max(float(reward), 0.0) / 1000.0
-        if reward_scale <= 0.0:
-            return
-        loss = F.cross_entropy(logits, target) * reward_scale
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        target_index = torch.round(actions).long().view(-1)
+        targets = torch.clamp(target_index, 0, len(TIMEOUT_VALUES_MS) - 1)
+        logits = torch.matmul(features, self.weights.t())
+        reward_scales = torch.clamp(rewards, min=0.0) / 1000.0
+        loss_vector = F.cross_entropy(logits, targets, reduction='none')
+        loss = (loss_vector * reward_scales.squeeze()).mean()
+
+        if loss > 0:
+            if backward:
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+            return loss.item() 
+        
+        return 0.0
 
     def reset_model(self) -> None:
         torch.nn.init.zeros_(self.weights)
 
+    @classmethod
+    def from_csv(
+        cls, n_features:int, lr:float, path:Path, epoch: int, batch_size:Optional[int] = 1, eval_ratio:Optional[float] = 0.2, verbose:Optional[bool] = False
+    )-> "LinearTorchModel":
+        reports:List[agent_pb2.Report] = []
+        rewards: List[float] = []
+        actions: List[torch.Tensor] = []
+        
+        model = cls(n_features = n_features, lr = lr)
+        
+        with path.open("r", newline="", encoding='utf-8') as file:
+            reader = csv.reader(file)
+            header = next(reader, None)
+            for lineno, row in enumerate(reader, start=1):
+                if not row:
+                    continue
+                if len(row) != 23:
+                    raise ValueError(
+                        f"Invalid csv file at line {lineno}: expected 23 columns."
+                    )
+                try:
+                    # Need to clarify usage
+                    # reward_episode = int(row[0])
+                    # report_node_id = int(row[1])
+                    # matched_episode = int(row[22])
 
+                    action_index = timeout_ms_to_index(int(row[20]))
+                    actions.append(torch.tensor(float(action_index), dtype=torch.float32))
+                    rewards.append(QuadraticRewardScaler.transform(float(row[21])))
+                    reports.append(
+                            agent_pb2.Report(
+                                processed_transactions = int(row[2]),
+                                avg_message_delay = float(row[3]),
+                                max_message_delay = float(row[4]),
+                                min_message_delay = float(row[5]),
+                                std_message_delay = float(row[6]),
+                                p95_message_delay = float(row[7]),
+                                p99_message_delay = float(row[8]),
+                                throughput_tps = float(row[9]),
+                                timeout_violation_rate = float(row[10]),
+                                no_op_rate = float(row[11]),
+                                avg_batch_size = float(row[12]),
+                                p95_batch_size = float(row[13]),
+                                leader_change_count = int(row[14]),
+                                regency_change_count = int(row[15]),
+                                avg_propose_delay = float(row[16]),
+                                avg_write_delay = float(row[17]),
+                                avg_accept_delay = float(row[18]),
+                                avg_post_decision_delay = float(row[19])
+                            )
+                        )
+                
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Invalid values at line {lineno}: {row}"
+                    ) from exc
+                
+        train_loader, eval_loader = produce_dataloader(
+                features = reports,
+                actions = actions,
+                rewards = rewards,
+                batch_size = batch_size,
+                eval_ratio= eval_ratio
+            )
+
+        global_loss = float('inf')       
+        if verbose:
+            pbar = tqdm(range(epoch), desc="Training")
+        else:
+            pbar = range(epoch)
+
+        for e in pbar:
+            loss,e_loss = 0,0
+            for idx, batch in enumerate(train_loader):
+                loss += model.update_model(batch["features"], batch["actions"], batch["rewards"])
+            curr_loss = loss / (idx+1)
+
+            for idx, batch in enumerate(eval_loader):
+                e_loss += model.update_model(batch["features"], batch["actions"], batch["rewards"], backward=False)
+            curr_e_loss = e_loss / (idx+1)
+
+            if curr_e_loss < global_loss:
+                global_loss = curr_e_loss
+                best_weights = model.weights.clone().detach()
+                if verbose:
+                    pbar.set_postfix(Epoch = f"{e+1}/{epoch}", Train_Loss=f"{curr_loss:.7f}", Eval_Loss = f"{curr_e_loss:.7f}")
+
+        with torch.no_grad():
+            model.weights.copy_(best_weights)
+
+        return model
+    
 class ScheduledTimeoutModel(TensorModel):
     """Returns protocol-specific timeout option indices from a time-based schedule."""
 
@@ -484,3 +673,15 @@ class ScheduledTimeoutModel(TensorModel):
     def reset_model(self) -> None:
         self._start_time = time.monotonic()
         self._active_row = -1
+        
+if __name__ == "__main__":
+    random.seed(42) 
+    model = LinearTorchModel.from_csv(
+        n_features = REPORT_FEATURE_DIM, 
+        lr = 1e-9,
+        path = Path('data/sample_large.csv'), 
+        epoch = 30, 
+        batch_size = 4,
+        verbose = True,
+        eval_ratio = 0.2
+    )

@@ -529,7 +529,7 @@ class LinearTorchModel(TensorModel):
             pbar = range(epoch)
 
         for e in pbar:
-            loss,e_loss = 0,0
+            loss,eval_loss = 0,0
             for idx, batch in enumerate(train_loader):
                 loss += model.update_model(batch["features"], batch["actions"], batch["rewards"])
             current_loss = loss / (idx+1)

@@ -532,17 +532,17 @@ class LinearTorchModel(TensorModel):
             loss,e_loss = 0,0
             for idx, batch in enumerate(train_loader):
                 loss += model.update_model(batch["features"], batch["actions"], batch["rewards"])
-            curr_loss = loss / (idx+1)
+            current_loss = loss / (idx+1)
 
             for idx, batch in enumerate(eval_loader):
-                e_loss += model.update_model(batch["features"], batch["actions"], batch["rewards"], backward=False)
-            curr_e_loss = e_loss / (idx+1)
+                eval_loss += model.update_model(batch["features"], batch["actions"], batch["rewards"], backward=False)
+            current_eval_loss = eval_loss / (idx+1)
 
-            if curr_e_loss < global_loss:
-                global_loss = curr_e_loss
+            if current_eval_loss < global_loss:
+                global_loss = current_eval_loss
                 best_weights = model.weights.clone().detach()
                 if verbose:
-                    pbar.set_postfix(Epoch = f"{e+1}/{epoch}", Train_Loss=f"{curr_loss:.7f}", Eval_Loss = f"{curr_e_loss:.7f}")
+                    pbar.set_postfix(Epoch = f"{e+1}/{epoch}", Train_Loss=f"{current_loss:.7f}", Eval_Loss = f"{current_eval_loss:.7f}")
 
         with torch.no_grad():
             model.weights.copy_(best_weights)

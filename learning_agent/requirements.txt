@@ -3,3 +3,4 @@ grpcio
 grpcio-tools
 numpy
 torch
+tqdm

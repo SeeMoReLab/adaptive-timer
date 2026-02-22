@@ -19,7 +19,6 @@ class TimeoutOption(IntEnum):
     TIMEOUT_600_MS = 600
     TIMEOUT_1800_MS = 1800
 
-
 TIMEOUT_OPTIONS: Tuple[TimeoutOption, ...] = (
     TimeoutOption.TIMEOUT_300_MS,
     TimeoutOption.TIMEOUT_600_MS,
@@ -28,6 +27,36 @@ TIMEOUT_OPTIONS: Tuple[TimeoutOption, ...] = (
 TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(int(option) for option in TIMEOUT_OPTIONS)
 TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
     value_ms: idx for idx, value_ms in enumerate(TIMEOUT_VALUES_MS)
+}
+
+class PhaseMapping(IntEnum):
+    PHASE_0 = TimeoutOption.TIMEOUT_300_MS
+    PHASE_1 = TimeoutOption.TIMEOUT_300_MS
+    PHASE_2 = TimeoutOption.TIMEOUT_300_MS
+    PHASE_3 = TimeoutOption.TIMEOUT_300_MS
+    PHASE_4 = TimeoutOption.TIMEOUT_600_MS
+    PHASE_5 = TimeoutOption.TIMEOUT_600_MS
+    PHASE_6 = TimeoutOption.TIMEOUT_600_MS
+    PHASE_7 = TimeoutOption.TIMEOUT_1800_MS
+    PHASE_8 = TimeoutOption.TIMEOUT_1800_MS
+    PHASE_9 = TimeoutOption.TIMEOUT_1800_MS
+
+PHASE_OPTIONS: Tuple[PhaseMapping, ...] = (
+    PhaseMapping.PHASE_0,
+    PhaseMapping.PHASE_1,
+    PhaseMapping.PHASE_2,
+    PhaseMapping.PHASE_3,
+    PhaseMapping.PHASE_4,
+    PhaseMapping.PHASE_5,
+    PhaseMapping.PHASE_6,
+    PhaseMapping.PHASE_7,
+    PhaseMapping.PHASE_8,
+    PhaseMapping.PHASE_9,
+)
+
+PHASE_VALUES_MS: Tuple[int, ...] = tuple(int(option) for option in PHASE_OPTIONS)
+PHASE_INDEX_TO_TIMEOUT_INDEX: Dict[int, int] = {
+    idx: TIMEOUT_MS_TO_INDEX[value_ms] for idx, value_ms in enumerate(PHASE_VALUES_MS)
 }
 
 PBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
@@ -270,7 +299,6 @@ def describe_action(protocol: int, index: int) -> str:
         f"batch_timeout_ms={batch_timeout_ms}"
     )
 
-
 class FeatureExtractor(Generic[S], ABC):
     """Converts an input state into a tensor for model consumption."""
 
@@ -297,11 +325,18 @@ class TensorModel(ABC):
     @abstractmethod
     def update_model(
         self, features: torch.Tensor, action: torch.Tensor, reward: float
-    ) -> None:
+    ) -> float:
         pass
 
     @abstractmethod
     def reset_model(self) -> None:
+        pass
+
+class RewardTransformer(ABC):
+    """Converts throughput result into float reward."""
+
+    @abstractmethod
+    def transform(self, throughput: float) -> float:
         pass
 
 
@@ -327,6 +362,16 @@ class ProtocolTimeoutActionDecoder(ActionDecoder[agent_pb2.Timeout]):
             option_index = int(torch.argmax(action).item())
         return action_index_to_timeout(self._protocol, option_index)
 
+class QuadraticRewardScaler(RewardTransformer):
+    """Quadratic shaping below 1000, linear above. Prior work"""
+
+    @staticmethod
+    def transform(throughput: float) -> float:
+        value = float(max(0, throughput))
+        if value < 1000.0:
+            return (value / 1000.0) ** 2 * 1000.0
+        return value
+            
 
 class LinearTorchModel(TensorModel):
     """Linear classifier over protocol-specific discrete timeout options."""
@@ -339,22 +384,53 @@ class LinearTorchModel(TensorModel):
         self.optimizer = torch.optim.SGD([self.weights], lr=lr)
 
     def predict_action(self, features: torch.Tensor) -> torch.Tensor:
-        return torch.mv(self.weights, features)
+        if features.dim() == 1:
+            return torch.mv(self.weights, features)
+        return torch.matmul(features, self.weights.t())
 
     def update_model(
-        self, features: torch.Tensor, action: torch.Tensor, reward: float
-    ) -> None:
-        target_index = int(round(float(action.item())))
-        target_index = max(0, min(target_index, self._action_dim - 1))
-        logits = torch.mv(self.weights, features).unsqueeze(0)
-        target = torch.tensor([target_index], dtype=torch.long)
-        reward_scale = max(float(reward), 0.0) / 1000.0
-        if reward_scale <= 0.0:
-            return
-        loss = F.cross_entropy(logits, target) * reward_scale
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        self,
+        features: torch.Tensor,
+        actions: torch.Tensor,
+        rewards: torch.Tensor | float,
+        backward: bool = True,
+    ) -> float:
+        with torch.set_grad_enabled(backward):
+            if features.dim() == 1:
+                features = features.unsqueeze(0)
+
+            actions_tensor = torch.as_tensor(actions, dtype=torch.float32).view(-1)
+            rewards_tensor = torch.as_tensor(rewards, dtype=torch.float32).view(-1)
+
+            batch_size = features.shape[0]
+            if actions_tensor.numel() == 1 and batch_size > 1:
+                actions_tensor = actions_tensor.repeat(batch_size)
+            if rewards_tensor.numel() == 1 and batch_size > 1:
+                rewards_tensor = rewards_tensor.repeat(batch_size)
+            if actions_tensor.numel() != batch_size:
+                raise ValueError(
+                    "actions batch size mismatch: "
+                    f"expected {batch_size}, got {actions_tensor.numel()}"
+                )
+            if rewards_tensor.numel() != batch_size:
+                raise ValueError(
+                    "rewards batch size mismatch: "
+                    f"expected {batch_size}, got {rewards_tensor.numel()}"
+                )
+
+            target_index = torch.round(actions_tensor).long().view(-1)
+            targets = torch.clamp(target_index, 0, self._action_dim - 1)
+            logits = torch.matmul(features, self.weights.t())
+            reward_scales = torch.clamp(rewards_tensor, min=0.0) / 1000.0
+            loss_vector = F.cross_entropy(logits, targets, reduction="none")
+            loss = (loss_vector * reward_scales).mean()
+
+            if backward and float(loss.item()) > 0.0:
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+            return float(loss.item())
 
     def reset_model(self) -> None:
         torch.nn.init.zeros_(self.weights)
@@ -478,8 +554,9 @@ class ScheduledTimeoutModel(TensorModel):
 
     def update_model(
         self, features: torch.Tensor, action: torch.Tensor, reward: float
-    ) -> None:
+    ) -> float:
         del features, action, reward
+        return 0.0
 
     def reset_model(self) -> None:
         self._start_time = time.monotonic()

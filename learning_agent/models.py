@@ -19,7 +19,6 @@ class TimeoutOption(IntEnum):
     TIMEOUT_600_MS = 600
     TIMEOUT_1800_MS = 1800
 
-
 TIMEOUT_OPTIONS: Tuple[TimeoutOption, ...] = (
     TimeoutOption.TIMEOUT_300_MS,
     TimeoutOption.TIMEOUT_600_MS,
@@ -28,6 +27,36 @@ TIMEOUT_OPTIONS: Tuple[TimeoutOption, ...] = (
 TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(int(option) for option in TIMEOUT_OPTIONS)
 TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
     value_ms: idx for idx, value_ms in enumerate(TIMEOUT_VALUES_MS)
+}
+
+class PhaseMapping(IntEnum):
+    PHASE_0 = TimeoutOption.TIMEOUT_300_MS
+    PHASE_1 = TimeoutOption.TIMEOUT_300_MS
+    PHASE_2 = TimeoutOption.TIMEOUT_300_MS
+    PHASE_3 = TimeoutOption.TIMEOUT_300_MS
+    PHASE_4 = TimeoutOption.TIMEOUT_600_MS
+    PHASE_5 = TimeoutOption.TIMEOUT_600_MS
+    PHASE_6 = TimeoutOption.TIMEOUT_600_MS
+    PHASE_7 = TimeoutOption.TIMEOUT_1800_MS
+    PHASE_8 = TimeoutOption.TIMEOUT_1800_MS
+    PHASE_9 = TimeoutOption.TIMEOUT_1800_MS
+
+PHASE_OPTIONS: Tuple[PhaseMapping, ...] = (
+    PhaseMapping.PHASE_0,
+    PhaseMapping.PHASE_1,
+    PhaseMapping.PHASE_2,
+    PhaseMapping.PHASE_3,
+    PhaseMapping.PHASE_4,
+    PhaseMapping.PHASE_5,
+    PhaseMapping.PHASE_6,
+    PhaseMapping.PHASE_7,
+    PhaseMapping.PHASE_8,
+    PhaseMapping.PHASE_9,
+)
+
+PHASE_VALUES_MS: Tuple[int, ...] = tuple(int(option) for option in PHASE_OPTIONS)
+PHASE_INDEX_TO_TIMEOUT_INDEX: Dict[int, int] = {
+    idx: TIMEOUT_MS_TO_INDEX[value_ms] for idx, value_ms in enumerate(PHASE_VALUES_MS)
 }
 
 PBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
@@ -366,41 +395,42 @@ class LinearTorchModel(TensorModel):
         rewards: torch.Tensor | float,
         backward: bool = True,
     ) -> float:
-        if features.dim() == 1:
-            features = features.unsqueeze(0)
+        with torch.set_grad_enabled(backward):
+            if features.dim() == 1:
+                features = features.unsqueeze(0)
 
-        actions_tensor = torch.as_tensor(actions, dtype=torch.float32).view(-1)
-        rewards_tensor = torch.as_tensor(rewards, dtype=torch.float32).view(-1)
+            actions_tensor = torch.as_tensor(actions, dtype=torch.float32).view(-1)
+            rewards_tensor = torch.as_tensor(rewards, dtype=torch.float32).view(-1)
 
-        batch_size = features.shape[0]
-        if actions_tensor.numel() == 1 and batch_size > 1:
-            actions_tensor = actions_tensor.repeat(batch_size)
-        if rewards_tensor.numel() == 1 and batch_size > 1:
-            rewards_tensor = rewards_tensor.repeat(batch_size)
-        if actions_tensor.numel() != batch_size:
-            raise ValueError(
-                "actions batch size mismatch: "
-                f"expected {batch_size}, got {actions_tensor.numel()}"
-            )
-        if rewards_tensor.numel() != batch_size:
-            raise ValueError(
-                "rewards batch size mismatch: "
-                f"expected {batch_size}, got {rewards_tensor.numel()}"
-            )
+            batch_size = features.shape[0]
+            if actions_tensor.numel() == 1 and batch_size > 1:
+                actions_tensor = actions_tensor.repeat(batch_size)
+            if rewards_tensor.numel() == 1 and batch_size > 1:
+                rewards_tensor = rewards_tensor.repeat(batch_size)
+            if actions_tensor.numel() != batch_size:
+                raise ValueError(
+                    "actions batch size mismatch: "
+                    f"expected {batch_size}, got {actions_tensor.numel()}"
+                )
+            if rewards_tensor.numel() != batch_size:
+                raise ValueError(
+                    "rewards batch size mismatch: "
+                    f"expected {batch_size}, got {rewards_tensor.numel()}"
+                )
 
-        target_index = torch.round(actions_tensor).long().view(-1)
-        targets = torch.clamp(target_index, 0, self._action_dim - 1)
-        logits = torch.matmul(features, self.weights.t())
-        reward_scales = torch.clamp(rewards_tensor, min=0.0) / 1000.0
-        loss_vector = F.cross_entropy(logits, targets, reduction="none")
-        loss = (loss_vector * reward_scales).mean()
+            target_index = torch.round(actions_tensor).long().view(-1)
+            targets = torch.clamp(target_index, 0, self._action_dim - 1)
+            logits = torch.matmul(features, self.weights.t())
+            reward_scales = torch.clamp(rewards_tensor, min=0.0) / 1000.0
+            loss_vector = F.cross_entropy(logits, targets, reduction="none")
+            loss = (loss_vector * reward_scales).mean()
 
-        if backward and float(loss.item()) > 0.0:
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
+            if backward and float(loss.item()) > 0.0:
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
 
-        return float(loss.item())
+            return float(loss.item())
 
     def reset_model(self) -> None:
         torch.nn.init.zeros_(self.weights)

@@ -7,6 +7,7 @@ import torch
 from data_loader import DatasetLoader, load_training_data_from_csv, split_train_eval_loaders
 from models import (
     TIMEOUT_VALUES_MS,
+    PHASE_INDEX_TO_TIMEOUT_INDEX,
     LinearTorchModel,
     QuadraticRewardScaler,
     get_action_space_size,
@@ -50,7 +51,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--train-csv",
         type=Path,
-        default=Path(__file__).resolve().parent / "data" / "sample_large.csv",
+        default=Path(__file__).resolve().parent / "data" / "sample_pbft.csv",
         help="Training CSV path.",
     )
     parser.add_argument(
@@ -135,6 +136,7 @@ def train_linear_model_from_csv(
         protocol=protocol,
         feature_field_names=get_report_feature_field_names(protocol),
         timeout_values_ms=TIMEOUT_VALUES_MS,
+        phase_options=PHASE_INDEX_TO_TIMEOUT_INDEX,
         reward_transform=reward_transform,
     )
     train_loader, eval_loader = split_train_eval_loaders(
@@ -183,11 +185,13 @@ def evaluate_linear_model_on_csv(
         protocol=protocol,
         feature_field_names=get_report_feature_field_names(protocol),
         timeout_values_ms=TIMEOUT_VALUES_MS,
+        phase_options=PHASE_INDEX_TO_TIMEOUT_INDEX
     )
     loader = DatasetLoader(
         features=data.features,
         actions=data.actions,
         rewards=data.rewards,
+        labels=data.labels,
         batch_size=batch_size,
         shuffle=False,
     )

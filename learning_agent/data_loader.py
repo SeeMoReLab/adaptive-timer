@@ -29,6 +29,7 @@ class CsvTrainingData:
     features: List[List[float]]
     actions: List[float]
     rewards: List[float]
+    labels: List[float]
 
 
 class DatasetLoader:
@@ -37,6 +38,7 @@ class DatasetLoader:
         features: Sequence[Sequence[float]],
         actions: Sequence[float],
         rewards: Sequence[float],
+        labels: Sequence[float],
         batch_size: int = 1,
         shuffle: bool = False,
     ) -> None:
@@ -50,6 +52,7 @@ class DatasetLoader:
         self._features = torch.tensor(features, dtype=torch.float32)
         self._actions = torch.tensor(actions, dtype=torch.float32)
         self._rewards = torch.tensor(rewards, dtype=torch.float32)
+        self._labels = torch.tensor(labels, dtype=torch.float32)
         self.batch_size = int(batch_size)
         self.shuffle = bool(shuffle)
         self._all_indices = list(range(len(features)))
@@ -78,6 +81,7 @@ class DatasetLoader:
             "features": self._features.index_select(0, index_tensor),
             "actions": self._actions.index_select(0, index_tensor),
             "rewards": self._rewards.index_select(0, index_tensor),
+            "labels": self._labels.index_select(0, index_tensor)
         }
 
 
@@ -111,6 +115,7 @@ def split_train_eval_loaders(
         features=[data.features[i] for i in train_idx],
         actions=[data.actions[i] for i in train_idx],
         rewards=[data.rewards[i] for i in train_idx],
+        labels=[data.labels[i] for i in train_idx],
         batch_size=batch_size,
         shuffle=True,
     )
@@ -121,6 +126,7 @@ def split_train_eval_loaders(
             features=[data.features[i] for i in eval_idx],
             actions=[data.actions[i] for i in eval_idx],
             rewards=[data.rewards[i] for i in eval_idx],
+            labels=[data.labels[i] for i in eval_idx],
             batch_size=batch_size,
             shuffle=False,
         )
@@ -133,6 +139,7 @@ def load_training_data_from_csv(
     protocol: int,
     feature_field_names: Sequence[str],
     timeout_values_ms: Sequence[int],
+    phase_options: Dict[int, int],
     reward_transform: Optional[Callable[[float], float]] = None,
 ) -> CsvTrainingData:
     reward_transform = reward_transform or (lambda value: value)
@@ -140,6 +147,7 @@ def load_training_data_from_csv(
     features: List[List[float]] = []
     actions: List[float] = []
     rewards: List[float] = []
+    labels: List[float] = []
 
     with path.open("r", newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
@@ -166,9 +174,17 @@ def load_training_data_from_csv(
             )
             reward_value = _extract_reward(row=row, row_number=row_number)
 
+            label_index = _extract_label(
+                row=row, 
+                phase_options=phase_options,
+                row_number=row_number
+            )
+
             features.append(feature_values)
             actions.append(float(action_index))
             rewards.append(float(reward_transform(reward_value)))
+            labels.append(float(label_index))
+
 
     if not features:
         raise ValueError(
@@ -176,7 +192,7 @@ def load_training_data_from_csv(
             "Rows with matched_episode_features=0 are skipped."
         )
 
-    return CsvTrainingData(features=features, actions=actions, rewards=rewards)
+    return CsvTrainingData(features=features, actions=actions, rewards=rewards, labels=labels)
 
 
 def _is_empty_row(row: Dict[str, str]) -> bool:
@@ -363,3 +379,29 @@ def _extract_reward(row: Dict[str, str], row_number: int) -> float:
     raise ValueError(
         f"Missing reward value at CSV line {row_number}. Tried: reward,total_transactions"
     )
+
+def _extract_label(row: Dict[str, str], phase_options: Dict[int, int], row_number: int) -> float:
+    for field_name in ("phase"):
+        raw_value = row.get("phase")
+        if raw_value is None or raw_value.strip() == "":
+            continue
+        try:
+            return label_to_timeout_index(int(raw_value), phase_options= phase_options, row_number=row_number)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid label index for '{field_name}' at CSV line {row_number}: {raw_value!r}"
+            ) from exc
+    raise ValueError(
+        f"Missing label index at CSV line {row_number}. Tried: phase"
+    )
+
+def label_to_timeout_index(
+        label_index: int, phase_options: Dict[int, int], row_number: int
+    ) -> int:
+        result = phase_options.get(label_index)
+        if result is None:
+            raise ValueError(
+                f"Unsupported label index {label_index} at CSV line {row_number}. "
+                f"Valid options: {tuple(phase_options)}"
+            )
+        return result

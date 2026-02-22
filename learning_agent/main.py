@@ -72,6 +72,44 @@ def _parse_protocol(value: str) -> int:
     return protocol
 
 
+def _protocols_compatible(incoming_protocol: int, expected_protocol: int) -> bool:
+    return incoming_protocol in (agent_pb2.PROTOCOL_UNSPECIFIED, expected_protocol)
+
+
+def _dataset_timeout_field_names(protocol: int) -> Tuple[str, ...]:
+    if protocol == agent_pb2.PROTOCOL_PBFT:
+        return ("election_timeout_milliseconds_used",)
+    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+        return (
+            "election_timeout_milliseconds_used",
+            "prepare_timeout_milliseconds_used",
+        )
+    if protocol == agent_pb2.PROTOCOL_SBFT:
+        return (
+            "election_timeout_milliseconds_used",
+            "slow_path_timeout_milliseconds_used",
+            "batch_timeout_milliseconds_used",
+        )
+    raise ValueError(f"Unsupported protocol: {protocol}")
+
+
+def _dataset_timeout_values(protocol: int, timeout_used: object) -> Tuple[object, ...]:
+    if protocol == agent_pb2.PROTOCOL_PBFT:
+        return (getattr(timeout_used, "election_timeout_milliseconds", ""),)
+    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+        return (
+            getattr(timeout_used, "election_timeout_milliseconds", ""),
+            getattr(timeout_used, "prepare_timeout_milliseconds", ""),
+        )
+    if protocol == agent_pb2.PROTOCOL_SBFT:
+        return (
+            getattr(timeout_used, "election_timeout_milliseconds", ""),
+            getattr(timeout_used, "slow_path_timeout_milliseconds", ""),
+            getattr(timeout_used, "batch_timeout_milliseconds", ""),
+        )
+    raise ValueError(f"Unsupported protocol: {protocol}")
+
+
 def _extract_state(report: agent_pb2.ReportLocal, protocol: int) -> object:
     if protocol == agent_pb2.PROTOCOL_PBFT:
         if not report.HasField("pbft_state"):
@@ -446,6 +484,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._state_by_episode: Dict[int, object] = {}
         self._phase_by_episode: Dict[int, int] = {}
         self._report_feature_field_names = get_report_feature_field_names(self._protocol)
+        self._dataset_timeout_field_names = _dataset_timeout_field_names(self._protocol)
         self._dataset_handle = None
         self._dataset_writer = None
         self._setup_dataset_csv(dataset_csv)
@@ -465,10 +504,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                     "phase",
                     "report_node_id",
                     *self._report_feature_field_names,
-                    "election_timeout_milliseconds_used",
-                    "prepare_timeout_milliseconds_used",
-                    "slow_path_timeout_milliseconds_used",
-                    "batch_timeout_milliseconds_used",
+                    *self._dataset_timeout_field_names,
                     "reward",
                     "matched_episode_features",
                 ]
@@ -798,20 +834,14 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             if report is not None
             else [""] * len(self._report_feature_field_names)
         )
-        election_timeout_ms = getattr(timeout_used, "election_timeout_milliseconds", "")
-        prepare_timeout_ms = getattr(timeout_used, "prepare_timeout_milliseconds", "")
-        slow_path_timeout_ms = getattr(timeout_used, "slow_path_timeout_milliseconds", "")
-        batch_timeout_ms = getattr(timeout_used, "batch_timeout_milliseconds", "")
+        timeout_values = _dataset_timeout_values(self._protocol, timeout_used)
         self._dataset_writer.writerow(
             [
                 reward_episode,
                 phase,
                 report_node_id,
                 *report_values,
-                election_timeout_ms,
-                prepare_timeout_ms,
-                slow_path_timeout_ms,
-                batch_timeout_ms,
+                *timeout_values,
                 _report_total_transactions(reward_report),
                 int(matched),
             ]
@@ -820,10 +850,11 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._dataset_handle.flush()
 
     def SendReport(self, request: agent_pb2.ReportLocal, context) -> empty_pb2.Empty:
-        if request.protocol != self._protocol:
+        if not _protocols_compatible(request.protocol, self._protocol):
             context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
-                "Protocol mismatch in report.",
+                "Protocol mismatch in report: "
+                f"expected={self._protocol}, got={request.protocol}",
             )
         try:
             incoming_state = _extract_state(request, self._protocol)
@@ -889,7 +920,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
     def ShareReport(self, request: agent_pb2.ReportLocal, context) -> empty_pb2.Empty:
         if not self._sharing:
             return empty_pb2.Empty()
-        if request.protocol != self._protocol:
+        if not _protocols_compatible(request.protocol, self._protocol):
             return empty_pb2.Empty()
         if not self._verify_report(request):
             return empty_pb2.Empty()
@@ -913,7 +944,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
     ) -> empty_pb2.Empty:
         if not request.reports:
             return empty_pb2.Empty()
-        if request.protocol != self._protocol:
+        if not _protocols_compatible(request.protocol, self._protocol):
             return empty_pb2.Empty()
 
         print(f"[episode {request.episode}] consensus batch {len(request.reports)} reports")
@@ -973,7 +1004,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
     def GetTimeout(
         self, request: agent_pb2.TimeoutRequest, context
     ) -> agent_pb2.TimeoutStatus:
-        if request.protocol != self._protocol:
+        if not _protocols_compatible(request.protocol, self._protocol):
             return agent_pb2.TimeoutStatus(
                 episode=request.episode,
                 status=agent_pb2.TimeoutStatus.Status.NOT_RECEIVED,

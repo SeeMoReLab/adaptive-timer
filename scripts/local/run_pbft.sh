@@ -62,6 +62,18 @@ cleanup() {
         sudo -n ip netns del "${ns_name}" >/dev/null 2>&1 || true
       done <<< "${existing_ns}"
     fi
+    stale_veths="$(
+      ip -o link show \
+        | awk -F': ' '{print $2}' \
+        | sed 's/@.*//' \
+        | awk '/^vh[0-9]+$/ || /^vn[0-9]+$/'
+    )"
+    if [[ -n "${stale_veths}" ]]; then
+      while read -r if_name; do
+        [[ -z "${if_name}" ]] && continue
+        sudo -n ip link del "${if_name}" >/dev/null 2>&1 || true
+      done <<< "${stale_veths}"
+    fi
     sudo -n ip link set "${OVERLAY_BRIDGE_NAME}" down >/dev/null 2>&1 || true
     sudo -n ip link del "${OVERLAY_BRIDGE_NAME}" type bridge >/dev/null 2>&1 || true
   fi
@@ -162,7 +174,7 @@ Arguments:
 Flags:
   --dataset         Collect per-replica learning-agent dataset CSVs as agentN.csv.
   -f <int>          Fault tolerance f passed to prepare_pbft.sh (default: 1).
-  -t <int>          Seconds to run experiment before stopping tmux sessions (default: 60).
+  -t <int>          Seconds to run experiment before stopping tmux sessions (default: 300).
 EOF
 }
 
@@ -256,6 +268,10 @@ if ! mode_enables_learning_agent "${MODE}"; then
 else
   LEARNING_AGENT_ENABLED=1
 fi
+if (( DATASET_ENABLED == 1 )) && (( LEARNING_AGENT_ENABLED == 0 )); then
+  echo "--dataset requires a learning-agent mode: heuristic|learning|sharing|scheduled." >&2
+  exit 2
+fi
 SERVER_LEARNING_FLAG=""
 AGENT_SHARING_FLAG=""
 AGENT_MODEL_ARGS=""
@@ -278,7 +294,7 @@ if [[ "${MODE}" == "sharing" ]]; then
   AGENT_SHARING_FLAG="--sharing true"
 fi
 if [[ "${MODE}" == "scheduled" ]]; then
-  AGENT_MODEL_ARGS="--model-type scheduled --schedule-file learning_agent/config/schedule.csv"
+  AGENT_MODEL_ARGS="--model-type scheduled --schedule-file learning_agent/config/schedule_pbft.csv"
 fi
 
 if (( LEARNING_AGENT_ENABLED == 1 )); then
@@ -316,8 +332,8 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
   rm -rf "${LOCAL_LIBRARY_DIR}/learning_agent"
   cp -a "${LEARNING_AGENT_SRC_DIR}" "${LOCAL_LIBRARY_DIR}/learning_agent"
 fi
-if [[ "${MODE}" == "scheduled" ]] && [[ ! -f "${LOCAL_LIBRARY_DIR}/learning_agent/config/schedule.csv" ]]; then
-  echo "Scheduled mode requires ${LOCAL_LIBRARY_DIR}/learning_agent/config/schedule.csv" >&2
+if [[ "${MODE}" == "scheduled" ]] && [[ ! -f "${LOCAL_LIBRARY_DIR}/learning_agent/config/schedule_pbft.csv" ]]; then
+  echo "Scheduled mode requires ${LOCAL_LIBRARY_DIR}/learning_agent/config/schedule_pbft.csv" >&2
   exit 1
 fi
 
@@ -357,8 +373,10 @@ cleanup
 cleanup_done=0
 
 bridge_ip="${OVERLAY_OCTET_A}.${OVERLAY_OCTET_B}.1.1"
+sudo -n ip link set "${OVERLAY_BRIDGE_NAME}" down >/dev/null 2>&1 || true
+sudo -n ip link del "${OVERLAY_BRIDGE_NAME}" type bridge >/dev/null 2>&1 || true
 sudo -n ip link add name "${OVERLAY_BRIDGE_NAME}" type bridge
-sudo -n ip addr add "${bridge_ip}/${OVERLAY_MASK_BITS}" dev "${OVERLAY_BRIDGE_NAME}"
+sudo -n ip addr replace "${bridge_ip}/${OVERLAY_MASK_BITS}" dev "${OVERLAY_BRIDGE_NAME}"
 sudo -n ip link set "${OVERLAY_BRIDGE_NAME}" up
 sudo -n sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
@@ -369,6 +387,9 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   ns_if="vn${replica_id}"
   ns_ip="${OVERLAY_OCTET_A}.${OVERLAY_OCTET_B}.1.$((OVERLAY_HOST_OFFSET + n))"
 
+  sudo -n ip netns del "${ns_name}" >/dev/null 2>&1 || true
+  sudo -n ip link del "${host_if}" >/dev/null 2>&1 || true
+  sudo -n ip link del "${ns_if}" >/dev/null 2>&1 || true
   sudo -n ip netns add "${ns_name}"
   sudo -n ip link add "${host_if}" type veth peer name "${ns_if}"
   sudo -n ip link set "${ns_if}" netns "${ns_name}"
@@ -376,7 +397,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   sudo -n ip link set "${host_if}" up
 
   sudo -n ip netns exec "${ns_name}" ip link set lo up
-  sudo -n ip netns exec "${ns_name}" ip addr add "${ns_ip}/${OVERLAY_MASK_BITS}" dev "${ns_if}"
+  sudo -n ip netns exec "${ns_name}" ip addr replace "${ns_ip}/${OVERLAY_MASK_BITS}" dev "${ns_if}"
   sudo -n ip netns exec "${ns_name}" ip link set "${ns_if}" up
   sudo -n ip netns exec "${ns_name}" ip route replace default via "${bridge_ip}"
 done
@@ -433,7 +454,7 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
       tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
       : > "${agent_log}"
       tmux new-session -d -s "${session_name}" \
-        "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${LOCAL_LIBRARY_DIR}\" && echo \"[DEBUG] netns launch context\" && echo \"[DEBUG] whoami:\" && id -un && echo \"[DEBUG] pwd:\" && pwd && echo \"[DEBUG] python_bin: ${AGENT_PYTHON_BIN}\" && \"${AGENT_PYTHON_BIN}\" -c \"import sys; print(\\\"[DEBUG] sys.executable=\\\" + sys.executable)\" && \"${AGENT_PYTHON_BIN}\" -c \"import grpc; print(\\\"[DEBUG] grpc import ok\\\")\" && exec \"${AGENT_PYTHON_BIN}\" learning_agent/main.py --node-id ${replica_id} --hosts-config \"${LOCAL_LIBRARY_DIR}/smallbank/hosts.config\" --failure-spec \"${LOCAL_LIBRARY_DIR}/config/failure_spec.xml\" --injection-start-unix-ms ${START_UNIX_MS} ${AGENT_SHARING_FLAG} ${AGENT_MODEL_ARGS} ${dataset_args}' > \"${agent_log}\" 2>&1"
+        "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${LOCAL_LIBRARY_DIR}\" && echo \"[DEBUG] netns launch context\" && echo \"[DEBUG] whoami:\" && id -un && echo \"[DEBUG] pwd:\" && pwd && echo \"[DEBUG] python_bin: ${AGENT_PYTHON_BIN}\" && \"${AGENT_PYTHON_BIN}\" -c \"import sys; print(\\\"[DEBUG] sys.executable=\\\" + sys.executable)\" && \"${AGENT_PYTHON_BIN}\" -c \"import grpc; print(\\\"[DEBUG] grpc import ok\\\")\" && exec \"${AGENT_PYTHON_BIN}\" learning_agent/main.py --node-id ${replica_id} --protocol pbft --hosts-config \"${LOCAL_LIBRARY_DIR}/smallbank/hosts.config\" --failure-spec \"${LOCAL_LIBRARY_DIR}/config/failure_spec.xml\" --injection-start-unix-ms ${START_UNIX_MS} ${AGENT_SHARING_FLAG} ${AGENT_MODEL_ARGS} ${dataset_args}' > \"${agent_log}\" 2>&1"
     ) &
     agent_start_pids+=("$!")
     agent_start_replicas+=("${n}")

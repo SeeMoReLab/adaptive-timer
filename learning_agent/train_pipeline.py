@@ -116,6 +116,7 @@ def run_pipeline(
         f"test_csv={test_csv or train_csv}, "
         f"samples={int(metrics['samples'])}, "
         f"accuracy={metrics['accuracy']:.4f}, "
+        f"f1_macro={metrics['f1_macro']:.4f}, "
         f"weighted_loss={metrics['weighted_loss']:.6f}"
     )
 
@@ -198,6 +199,12 @@ def evaluate_linear_model_on_csv(
 
     total = 0
     correct = 0
+    num_classes = len(TIMEOUT_VALUES_MS)
+    tp = torch.zeros(num_classes)
+    fp = torch.zeros(num_classes)
+    fn = torch.zeros(num_classes)
+    f1_sum = 0.0
+
     weighted_loss_sum = 0.0
     for batch in loader:
         weighted_loss_sum += model.update_model(
@@ -205,14 +212,28 @@ def evaluate_linear_model_on_csv(
         )
         logits = model.predict_action(batch["features"])
         predicted = torch.argmax(logits, dim=1)
-        expected = torch.round(batch["actions"]).long()
+        expected = torch.round(batch["labels"]).long()
         total += int(expected.numel())
         correct += int((predicted == expected).sum().item())
 
+        for c in range(num_classes):
+            tp[c] += ((predicted == c) & (expected == c)).sum()
+            fp[c] += ((predicted == c) & (expected != c)).sum()
+            fn[c] += ((predicted != c) & (expected == c)).sum()
+
+            precision = tp[c] / (tp[c] + fp[c]) if (tp[c] + fp[c]) else 0.0
+            recall = tp[c] / (tp[c] + fn[c]) if (tp[c] + fn[c]) else 0.0
+            f1_class = 2 * (precision * recall) / (precision + recall) if (precision + recall) else 0.0
+            f1_sum += f1_class
+                
+
     accuracy = (correct / total) if total else 0.0
+    f1 = f1_sum / num_classes
+
     return {
         "samples": float(total),
         "accuracy": float(accuracy),
+        "f1_macro": float(f1),
         "weighted_loss": float(weighted_loss_sum / max(len(loader), 1)),
     }
 

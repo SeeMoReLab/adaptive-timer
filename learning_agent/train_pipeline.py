@@ -67,7 +67,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         type=_parse_model,
-        default='linear',
+        default='dqn',
         help="Model: linear | dqn",
     )
     parser.add_argument(

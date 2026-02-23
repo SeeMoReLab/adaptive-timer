@@ -672,10 +672,10 @@ class DQNTorchModel(TensorModel):
 
             target_index = torch.round(actions_tensor).long()
             valid_actions = torch.clamp(target_index, 0, self._action_dim - 1).view(-1, 1)
-            # scaled_rewards = (torch.clamp(rewards_tensor, min=0.0) / 1000.0).view(-1, 1)
+            scaled_rewards = (torch.clamp(rewards_tensor, min=0.0) / 1000.0).view(-1, 1)
 
             q_values = self.q_network(features).gather(1, valid_actions)
-            loss = F.smooth_l1_loss(q_values, rewards_tensor.view(-1, 1).detach())
+            loss = F.smooth_l1_loss(q_values, scaled_rewards.detach())
 
             if backward and float(loss.item()) > 0.0:
                 self.optimizer.zero_grad()

@@ -1,14 +1,17 @@
 import argparse
 from pathlib import Path
 from typing import Callable, Dict, Optional
+import random
+import torch
 
 import agent_pb2
-import torch
 from data_loader import DatasetLoader, load_training_data_from_csv, split_train_eval_loaders
 from models import (
     TIMEOUT_VALUES_MS,
     PHASE_INDEX_TO_TIMEOUT_INDEX,
     LinearTorchModel,
+    DQNTorchModel,
+    TensorModel,
     QuadraticRewardScaler,
     get_action_space_size,
     get_report_feature_dim,
@@ -27,6 +30,11 @@ PROTOCOL_NAME_TO_ENUM = {
     "sbft": agent_pb2.PROTOCOL_SBFT,
 }
 
+MODEL_NAME_TO_TENSORMODEL = {
+    "linear": LinearTorchModel,
+    "dqn": DQNTorchModel,
+}
+
 
 def _parse_protocol(value: str) -> int:
     protocol = PROTOCOL_NAME_TO_ENUM.get(value.strip().lower().replace("-", "_"))
@@ -37,6 +45,14 @@ def _parse_protocol(value: str) -> int:
         )
     return protocol
 
+def _parse_model(value: str) -> TensorModel:
+    model = MODEL_NAME_TO_TENSORMODEL.get(value.strip().lower())
+    if model is None:
+        valid = ", ".join(sorted({"linear", "dqn"}))
+        raise argparse.ArgumentTypeError(
+            f"Unsupported model '{value}'. Valid options: {valid}"
+        )
+    return model
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -49,9 +65,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Protocol: pbft | two_pc_over_pbft | sbft",
     )
     parser.add_argument(
+        "--model",
+        type=_parse_model,
+        default='linear',
+        help="Model: linear | dqn",
+    )
+    parser.add_argument(
         "--train-csv",
         type=Path,
-        default=Path(__file__).resolve().parent / "data" / "sample_pbft.csv",
+        default=Path(__file__).resolve().parent / "data" / "sample_pbft_large.csv",
         help="Training CSV path.",
     )
     parser.add_argument(
@@ -77,6 +99,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def run_pipeline(
     protocol: int,
+    model: TensorModel,
     train_csv: Path,
     test_csv: Optional[Path],
     epochs: int,
@@ -93,6 +116,7 @@ def run_pipeline(
     )
     model = train_linear_model_from_csv(
         protocol=protocol,
+        model=model,
         train_csv=train_csv,
         lr=lr,
         epochs=epochs,
@@ -123,6 +147,7 @@ def run_pipeline(
 
 def train_linear_model_from_csv(
     protocol: int,
+    model: TensorModel,
     train_csv: Path,
     lr: float,
     epochs: int,
@@ -131,7 +156,7 @@ def train_linear_model_from_csv(
     verbose: bool,
     reward_transform: Optional[Callable[[float], float]],
     seed: Optional[int],
-) -> LinearTorchModel:
+) -> TensorModel:
     data = load_training_data_from_csv(
         path=train_csv,
         protocol=protocol,
@@ -146,26 +171,30 @@ def train_linear_model_from_csv(
         eval_ratio=eval_ratio,
         seed=seed,
     )
-    model = LinearTorchModel(
+
+    
+    tensor_model = model(
         action_dim=get_action_space_size(protocol),
         n_features=get_report_feature_dim(protocol),
         lr=lr,
     )
-    best_weights = model.weights.clone().detach()
+
+
+    best_weights = tensor_model.save()
     best_eval_loss = float("inf")
 
     show_progress = bool(verbose and tqdm is not None)
     epochs_iter = tqdm(range(epochs), desc="Training") if show_progress else range(epochs)
     for e in epochs_iter:
-        train_loss = _run_epoch(model, train_loader, backward=True)
+        train_loss = _run_epoch(tensor_model, train_loader, backward=True)
         eval_loss = (
             train_loss
             if eval_loader is None
-            else _run_epoch(model, eval_loader, backward=False)
+            else _run_epoch(tensor_model, eval_loader, backward=False)
         )
         if eval_loss < best_eval_loss:
             best_eval_loss = eval_loss
-            best_weights = model.weights.clone().detach()
+            best_weights = tensor_model.save()
         if show_progress:
             epochs_iter.set_postfix(
                 Epoch=f"{e + 1}/{epochs}",
@@ -173,13 +202,14 @@ def train_linear_model_from_csv(
                 Eval_Loss=f"{eval_loss:.7f}",
             )
 
-    with torch.no_grad():
-        model.weights.copy_(best_weights)
-    return model
+   
+    tensor_model.load(best_weights)
+
+    return tensor_model
 
 
 def evaluate_linear_model_on_csv(
-    model: LinearTorchModel, protocol: int, path: Path, batch_size: int = 64
+    model: TensorModel, protocol: int, path: Path, batch_size: int = 64
 ) -> Dict[str, float]:
     data = load_training_data_from_csv(
         path=path,
@@ -217,15 +247,20 @@ def evaluate_linear_model_on_csv(
         correct += int((predicted == expected).sum().item())
 
         for c in range(num_classes):
-            tp[c] += ((predicted == c) & (expected == c)).sum()
-            fp[c] += ((predicted == c) & (expected != c)).sum()
-            fn[c] += ((predicted != c) & (expected == c)).sum()
+            tp[c] += ((predicted == c) & (expected == c)).sum().item()
+            fp[c] += ((predicted == c) & (expected != c)).sum().item()
+            fn[c] += ((predicted != c) & (expected == c)).sum().item()
 
-            precision = tp[c] / (tp[c] + fp[c]) if (tp[c] + fp[c]) else 0.0
-            recall = tp[c] / (tp[c] + fn[c]) if (tp[c] + fn[c]) else 0.0
-            f1_class = 2 * (precision * recall) / (precision + recall) if (precision + recall) else 0.0
-            f1_sum += f1_class
-                
+    for c in range(num_classes):
+        p_denom = tp[c] + fp[c]
+        r_denom = tp[c] + fn[c]
+
+        precision = tp[c] / p_denom if p_denom > 0 else 0.0
+        recall = tp[c] / r_denom if r_denom > 0 else 0.0
+
+        f1_denom = precision + recall
+        f1_class = 2 * (precision * recall) / f1_denom if f1_denom > 0 else 0.0
+        f1_sum += f1_class
 
     accuracy = (correct / total) if total else 0.0
     f1 = f1_sum / num_classes
@@ -238,7 +273,7 @@ def evaluate_linear_model_on_csv(
     }
 
 
-def _run_epoch(model: LinearTorchModel, loader: DatasetLoader, backward: bool) -> float:
+def _run_epoch(model: TensorModel, loader: DatasetLoader, backward: bool) -> float:
     loss_sum = 0.0
     batch_count = 0
     for batch in loader:
@@ -254,10 +289,24 @@ def _run_epoch(model: LinearTorchModel, loader: DatasetLoader, backward: bool) -
     return loss_sum / batch_count
 
 
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed) 
+        
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+
 def main() -> None:
     args = _build_parser().parse_args()
+    set_seed(11)
     run_pipeline(
         protocol=args.protocol,
+        model=args.model,
         train_csv=args.train_csv,
         test_csv=args.test_csv,
         epochs=args.epochs,
@@ -266,7 +315,7 @@ def main() -> None:
         lr=args.lr,
         seed=args.seed,
         reward_scaler=args.reward_scaler,
-        verbose=args.verbose,
+        verbose=True,
     )
 
 

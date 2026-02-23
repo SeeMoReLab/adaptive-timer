@@ -332,13 +332,20 @@ class TensorModel(ABC):
     def reset_model(self) -> None:
         pass
 
+    @abstractmethod
+    def save(self) -> None:
+        pass
+
+    @abstractmethod
+    def load(self) -> None:
+        pass
+
 class RewardTransformer(ABC):
     """Converts throughput result into float reward."""
 
     @abstractmethod
     def transform(self, throughput: float) -> float:
         pass
-
 
 class ProtocolReportFeatureExtractor(FeatureExtractor[object]):
     def __init__(self, protocol: int):
@@ -434,6 +441,13 @@ class LinearTorchModel(TensorModel):
 
     def reset_model(self) -> None:
         torch.nn.init.zeros_(self.weights)
+
+    def save(self) -> torch.Tensor:
+        return self.weights.clone().detach()
+
+    def load(self, weights: torch.Tensor) -> None:
+        with torch.no_grad():
+            self.weights.copy_(weights)
 
 
 class RandomTimeoutModel(TensorModel):
@@ -596,3 +610,87 @@ class ScheduledTimeoutModel(TensorModel):
     def reset_model(self) -> None:
         self._start_time = time.monotonic()
         self._active_row = -1
+
+
+class DQNTorchModel(TensorModel):
+    """DQN classifier estimating Q-values for discrete options."""
+
+    def __init__(self, action_dim: int, n_features: int, lr: float = 0.001):
+        super().__init__()
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        
+        self._action_dim = int(action_dim)
+        
+        self.q_network = torch.nn.Linear(n_features, self._action_dim)
+        # torch.nn.init.xavier_uniform_(self.q_network.weight)
+        torch.nn.init.zeros_(self.q_network.weight)
+        self.optimizer = torch.optim.Adam(self.q_network.parameters(), lr=lr)
+
+    def predict_action(self, features: torch.Tensor, epsilon: float = 0.0) -> torch.Tensor:
+        if features.dim() == 1:
+            features = features.unsqueeze(0)
+
+        if torch.rand(1).item() < epsilon:
+            batch_size = features.shape[0]
+            return torch.randint(0, self._action_dim, (batch_size,))
+
+        with torch.no_grad():
+            q_values = self.q_network(features)
+            return q_values
+
+    def update_model(
+        self,
+        features: torch.Tensor,
+        actions: torch.Tensor,
+        rewards: torch.Tensor | float,
+        backward: bool = True,
+    ) -> float:
+        with torch.set_grad_enabled(backward):
+            if features.dim() == 1:
+                features = features.unsqueeze(0)
+
+            batch_size = features.shape[0]
+            actions_tensor = torch.as_tensor(actions, dtype=torch.float32).view(-1)
+            rewards_tensor = torch.as_tensor(rewards, dtype=torch.float32).view(-1)
+
+            if actions_tensor.numel() == 1 and batch_size > 1:
+                actions_tensor = actions_tensor.repeat(batch_size)
+            if rewards_tensor.numel() == 1 and batch_size > 1:
+                rewards_tensor = rewards_tensor.repeat(batch_size)
+
+            if actions_tensor.numel() != batch_size:
+                raise ValueError(
+                    "actions batch size mismatch: "
+                    f"expected {batch_size}, got {actions_tensor.numel()}"
+                )
+            if rewards_tensor.numel() != batch_size:
+                raise ValueError(
+                    "rewards batch size mismatch: "
+                    f"expected {batch_size}, got {rewards_tensor.numel()}"
+                )
+
+            target_index = torch.round(actions_tensor).long()
+            valid_actions = torch.clamp(target_index, 0, self._action_dim - 1).view(-1, 1)
+            # scaled_rewards = (torch.clamp(rewards_tensor, min=0.0) / 1000.0).view(-1, 1)
+
+            q_values = self.q_network(features).gather(1, valid_actions)
+            loss = F.smooth_l1_loss(q_values, rewards_tensor.view(-1, 1).detach())
+
+            if backward and float(loss.item()) > 0.0:
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_value_(self.q_network.parameters(), 100)
+                self.optimizer.step()
+
+            return float(loss.item())
+    
+    def reset_model(self) -> None:
+        self.q_network.reset_parameters()
+
+    def save(self) -> torch.Tensor:
+        return self.q_network.weight.clone().detach()
+
+    def load(self, weights: torch.Tensor) -> None:
+        with torch.no_grad():
+            self.q_network.weight.copy_(weights)

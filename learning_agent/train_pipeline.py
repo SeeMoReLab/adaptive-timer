@@ -73,7 +73,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--train-csv",
         type=Path,
-        default=Path(__file__).resolve().parent / "data" / "sample_pbft_large.csv",
+        default=Path(__file__).resolve().parent / "data" / "sample_pbft.csv",
         help="Training CSV path.",
     )
     parser.add_argument(

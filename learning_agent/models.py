@@ -611,7 +611,6 @@ class ScheduledTimeoutModel(TensorModel):
         self._start_time = time.monotonic()
         self._active_row = -1
 
-
 class QLearningTorchModel(TensorModel):
     """Q-learning classifier estimating Q-values for discrete options."""
 
@@ -686,8 +685,8 @@ class QLearningTorchModel(TensorModel):
         self.q_network.reset_parameters()
 
     def save(self) -> torch.Tensor:
-        return self.q_network.weight.clone().detach()
+        return self.q_network.state_dict()
 
-    def load(self, weights: torch.Tensor) -> None:
+    def load(self, state: torch.Tensor) -> None:
         with torch.no_grad():
-            self.q_network.weight.copy_(weights)
+            self.q_network.load_state_dict(state)

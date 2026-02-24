@@ -612,8 +612,8 @@ class ScheduledTimeoutModel(TensorModel):
         self._active_row = -1
 
 
-class DQNTorchModel(TensorModel):
-    """DQN classifier estimating Q-values for discrete options."""
+class QLearningTorchModel(TensorModel):
+    """Q-learning classifier estimating Q-values for discrete options."""
 
     def __init__(self, action_dim: int, n_features: int, lr: float = 0.001):
         super().__init__()

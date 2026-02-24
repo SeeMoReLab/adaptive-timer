@@ -10,7 +10,7 @@ from models import (
     TIMEOUT_VALUES_MS,
     PHASE_INDEX_TO_TIMEOUT_INDEX,
     LinearTorchModel,
-    DQNTorchModel,
+    QLearningTorchModel,
     TensorModel,
     QuadraticRewardScaler,
     get_action_space_size,
@@ -32,7 +32,7 @@ PROTOCOL_NAME_TO_ENUM = {
 
 MODEL_NAME_TO_TENSORMODEL = {
     "linear": LinearTorchModel,
-    "dqn": DQNTorchModel,
+    "q-learning": QLearningTorchModel,
 }
 
 
@@ -48,7 +48,7 @@ def _parse_protocol(value: str) -> int:
 def _parse_model(value: str) -> TensorModel:
     model = MODEL_NAME_TO_TENSORMODEL.get(value.strip().lower())
     if model is None:
-        valid = ", ".join(sorted({"linear", "dqn"}))
+        valid = ", ".join(sorted({"linear", "q-learning"}))
         raise argparse.ArgumentTypeError(
             f"Unsupported model '{value}'. Valid options: {valid}"
         )
@@ -67,8 +67,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         type=_parse_model,
-        default='dqn',
-        help="Model: linear | dqn",
+        default='q-learning',
+        help="Model: linear | q-learning",
     )
     parser.add_argument(
         "--train-csv",

@@ -862,8 +862,8 @@ if [[ ! -f "$HOME/library/smallbank/hosts.config" ]]; then
   echo "hosts config missing on $(hostname): $HOME/library/smallbank/hosts.config" >&2
   exit 1
 fi
-if [[ "${mode}" == "scheduled" ]] && [[ ! -f "$HOME/learning_agent/config/schedule.csv" ]]; then
-  echo "Scheduled mode requires $HOME/learning_agent/config/schedule.csv on $(hostname)" >&2
+if [[ "${mode}" == "scheduled" ]] && [[ ! -f "$HOME/learning_agent/config/schedule_pbft.csv" ]]; then
+  echo "Scheduled mode requires $HOME/learning_agent/config/schedule_pbft.csv on $(hostname)" >&2
   exit 1
 fi
 
@@ -871,7 +871,7 @@ agent_mode_args=""
 if [[ "${mode}" == "sharing" ]]; then
   agent_mode_args="--sharing true"
 elif [[ "${mode}" == "scheduled" ]]; then
-  agent_mode_args="--model-type scheduled --schedule-file learning_agent/config/schedule.csv"
+  agent_mode_args="--model-type scheduled --schedule-file learning_agent/config/schedule_pbft.csv"
 fi
 
 for ((n = 0; n < replicas_per_machine; n++)); do

@@ -199,6 +199,13 @@ class AgentInjectionPhase:
     ignore_report_replica_ids: Set[int]
 
 
+@dataclass(frozen=True)
+class TimeoutDecision:
+    timeout: agent_pb2.Timeout
+    start_tick: int
+    report_seq: int
+
+
 def _parse_required_int(parent: ET.Element, tag: str) -> int:
     node = parent.find(tag)
     if node is None or node.text is None:
@@ -473,14 +480,17 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._injection_start_mono = injection_start_mono
         self._active_injection_phase_index = -1
         self._current_episode = 0
-        self._local_accepted_episode: Optional[int] = None
-        self._reports_by_episode: Dict[int, Dict[int, agent_pb2.ReportLocal]] = {}
+        self._sealed_through_episode = 0
+        self._winner_report_seq_by_episode: Dict[int, int] = {}
+        self._reports_by_episode: Dict[
+            int, Dict[int, Dict[int, agent_pb2.ReportLocal]]
+        ] = {}
         self._timers_by_episode: Dict[int, threading.Timer] = {}
         self._submitted_episodes: Set[int] = set()
         self._finalized_episodes: Set[int] = set()
         self._received_episodes: Set[int] = set()
         self._pending_episodes: Set[int] = set()
-        self._timeouts_by_episode: Dict[int, agent_pb2.Timeout] = {}
+        self._timeouts_by_episode: Dict[int, TimeoutDecision] = {}
         self._state_by_episode: Dict[int, object] = {}
         self._phase_by_episode: Dict[int, int] = {}
         self._report_feature_field_names = get_report_feature_field_names(self._protocol)
@@ -510,6 +520,28 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 ]
             )
             self._dataset_handle.flush()
+
+    def _is_episode_sealed_locked(self, episode: int) -> bool:
+        if episode <= self._sealed_through_episode:
+            return True
+        if episode in self._submitted_episodes:
+            return True
+        if episode in self._finalized_episodes:
+            return True
+        return episode in self._winner_report_seq_by_episode
+
+    def _derive_window_from_reports(
+        self, reports: List[agent_pb2.ReportLocal]
+    ) -> Tuple[int, int]:
+        # Consensus winner for an episode is keyed by report_seq; use the
+        # shortest window among participants (highest start tick).
+        report_seq = max(int(report.report_seq) for report in reports)
+        start_tick = max(int(report.start_tick) for report in reports)
+        if report_seq - start_tick <= 0:
+            raise ValueError(
+                f"Invalid consensus report window: start={start_tick}, seq={report_seq}"
+            )
+        return start_tick, report_seq
 
     def _active_agent_injection_flags_locked(self) -> Tuple[bool, bool]:
         if not self._agent_injection_schedule:
@@ -856,6 +888,11 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 "Protocol mismatch in report: "
                 f"expected={self._protocol}, got={request.protocol}",
             )
+        if int(request.report_seq) <= int(request.start_tick):
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "Invalid report window: report_seq must be greater than start_tick.",
+            )
         try:
             incoming_state = _extract_state(request, self._protocol)
         except ValueError as exc:
@@ -865,6 +902,8 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             node_id=self.node_id,
             episode=request.episode,
             protocol=self._protocol,
+            start_tick=request.start_tick,
+            report_seq=request.report_seq,
         )
         _set_state(local_report, self._protocol, incoming_state)
 
@@ -885,16 +924,13 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                     grpc.StatusCode.OUT_OF_RANGE,
                     "Episode is older than current episode.",
                 )
-            if self._local_accepted_episode == local_report.episode:
+            if self._is_episode_sealed_locked(local_report.episode):
                 context.abort(
                     grpc.StatusCode.ALREADY_EXISTS,
-                    "Local report already accepted for this episode.",
+                    "Episode is already sealed.",
                 )
             if local_report.episode > self._current_episode:
                 self._current_episode = local_report.episode
-                self._local_accepted_episode = None
-
-            self._local_accepted_episode = local_report.episode
             self._received_episodes.add(local_report.episode)
 
             if not self._sharing:
@@ -904,13 +940,21 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 )
                 state = _extract_state(local_report, self._protocol)
                 timeout = self._predict_timeout_locked(
-                    local_report.episode, state
+                    local_report.episode,
+                    state,
+                    int(local_report.start_tick),
+                    int(local_report.report_seq),
                 )
-                self._timeouts_by_episode[local_report.episode] = timeout
+                self._timeouts_by_episode[local_report.episode] = TimeoutDecision(
+                    timeout=timeout,
+                    start_tick=int(local_report.start_tick),
+                    report_seq=int(local_report.report_seq),
+                )
             else:
                 self._pending_episodes.add(local_report.episode)
                 signed_report = self._sign_report(local_report)
-                self._store_report_locked(signed_report)
+                if not self._store_report_locked(signed_report):
+                    signed_report = None
 
         if signed_report is not None:
             self._broadcast_signed_report_async(signed_report)
@@ -922,6 +966,8 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             return empty_pb2.Empty()
         if not _protocols_compatible(request.protocol, self._protocol):
             return empty_pb2.Empty()
+        if int(request.report_seq) <= int(request.start_tick):
+            return empty_pb2.Empty()
         if not self._verify_report(request):
             return empty_pb2.Empty()
 
@@ -931,9 +977,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         with self._lock:
             if stored.episode < self._current_episode:
                 return empty_pb2.Empty()
-            if stored.episode in self._finalized_episodes:
-                return empty_pb2.Empty()
-            if stored.episode in self._submitted_episodes:
+            if self._is_episode_sealed_locked(stored.episode):
                 return empty_pb2.Empty()
             self._store_report_locked(stored)
 
@@ -980,24 +1024,42 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         aggregated_report = self._aggregator.aggregate(
             node_id=self.node_id, report_batch=request
         )
+        try:
+            start_tick, report_seq = self._derive_window_from_reports(
+                list(request.reports)
+            )
+        except ValueError:
+            return empty_pb2.Empty()
         with self._lock:
             if request.episode in self._finalized_episodes:
                 return empty_pb2.Empty()
             if request.episode > self._current_episode:
                 self._current_episode = request.episode
-                self._local_accepted_episode = None
 
             timer = self._timers_by_episode.pop(request.episode, None)
             if timer is not None:
                 timer.cancel()
             self._reports_by_episode.pop(request.episode, None)
+            self._winner_report_seq_by_episode.pop(request.episode, None)
             self._submitted_episodes.add(request.episode)
             self._finalized_episodes.add(request.episode)
+            self._sealed_through_episode = max(
+                self._sealed_through_episode, int(request.episode)
+            )
             self._pending_episodes.discard(request.episode)
             self._received_episodes.add(request.episode)
 
-            timeout = self._predict_timeout_locked(request.episode, aggregated_report)
-            self._timeouts_by_episode[request.episode] = timeout
+            timeout = self._predict_timeout_locked(
+                request.episode,
+                aggregated_report,
+                start_tick,
+                report_seq,
+            )
+            self._timeouts_by_episode[request.episode] = TimeoutDecision(
+                timeout=timeout,
+                start_tick=start_tick,
+                report_seq=report_seq,
+            )
 
         return empty_pb2.Empty()
 
@@ -1010,12 +1072,14 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 status=agent_pb2.TimeoutStatus.Status.NOT_RECEIVED,
             )
         with self._lock:
-            timeout = self._timeouts_by_episode.get(request.episode)
-            if timeout is not None:
+            decision = self._timeouts_by_episode.get(request.episode)
+            if decision is not None:
                 return agent_pb2.TimeoutStatus(
                     episode=request.episode,
                     status=agent_pb2.TimeoutStatus.Status.READY,
-                    timeout=timeout,
+                    timeout=decision.timeout,
+                    start_tick=decision.start_tick,
+                    report_seq=decision.report_seq,
                 )
             if request.episode in self._pending_episodes or request.episode in self._received_episodes:
                 return agent_pb2.TimeoutStatus(
@@ -1033,6 +1097,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 timer.cancel()
             self._timers_by_episode.clear()
             self._reports_by_episode.clear()
+            self._winner_report_seq_by_episode.clear()
             self._submitted_episodes.clear()
             self._finalized_episodes.clear()
             self._received_episodes.clear()
@@ -1041,56 +1106,77 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._state_by_episode.clear()
             self._phase_by_episode.clear()
             self._current_episode = 0
-            self._local_accepted_episode = None
+            self._sealed_through_episode = 0
         return empty_pb2.Empty()
 
     def _store_report_locked(self, report: agent_pb2.ReportLocal) -> bool:
-        if report.episode in self._finalized_episodes:
-            return False
-        if report.episode in self._submitted_episodes:
+        if self._is_episode_sealed_locked(report.episode):
             return False
 
-        reports_for_episode = self._reports_by_episode.setdefault(report.episode, {})
-        if report.node_id in reports_for_episode:
+        winner_seq = self._winner_report_seq_by_episode.get(report.episode)
+        report_seq = int(report.report_seq)
+        if winner_seq is not None and report_seq != winner_seq:
             return False
-        reports_for_episode[report.node_id] = report
-        reports_collected = len(reports_for_episode)
+
+        by_seq = self._reports_by_episode.setdefault(report.episode, {})
+        reports_for_seq = by_seq.setdefault(report_seq, {})
+        existing = reports_for_seq.get(report.node_id)
+        if existing is not None:
+            if int(report.start_tick) > int(existing.start_tick):
+                reports_for_seq[report.node_id] = report
+            return False
+
+        reports_for_seq[report.node_id] = report
+        reports_collected = len(reports_for_seq)
 
         print(
-            f"[episode {report.episode}] accepted valid report "
+            f"[episode {report.episode} seq={report_seq}] accepted valid report "
             f"from node={report.node_id} ({reports_collected}/{self._threshold})"
         )
 
         if (
-            reports_collected >= self._threshold
+            winner_seq is None
+            and reports_collected >= self._threshold
             and report.episode not in self._timers_by_episode
             and report.episode not in self._submitted_episodes
         ):
+            self._winner_report_seq_by_episode[report.episode] = report_seq
+            self._sealed_through_episode = max(
+                self._sealed_through_episode, int(report.episode)
+            )
             timer = threading.Timer(
-                self._collect_wait_s, self._finalize_episode, args=(report.episode,)
+                self._collect_wait_s,
+                self._finalize_episode,
+                args=(int(report.episode), report_seq),
             )
             self._timers_by_episode[report.episode] = timer
             timer.daemon = True
             timer.start()
         return True
 
-    def _finalize_episode(self, episode: int) -> None:
+    def _finalize_episode(self, episode: int, report_seq: int) -> None:
         with self._lock:
             if episode in self._finalized_episodes or episode in self._submitted_episodes:
                 return
-            reports_for_episode = self._reports_by_episode.get(episode, {})
-            if not reports_for_episode:
+            winner_seq = self._winner_report_seq_by_episode.get(episode)
+            if winner_seq is None or int(winner_seq) != int(report_seq):
                 return
-            snapshot = list(reports_for_episode.values())
+            reports_by_seq = self._reports_by_episode.get(episode, {})
+            reports_for_seq = reports_by_seq.get(report_seq, {})
+            if not reports_for_seq:
+                return
+            snapshot = list(reports_for_seq.values())
             _, ignore_active = self._active_agent_injection_flags_locked()
             if ignore_active and len(snapshot) > self._threshold:
                 snapshot = sorted(snapshot, key=lambda item: item.node_id)[: self._threshold]
                 print(
                     "[injection] ignoreReport applied "
-                    f"(node={self.node_id}, episode={episode}, kept={len(snapshot)})"
+                    f"(node={self.node_id}, episode={episode}, seq={report_seq}, "
+                    f"kept={len(snapshot)})"
                 )
             self._submitted_episodes.add(episode)
             self._reports_by_episode.pop(episode, None)
+            self._winner_report_seq_by_episode.pop(episode, None)
             self._timers_by_episode.pop(episode, None)
 
         if self._consensus_stub is None:
@@ -1223,8 +1309,12 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         )
 
     def _predict_timeout_locked(
-        self, episode: int, report: object
+        self, episode: int, report: object, start_tick: int, report_seq: int
     ) -> agent_pb2.Timeout:
+        if report_seq <= start_tick:
+            raise ValueError(
+                f"Invalid report window for timeout prediction: start={start_tick}, seq={report_seq}"
+            )
         cached_report = _copy_state(report)
         self._state_by_episode[episode] = cached_report
         self._phase_by_episode[episode] = self._current_injection_phase_index_locked()

@@ -131,6 +131,10 @@ message ReportLocal {
     uint32 node_id = 1;
     uint32 episode = 2;
     Protocol protocol = 3;
+    // Window start consensus tick used to build this report.
+    uint32 start_tick = 6;
+    // Window end consensus tick (exclusive) used to build this report.
+    uint32 report_seq = 7;
     oneof state {
         PbftReport pbft_state = 10;
         TwoPcOverPbftReport two_pc_over_pbft_state = 11;
@@ -218,6 +222,9 @@ message TimeoutStatus {
     uint32 episode = 1;
     Status status = 2;
     optional Timeout timeout = 3;
+    // Echoes the report window selected for this episode.
+    uint32 start_tick = 4;
+    uint32 report_seq = 5;
 }
 
 // Consensus service

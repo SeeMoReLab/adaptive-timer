@@ -42,12 +42,16 @@ class LearningAgentClient:
         episode: int,
         protocol: int,
         report: object,
+        start_tick: int,
+        report_seq: int,
         reward: Optional[agent_pb2.Reward] = None,
     ) -> None:
         local_report = agent_pb2.ReportLocal(
             node_id=node_id,
             episode=episode,
             protocol=protocol,
+            start_tick=start_tick,
+            report_seq=report_seq,
         )
         if protocol == agent_pb2.PROTOCOL_PBFT:
             local_report.pbft_state.CopyFrom(report)
@@ -407,10 +411,15 @@ def _print_timeout_status(status: agent_pb2.TimeoutStatus) -> None:
     if status.status != agent_pb2.TimeoutStatus.Status.READY or not status.HasField("timeout"):
         print("Timeout status:", agent_pb2.TimeoutStatus.Status.Name(status.status))
         return
+    window_desc = (
+        f"start_tick={status.start_tick} "
+        f"report_seq={status.report_seq}"
+    )
     if status.timeout.HasField("pbft"):
         print(
             "Timeout ready:",
             f"election_timeout_ms={status.timeout.pbft.election_timeout_milliseconds}",
+            window_desc,
         )
         return
     if status.timeout.HasField("two_pc_over_pbft"):
@@ -420,6 +429,7 @@ def _print_timeout_status(status: agent_pb2.TimeoutStatus) -> None:
             f"{status.timeout.two_pc_over_pbft.election_timeout_milliseconds}",
             "prepare_timeout_ms="
             f"{status.timeout.two_pc_over_pbft.prepare_timeout_milliseconds}",
+            window_desc,
         )
         return
     if status.timeout.HasField("sbft"):
@@ -431,6 +441,7 @@ def _print_timeout_status(status: agent_pb2.TimeoutStatus) -> None:
             f"{status.timeout.sbft.slow_path_timeout_milliseconds}",
             "batch_timeout_ms="
             f"{status.timeout.sbft.batch_timeout_milliseconds}",
+            window_desc,
         )
         return
     print("Timeout status:", agent_pb2.TimeoutStatus.Status.Name(status.status))
@@ -448,6 +459,18 @@ def main() -> None:
         help="Protocol: pbft, two_pc_over_pbft (alias: 2pc), or sbft.",
     )
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--start-tick",
+        type=int,
+        default=0,
+        help="Report window start consensus tick.",
+    )
+    parser.add_argument(
+        "--report-seq",
+        type=int,
+        default=10,
+        help="Report window end consensus tick (exclusive). Must be > --start-tick.",
+    )
     parser.add_argument(
         "--get",
         action="store_true",
@@ -472,6 +495,8 @@ def main() -> None:
     if args.get:
         _print_timeout_status(client.get_timeout(args.episode, args.protocol))
     else:
+        if args.report_seq <= args.start_tick:
+            raise ValueError("--report-seq must be greater than --start-tick")
         rng = random.Random(args.seed)
         report = _random_report(args.protocol, rng)
         reward = None
@@ -508,6 +533,8 @@ def main() -> None:
             episode=args.episode,
             protocol=args.protocol,
             report=report,
+            start_tick=args.start_tick,
+            report_seq=args.report_seq,
             reward=reward,
         )
         _print_sent_payload(

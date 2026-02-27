@@ -27,6 +27,7 @@ EXPERIMENT_TIME_S=300
 CLIENT_START_DELAY_S=10
 START_OFFSET_AFTER_CLIENT_LAUNCH_S=10
 DATASET_ENABLED=0
+LOG_ENABLED=0
 
 OVERLAY_OCTET_A=10
 OVERLAY_OCTET_B=251
@@ -166,13 +167,14 @@ wait_for_server_endpoints_or_fail() {
 
 usage() {
   cat <<EOF
-Usage: $0 [normal|heuristic|learning|sharing|scheduled] [--dataset] [-f <fault_tolerance>] [-t <experiment_seconds>]
+Usage: $0 [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [-f <fault_tolerance>] [-t <experiment_seconds>]
 
 Arguments:
   mode              Optional; one of normal|heuristic|learning|sharing|scheduled (default: normal).
 
 Flags:
   --dataset         Collect per-replica learning-agent dataset CSVs as agentN.csv.
+  --log             Collect per-replica server logs under scripts/local/tmp/server_logs/.
   -f <int>          Fault tolerance f passed to prepare_pbft.sh (default: 1).
   -t <int>          Seconds to run experiment before stopping tmux sessions (default: 300).
 EOF
@@ -215,6 +217,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dataset)
       DATASET_ENABLED=1
+      shift
+      ;;
+    --log)
+      LOG_ENABLED=1
       shift
       ;;
     normal|heuristic|learning|sharing|scheduled)
@@ -311,7 +317,7 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
 fi
 
 echo "Selected mode: ${MODE}"
-echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (dataset=${DATASET_ENABLED})"
+echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (dataset=${DATASET_ENABLED}, log=${LOG_ENABLED})"
 echo "Preparing PBFT configs in local mode with f=${F}..."
 "${PREPARE_SCRIPT}" local -f "${F}"
 
@@ -584,6 +590,30 @@ if [[ -f "${LOCAL_LIBRARY_DIR}/output.txt" ]]; then
   echo "Done. Client output saved to ${OUTPUT_LOCAL}."
 else
   echo "Client output not found: ${LOCAL_LIBRARY_DIR}/output.txt" >&2
+fi
+
+if (( LOG_ENABLED == 1 )); then
+  SERVER_LOGS_LOCAL_DIR="${LOCAL_TMP_DIR}/server_logs"
+  echo "Collecting server logs to ${SERVER_LOGS_LOCAL_DIR}..."
+  rm -rf "${SERVER_LOGS_LOCAL_DIR}"
+  mkdir -p "${SERVER_LOGS_LOCAL_DIR}"
+  log_collect_failed=0
+  for ((n = 0; n < replicas_per_machine; n++)); do
+    replica_id="${n}"
+    src_log="${LOCAL_LIBRARY_DIR}/server_${replica_id}.log"
+    dst_log="${SERVER_LOGS_LOCAL_DIR}/server_${replica_id}.log"
+    rm -f "${dst_log}"
+    if [[ -f "${src_log}" ]]; then
+      cp -a "${src_log}" "${dst_log}"
+      echo "  - copied server_${replica_id}.log"
+    else
+      echo "  - missing server_${replica_id}.log: ${src_log}" >&2
+      log_collect_failed=1
+    fi
+  done
+  if (( log_collect_failed != 0 )); then
+    echo "Some server logs could not be collected." >&2
+  fi
 fi
 
 if (( LEARNING_AGENT_ENABLED == 1 )) && (( DATASET_ENABLED == 1 )); then

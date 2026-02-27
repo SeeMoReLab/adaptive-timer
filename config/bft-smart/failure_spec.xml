@@ -16,11 +16,12 @@
     <schemaVersion>2</schemaVersion>
     <replicaIdType>global</replicaIdType>
     <!-- Warm-up period in seconds: no failure behavior is active during this time. -->
-    <warmUpTime>0</warmUpTime>
+    <warmUpTime>10</warmUpTime>
     <!-- Force leader failure / view-change interval in seconds, starting after warm-up. -->
-    <leaderFailureInterval>300</leaderFailureInterval>
+    <leaderFailureInterval>40</leaderFailureInterval>
 
     <phases>
+        <!-- Base case -->
         <phase>
             <!-- Activate this phase at t=0 seconds from experiment start -->
             <atTime>0</atTime>
@@ -105,23 +106,9 @@
             </agent>
         </phase>
 
-        <!-- Base case -->
-        <phase>
-            <atTime>10</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>0</delayMs>
-                    <lossPct>0</lossPct>
-                </global>
-            </network>
-        </phase>
-
         <!-- Small proposal delay -->
         <phase>
-            <atTime>40</atTime>
+            <atTime>200</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -146,7 +133,7 @@
 
         <!-- Large proposal delay -->
         <phase>
-            <atTime>70</atTime>
+            <atTime>400</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -171,7 +158,7 @@
 
         <!-- Small network delay -->
         <phase>
-            <atTime>100</atTime>
+            <atTime>600</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -185,7 +172,7 @@
 
         <!-- Small network delay + small proposal delay -->
         <phase>
-            <atTime>400</atTime>
+            <atTime>800</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -210,7 +197,7 @@
 
         <!-- Small network delay + large proposal delay -->
         <phase>
-            <atTime>700</atTime>
+            <atTime>1000</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -235,7 +222,7 @@
 
         <!-- Large network delay -->
         <phase>
-            <atTime>1000</atTime>
+            <atTime>1200</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -249,7 +236,7 @@
 
         <!-- Large network delay + small proposal delay -->
         <phase>
-            <atTime>1600</atTime>
+            <atTime>1400</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -265,8 +252,8 @@
                     <replicas>
                         <replica>
                             <id>0</id>
-                            <delayMs>500</delayMs>
                         </replica>
+                            <delayMs>500</delayMs>
                     </replicas>
                 </proposalDelay>
             </pbft>
@@ -274,7 +261,7 @@
 
         <!-- Large network delay + large proposal delay -->
         <phase>
-            <atTime>2200</atTime>
+            <atTime>1600</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>

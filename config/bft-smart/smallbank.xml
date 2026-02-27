@@ -14,14 +14,15 @@
     <works>
         <work>
             <!-- Duration in seconds -->
-            <time>2800</time>
+            <time>10000</time>
 
             <!-- Number of terminals active in this phase -->
             <terminals>100</terminals>
 
             <!-- Target transactions per second PER TERMINAL -->
             <!-- Total TPS = rate * terminals -->
-            <rate>150</rate>
+            <!-- rate=0 enables SATURATE mode (no rate limiting) -->
+            <rate>0</rate>
 
             <!-- Transaction mix weights (must sum to 100) -->
             <!-- Order: DepositChecking, TransactSavings, WriteCheck, SendPayment, Amalgamate, Balance -->

@@ -18,7 +18,7 @@
     <!-- Warm-up period in seconds: no failure behavior is active during this time. -->
     <warmUpTime>10</warmUpTime>
     <!-- Force leader failure / view-change interval in seconds, starting after warm-up. -->
-    <leaderFailureInterval>40</leaderFailureInterval>
+    <leaderFailureInterval>60</leaderFailureInterval>
 
     <phases>
         <!-- Base case -->
@@ -108,7 +108,7 @@
 
         <!-- Small proposal delay -->
         <phase>
-            <atTime>200</atTime>
+            <atTime>900</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -133,7 +133,7 @@
 
         <!-- Large proposal delay -->
         <phase>
-            <atTime>400</atTime>
+            <atTime>1800</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -158,7 +158,7 @@
 
         <!-- Small network delay -->
         <phase>
-            <atTime>600</atTime>
+            <atTime>2700</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -172,7 +172,7 @@
 
         <!-- Small network delay + small proposal delay -->
         <phase>
-            <atTime>800</atTime>
+            <atTime>3600</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -196,8 +196,8 @@
         </phase>
 
         <!-- Small network delay + large proposal delay -->
-        <phase>
-            <atTime>1000</atTime>
+        <!-- <phase>
+            <atTime>3000</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -218,11 +218,11 @@
                     </replicas>
                 </proposalDelay>
             </pbft>
-        </phase>
+        </phase> -->
 
         <!-- Large network delay -->
         <phase>
-            <atTime>1200</atTime>
+            <atTime>4500</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -235,7 +235,7 @@
         </phase>
 
         <!-- Large network delay + small proposal delay -->
-        <phase>
+        <!-- <phase>
             <atTime>1400</atTime>
             <network>
                 <directedEdges>true</directedEdges>
@@ -252,15 +252,15 @@
                     <replicas>
                         <replica>
                             <id>0</id>
-                        </replica>
                             <delayMs>500</delayMs>
+                        </replica>
                     </replicas>
                 </proposalDelay>
             </pbft>
-        </phase>
+        </phase> -->
 
         <!-- Large network delay + large proposal delay -->
-        <phase>
+        <!-- <phase>
             <atTime>1600</atTime>
             <network>
                 <directedEdges>true</directedEdges>
@@ -282,6 +282,6 @@
                     </replicas>
                 </proposalDelay>
             </pbft>
-        </phase>
+        </phase> -->
     </phases>
 </failureSpec>

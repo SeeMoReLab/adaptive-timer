@@ -76,6 +76,26 @@ def _parse_required_int(parent: ET.Element, tag: str) -> int:
         raise ValueError(f"Invalid integer in <{tag}>: {node.text!r}") from exc
 
 
+def _parse_optional_float(parent: ET.Element, tag: str) -> float | None:
+    node = parent.find(tag)
+    if node is None or node.text is None:
+        return None
+    try:
+        return float(node.text.strip())
+    except ValueError as exc:
+        raise ValueError(f"Invalid float in <{tag}>: {node.text!r}") from exc
+
+
+def _parse_optional_int(parent: ET.Element, tag: str) -> int | None:
+    node = parent.find(tag)
+    if node is None or node.text is None:
+        return None
+    try:
+        return int(node.text.strip())
+    except ValueError as exc:
+        raise ValueError(f"Invalid integer in <{tag}>: {node.text!r}") from exc
+
+
 def _parse_delay_loss(node: ET.Element) -> DelayLoss:
     delay_ms = _parse_required_float(node, "delayMs")
     loss_pct = _parse_required_float(node, "lossPct")
@@ -86,8 +106,20 @@ def _parse_delay_loss(node: ET.Element) -> DelayLoss:
     return DelayLoss(delay_ms=delay_ms, loss_pct=loss_pct)
 
 
-def _parse_phases(spec_path: Path) -> List[PhaseNetworkSpec]:
+def _parse_warmup_seconds(root: ET.Element) -> float:
+    warmup_ms = _parse_optional_int(root, "warmUpTimeMs")
+    if warmup_ms is not None:
+        return max(0.0, warmup_ms / 1000.0)
+
+    warmup_s = _parse_optional_float(root, "warmUpTime")
+    if warmup_s is None:
+        return 0.0
+    return max(0.0, warmup_s)
+
+
+def _parse_phases(spec_path: Path) -> Tuple[float, List[PhaseNetworkSpec]]:
     root = ET.parse(spec_path).getroot()
+    warmup_s = _parse_warmup_seconds(root)
     phase_nodes = root.findall("./phases/phase")
     if not phase_nodes:
         raise ValueError("No <phase> entries found under <phases>")
@@ -163,7 +195,7 @@ def _parse_phases(spec_path: Path) -> List[PhaseNetworkSpec]:
     if not has_at_time:
         _log("No <atTime> found; treating <time> as phase duration (legacy behavior).")
 
-    return phases
+    return warmup_s, phases
 
 
 def _load_hosts(hosts_config: Path) -> Dict[int, HostEntry]:
@@ -531,7 +563,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    phases = _parse_phases(args.failure_spec)
+    warmup_s, phases = _parse_phases(args.failure_spec)
     hosts = _load_hosts(args.hosts_config)
     if args.replica_id not in hosts:
         raise ValueError(
@@ -554,11 +586,11 @@ def main() -> int:
     _log(
         "Starting network applier "
         f"(replica_id={args.replica_id}, netns={args.netns or 'host'}, "
-        f"interface={interface}, phases={len(phases)})"
+        f"interface={interface}, warmup_s={warmup_s:.3f}, phases={len(phases)})"
     )
 
     for idx, phase in enumerate(phases):
-        target_mono = start_mono + phase.at_time_s
+        target_mono = start_mono + warmup_s + phase.at_time_s
         sleep_s = target_mono - time.monotonic()
         if sleep_s > 0:
             time.sleep(sleep_s)

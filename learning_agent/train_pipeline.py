@@ -10,7 +10,7 @@ from models import (
     TIMEOUT_VALUES_MS,
     PHASE_INDEX_TO_TIMEOUT_INDEX,
     LinearTorchModel,
-    QLearningTorchModel,
+    ThompsonLinearModel,
     TensorModel,
     QuadraticRewardScaler,
     get_action_space_size,
@@ -32,7 +32,7 @@ PROTOCOL_NAME_TO_ENUM = {
 
 MODEL_NAME_TO_TENSORMODEL = {
     "linear": LinearTorchModel,
-    "q-learning": QLearningTorchModel,
+    "thompson": ThompsonLinearModel
 }
 
 
@@ -48,7 +48,7 @@ def _parse_protocol(value: str) -> int:
 def _parse_model(value: str) -> TensorModel:
     model = MODEL_NAME_TO_TENSORMODEL.get(value.strip().lower())
     if model is None:
-        valid = ", ".join(sorted({"linear", "q-learning"}))
+        valid = ", ".join(sorted({"linear","thompson"}))
         raise argparse.ArgumentTypeError(
             f"Unsupported model '{value}'. Valid options: {valid}"
         )
@@ -67,8 +67,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         type=_parse_model,
-        default='q-learning',
-        help="Model: linear | q-learning",
+        default='linear',
+        help="Model: linear | thompson",
     )
     parser.add_argument(
         "--train-csv",
@@ -82,7 +82,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional test CSV path. If omitted, train CSV is reused.",
     )
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--eval-ratio", type=float, default=0.2)
     parser.add_argument("--lr", type=float, default=0.01)
@@ -136,6 +136,7 @@ def run_pipeline(
     print(
         "[csv-train-test] "
         f"protocol={protocol_name}, "
+        f"model={model.__class__.__name__}, "
         f"train_csv={train_csv}, "
         f"test_csv={test_csv or train_csv}, "
         f"samples={int(metrics['samples'])}, "

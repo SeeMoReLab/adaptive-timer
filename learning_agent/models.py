@@ -7,6 +7,9 @@ from typing import Dict, Generic, List, Optional, Tuple, TypeVar
 
 import torch
 import torch.nn.functional as F
+from torch.distributions import Categorical
+import random
+from collections import deque
 
 import agent_pb2
 
@@ -388,7 +391,7 @@ class LinearTorchModel(TensorModel):
             raise ValueError(f"action_dim must be > 0, got {action_dim}")
         self._action_dim = int(action_dim)
         self.weights = torch.zeros((self._action_dim, n_features), requires_grad=True)
-        self.optimizer = torch.optim.SGD([self.weights], lr=lr)
+        self.optimizer = torch.optim.AdamW([self.weights], lr=lr)
 
     def predict_action(self, features: torch.Tensor) -> torch.Tensor:
         if features.dim() == 1:
@@ -611,31 +614,39 @@ class ScheduledTimeoutModel(TensorModel):
         self._start_time = time.monotonic()
         self._active_row = -1
 
-class QLearningTorchModel(TensorModel):
-    """Q-learning classifier estimating Q-values for discrete options."""
+class ThompsonLinearModel(TensorModel):
+    """Bayesian Linear CMAB over protocol-specific discrete timeout options."""
 
-    def __init__(self, action_dim: int, n_features: int, lr: float = 0.001):
-        super().__init__()
+    def __init__(self, action_dim: int, n_features: int, lr: float = 0.01, kl_weight: float = 0.001):
         if action_dim <= 0:
             raise ValueError(f"action_dim must be > 0, got {action_dim}")
-        
+            
         self._action_dim = int(action_dim)
+        self.n_features = n_features
+        self.kl_weight = kl_weight
         
-        self.q_network = torch.nn.Linear(n_features, self._action_dim)
-        torch.nn.init.zeros_(self.q_network.weight)
-        self.optimizer = torch.optim.Adam(self.q_network.parameters(), lr=lr)
+        self.mu = torch.zeros((self._action_dim, n_features), requires_grad=True)
+        self.log_var = torch.zeros((self._action_dim, n_features), requires_grad=True)
+        
+        self.optimizer = torch.optim.AdamW([self.mu, self.log_var], lr=lr)
 
-    def predict_action(self, features: torch.Tensor, epsilon: float = 0.0) -> torch.Tensor:
+    def predict_action(self, features: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
+        """
+        deterministic=False: Exploration
+        deterministic=True: Exploitation
+        """
         if features.dim() == 1:
             features = features.unsqueeze(0)
-
-        if torch.rand(1).item() < epsilon:
-            batch_size = features.shape[0]
-            return torch.randint(0, self._action_dim, (batch_size,))
-
-        with torch.no_grad():
-            q_values = self.q_network(features)
-            return q_values
+            
+        if deterministic:
+            weights = self.mu
+        else:
+            # Sample weights N(mu, exp(log_var))
+            std = torch.exp(0.5 * self.log_var)
+            eps = torch.randn_like(std)
+            weights = self.mu + (eps * std)
+        
+        return torch.matmul(features, weights.t())
 
     def update_model(
         self,
@@ -648,45 +659,55 @@ class QLearningTorchModel(TensorModel):
             if features.dim() == 1:
                 features = features.unsqueeze(0)
 
-            batch_size = features.shape[0]
             actions_tensor = torch.as_tensor(actions, dtype=torch.float32).view(-1)
             rewards_tensor = torch.as_tensor(rewards, dtype=torch.float32).view(-1)
 
+            batch_size = features.shape[0]
             if actions_tensor.numel() == 1 and batch_size > 1:
                 actions_tensor = actions_tensor.repeat(batch_size)
             if rewards_tensor.numel() == 1 and batch_size > 1:
                 rewards_tensor = rewards_tensor.repeat(batch_size)
-
             if actions_tensor.numel() != batch_size:
-                raise ValueError(
-                    "actions batch size mismatch: "
-                    f"expected {batch_size}, got {actions_tensor.numel()}"
-                )
+                raise ValueError(f"actions batch size mismatch: expected {batch_size}, got {actions_tensor.numel()}")
             if rewards_tensor.numel() != batch_size:
-                raise ValueError(
-                    "rewards batch size mismatch: "
-                    f"expected {batch_size}, got {rewards_tensor.numel()}"
-                )
+                raise ValueError(f"rewards batch size mismatch: expected {batch_size}, got {rewards_tensor.numel()}")
 
-            target_index = torch.round(actions_tensor).long()
-            valid_actions = torch.clamp(target_index, 0, self._action_dim - 1).view(-1, 1)
+            # 1. Sample weights N(mu, exp(log_var))
+            std = torch.exp(0.5 * self.log_var)
+            eps = torch.randn_like(std)
+            sampled_weights = self.mu + (eps * std)
+            
+            logits = torch.matmul(features, sampled_weights.t())
+            
+            
+            target_index = torch.round(actions_tensor).long().view(-1)
+            targets = torch.clamp(target_index, 0, self._action_dim - 1)
+            reward_scales = torch.clamp(rewards_tensor, min=0.0) / 1000.0
+            ce_loss = (F.cross_entropy(logits, targets, reduction='none') * reward_scales).mean()
+            kl_loss = -0.5 * torch.sum(1 + self.log_var - self.mu.pow(2) - self.log_var.exp())
+            
+            loss = ce_loss + (self.kl_weight * kl_loss) 
 
-            q_values = self.q_network(features).gather(1, valid_actions)
-            loss = F.smooth_l1_loss(q_values, rewards_tensor.view(-1, 1).detach())
-
-            if backward:
+            if backward and float(loss.item()) > 0.0:
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
-
+                
             return float(loss.item())
     
     def reset_model(self) -> None:
-        self.q_network.reset_parameters()
+        """Initialize means to zero and variances to a standard normal uncertainty."""
+        with torch.no_grad():
+            torch.nn.init.zeros_(self.mu)
+            torch.nn.init.zeros_(self.log_var)
 
     def save(self) -> torch.Tensor:
-        return self.q_network.state_dict()
-
-    def load(self, state: torch.Tensor) -> None:
+        """Return the learned means and the variances."""
+        return torch.stack([self.mu, self.log_var]).detach()
+    
+    def load(self, weights: torch.Tensor) -> None:
+        """Load the distribution parameters into the model."""
         with torch.no_grad():
-            self.q_network.load_state_dict(state)
+            self.mu.copy_(weights[0])
+            self.log_var.copy_(weights[1])
+

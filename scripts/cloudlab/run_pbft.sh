@@ -22,11 +22,15 @@ START_OFFSET_AFTER_CLIENT_LAUNCH_S=20
 OUTPUT_LOCAL="${REPO_ROOT}/scripts/cloudlab/tmp/output.txt"
 DATASET_ENABLED=0
 LOG_ENABLED=0
+TRIM_OUTPUT=0
 OVERLAY_OCTET_A=10
 OVERLAY_OCTET_B=250
 OVERLAY_MASK_BITS=24
 OVERLAY_BRIDGE_NAME="br-pbft"
 OVERLAY_HOST_OFFSET=10
+LOG_LEVEL="INFO"
+AGENT_MODEL_TYPE="random"
+AGENT_MODEL_SET=0
 
 mode_enables_learning_agent() {
   case "$1" in
@@ -37,6 +41,76 @@ mode_enables_learning_agent() {
       return 1
       ;;
   esac
+}
+
+normalize_log_level() {
+  local level_upper
+  level_upper="$(echo "$1" | tr '[:lower:]' '[:upper:]')"
+  case "${level_upper}" in
+    TRACE|DEBUG|INFO|WARN|ERROR)
+      printf '%s\n' "${level_upper}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+normalize_agent_model_type() {
+  local model_lower
+  model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
+  case "${model_lower}" in
+    random|linear)
+      printf '%s\n' "${model_lower}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+configure_logback_level() {
+  local logback_file="$1"
+  local level="$2"
+  local tmp_file
+
+  if [[ ! -f "${logback_file}" ]]; then
+    echo "logback.xml not found: ${logback_file}" >&2
+    return 1
+  fi
+
+  tmp_file="$(mktemp)"
+  awk -v level="${level}" '
+    {
+      if ($0 ~ /^[[:space:]]*<root[[:space:]]+level="/) {
+        gsub(/level="[^"]+"/, "level=\"" level "\"")
+      } else if ($0 ~ /^[[:space:]]*<logger[[:space:]]+name="bftsmart"[[:space:]]+level="/) {
+        gsub(/level="[^"]+"/, "level=\"" level "\"")
+      } else if ($0 ~ /^[[:space:]]*<logger[[:space:]]+name="bftsmart\.proxy"[[:space:]]+level="/) {
+        gsub(/level="[^"]+"/, "level=\"" level "\"")
+      }
+      print
+    }
+  ' "${logback_file}" > "${tmp_file}"
+  mv "${tmp_file}" "${logback_file}"
+}
+
+trim_client_output_file() {
+  local output_file="$1"
+  local header_lines="$2"
+  local tmp_file
+
+  if [[ ! -f "${output_file}" ]]; then
+    echo "Cannot trim missing output file: ${output_file}" >&2
+    return 1
+  fi
+
+  tmp_file="$(mktemp)"
+  awk -v header_lines="${header_lines}" '
+    NR <= header_lines { print; next }
+    /-- Monitor/ { print }
+  ' "${output_file}" > "${tmp_file}"
+  mv "${tmp_file}" "${output_file}"
 }
 
 rewrite_hosts_for_namespaces() {
@@ -159,7 +233,7 @@ REMOTE
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--trim-output] [--log-level <TRACE|DEBUG|INFO|WARN|ERROR>] [--model <random|linear>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -168,7 +242,10 @@ Arguments:
 
 Flags:
   --dataset         Collect per-replica learning-agent dataset CSVs as agentN.csv.
-  --log             Download per-replica server logs to scripts/cloudlab/tmp/server_logs/.
+  --log             Download per-replica logs (server, and mode-specific dataexchange/agent logs) to scripts/cloudlab/tmp/.
+  --trim-output     Post-process output.txt: keep lines 1..19, then only lines containing "-- Monitor".
+  --log-level       Logging level applied to root, bftsmart and bftsmart.proxy in staged logback.xml (default: INFO).
+  --model           Learning-agent model for learning/sharing modes: random|linear (default: random).
   -f <int>          Fault tolerance f passed to prepare_pbft.sh (default: 1).
   -t <int>          Seconds to run experiment before stopping tmux sessions (default: 60).
 EOF
@@ -216,6 +293,29 @@ while [[ $# -gt 0 ]]; do
       LOG_ENABLED=1
       shift
       ;;
+    --trim-output)
+      TRIM_OUTPUT=1
+      shift
+      ;;
+    --log-level)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --log-level." >&2
+        usage >&2
+        exit 2
+      fi
+      LOG_LEVEL="${2}"
+      shift 2
+      ;;
+    --model)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --model." >&2
+        usage >&2
+        exit 2
+      fi
+      AGENT_MODEL_TYPE="${2}"
+      AGENT_MODEL_SET=1
+      shift 2
+      ;;
     normal|heuristic|learning|sharing|scheduled)
       MODE="$1"
       shift
@@ -243,6 +343,18 @@ if ! [[ "${F}" =~ ^[0-9]+$ ]] || (( F < 1 )); then
 fi
 if ! [[ "${EXPERIMENT_TIME_S}" =~ ^[0-9]+$ ]] || (( EXPERIMENT_TIME_S < 1 )); then
   echo "Invalid -t value: ${EXPERIMENT_TIME_S}. It must be an integer >= 1." >&2
+  exit 2
+fi
+if ! LOG_LEVEL="$(normalize_log_level "${LOG_LEVEL}")"; then
+  echo "Invalid --log-level value: ${LOG_LEVEL}. Use one of TRACE|DEBUG|INFO|WARN|ERROR." >&2
+  exit 2
+fi
+if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear." >&2
+  exit 2
+fi
+if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
+  echo "--model is only supported with learning or sharing mode." >&2
   exit 2
 fi
 
@@ -273,6 +385,9 @@ else
   LEARNING_AGENT_ENABLED=1
 fi
 echo "Selected mode: ${MODE}"
+if [[ "${MODE}" == "learning" || "${MODE}" == "sharing" ]]; then
+  echo "Learning-agent model: ${AGENT_MODEL_TYPE}"
+fi
 echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (dataset=${DATASET_ENABLED}, log=${LOG_ENABLED})"
 echo "Preparing PBFT configs in cloudlab mode with f=${F}..."
 "${PREPARE_SCRIPT}" cloudlab -f "${F}"
@@ -281,6 +396,8 @@ if [[ ! -d "${LIBRARY_DIR}" ]]; then
   echo "Prepared library directory not found: ${LIBRARY_DIR}" >&2
   exit 1
 fi
+configure_logback_level "${LIBRARY_DIR}/config/logback.xml" "${LOG_LEVEL}"
+echo "Configured staged logback level: ${LOG_LEVEL}"
 if [[ ! -d "${LEARNING_AGENT_SRC_DIR}" ]]; then
   echo "learning_agent directory not found: ${LEARNING_AGENT_SRC_DIR}" >&2
   exit 1
@@ -825,6 +942,95 @@ if (( applier_start_failed != 0 )); then
   exit 1
 fi
 
+if [[ "${MODE}" == "sharing" ]]; then
+  echo "Starting data-exchange PBFT servers in tmux (parallel)..."
+  dataexchange_start_failed=0
+  dataexchange_start_pids=()
+  dataexchange_start_nodes=()
+  for i in "${!server_nodes[@]}"; do
+    node="${server_nodes[$i]}"
+    host="${server_hosts[$i]}"
+    user="${server_users[$i]}"
+    machine_idx="${i}"
+
+    (
+      ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${replicas_per_server_machine}" "${machine_idx}" "${OVERLAY_OCTET_A}" "${OVERLAY_OCTET_B}" "${OVERLAY_HOST_OFFSET}" <<'REMOTE'
+set -euo pipefail
+
+replicas_per_machine="$1"
+machine_idx="$2"
+overlay_a="$3"
+overlay_b="$4"
+overlay_host_offset="$5"
+
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "tmux not found on $(hostname)" >&2
+  exit 1
+fi
+
+if [[ ! -d "$HOME/library" ]]; then
+  echo "library directory missing on $(hostname): $HOME/library" >&2
+  exit 1
+fi
+
+for ((n = 0; n < replicas_per_machine; n++)); do
+  replica_id=$((machine_idx * replicas_per_machine + n))
+  ns_name="pbft-r${replica_id}"
+  session_name="pbft_dataexchange_${replica_id}"
+  dataexchange_log="$HOME/library/dataexchange_${replica_id}.log"
+  bind_ip="${overlay_a}.${overlay_b}.$((machine_idx + 1)).$((overlay_host_offset + n))"
+  config_path="$HOME/library/dataexchange${n}/system.config"
+  if ! ip netns list | awk '{print $1}' | grep -qx "${ns_name}"; then
+    echo "Namespace missing on $(hostname): ${ns_name}" >&2
+    exit 1
+  fi
+  if [[ ! -f "${config_path}" ]]; then
+    echo "Missing config file on $(hostname): ${config_path}" >&2
+    exit 1
+  fi
+  if grep -Eq '^[[:space:]]*system\.communication\.bindaddress[[:space:]]*=' "${config_path}"; then
+    sed -E -i "s|^[[:space:]]*system\.communication\.bindaddress[[:space:]]*=.*$|system.communication.bindaddress = ${bind_ip}|" "${config_path}"
+  else
+    echo "system.communication.bindaddress = ${bind_ip}" >> "${config_path}"
+  fi
+  tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
+  : > "${dataexchange_log}"
+  tmux new-session -d -s "${session_name}" \
+    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"$HOME/library\" && exec bash smartrun.sh bftsmart.demo.dataexchange.DataExchangeServer ${replica_id} dataexchange${n}' > \"${dataexchange_log}\" 2>&1"
+done
+
+sleep 2
+for ((n = 0; n < replicas_per_machine; n++)); do
+  replica_id=$((machine_idx * replicas_per_machine + n))
+  session_name="pbft_dataexchange_${replica_id}"
+  if ! tmux has-session -t "${session_name}" 2>/dev/null; then
+    echo "Data-exchange server session exited early on $(hostname): ${session_name}" >&2
+    tail -n 80 "$HOME/library/dataexchange_${replica_id}.log" >&2 || true
+    exit 1
+  fi
+done
+REMOTE
+    ) &
+    dataexchange_start_pids+=("$!")
+    dataexchange_start_nodes+=("${node}")
+  done
+
+  for i in "${!dataexchange_start_pids[@]}"; do
+    pid="${dataexchange_start_pids[$i]}"
+    node="${dataexchange_start_nodes[$i]}"
+    if wait "${pid}"; then
+      echo "  - ${node}: data-exchange servers started"
+    else
+      echo "  - ${node}: failed to start data-exchange servers" >&2
+      dataexchange_start_failed=1
+    fi
+  done
+  if (( dataexchange_start_failed != 0 )); then
+    echo "Data-exchange server start failed on one or more nodes." >&2
+    exit 1
+  fi
+fi
+
 if (( LEARNING_AGENT_ENABLED == 1 )); then
   echo "Starting learning-agent replicas in tmux (parallel)..."
   agent_start_failed=0
@@ -837,7 +1043,7 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
     machine_idx="${i}"
 
     (
-      ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${replicas_per_server_machine}" "${machine_idx}" "${START_UNIX_MS}" "${MODE}" "${DATASET_ENABLED}" <<'REMOTE'
+      ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${replicas_per_server_machine}" "${machine_idx}" "${START_UNIX_MS}" "${MODE}" "${DATASET_ENABLED}" "${AGENT_MODEL_TYPE}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
@@ -845,6 +1051,7 @@ machine_idx="$2"
 start_unix_ms="$3"
 mode="$4"
 dataset_enabled="$5"
+model_type="$6"
 
 if ! command -v tmux >/dev/null 2>&1; then
   echo "tmux not found on $(hostname)" >&2
@@ -869,7 +1076,9 @@ fi
 
 agent_mode_args=""
 if [[ "${mode}" == "sharing" ]]; then
-  agent_mode_args="--sharing true"
+  agent_mode_args="--sharing true --model-type ${model_type}"
+elif [[ "${mode}" == "learning" ]]; then
+  agent_mode_args="--model-type ${model_type}"
 elif [[ "${mode}" == "scheduled" ]]; then
   agent_mode_args="--model-type scheduled --schedule-file learning_agent/config/schedule_pbft.csv"
 fi
@@ -1093,7 +1302,7 @@ fi
 
 printf '%s\n' "${sessions}" | while read -r session_name; do
   [[ -z "${session_name}" ]] && continue
-  if [[ "${session_name}" == pbft_server_* || "${session_name}" == pbft_applier_* || "${session_name}" == pbft_agent_* || "${session_name}" == pbft_client ]]; then
+  if [[ "${session_name}" == pbft_server_* || "${session_name}" == pbft_dataexchange_* || "${session_name}" == pbft_applier_* || "${session_name}" == pbft_agent_* || "${session_name}" == pbft_client ]]; then
     tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   fi
 done
@@ -1190,13 +1399,17 @@ mkdir -p "$(dirname "${OUTPUT_LOCAL}")"
 rm -f "${OUTPUT_LOCAL}"
 echo "Fetching client output to ${OUTPUT_LOCAL}..."
 scp "${SSH_OPTS[@]}" "${node0_user}@${node0_host}:~/library/output.txt" "${OUTPUT_LOCAL}"
+if (( TRIM_OUTPUT == 1 )); then
+  echo "Trimming ${OUTPUT_LOCAL}: preserving first 19 lines, then only '-- Monitor' lines..."
+  trim_client_output_file "${OUTPUT_LOCAL}" 19
+fi
 
 if (( LOG_ENABLED == 1 )); then
   SERVER_LOGS_LOCAL_DIR="${REPO_ROOT}/scripts/cloudlab/tmp/server_logs"
   echo "Fetching server logs to ${SERVER_LOGS_LOCAL_DIR}..."
   rm -rf "${SERVER_LOGS_LOCAL_DIR}"
   mkdir -p "${SERVER_LOGS_LOCAL_DIR}"
-  log_fetch_failed=0
+  server_log_fetch_failed=0
   for i in "${!server_nodes[@]}"; do
     node="${server_nodes[$i]}"
     host="${server_hosts[$i]}"
@@ -1213,16 +1426,86 @@ if (( LOG_ENABLED == 1 )); then
           echo "  - copied server_${replica_id}.log from ${node}"
         else
           echo "  - failed to copy server_${replica_id}.log from ${node}" >&2
-          log_fetch_failed=1
+          server_log_fetch_failed=1
         fi
       else
         echo "  - missing server_${replica_id}.log on ${node}" >&2
-        log_fetch_failed=1
+        server_log_fetch_failed=1
       fi
     done
   done
-  if (( log_fetch_failed != 0 )); then
+  if (( server_log_fetch_failed != 0 )); then
     echo "Some server logs could not be fetched." >&2
+  fi
+
+  if [[ "${MODE}" == "sharing" ]]; then
+    DATAEXCHANGE_LOGS_LOCAL_DIR="${REPO_ROOT}/scripts/cloudlab/tmp/dataexchange_logs"
+    echo "Fetching data-exchange server logs to ${DATAEXCHANGE_LOGS_LOCAL_DIR}..."
+    rm -rf "${DATAEXCHANGE_LOGS_LOCAL_DIR}"
+    mkdir -p "${DATAEXCHANGE_LOGS_LOCAL_DIR}"
+    dataexchange_log_fetch_failed=0
+    for i in "${!server_nodes[@]}"; do
+      node="${server_nodes[$i]}"
+      host="${server_hosts[$i]}"
+      user="${server_users[$i]}"
+      machine_idx="${i}"
+      for ((n = 0; n < replicas_per_server_machine; n++)); do
+        replica_id=$((machine_idx * replicas_per_server_machine + n))
+        remote_log_path="\$HOME/library/dataexchange_${replica_id}.log"
+        remote_log_rel="library/dataexchange_${replica_id}.log"
+        local_log="${DATAEXCHANGE_LOGS_LOCAL_DIR}/dataexchange_${replica_id}.log"
+        rm -f "${local_log}"
+        if ssh "${SSH_OPTS[@]}" "${user}@${host}" "test -f ${remote_log_path}"; then
+          if scp "${SSH_OPTS[@]}" "${user}@${host}:${remote_log_rel}" "${local_log}"; then
+            echo "  - copied dataexchange_${replica_id}.log from ${node}"
+          else
+            echo "  - failed to copy dataexchange_${replica_id}.log from ${node}" >&2
+            dataexchange_log_fetch_failed=1
+          fi
+        else
+          echo "  - missing dataexchange_${replica_id}.log on ${node}" >&2
+          dataexchange_log_fetch_failed=1
+        fi
+      done
+    done
+    if (( dataexchange_log_fetch_failed != 0 )); then
+      echo "Some data-exchange logs could not be fetched." >&2
+    fi
+  fi
+
+  if [[ "${MODE}" == "learning" || "${MODE}" == "scheduled" || "${MODE}" == "sharing" ]]; then
+    AGENT_LOGS_LOCAL_DIR="${REPO_ROOT}/scripts/cloudlab/tmp/agent_logs"
+    echo "Fetching learning-agent logs to ${AGENT_LOGS_LOCAL_DIR}..."
+    rm -rf "${AGENT_LOGS_LOCAL_DIR}"
+    mkdir -p "${AGENT_LOGS_LOCAL_DIR}"
+    agent_log_fetch_failed=0
+    for i in "${!server_nodes[@]}"; do
+      node="${server_nodes[$i]}"
+      host="${server_hosts[$i]}"
+      user="${server_users[$i]}"
+      machine_idx="${i}"
+      for ((n = 0; n < replicas_per_server_machine; n++)); do
+        replica_id=$((machine_idx * replicas_per_server_machine + n))
+        remote_log_path="\$HOME/library/agent_${replica_id}.log"
+        remote_log_rel="library/agent_${replica_id}.log"
+        local_log="${AGENT_LOGS_LOCAL_DIR}/agent_${replica_id}.log"
+        rm -f "${local_log}"
+        if ssh "${SSH_OPTS[@]}" "${user}@${host}" "test -f ${remote_log_path}"; then
+          if scp "${SSH_OPTS[@]}" "${user}@${host}:${remote_log_rel}" "${local_log}"; then
+            echo "  - copied agent_${replica_id}.log from ${node}"
+          else
+            echo "  - failed to copy agent_${replica_id}.log from ${node}" >&2
+            agent_log_fetch_failed=1
+          fi
+        else
+          echo "  - missing agent_${replica_id}.log on ${node}" >&2
+          agent_log_fetch_failed=1
+        fi
+      done
+    done
+    if (( agent_log_fetch_failed != 0 )); then
+      echo "Some learning-agent logs could not be fetched." >&2
+    fi
   fi
 fi
 

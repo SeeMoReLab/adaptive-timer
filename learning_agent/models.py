@@ -436,6 +436,41 @@ class LinearTorchModel(TensorModel):
         torch.nn.init.zeros_(self.weights)
 
 
+class RandomTimeoutModel(TensorModel):
+    """Selects a random timeout action index each prediction."""
+
+    def __init__(self, action_dim: int, seed: Optional[int] = None):
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        self._action_dim = int(action_dim)
+        if seed is None:
+            seed = int(time.time_ns() & 0x7FFFFFFF)
+        self._initial_seed = int(seed)
+        self._rng = torch.Generator()
+        self._rng.manual_seed(self._initial_seed)
+
+    def predict_action(self, features: torch.Tensor) -> torch.Tensor:
+        if features.dim() == 1:
+            option_index = int(
+                torch.randint(0, self._action_dim, (1,), generator=self._rng).item()
+            )
+            return torch.tensor(float(option_index), dtype=torch.float32)
+
+        batch_size = int(features.shape[0])
+        return torch.randint(
+            0, self._action_dim, (batch_size,), generator=self._rng, dtype=torch.int64
+        ).to(torch.float32)
+
+    def update_model(
+        self, features: torch.Tensor, action: torch.Tensor, reward: float
+    ) -> float:
+        del features, action, reward
+        return 0.0
+
+    def reset_model(self) -> None:
+        self._rng.manual_seed(self._initial_seed)
+
+
 class ScheduledTimeoutModel(TensorModel):
     """Returns protocol-specific timeout option indices from a time-based schedule."""
 

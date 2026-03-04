@@ -24,6 +24,7 @@ from models import (
     LinearTorchModel,
     ProtocolReportFeatureExtractor,
     ProtocolTimeoutActionDecoder,
+    RandomTimeoutModel,
     ScheduledTimeoutModel,
     TensorModel,
     get_action_space_size,
@@ -493,6 +494,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._timeouts_by_episode: Dict[int, TimeoutDecision] = {}
         self._state_by_episode: Dict[int, object] = {}
         self._phase_by_episode: Dict[int, int] = {}
+        self._pending_rewards_by_episode: Dict[int, Tuple[int, object, object]] = {}
         self._report_feature_field_names = get_report_feature_field_names(self._protocol)
         self._dataset_timeout_field_names = _dataset_timeout_field_names(self._protocol)
         self._dataset_handle = None
@@ -932,6 +934,12 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             if local_report.episode > self._current_episode:
                 self._current_episode = local_report.episode
             self._received_episodes.add(local_report.episode)
+            if self._sharing and local_report.episode not in self._phase_by_episode:
+                # In sharing mode, mirror non-sharing semantics by capturing
+                # the active injection phase as soon as the local report is accepted.
+                self._phase_by_episode[local_report.episode] = (
+                    self._current_injection_phase_index_locked()
+                )
 
             if not self._sharing:
                 print(
@@ -1105,6 +1113,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._timeouts_by_episode.clear()
             self._state_by_episode.clear()
             self._phase_by_episode.clear()
+            self._pending_rewards_by_episode.clear()
             self._current_episode = 0
             self._sealed_through_episode = 0
         return empty_pb2.Empty()
@@ -1256,28 +1265,53 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             return
         reward_episode, reward_report, timeout_used = payload
 
+        reward_report_copy = reward_report.__class__()
+        reward_report_copy.CopyFrom(reward_report)
+        timeout_used_copy = timeout_used.__class__()
+        timeout_used_copy.CopyFrom(timeout_used)
+
+        self._apply_reward_payload_locked(
+            report_node_id=int(request.node_id),
+            reward_episode=int(reward_episode),
+            reward_report=reward_report_copy,
+            timeout_used=timeout_used_copy,
+        )
+
+    def _apply_reward_payload_locked(
+        self,
+        report_node_id: int,
+        reward_episode: int,
+        reward_report: object,
+        timeout_used: object,
+    ) -> None:
         matched_state = self._state_by_episode.get(reward_episode)
+        if matched_state is None:
+            self._pending_rewards_by_episode[reward_episode] = (
+                report_node_id,
+                reward_report,
+                timeout_used,
+            )
+            print(
+                "[learning] deferred reward update "
+                f"(episode={reward_episode}): waiting for consensus state"
+            )
+            return
+
         phase = self._phase_by_episode.get(reward_episode, -1)
         self._log_reward_row_locked(
             phase=phase,
-            report_node_id=request.node_id,
+            report_node_id=report_node_id,
             reward_episode=reward_episode,
             timeout_used=timeout_used,
             reward_report=reward_report,
             matched_state=matched_state,
         )
-        if matched_state is None:
-            print(
-                "[learning] skipped reward update "
-                f"(episode={reward_episode}): no stored state for episode"
-            )
-            self._phase_by_episode.pop(reward_episode, None)
-            return
 
         try:
             action_index = timeout_to_action_index(self._protocol, timeout_used)
         except ValueError as exc:
             print(f"[learning] skipped reward for episode {reward_episode}: {exc}")
+            self._pending_rewards_by_episode.pop(reward_episode, None)
             return
 
         total_transactions = _report_total_transactions(reward_report)
@@ -1288,6 +1322,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         # Reward for this episode has been consumed.
         self._state_by_episode.pop(reward_episode, None)
         self._phase_by_episode.pop(reward_episode, None)
+        self._pending_rewards_by_episode.pop(reward_episode, None)
         if self._protocol == agent_pb2.PROTOCOL_PBFT:
             reward_timeout = f"{timeout_used.election_timeout_milliseconds}"
         elif self._protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
@@ -1318,6 +1353,17 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         cached_report = _copy_state(report)
         self._state_by_episode[episode] = cached_report
         self._phase_by_episode[episode] = self._current_injection_phase_index_locked()
+
+        pending_reward = self._pending_rewards_by_episode.get(episode)
+        if pending_reward is not None:
+            report_node_id, reward_report, timeout_used = pending_reward
+            self._apply_reward_payload_locked(
+                report_node_id=report_node_id,
+                reward_episode=episode,
+                reward_report=reward_report,
+                timeout_used=timeout_used,
+            )
+
         features = self._feature_extractor.featurize(report)
         action = self._model.predict_action(features)
         return self._action_decoder.decode(action)
@@ -1381,7 +1427,11 @@ def serve(
         )
         consensus_stub = agent_pb2_grpc.ConsensusStub(consensus_channel)
 
-    if model_type == "linear":
+    if model_type == "random":
+        model = RandomTimeoutModel(
+            action_dim=get_action_space_size(protocol),
+        )
+    elif model_type == "linear":
         model = LinearTorchModel(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
@@ -1523,9 +1573,9 @@ def main():
     parser.add_argument(
         "--model-type",
         type=str,
-        choices=("linear", "scheduled"),
-        default="linear",
-        help="linear: learned linear model; scheduled: timeout from a time-based schedule CSV.",
+        choices=("random", "linear", "scheduled"),
+        default="random",
+        help="random: random timeout selection; linear: learned linear model; scheduled: timeout from a time-based schedule CSV.",
     )
 
     parser.add_argument(

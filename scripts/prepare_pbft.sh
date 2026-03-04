@@ -156,14 +156,38 @@ generate_hosts_config() {
   mv "${tmp_hosts}" "${hosts_file}"
 }
 
-set_dataexchange_episode_requests_true() {
+configure_dataexchange_system_config() {
   local config_file="$1"
   local tmp_config
 
   tmp_config="$(mktemp)"
-  sed \
-    's/^\([[:space:]]*system\.optimizations\.episode_requests[[:space:]]*=[[:space:]]*\)false[[:space:]]*$/\1true/' \
-    "${config_file}" > "${tmp_config}"
+  awk '
+    BEGIN {
+      seen_episode_requests = 0
+      seen_use_signatures = 0
+    }
+    /^[[:space:]]*system\.optimizations\.episode_requests[[:space:]]*=/ {
+      print "system.optimizations.episode_requests = true"
+      seen_episode_requests = 1
+      next
+    }
+    /^[[:space:]]*system\.communication\.useSignatures[[:space:]]*=/ {
+      # DataExchangeServer submits TOM messages directly and does not attach a
+      # client signature payload; keep signature checks off for this config.
+      print "system.communication.useSignatures = 0"
+      seen_use_signatures = 1
+      next
+    }
+    { print }
+    END {
+      if (!seen_episode_requests) {
+        print "system.optimizations.episode_requests = true"
+      }
+      if (!seen_use_signatures) {
+        print "system.communication.useSignatures = 0"
+      }
+    }
+  ' "${config_file}" > "${tmp_config}"
   mv "${tmp_config}" "${config_file}"
 }
 
@@ -318,7 +342,7 @@ cp -a "${SYSTEM_CONFIG_SRC}" "${DATAEXCHANGE_DIR}/system.config"
 
 update_system_config "${SMALLBANK_DIR}/system.config" "${NUM_SERVERS}" "${F}"
 update_system_config "${DATAEXCHANGE_DIR}/system.config" "${NUM_SERVERS}" "${F}"
-set_dataexchange_episode_requests_true "${DATAEXCHANGE_DIR}/system.config"
+configure_dataexchange_system_config "${DATAEXCHANGE_DIR}/system.config"
 
 generate_hosts_config \
   "${SMALLBANK_DIR}/hosts.config" \

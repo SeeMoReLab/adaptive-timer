@@ -21,7 +21,7 @@
 			<onMismatch>DENY</onMismatch>
 		</filter>
 		<encoder>
-			<pattern> -- %msg%n</pattern>
+			<pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} -- %msg%n</pattern>
 		</encoder>
 	</appender>
 
@@ -31,7 +31,7 @@
 			<level>WARN</level>
 		</filter>
 		<encoder>
-			<pattern> -- %msg%n</pattern>
+			<pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} -- %msg%n</pattern>
 		</encoder>
 	</appender>
 

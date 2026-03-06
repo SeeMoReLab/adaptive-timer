@@ -10,7 +10,7 @@ from models import (
     TIMEOUT_VALUES_MS,
     PHASE_INDEX_TO_TIMEOUT_INDEX,
     LinearTorchModel,
-    ThompsonLinearModel,
+    SVMTorchModel,
     TensorModel,
     QuadraticRewardScaler,
     get_action_space_size,
@@ -32,7 +32,7 @@ PROTOCOL_NAME_TO_ENUM = {
 
 MODEL_NAME_TO_TENSORMODEL = {
     "linear": LinearTorchModel,
-    "thompson": ThompsonLinearModel
+    "svm": SVMTorchModel,
 }
 
 
@@ -48,7 +48,7 @@ def _parse_protocol(value: str) -> int:
 def _parse_model(value: str) -> TensorModel:
     model = MODEL_NAME_TO_TENSORMODEL.get(value.strip().lower())
     if model is None:
-        valid = ", ".join(sorted({"linear","thompson"}))
+        valid = ", ".join(sorted({"linear","thompson", 'svm'}))
         raise argparse.ArgumentTypeError(
             f"Unsupported model '{value}'. Valid options: {valid}"
         )
@@ -73,7 +73,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--train-csv",
         type=Path,
-        default=Path(__file__).resolve().parent / "data" / "sample_pbft.csv",
+        default=Path(__file__).resolve().parent / "data" / "pbft_synthetic.csv",
         help="Training CSV path.",
     )
     parser.add_argument(
@@ -82,8 +82,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional test CSV path. If omitted, train CSV is reused.",
     )
-    parser.add_argument("--epochs", type=int, default=1000)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--eval-ratio", type=float, default=0.2)
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
@@ -114,23 +114,34 @@ def run_pipeline(
     reward_transform = (
         QuadraticRewardScaler.transform if reward_scaler == "quadratic" else None
     )
+    data = load_training_data_from_csv(
+        path=train_csv,
+        protocol=protocol,
+        feature_field_names=get_report_feature_field_names(protocol),
+        timeout_values_ms=TIMEOUT_VALUES_MS,
+        phase_options=PHASE_INDEX_TO_TIMEOUT_INDEX,
+        reward_transform=reward_transform,
+    )
+
+    train_loader, eval_loader = split_train_eval_loaders(
+        data=data,
+        batch_size=batch_size,
+        eval_ratio=eval_ratio,
+        seed=seed,
+    )
+
     model = train_linear_model_from_csv(
         protocol=protocol,
         model=model,
-        train_csv=train_csv,
+        train_loader=train_loader,
+        eval_loader=eval_loader,
         lr=lr,
         epochs=epochs,
-        batch_size=batch_size,
-        eval_ratio=eval_ratio,
         verbose=verbose,
-        reward_transform=reward_transform,
-        seed=seed,
     )
     metrics = evaluate_linear_model_on_csv(
         model=model,
-        protocol=protocol,
-        path=test_csv or train_csv,
-        batch_size=batch_size,
+        eval_loader=eval_loader,
     )
     protocol_name = agent_pb2.Protocol.Name(protocol)
     print(
@@ -139,7 +150,6 @@ def run_pipeline(
         f"model={model.__class__.__name__}, "
         f"train_csv={train_csv}, "
         f"test_csv={test_csv or train_csv}, "
-        f"samples={int(metrics['samples'])}, "
         f"accuracy={metrics['accuracy']:.4f}, "
         f"f1_macro={metrics['f1_macro']:.4f}, "
         f"weighted_loss={metrics['weighted_loss']:.6f}"
@@ -149,58 +159,43 @@ def run_pipeline(
 def train_linear_model_from_csv(
     protocol: int,
     model: TensorModel,
-    train_csv: Path,
+    train_loader: DatasetLoader,
+    eval_loader: DatasetLoader,
     lr: float,
     epochs: int,
-    batch_size: int,
-    eval_ratio: float,
     verbose: bool,
-    reward_transform: Optional[Callable[[float], float]],
-    seed: Optional[int],
 ) -> TensorModel:
-    data = load_training_data_from_csv(
-        path=train_csv,
-        protocol=protocol,
-        feature_field_names=get_report_feature_field_names(protocol),
-        timeout_values_ms=TIMEOUT_VALUES_MS,
-        phase_options=PHASE_INDEX_TO_TIMEOUT_INDEX,
-        reward_transform=reward_transform,
-    )
-    train_loader, eval_loader = split_train_eval_loaders(
-        data=data,
-        batch_size=batch_size,
-        eval_ratio=eval_ratio,
-        seed=seed,
-    )
-
     
     tensor_model = model(
         action_dim=get_action_space_size(protocol),
         n_features=get_report_feature_dim(protocol),
         lr=lr,
     )
-
-
     best_weights = tensor_model.save()
-    best_eval_loss = float("inf")
+    best_eval_loss = float("-inf")
 
     show_progress = bool(verbose and tqdm is not None)
     epochs_iter = tqdm(range(epochs), desc="Training") if show_progress else range(epochs)
     for e in epochs_iter:
         train_loss = _run_epoch(tensor_model, train_loader, backward=True)
-        eval_loss = (
-            train_loss
-            if eval_loader is None
-            else _run_epoch(tensor_model, eval_loader, backward=False)
+    
+        metrics = evaluate_linear_model_on_csv(
+            model=tensor_model,
+            eval_loader= eval_loader,
         )
-        if eval_loss < best_eval_loss:
-            best_eval_loss = eval_loss
+        # eval_loss = (
+        #     train_loss
+        #     if eval_loader is None
+        #     else _run_epoch(tensor_model, eval_loader, backward=False)
+        # )
+        if metrics['f1_macro'] > best_eval_loss:
+            best_eval_loss = metrics['f1_macro']
             best_weights = tensor_model.save()
         if show_progress:
             epochs_iter.set_postfix(
                 Epoch=f"{e + 1}/{epochs}",
                 Train_Loss=f"{train_loss:.7f}",
-                Eval_Loss=f"{eval_loss:.7f}",
+                Best_F1=f"{best_eval_loss:.7f}",
             )
 
    
@@ -210,23 +205,8 @@ def train_linear_model_from_csv(
 
 
 def evaluate_linear_model_on_csv(
-    model: TensorModel, protocol: int, path: Path, batch_size: int = 64
+    model: TensorModel, eval_loader: DatasetLoader
 ) -> Dict[str, float]:
-    data = load_training_data_from_csv(
-        path=path,
-        protocol=protocol,
-        feature_field_names=get_report_feature_field_names(protocol),
-        timeout_values_ms=TIMEOUT_VALUES_MS,
-        phase_options=PHASE_INDEX_TO_TIMEOUT_INDEX
-    )
-    loader = DatasetLoader(
-        features=data.features,
-        actions=data.actions,
-        rewards=data.rewards,
-        labels=data.labels,
-        batch_size=batch_size,
-        shuffle=False,
-    )
 
     total = 0
     correct = 0
@@ -237,7 +217,7 @@ def evaluate_linear_model_on_csv(
     f1_sum = 0.0
 
     weighted_loss_sum = 0.0
-    for batch in loader:
+    for batch in eval_loader:
         weighted_loss_sum += model.update_model(
             batch["features"], batch["actions"], batch["rewards"], backward=False
         )
@@ -267,10 +247,10 @@ def evaluate_linear_model_on_csv(
     f1 = f1_sum / num_classes
 
     return {
-        "samples": float(total),
+        "test samples": float(total),
         "accuracy": float(accuracy),
         "f1_macro": float(f1),
-        "weighted_loss": float(weighted_loss_sum / max(len(loader), 1)),
+        "weighted_loss": float(weighted_loss_sum / max(len(eval_loader), 1)),
     }
 
 

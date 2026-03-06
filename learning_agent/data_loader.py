@@ -1,3 +1,4 @@
+from collections import defaultdict
 import csv
 import random
 from dataclasses import dataclass
@@ -86,7 +87,7 @@ class DatasetLoader:
 
 
 def split_train_eval_loaders(
-    data: CsvTrainingData,
+    data, # Assuming CsvTrainingData
     batch_size: int,
     eval_ratio: float = 0.2,
     seed: Optional[int] = None,
@@ -98,18 +99,37 @@ def split_train_eval_loaders(
     if num_samples == 0:
         raise ValueError("Cannot split empty dataset.")
 
-    indices = list(range(num_samples))
     rng = random.Random(seed)
-    rng.shuffle(indices)
 
     if eval_ratio == 0.0 or num_samples == 1:
-        split_idx = num_samples
+        train_idx = list(range(num_samples))
+        rng.shuffle(train_idx)
+        eval_idx = []
     else:
-        split_idx = int(num_samples * (1.0 - eval_ratio))
-        split_idx = min(max(split_idx, 1), num_samples - 1)
+        label_to_indices = defaultdict(list)
+        for i, label in enumerate(data.labels):
+            label_val = label.item() if hasattr(label, 'item') else label
+            label_to_indices[label_val].append(i)
 
-    train_idx = indices[:split_idx]
-    eval_idx = indices[split_idx:]
+        train_idx = []
+        eval_idx = []
+
+        #Split each label group proportionally
+        for label_val, idxs in label_to_indices.items():
+            rng.shuffle(idxs)
+            n_class = len(idxs)
+
+            if n_class == 1:
+                train_idx.extend(idxs)
+            else:
+                split_idx = int(n_class * (1.0 - eval_ratio))
+                split_idx = max(1, min(split_idx, n_class - 1))
+
+                train_idx.extend(idxs[:split_idx])
+                eval_idx.extend(idxs[split_idx:])
+
+        rng.shuffle(train_idx)
+        rng.shuffle(eval_idx)
 
     train_loader = DatasetLoader(
         features=[data.features[i] for i in train_idx],
@@ -119,8 +139,8 @@ def split_train_eval_loaders(
         batch_size=batch_size,
         shuffle=True,
     )
-
-    eval_loader: Optional[DatasetLoader] = None
+    
+    eval_loader = None
     if eval_idx:
         eval_loader = DatasetLoader(
             features=[data.features[i] for i in eval_idx],
@@ -128,7 +148,7 @@ def split_train_eval_loaders(
             rewards=[data.rewards[i] for i in eval_idx],
             labels=[data.labels[i] for i in eval_idx],
             batch_size=batch_size,
-            shuffle=False,
+            shuffle=False, # Eval loader doesn't strictly need shuffling
         )
 
     return train_loader, eval_loader

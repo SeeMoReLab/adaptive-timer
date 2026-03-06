@@ -7,9 +7,10 @@ from typing import Dict, Generic, List, Optional, Tuple, TypeVar
 
 import torch
 import torch.nn.functional as F
-from torch.distributions import Categorical
-import random
-from collections import deque
+import numpy as np
+# import xgboost as xgb
+import pickle
+import io
 
 import agent_pb2
 
@@ -380,8 +381,7 @@ class QuadraticRewardScaler(RewardTransformer):
         value = float(max(0, throughput))
         if value < 1000.0:
             return (value / 1000.0) ** 2 * 1000.0
-        return value
-            
+        return value          
 
 class LinearTorchModel(TensorModel):
     """Linear classifier over protocol-specific discrete timeout options."""
@@ -391,7 +391,7 @@ class LinearTorchModel(TensorModel):
             raise ValueError(f"action_dim must be > 0, got {action_dim}")
         self._action_dim = int(action_dim)
         self.weights = torch.zeros((self._action_dim, n_features), requires_grad=True)
-        self.optimizer = torch.optim.AdamW([self.weights], lr=lr)
+        self.optimizer = torch.optim.AdamW([self.weights], lr=lr,  weight_decay=0.01)
 
     def predict_action(self, features: torch.Tensor) -> torch.Tensor:
         if features.dim() == 1:
@@ -452,7 +452,6 @@ class LinearTorchModel(TensorModel):
         with torch.no_grad():
             self.weights.copy_(weights)
 
-
 class RandomTimeoutModel(TensorModel):
     """Selects a random timeout action index each prediction."""
 
@@ -486,7 +485,6 @@ class RandomTimeoutModel(TensorModel):
 
     def reset_model(self) -> None:
         self._rng.manual_seed(self._initial_seed)
-
 
 class ScheduledTimeoutModel(TensorModel):
     """Returns protocol-specific timeout option indices from a time-based schedule."""
@@ -614,39 +612,21 @@ class ScheduledTimeoutModel(TensorModel):
         self._start_time = time.monotonic()
         self._active_row = -1
 
-class ThompsonLinearModel(TensorModel):
-    """Bayesian Linear CMAB over protocol-specific discrete timeout options."""
+class SVMTorchModel(TensorModel):
+    """Linear SVM classifier over protocol-specific discrete timeout options."""
 
-    def __init__(self, action_dim: int, n_features: int, lr: float = 0.01, kl_weight: float = 0.001):
+    def __init__(self, action_dim: int, n_features: int, lr: float = 0.01, margin: float = 1.0):
         if action_dim <= 0:
             raise ValueError(f"action_dim must be > 0, got {action_dim}")
-            
         self._action_dim = int(action_dim)
-        self.n_features = n_features
-        self.kl_weight = kl_weight
-        
-        self.mu = torch.zeros((self._action_dim, n_features), requires_grad=True)
-        self.log_var = torch.zeros((self._action_dim, n_features), requires_grad=True)
-        
-        self.optimizer = torch.optim.AdamW([self.mu, self.log_var], lr=lr)
+        self.margin = margin
+        self.weights = torch.nn.Parameter(torch.randn(self._action_dim, n_features) * 0.01)
+        self.optimizer = torch.optim.AdamW([self.weights], lr=lr, weight_decay=0.01)
 
-    def predict_action(self, features: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
-        """
-        deterministic=False: Exploration
-        deterministic=True: Exploitation
-        """
+    def predict_action(self, features: torch.Tensor) -> torch.Tensor:
         if features.dim() == 1:
-            features = features.unsqueeze(0)
-            
-        if deterministic:
-            weights = self.mu
-        else:
-            # Sample weights N(mu, exp(log_var))
-            std = torch.exp(0.5 * self.log_var)
-            eps = torch.randn_like(std)
-            weights = self.mu + (eps * std)
-        
-        return torch.matmul(features, weights.t())
+            return torch.mv(self.weights, features)
+        return torch.matmul(features, self.weights.t())
 
     def update_model(
         self,
@@ -659,55 +639,36 @@ class ThompsonLinearModel(TensorModel):
             if features.dim() == 1:
                 features = features.unsqueeze(0)
 
-            actions_tensor = torch.as_tensor(actions, dtype=torch.float32).view(-1)
+            actions_tensor = torch.as_tensor(actions, dtype=torch.long).view(-1)
             rewards_tensor = torch.as_tensor(rewards, dtype=torch.float32).view(-1)
-
+            
             batch_size = features.shape[0]
-            if actions_tensor.numel() == 1 and batch_size > 1:
-                actions_tensor = actions_tensor.repeat(batch_size)
-            if rewards_tensor.numel() == 1 and batch_size > 1:
-                rewards_tensor = rewards_tensor.repeat(batch_size)
-            if actions_tensor.numel() != batch_size:
-                raise ValueError(f"actions batch size mismatch: expected {batch_size}, got {actions_tensor.numel()}")
-            if rewards_tensor.numel() != batch_size:
-                raise ValueError(f"rewards batch size mismatch: expected {batch_size}, got {rewards_tensor.numel()}")
+            logits = self.predict_action(features) # Shape: [batch, action_dim]
 
-            # 1. Sample weights N(mu, exp(log_var))
-            std = torch.exp(0.5 * self.log_var)
-            eps = torch.randn_like(std)
-            sampled_weights = self.mu + (eps * std)
+            target_scores = logits.gather(1, actions_tensor.unsqueeze(1))
             
-            logits = torch.matmul(features, sampled_weights.t())
+            margins = torch.clamp(logits - target_scores + self.margin, min=0.0)
             
+            margins.scatter_(1, actions_tensor.unsqueeze(1), 0.0)
             
-            target_index = torch.round(actions_tensor).long().view(-1)
-            targets = torch.clamp(target_index, 0, self._action_dim - 1)
+            loss_vector = margins.sum(dim=1)
+            
             reward_scales = torch.clamp(rewards_tensor, min=0.0) / 1000.0
-            ce_loss = (F.cross_entropy(logits, targets, reduction='none') * reward_scales).mean()
-            kl_loss = -0.5 * torch.sum(1 + self.log_var - self.mu.pow(2) - self.log_var.exp())
-            
-            loss = ce_loss + (self.kl_weight * kl_loss) 
+            loss = (loss_vector * reward_scales).mean()
 
-            if backward and float(loss.item()) > 0.0:
+            if backward and loss > 0.0:
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
-                
+
             return float(loss.item())
-    
+
     def reset_model(self) -> None:
-        """Initialize means to zero and variances to a standard normal uncertainty."""
-        with torch.no_grad():
-            torch.nn.init.zeros_(self.mu)
-            torch.nn.init.zeros_(self.log_var)
+        torch.nn.init.xavier_uniform_(self.weights)
 
     def save(self) -> torch.Tensor:
-        """Return the learned means and the variances."""
-        return torch.stack([self.mu, self.log_var]).detach()
-    
-    def load(self, weights: torch.Tensor) -> None:
-        """Load the distribution parameters into the model."""
-        with torch.no_grad():
-            self.mu.copy_(weights[0])
-            self.log_var.copy_(weights[1])
+        return self.weights.clone().detach()
 
+    def load(self, weights: torch.Tensor) -> None:
+        with torch.no_grad():
+            self.weights.copy_(weights)

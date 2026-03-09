@@ -87,7 +87,7 @@ class DatasetLoader:
 
 
 def split_train_eval_loaders(
-    data, # Assuming CsvTrainingData
+    data, 
     batch_size: int,
     eval_ratio: float = 0.2,
     seed: Optional[int] = None,
@@ -114,7 +114,7 @@ def split_train_eval_loaders(
         train_idx = []
         eval_idx = []
 
-        #Split each label group proportionally
+        #Stratified Sampling
         for label_val, idxs in label_to_indices.items():
             rng.shuffle(idxs)
             n_class = len(idxs)
@@ -125,6 +125,7 @@ def split_train_eval_loaders(
                 split_idx = int(n_class * (1.0 - eval_ratio))
                 split_idx = max(1, min(split_idx, n_class - 1))
 
+                # eval should have smaller ratio
                 train_idx.extend(idxs[:split_idx])
                 eval_idx.extend(idxs[split_idx:])
 

@@ -27,6 +27,12 @@ def _extract_state(report_local: agent_pb2.ReportLocal, protocol: int) -> object
                 f"ReportLocal for node {report_local.node_id} missing sbft_state"
             )
         return report_local.sbft_state
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        if not report_local.HasField("tendermint_state"):
+            raise ValueError(
+                f"ReportLocal for node {report_local.node_id} missing tendermint_state"
+            )
+        return report_local.tendermint_state
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -93,6 +99,7 @@ class BaseAggregator(ABC):
             agent_pb2.PROTOCOL_PBFT,
             agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT,
             agent_pb2.PROTOCOL_SBFT,
+            agent_pb2.PROTOCOL_TENDERMINT,
         ):
             raise ValueError(f"Unsupported protocol: {protocol}")
         self.protocol = protocol

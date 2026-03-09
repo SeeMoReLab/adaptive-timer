@@ -57,6 +57,7 @@ PROTOCOL_NAME_TO_ENUM = {
     "pbft": agent_pb2.PROTOCOL_PBFT,
     "two_pc_over_pbft": agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT,
     "sbft": agent_pb2.PROTOCOL_SBFT,
+    "tendermint": agent_pb2.PROTOCOL_TENDERMINT,
 }
 
 
@@ -69,6 +70,7 @@ def _parse_protocol(value: str) -> int:
         raise argparse.ArgumentTypeError(
             f"Invalid protocol '{value}'. Valid options: {', '.join(PROTOCOL_NAME_TO_ENUM.keys())}"
         )
+    print(f"Returning protocol enum {protocol} for input '{value}'")
     return protocol
 
 
@@ -90,6 +92,12 @@ def _dataset_timeout_field_names(protocol: int) -> Tuple[str, ...]:
             "slow_path_timeout_milliseconds_used",
             "batch_timeout_milliseconds_used",
         )
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        return (
+            "propose_timeout_milliseconds_used",
+            "prevote_timeout_milliseconds_used",
+            "precommit_timeout_milliseconds_used",
+        )
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -107,6 +115,12 @@ def _dataset_timeout_values(protocol: int, timeout_used: object) -> Tuple[object
             getattr(timeout_used, "slow_path_timeout_milliseconds", ""),
             getattr(timeout_used, "batch_timeout_milliseconds", ""),
         )
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        return (
+            getattr(timeout_used, "propose_timeout_milliseconds", ""),
+            getattr(timeout_used, "prevote_timeout_milliseconds", ""),
+            getattr(timeout_used, "precommit_timeout_milliseconds", ""),
+        )
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -123,6 +137,10 @@ def _extract_state(report: agent_pb2.ReportLocal, protocol: int) -> object:
         if not report.HasField("sbft_state"):
             raise ValueError("ReportLocal missing sbft_state")
         return report.sbft_state
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        if not report.HasField("tendermint_report"):
+            raise ValueError("ReportLocal missing tendermint_report")
+        return report.tendermint_report
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -135,6 +153,9 @@ def _set_state(report: agent_pb2.ReportLocal, protocol: int, state: object) -> N
         return
     if protocol == agent_pb2.PROTOCOL_SBFT:
         report.sbft_state.CopyFrom(state)
+        return
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        report.tendermint_report.CopyFrom(state)
         return
     raise ValueError(f"Unsupported protocol: {protocol}")
 
@@ -158,6 +179,10 @@ def _timeout_from_status(protocol: int, timeout: agent_pb2.Timeout) -> object:
         if not timeout.HasField("sbft"):
             raise ValueError("Timeout payload missing sbft")
         return timeout.sbft
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        if not timeout.HasField("tendermint"):
+            raise ValueError("Timeout payload missing tendermint")
+        return timeout.tendermint
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -176,6 +201,11 @@ def _extract_reward_payload(protocol: int, reward: agent_pb2.Reward) -> Optional
         if not reward.HasField("sbft"):
             return None
         payload = reward.sbft
+        return payload.episode, payload.report, payload.timeout_used
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        if not reward.HasField("tendermint"):
+            return None
+        payload = reward.tendermint
         return payload.episode, payload.report, payload.timeout_used
     return None
 
@@ -480,7 +510,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._injection_start_mono = injection_start_mono
         self._active_injection_phase_index = -1
         self._current_episode = 0
-        self._sealed_through_episode = 0
+        self._sealed_through_episode = -1
         self._winner_report_seq_by_episode: Dict[int, int] = {}
         self._reports_by_episode: Dict[
             int, Dict[int, Dict[int, agent_pb2.ReportLocal]]
@@ -522,6 +552,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._dataset_handle.flush()
 
     def _is_episode_sealed_locked(self, episode: int) -> bool:
+        print(f"Checking if episode {episode} is sealed. Sealed through: {self._sealed_through_episode}, submitted: {self._submitted_episodes}, finalized: {self._finalized_episodes}, winner_report_seq_by_episode: {self._winner_report_seq_by_episode}")
         if episode <= self._sealed_through_episode:
             return True
         if episode in self._submitted_episodes:
@@ -905,6 +936,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             start_tick=request.start_tick,
             report_seq=request.report_seq,
         )
+        print(f"[episode {local_report.episode}] received local report from node={self.node_id}")
         _set_state(local_report, self._protocol, incoming_state)
 
         signed_report: Optional[agent_pb2.ReportLocal] = None
@@ -1072,8 +1104,15 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 status=agent_pb2.TimeoutStatus.Status.NOT_RECEIVED,
             )
         with self._lock:
+            print(f"[episode {request.episode}] received timeout request")
             decision = self._timeouts_by_episode.get(request.episode)
+            print(f"[episode {request.episode}] timeout decision: {decision}")
             if decision is not None:
+                print(
+                    f"[episode {request.episode}] returning timeout decision: "
+                    f"timeout={decision.timeout}, start_tick={decision.start_tick}, "
+                    f"report_seq={decision.report_seq}"
+                )
                 return agent_pb2.TimeoutStatus(
                     episode=request.episode,
                     status=agent_pb2.TimeoutStatus.Status.READY,
@@ -1106,7 +1145,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._state_by_episode.clear()
             self._phase_by_episode.clear()
             self._current_episode = 0
-            self._sealed_through_episode = 0
+            self._sealed_through_episode = -1
         return empty_pb2.Empty()
 
     def _store_report_locked(self, report: agent_pb2.ReportLocal) -> bool:
@@ -1141,6 +1180,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             and report.episode not in self._submitted_episodes
         ):
             self._winner_report_seq_by_episode[report.episode] = report_seq
+            print(f"Sealed through episode {self._sealed_through_episode}. Report episode {report.episode} sealed with seq {report_seq}")
             self._sealed_through_episode = max(
                 self._sealed_through_episode, int(report.episode)
             )
@@ -1295,9 +1335,15 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 f"{timeout_used.election_timeout_milliseconds}/"
                 f"{timeout_used.prepare_timeout_milliseconds}"
             )
+        elif self._protocol == agent_pb2.PROTOCOL_TENDERMINT:
+            reward_timeout = (
+                f"{timeout_used.propose_timeout_milliseconds}/"
+                f"{timeout_used.prevote_timeout_milliseconds}/"
+                f"{timeout_used.precommit_timeout_milliseconds}"
+            )
         else:
             reward_timeout = (
-                f"{timeout_used.election_timeout_milliseconds}/"
+                f"{timeout_used.prevote_timeout_milliseconds}/"
                 f"{timeout_used.slow_path_timeout_milliseconds}/"
                 f"{timeout_used.batch_timeout_milliseconds}"
             )
@@ -1584,7 +1630,7 @@ def main():
         ),
     )
     args = parser.parse_args()
-
+    print(args.protocol)
     serve(
         protocol=args.protocol,
         node_id=args.node_id,

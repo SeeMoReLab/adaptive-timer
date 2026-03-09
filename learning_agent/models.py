@@ -130,6 +130,20 @@ SBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "regency_change_count",
 )
 
+TENDERMINT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
+    "total_transactions",
+    "total_consensus_instances",
+    "avg_consensus_latency_ms",
+    "p95_consensus_latency_ms",
+    "p99_consensus_latency_ms",
+    "throughput_tps",
+    "timeout_violation_rate",
+    "avg_batch_size",
+    "p95_batch_size",
+    "leader_change_count",
+    "regency_change_count",
+)
+
 
 def _protocol_name(protocol: int) -> str:
     try:
@@ -143,6 +157,7 @@ def _validate_protocol(protocol: int) -> int:
         agent_pb2.PROTOCOL_PBFT,
         agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT,
         agent_pb2.PROTOCOL_SBFT,
+        agent_pb2.PROTOCOL_TENDERMINT,
     ):
         raise ValueError(f"Unsupported protocol: {_protocol_name(protocol)}")
     return int(protocol)
@@ -154,6 +169,8 @@ def get_report_feature_field_names(protocol: int) -> Tuple[str, ...]:
         return PBFT_REPORT_FEATURE_FIELD_NAMES
     if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
         return TWO_PC_OVER_PBFT_REPORT_FEATURE_FIELD_NAMES
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        return TENDERMINT_REPORT_FEATURE_FIELD_NAMES
     return SBFT_REPORT_FEATURE_FIELD_NAMES
 
 
@@ -192,6 +209,31 @@ def _two_pc_index_to_pair(index: int) -> Tuple[int, int]:
     return timeout_index_to_ms(election_idx), timeout_index_to_ms(prepare_idx)
 
 
+def _tendermint_triple_to_index(
+    propose_timeout_ms: int, prevote_timeout_ms: int, precommit_timeout_ms: int
+) -> int:
+    propose_idx = timeout_ms_to_index(propose_timeout_ms)
+    prevote_idx = timeout_ms_to_index(prevote_timeout_ms)
+    precommit_idx = timeout_ms_to_index(precommit_timeout_ms)
+    base = len(TIMEOUT_VALUES_MS)
+    return (propose_idx * base * base) + (prevote_idx * base) + precommit_idx
+
+
+def _tendermint_index_to_triple(index: int) -> Tuple[int, int, int]:
+    base = len(TIMEOUT_VALUES_MS)
+    total = base * base * base
+    bounded = max(0, min(index, total - 1))
+    propose_idx = bounded // (base * base)
+    rem = bounded % (base * base)
+    prevote_idx = rem // base
+    precommit_idx = rem % base
+    return (
+        timeout_index_to_ms(propose_idx),
+        timeout_index_to_ms(prevote_idx),
+        timeout_index_to_ms(precommit_idx),
+    )
+
+
 def _sbft_triple_to_index(
     election_timeout_ms: int, slow_path_timeout_ms: int, batch_timeout_ms: int
 ) -> int:
@@ -223,6 +265,7 @@ def get_action_space_size(protocol: int) -> int:
         return len(TIMEOUT_VALUES_MS)
     if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
         return len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS)
+    # SBFT and TENDERMINT both have 3 independent timeouts → 3³ actions
     return len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS)
 
 
@@ -244,6 +287,13 @@ def timeout_to_action_index(protocol: int, timeout_used: object) -> int:
             int(timeout_msg.prepare_timeout_milliseconds),
         )
 
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        timeout_msg = timeout_used
+        return _tendermint_triple_to_index(
+            int(timeout_msg.propose_timeout_milliseconds),
+            int(timeout_msg.prevote_timeout_milliseconds),
+            int(timeout_msg.precommit_timeout_milliseconds),
+        )
     timeout_msg = timeout_used
     return _sbft_triple_to_index(
         int(timeout_msg.election_timeout_milliseconds),
@@ -268,9 +318,16 @@ def action_index_to_timeout(protocol: int, index: int) -> agent_pb2.Timeout:
             )
         )
 
-    election_timeout_ms, slow_path_timeout_ms, batch_timeout_ms = _sbft_index_to_triple(
-        index
-    )
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        propose_timeout_ms, prevote_timeout_ms, precommit_timeout_ms = _tendermint_index_to_triple(index)
+        return agent_pb2.Timeout(
+            tendermint=agent_pb2.TendermintTimeout(
+                propose_timeout_milliseconds=propose_timeout_ms,
+                prevote_timeout_milliseconds=prevote_timeout_ms,
+                precommit_timeout_milliseconds=precommit_timeout_ms,
+            )
+        )
+    election_timeout_ms, slow_path_timeout_ms, batch_timeout_ms = _sbft_index_to_triple(index)
     return agent_pb2.Timeout(
         sbft=agent_pb2.SbftTimeout(
             election_timeout_milliseconds=election_timeout_ms,
@@ -290,9 +347,14 @@ def describe_action(protocol: int, index: int) -> str:
             f"election_timeout_ms={election_timeout_ms}, "
             f"prepare_timeout_ms={prepare_timeout_ms}"
         )
-    election_timeout_ms, slow_path_timeout_ms, batch_timeout_ms = _sbft_index_to_triple(
-        index
-    )
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        propose_ms, prevote_ms, precommit_ms = _tendermint_index_to_triple(index)
+        return (
+            f"propose_timeout_ms={propose_ms}, "
+            f"prevote_timeout_ms={prevote_ms}, "
+            f"precommit_timeout_ms={precommit_ms}"
+        )
+    election_timeout_ms, slow_path_timeout_ms, batch_timeout_ms = _sbft_index_to_triple(index)
     return (
         f"election_timeout_ms={election_timeout_ms}, "
         f"slow_path_timeout_ms={slow_path_timeout_ms}, "
@@ -502,6 +564,21 @@ class ScheduledTimeoutModel(TensorModel):
                     prepare_timeout_ms = int(row[2].strip())
                     option_index = _two_pc_pair_to_index(
                         election_timeout_ms, prepare_timeout_ms
+                    )
+                elif protocol == agent_pb2.PROTOCOL_TENDERMINT:
+                    if len(row) < 4:
+                        raise ValueError(
+                            "Invalid Tendermint schedule at line "
+                            f"{lineno}: expected 4 columns "
+                            "time_s,propose_timeout_ms,prevote_timeout_ms,precommit_timeout_ms."
+                        )
+                    propose_timeout_ms = int(row[1].strip())
+                    prevote_timeout_ms = int(row[2].strip())
+                    precommit_timeout_ms = int(row[3].strip())
+                    option_index = _tendermint_triple_to_index(
+                        propose_timeout_ms,
+                        prevote_timeout_ms,
+                        precommit_timeout_ms,
                     )
                 else:
                     if len(row) < 4:

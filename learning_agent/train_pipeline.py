@@ -11,6 +11,7 @@ from models import (
     PHASE_INDEX_TO_TIMEOUT_INDEX,
     LinearTorchModel,
     SVMTorchModel,
+    PPOTorchModel,
     TensorModel,
     QuadraticRewardScaler,
     get_action_space_size,
@@ -33,6 +34,7 @@ PROTOCOL_NAME_TO_ENUM = {
 MODEL_NAME_TO_TENSORMODEL = {
     "linear": LinearTorchModel,
     "svm": SVMTorchModel,
+    "ppo": PPOTorchModel
 }
 
 
@@ -48,7 +50,7 @@ def _parse_protocol(value: str) -> int:
 def _parse_model(value: str) -> TensorModel:
     model = MODEL_NAME_TO_TENSORMODEL.get(value.strip().lower())
     if model is None:
-        valid = ", ".join(sorted({"linear","thompson", 'svm'}))
+        valid = ", ".join(sorted({"linear", 'svm'}))
         raise argparse.ArgumentTypeError(
             f"Unsupported model '{value}'. Valid options: {valid}"
         )
@@ -68,12 +70,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--model",
         type=_parse_model,
         default='linear',
-        help="Model: linear | thompson",
+        help="Model: linear | svm",
     )
     parser.add_argument(
         "--train-csv",
         type=Path,
-        default=Path(__file__).resolve().parent / "data" / "pbft_synthetic.csv",
+        default=Path(__file__).resolve().parent / "data" / "pbft_original.csv",
         help="Training CSV path.",
     )
     parser.add_argument(
@@ -85,7 +87,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--eval-ratio", type=float, default=0.2)
-    parser.add_argument("--lr", type=float, default=0.01)
+    parser.add_argument("--lr", type=float, default=0.0001)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--reward-scaler",

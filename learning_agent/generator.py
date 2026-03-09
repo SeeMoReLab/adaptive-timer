@@ -61,7 +61,7 @@ class BaseDataGenerator(ABC):
         pass
 
     @abstractmethod
-    def _save(self, df: pd.DataFrame, filename: str) -> None:
+    def save(self, df: pd.DataFrame, filename: str) -> None:
         pass
 
 
@@ -83,7 +83,7 @@ class DataGenerator(BaseDataGenerator):
         with os.scandir(path=self.directory_path) as entries:
             for entry in entries:
                 if entry.is_file() and entry.name.endswith('.csv'):
-                    csv_files.append(entry.path)  # Fixed: Use full path to avoid FileNotFoundError
+                    csv_files.append(entry.path) 
 
         if not csv_files:
             print("No CSV files found in the current directory.")
@@ -93,7 +93,7 @@ class DataGenerator(BaseDataGenerator):
         self.df = pd.concat(dataframes, ignore_index=True)
         
         if save:
-            self._save(self.df, f'{self.protocol}_{filename}')
+            self.save(self.df, f'{self.protocol}_{filename}')
 
         print(f"Successfully read {len(csv_files)} files!")
         return self.df
@@ -169,11 +169,11 @@ class DataGenerator(BaseDataGenerator):
         )
 
         if save:
-            self._save(df_synthetic, f'{self.protocol}_{filename}')
+            self.save(df_synthetic, f'{self.protocol}_{filename}')
             
         return df_synthetic
 
-    def _save(self, df: pd.DataFrame, filename: str) -> None:
+    def save(self, df: pd.DataFrame, filename: str) -> None:
         df.to_csv(os.path.join(self.directory_path, filename), index=False)
 
     def _generate_kde(self, original_df: pd.DataFrame, num_samples: int, ordinal_cols: List[str]) -> pd.DataFrame:

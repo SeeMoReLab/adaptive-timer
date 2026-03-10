@@ -8,6 +8,7 @@ RUN_SCRIPT="${REPO_ROOT}/scripts/cloudlab/run_pbft.sh"
 FAILURE_SPEC="${REPO_ROOT}/config/bft-smart/failure_spec.xml"
 SYSTEM_CONFIG="${REPO_ROOT}/config/bft-smart/system.config"
 RUN_OUTPUT="${REPO_ROOT}/scripts/cloudlab/tmp/output.txt"
+SERVER_LOG_DIR="${REPO_ROOT}/scripts/cloudlab/tmp/server_logs"
 
 SSH_KEY="${HOME}/.ssh/cloudlab"
 MODE="normal"
@@ -33,6 +34,9 @@ Options:
   --keep-config           Keep last tuple config values instead of restoring originals
   --continue-on-error     Continue remaining tuples if one run fails
   -h, --help              Show this help
+
+Notes:
+  This script always runs run_pbft with --log so server regency can be appended to output.
 
 Tuple format:
   delay:timeout:backoff
@@ -65,6 +69,81 @@ normalize_bool() {
       return 1
       ;;
   esac
+}
+
+extract_regency_from_log() {
+  local log_file="$1"
+  local last_line
+
+  if [[ ! -f "${log_file}" ]]; then
+    echo "unknown"
+    return 0
+  fi
+
+  last_line="$(grep -Ei 'Last regency:|regency[[:space:]]+[0-9]+' "${log_file}" | tail -n 1 || true)"
+  if [[ -z "${last_line}" ]]; then
+    echo "unknown"
+    return 0
+  fi
+
+  if [[ "${last_line}" =~ [Ll]ast[[:space:]]+regency:[[:space:]]*([0-9]+),[[:space:]]*next[[:space:]]+regency:[[:space:]]*([0-9]+) ]]; then
+    local current_regency="${BASH_REMATCH[1]}"
+    local next_regency="${BASH_REMATCH[2]}"
+    if (( next_regency > current_regency )); then
+      echo "${next_regency}"
+    else
+      echo "${current_regency}"
+    fi
+    return 0
+  fi
+
+  if [[ "${last_line}" =~ [Rr]egency[[:space:]]+([0-9]+) ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  echo "unknown"
+}
+
+prepend_regency_snapshot_to_output() {
+  local output_file="$1"
+  local tmp_header_file
+  local tmp_output_file
+  local found_logs=0
+
+  if [[ ! -f "${output_file}" ]]; then
+    return 1
+  fi
+
+  if [[ ! -d "${SERVER_LOG_DIR}" ]]; then
+    return 1
+  fi
+
+  tmp_header_file="$(mktemp)"
+  tmp_output_file="$(mktemp)"
+
+  {
+    echo "Regency snapshot (generated at $(date -u '+%Y-%m-%dT%H:%M:%SZ'))"
+    while IFS= read -r log_file; do
+      [[ -z "${log_file}" ]] && continue
+      found_logs=1
+      echo "  - $(basename "${log_file}"): regency=$(extract_regency_from_log "${log_file}")"
+    done < <(find "${SERVER_LOG_DIR}" -maxdepth 1 -type f -name 'server_*.log' | sort)
+    echo
+  } > "${tmp_header_file}"
+
+  if (( found_logs == 0 )); then
+    rm -f "${tmp_header_file}" "${tmp_output_file}"
+    return 1
+  fi
+
+  {
+    cat "${tmp_header_file}"
+    cat "${output_file}"
+  } > "${tmp_output_file}"
+  mv "${tmp_output_file}" "${output_file}"
+  rm -f "${tmp_header_file}"
+  return 0
 }
 
 update_failure_spec_first_phase_delay() {
@@ -277,7 +356,7 @@ for tuple in "${TUPLES[@]}"; do
   update_system_config_timeout "${timeout_ms}" "${backoff}"
 
   cmd=(
-    bash "${RUN_SCRIPT}" "${SSH_KEY}" "${MODE}" --trim-output -f "${F}" -t "${DURATION_SECONDS}"
+    bash "${RUN_SCRIPT}" "${SSH_KEY}" "${MODE}" --trim-output --log -f "${F}" -t "${DURATION_SECONDS}"
   )
   echo "Command: ${cmd[*]}"
 
@@ -295,6 +374,9 @@ for tuple in "${TUPLES[@]}"; do
     output_snapshot="${RESULTS_DIR}/${output_basename}"
 
     if [[ -f "${RUN_OUTPUT}" ]]; then
+      if ! prepend_regency_snapshot_to_output "${RUN_OUTPUT}"; then
+        echo "Warning: unable to prepend regency snapshot (missing or unparsable server logs)." >&2
+      fi
       cp "${RUN_OUTPUT}" "${output_snapshot}"
       echo "Saved output snapshot: ${output_snapshot}"
     else

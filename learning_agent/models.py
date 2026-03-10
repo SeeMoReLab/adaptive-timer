@@ -17,12 +17,12 @@ A = TypeVar("A")  # generic action type
 class TimeoutOption(IntEnum):
     TIMEOUT_300_MS = 300
     TIMEOUT_600_MS = 600
-    TIMEOUT_1800_MS = 1800
+    TIMEOUT_1200_MS = 1200
 
 TIMEOUT_OPTIONS: Tuple[TimeoutOption, ...] = (
     TimeoutOption.TIMEOUT_300_MS,
     TimeoutOption.TIMEOUT_600_MS,
-    TimeoutOption.TIMEOUT_1800_MS,
+    TimeoutOption.TIMEOUT_1200_MS,
 )
 TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(int(option) for option in TIMEOUT_OPTIONS)
 TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
@@ -37,9 +37,9 @@ class PhaseMapping(IntEnum):
     PHASE_4 = TimeoutOption.TIMEOUT_600_MS
     PHASE_5 = TimeoutOption.TIMEOUT_600_MS
     PHASE_6 = TimeoutOption.TIMEOUT_600_MS
-    PHASE_7 = TimeoutOption.TIMEOUT_1800_MS
-    PHASE_8 = TimeoutOption.TIMEOUT_1800_MS
-    PHASE_9 = TimeoutOption.TIMEOUT_1800_MS
+    PHASE_7 = TimeoutOption.TIMEOUT_1200_MS
+    PHASE_8 = TimeoutOption.TIMEOUT_1200_MS
+    PHASE_9 = TimeoutOption.TIMEOUT_1200_MS
 
 PHASE_OPTIONS: Tuple[PhaseMapping, ...] = (
     PhaseMapping.PHASE_0,

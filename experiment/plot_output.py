@@ -7,6 +7,10 @@ import re
 from pathlib import Path
 
 KV_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
+RUN_FILE_RE = re.compile(
+    r"^(?P<run>\d+)_d(?P<delay>\d+)_t(?P<timeout>\d+)_b(?P<backoff>true|false)$",
+    re.IGNORECASE,
+)
 
 
 def parse_monitor_series(file_path: Path):
@@ -34,6 +38,18 @@ def parse_monitor_series(file_path: Path):
             )
 
     return rows
+
+
+def parse_run_key_from_filename(file_path: Path):
+    match = RUN_FILE_RE.fullmatch(file_path.stem)
+    if not match:
+        return None
+    return (
+        int(match.group("delay")),
+        int(match.group("timeout")),
+        match.group("backoff").lower(),
+        int(match.group("run")),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -70,6 +86,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("tps", "p95"),
         help="Plot only one metric: tps or p95. Default plots all metrics.",
     )
+    parser.add_argument(
+        "--average",
+        action="store_true",
+        help=(
+            "Average inputs by (d,t,b) extracted from filename format "
+            "'NNN_d<delay>_t<timeout>_b<true|false>.txt'. "
+            "If any input filename does not match, abort."
+        ),
+    )
     return parser
 
 
@@ -101,7 +126,7 @@ def _visible_sum(values, left_x: float, right_x: float):
     end = min(len(values) - 1, math.floor(right_x))
     if end < start:
         return 0
-    return int(sum(values[start : end + 1]))
+    return int(round(sum(values[start : end + 1])))
 
 
 def _avg_nonzero(values):
@@ -169,6 +194,75 @@ def _format_avg(value):
     return f"{value:.2f}"
 
 
+def _mean(values):
+    return float(sum(values) / len(values))
+
+
+def _mean_nonzero_or_zero(values):
+    nonzero = [value for value in values if value != 0]
+    if not nonzero:
+        return 0.0
+    return float(sum(nonzero) / len(nonzero))
+
+
+def _build_average_series(parser: argparse.ArgumentParser, input_paths, warmup: int):
+    grouped = {}
+
+    for path in input_paths:
+        parsed = parse_run_key_from_filename(path)
+        if parsed is None:
+            parser.error(
+                "Average mode requires all inputs to follow filename format "
+                "'NNN_d<delay>_t<timeout>_b<true|false>.txt'. "
+                f"Bad file: {path.name}"
+            )
+
+        delay, timeout, backoff, run = parsed
+        key = (delay, timeout, backoff)
+        grouped.setdefault(key, []).append((run, path))
+
+    series = []
+    for key in sorted(grouped.keys()):
+        delay, timeout, backoff = key
+        run_paths = [path for _, path in sorted(grouped[key], key=lambda item: item[0])]
+
+        runs = []
+        for path in run_paths:
+            rows = parse_monitor_series(path)
+            rows = _trim_warmup(rows, warmup)
+            if not rows:
+                parser.error(
+                    f"No monitor lines parsed from: {path} "
+                    f"(after warm-up slice rows[{warmup}:])"
+                )
+            runs.append(rows)
+
+        min_len = min(len(rows) for rows in runs)
+        if min_len <= 0:
+            parser.error(
+                f"No samples left to average for d={delay}, t={timeout}, b={backoff}"
+            )
+
+        averaged_rows = []
+        for idx in range(min_len):
+            samples = [rows[idx] for rows in runs]
+            averaged_rows.append(
+                {
+                    "trxs": int(round(_mean([sample["trxs"] for sample in samples]))),
+                    "tps": _mean([sample["tps"] for sample in samples]),
+                    "avg_ms": _mean([sample["avg_ms"] for sample in samples]),
+                    "p95": _mean_nonzero_or_zero([sample["p95"] for sample in samples]),
+                    "p99": _mean_nonzero_or_zero([sample["p99"] for sample in samples]),
+                    "err": int(round(_mean([sample["err"] for sample in samples]))),
+                }
+            )
+
+        label = f"d{delay}_t{timeout}_b{backoff} (n={len(runs)})"
+        series.append((label, run_paths, averaged_rows))
+
+    return series
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -186,17 +280,20 @@ def main():
         parser.error("--warmup must be >= 0")
     warmup = args.warmup
 
-    labels = _make_unique_labels(input_paths)
-    series = []
-    for path, label in zip(input_paths, labels):
-        rows = parse_monitor_series(path)
-        rows = _trim_warmup(rows, warmup)
-        if not rows:
-            parser.error(
-                f"No monitor lines parsed from: {path} "
-                f"(after warm-up slice rows[{warmup}:])"
-            )
-        series.append((label, path, rows))
+    if args.average:
+        series = _build_average_series(parser, input_paths, warmup)
+    else:
+        labels = _make_unique_labels(input_paths)
+        series = []
+        for path, label in zip(input_paths, labels):
+            rows = parse_monitor_series(path)
+            rows = _trim_warmup(rows, warmup)
+            if not rows:
+                parser.error(
+                    f"No monitor lines parsed from: {path} "
+                    f"(after warm-up slice rows[{warmup}:])"
+                )
+            series.append((label, [path], rows))
 
     if args.only == "tps":
         fig, ax_tps = plt.subplots(1, 1, figsize=(12, 4))
@@ -219,7 +316,7 @@ def main():
         tps = [r["tps"] for r in rows]
         p95 = [r["p95"] for r in rows]
         err = [r["err"] for r in rows]
-        total_trxs = int(sum(trxs))
+        total_trxs = int(round(sum(trxs)))
 
         if ax_tps is not None:
             (line_tps,) = ax_tps.plot(
@@ -322,7 +419,8 @@ def main():
 
     fig.suptitle(
         "SmallBank Monitor Comparison\n"
-        f"inputs={len(series)}, warmup={warmup}, only={args.only or 'all'}"
+        f"inputs={len(input_paths)}, series={len(series)}, warmup={warmup}, "
+        f"only={args.only or 'all'}, average={args.average}"
     )
     fig.tight_layout()
 

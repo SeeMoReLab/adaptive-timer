@@ -232,13 +232,13 @@ if __name__ == '__main__':
         help="The protocol to use (default: pbft)"
     )
     parser.add_argument(
-        '-d', '--data_dir', 
+        '-d', '--data-dir', 
         type=str, 
-        default='./data/pbft', 
+        default='learning_agent/data/pbft', 
         help="Directory containing the original CSV files (default: ./data)"
     )
     parser.add_argument(
-        '-n', '--num_episodes', 
+        '-n', '--num-episodes', 
         type=int, 
         default=1000, 
         help="Number of episodes per phase to generate (default: 1000)"

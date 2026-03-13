@@ -65,6 +65,39 @@ If you change `proto/agent.proto`, regenerate Python stubs:
 bash compile_proto.sh
 ```
 
+### Generate Synthetic Dataset
+
+To generate synthetic dataset from the observed environment dataset:
+
+```bash
+python learning_agent/generator.py \
+  --protocol pbft \
+  --data-dir learning_agent/data/pbft \
+  --num-episodes 1000
+```
+With $N$ agent observations located in ./data/pbft, each agent will generate 1,000 episodes per phase.
+
+### Learning Agent Offline Training
+
+To train defined models using available dataset:
+
+```bash
+python learning_agent/train_pipeline.py \
+  --protocol pbft \
+  --model linear \
+  --train-csv learning_agent/data/pbft_synthetic.csv \
+  --save-path learning_agent/pretrained_models/linear.pt
+```
+
+You can use the pretrained weight on with loading the saved .pt file:
+```python
+import torch
+from models import LinearModel
+model = LinearModel()
+model.load_state_dict(torch.load('learning_agent/pretrained_models/linear.pt'))
+```
+
+
 ## PBFT Run
 
 These scripts run SmallBank PBFT with:

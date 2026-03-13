@@ -84,6 +84,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional test CSV path. If omitted, train CSV is reused.",
     )
+
+    parser.add_argument(
+        "--save-path",
+        type=Path,
+        default=Path(__file__).resolve().parent / "pretrained_models" / "linear.pt",
+        help="Pretrained weight path.",
+    )
+
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--eval-ratio", type=float, default=0.2)
@@ -111,6 +119,7 @@ def run_pipeline(
     seed: int,
     reward_scaler: str,
     verbose: bool,
+    save_path: Optional[Path] = None,
 ) -> None:
     protocol = int(protocol)
     reward_transform = (
@@ -140,6 +149,7 @@ def run_pipeline(
         lr=lr,
         epochs=epochs,
         verbose=verbose,
+        save_path = save_path
     )
     metrics = evaluate_linear_model_on_csv(
         model=model,
@@ -166,6 +176,7 @@ def train_linear_model_from_csv(
     lr: float,
     epochs: int,
     verbose: bool,
+    save_path: Optional[Path] = None,
 ) -> TensorModel:
     
     tensor_model = model(
@@ -185,11 +196,6 @@ def train_linear_model_from_csv(
             model=tensor_model,
             eval_loader= eval_loader,
         )
-        # eval_loss = (
-        #     train_loss
-        #     if eval_loader is None
-        #     else _run_epoch(tensor_model, eval_loader, backward=False)
-        # )
         if metrics['f1_macro'] > best_eval_loss:
             best_eval_loss = metrics['f1_macro']
             best_weights = tensor_model.save()
@@ -202,6 +208,10 @@ def train_linear_model_from_csv(
 
    
     tensor_model.load(best_weights)
+
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(best_weights, save_path)
 
     return tensor_model
 
@@ -299,6 +309,7 @@ def main() -> None:
         seed=args.seed,
         reward_scaler=args.reward_scaler,
         verbose=True,
+        save_path= args.save_path
     )
 
 

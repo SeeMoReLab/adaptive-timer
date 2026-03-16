@@ -142,6 +142,9 @@ TENDERMINT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "p95_batch_size",
     "leader_change_count",
     "regency_change_count",
+    "propose_latency_ms",
+    "prevote_latency_ms",
+    "precommit_latency_ms",
 )
 
 

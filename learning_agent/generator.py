@@ -1,16 +1,17 @@
 import os
 import random
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Tuple, TypeVar
+from typing import  List, Optional, Tuple
 import argparse
 
 import numpy as np
 import pandas as pd
 from scipy.stats import gaussian_kde
+import csv
+import io
 
 PBFT_FEATURE_FIELD: Tuple[str, ...] = (
     "report_node_id",
-    "phase",
     "total_transactions",
     "total_consensus_instances",
     "avg_consensus_latency_ms",
@@ -50,15 +51,11 @@ def seed_everything(seed: int = 42):
 class BaseDataGenerator(ABC):
     
     @abstractmethod
-    def read_data(self, save: bool = False, filename: str = "original.csv") -> Optional[pd.DataFrame]:
+    def _read_data(self) -> Optional[pd.DataFrame]:
         pass
 
     @abstractmethod
-    def generate_data(self, save: bool = False, filename: str = "synthetic.csv") -> Optional[pd.DataFrame]:
-        pass
-
-    @abstractmethod
-    def save(self, df: pd.DataFrame, filename: str) -> None:
+    def generate_phase(self) -> Optional[pd.DataFrame]:
         pass
 
 
@@ -74,8 +71,10 @@ class DataGenerator(BaseDataGenerator):
             self.col_ordinal = PBFT_REPORT_ORDINAL_COLUMNS
         else:
             raise ValueError("Unknown protocol! Supported: pbft")
+        
+        self._read_data()
     
-    def read_data(self, save: bool = False, filename: str = "original.csv") -> Optional[pd.DataFrame]:
+    def _read_data(self) -> Optional[pd.DataFrame]:
         csv_files = []
         with os.scandir(path=self.directory_path) as entries:
             for entry in entries:
@@ -88,90 +87,82 @@ class DataGenerator(BaseDataGenerator):
 
         dataframes = [pd.read_csv(file) for file in csv_files]
         self.df = pd.concat(dataframes, ignore_index=True)
-        
-        if save:
-            self.save(self.df, f'{self.protocol}_{filename}')
+   
 
         print(f"Successfully read {len(csv_files)} files!")
         return self.df
-        
-    def generate_data(self, save: bool = False, filename: str = "synthetic.csv") -> Optional[pd.DataFrame]:
+      
+    def generate_phase(self, phase_index: int = 0, current_start_episode: int = 0, verbose: bool = False)-> csv.DictReader:
         if self.df is None or self.df.empty:
             print("No data available. Please run read_data() first.")
             return None
 
-        phase_df = {}
-        for phase_name, phase_data in self.df.groupby('phase'):
-            phase_df[phase_name] = phase_data
-            print(f"Phase '{phase_name}' has {len(phase_data)} rows.")
+        grouped_df = self.df[self.df['phase'] == phase_index]
 
-        conf = {}
-        conf_stats = {}
-
-        for key, items in phase_df.items():
-            conf[key] = {
+        conf = {
                 timeout: group['reward'].dropna().values
-                for timeout, group in items.groupby('election_timeout_milliseconds_used')
+                for timeout, group in grouped_df.groupby('election_timeout_milliseconds_used')
             }
-            conf_stats[key] = items.groupby('election_timeout_milliseconds_used')['reward'].agg(
-                ['mean', 'std', 'median', 'var', 'min', 'max']
-            ).to_dict()
         
-        first_phase_key = list(phase_df.keys())[0]
-        unique_nodes = phase_df[first_phase_key]['report_node_id'].dropna().unique()
+        conf_stats = grouped_df.groupby('election_timeout_milliseconds_used')['reward'].agg(
+                ['mean', 'std', 'median', 'var', 'min', 'max']
+        ).to_dict(orient='index')
+        
+        unique_nodes = grouped_df['report_node_id'].dropna().unique()
         
         res = {}
-        current_start_episode = 1
 
-        for key in sorted(phase_df.keys()):
-            feature_cols = [c for c in self.col_name if c not in STRUCTURAL_COLUMNS]
-            original_phase_data = phase_df[key][feature_cols]
+        feature_cols = [c for c in self.col_name if c not in STRUCTURAL_COLUMNS]
+        original_phase_data = grouped_df[feature_cols]
 
-            synthetic_episodes = np.arange(current_start_episode, current_start_episode + self.num_episodes_per_phase)
-            skeleton_index = pd.MultiIndex.from_product(
-                [synthetic_episodes, unique_nodes],
-                names=['reward_episode', 'report_node_id']
-            )
-            trial = pd.DataFrame(index=skeleton_index).reset_index()
-            total_rows = len(trial)
+        synthetic_episodes = np.arange(current_start_episode, current_start_episode + self.num_episodes_per_phase)
+        skeleton_index = pd.MultiIndex.from_product(
+            [synthetic_episodes, unique_nodes],
+            names=['reward_episode', 'report_node_id']
+        )
+        trial = pd.DataFrame(index=skeleton_index).reset_index()
+        total_rows = len(trial)
 
-            print(f"Phase {key}: Generating {total_rows} rows...")
+        if verbose:
+            print(f"Phase {phase_index}: Generating {total_rows} rows...")
 
-            synthetic_features = self._generate_kde(
-                original_df=original_phase_data,
-                num_samples=total_rows,
-                ordinal_cols=self.col_ordinal
-            )
-            
-            for col in feature_cols:
-                trial[col] = synthetic_features[col].values
+        synthetic_features = self._generate_kde(
+            original_df=original_phase_data,
+            num_samples=total_rows,
+            ordinal_cols=self.col_ordinal
+        )
+        
+        for col in feature_cols:
+            trial[col] = synthetic_features[col].values
 
-            available_timeouts = list(conf[key].keys())
+        available_timeouts = list(conf.keys())
+
+        if current_start_episode ==0:
+            trial['election_timeout_milliseconds_used'] = 300
+        else:
             trial['election_timeout_milliseconds_used'] = trial['election_timeout_milliseconds_used'].apply(
                 lambda t: min(available_timeouts, key=lambda x: abs(x - t))
             )
 
-            rewards = np.empty(total_rows)
-            for timeout_val, group_idx in trial.groupby('election_timeout_milliseconds_used').groups.items():
-                n = len(group_idx)
-                rewards[group_idx] = self._sample_reward_by_timeout(timeout_val, conf[key], n)
+        rewards = np.empty(total_rows)
+        for timeout_val, group_idx in trial.groupby('election_timeout_milliseconds_used').groups.items():
+            n = len(group_idx)
+            rewards[group_idx] = self._sample_reward_by_timeout(timeout_val, conf_stats, n)
 
-            trial['reward'] = rewards
-            res[key] = trial
-            current_start_episode += self.num_episodes_per_phase
+        trial['reward'] = rewards
+        res = trial
+        res = res.assign(phase=phase_index)
 
-        df_synthetic = pd.concat(
-            [df.assign(phase=key) for key, df in res.items()],
-            ignore_index=True
-        )
+        csv_buffer = io.StringIO()
 
-        if save:
-            self.save(df_synthetic, f'{self.protocol}_{filename}')
+        res.to_csv(csv_buffer, index=False)
+        csv_buffer.seek(0)
+        reader = csv.DictReader(csv_buffer)
+
+        
+        current_start_episode += self.num_episodes_per_phase
             
-        return df_synthetic
-
-    def save(self, df: pd.DataFrame, filename: str) -> None:
-        df.to_csv(os.path.join(self.directory_path, filename), index=False)
+        return reader, current_start_episode
 
     def _generate_kde(self, original_df: pd.DataFrame, num_samples: int, ordinal_cols: List[str]) -> pd.DataFrame:
         """
@@ -205,64 +196,37 @@ class DataGenerator(BaseDataGenerator):
 
         return pd.DataFrame(res)
     
-    def _sample_reward_by_timeout(self, timeout_val: float, phase_rewards: dict, n_samples: int) -> np.ndarray:
+    def _sample_reward_by_timeout(
+            self, timeout_val: float, conf_stats: dict, n_samples: int, temperature:float = 1.5
+            ) -> np.ndarray:
         """
-        Quantile resample: maps uniform random draws onto the sorted original reward values
+        Generates rewards using a Normal distribution based on historical mean and std, 
         """
-        orig_vals = np.sort(phase_rewards.get(timeout_val, np.array([0.0])))
+        if n_samples == 0:
+            return np.array([])
 
-        if len(orig_vals) == 0 or n_samples == 0:
-            return np.array([0.0] * n_samples)
+        stats = conf_stats.get(timeout_val, {})
+        mean = stats.get('mean', 0.0)
+        std = stats.get('std', 0.0)
+        min_val = stats.get('min', 0.0)
+        max_val = stats.get('max', 0.0)
 
-        if len(np.unique(orig_vals)) <= 1:
-            return np.full(n_samples, orig_vals[0])
 
-        u = np.random.uniform(0, 1, size=n_samples)
-        indices = (u * (len(orig_vals) - 1)).astype(int)
-        return orig_vals[indices]
+        # Add randomness if sample data small
+        if pd.isna(std) or std == 0:
+            jitter = abs(mean * 0.05) 
+            jitter = jitter if jitter > 0 else 0.1 
+            return np.random.uniform(mean - jitter, mean + jitter, size=n_samples)
+
+        # Generate Normal/Gaussian distribution
+        sampled_rewards = np.random.normal(loc=mean, scale=(std * temperature), size=n_samples)
+
+        # Inject noise
+        anomaly_mask = np.random.rand(n_samples) < 0.1
+        if np.any(anomaly_mask):
+            num_anomalies = np.sum(anomaly_mask)
+            random_spikes = np.random.uniform(min_val, max_val, size=num_anomalies)
+            sampled_rewards[anomaly_mask] = random_spikes
+
+        return sampled_rewards
     
-
-if __name__ == '__main__':
-    seed_everything(42)
-    parser = argparse.ArgumentParser(description="Generate synthetic data for PBFT protocol.")
-    parser.add_argument(
-        '-p', '--protocol', 
-        type=str, 
-        default='pbft', 
-        help="The protocol to use (default: pbft)"
-    )
-    parser.add_argument(
-        '-d', '--data-dir', 
-        type=str, 
-        default='learning_agent/data/pbft', 
-        help="Directory containing the original CSV files (default: ./data)"
-    )
-    parser.add_argument(
-        '-n', '--num-episodes', 
-        type=int, 
-        default=1000, 
-        help="Number of episodes per phase to generate (default: 1000)"
-    )
-
-    args = parser.parse_args()
-
-    if not os.path.exists(args.data_dir):
-        print(f"Directory '{args.data_dir}' not found.\nPlace original'{args.protocol}' CSV files inside '{args.data_dir}' and run again.")
-    else:
-        print(f"Initializing DataGenerator for protocol: {args.protocol}")
-        
-        generator = DataGenerator(
-            protocol=args.protocol, 
-            directory_path=args.data_dir, 
-            num_episode_each_phase=args.num_episodes
-        )
-        df_original = generator.read_data(save=True)
-        
-        if df_original is not None:
-            df_synthetic = generator.generate_data(save=True)
-            
-            if df_synthetic is not None:
-                print(f"Original data shape: {df_original.shape}")
-                print(f"Synthetic data shape: {df_synthetic.shape}")
-        else:
-            print("\nProcess aborted: No original data could be loaded. Please check your directory and CSV files.")

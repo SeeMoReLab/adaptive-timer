@@ -65,38 +65,19 @@ If you change `proto/agent.proto`, regenerate Python stubs:
 bash compile_proto.sh
 ```
 
-### Generate Synthetic Dataset
+### Run Agent Simulation
 
 To generate synthetic dataset from the observed environment dataset:
 
 ```bash
-python learning_agent/generator.py \
-  --protocol pbft \
-  --data-dir learning_agent/data/pbft \
-  --num-episodes 1000
-```
-With $N$ agent observations located in ./data/pbft, each agent will generate 1,000 episodes per phase.
-
-### Learning Agent Offline Training
-
-To train defined models using available dataset:
-
-```bash
-python learning_agent/train_pipeline.py \
+python learning_agent/simulator.py \
   --protocol pbft \
   --model linear \
-  --train-csv learning_agent/data/pbft_synthetic.csv \
-  --save-path learning_agent/pretrained_models/linear.pt
+  --data-dir learning_agent/data/pbft \
+  --num-episodes 1000 \
+  --phases "5;1;2;3;4;5;0;2;1;5;4;2;1"
 ```
-
-You can use the pretrained weight on with loading the saved .pt file:
-```python
-import torch
-from models import LinearModel
-model = LinearModel()
-model.load_state_dict(torch.load('learning_agent/pretrained_models/linear.pt'))
-```
-
+With $N$ agent observations located in ./data/pbft, each agent will have 1,000 episodes for each phase.
 
 ## PBFT Run
 

@@ -3,6 +3,9 @@ from pathlib import Path
 from typing import Callable, Dict, Optional
 import random
 import torch
+import numpy as np
+import os
+
 
 import agent_pb2
 from data_loader import DatasetLoader, load_training_data_from_csv, split_train_eval_loaders
@@ -231,7 +234,7 @@ def evaluate_linear_model_on_csv(
     weighted_loss_sum = 0.0
     for batch in eval_loader:
         weighted_loss_sum += model.update_model(
-            batch["features"], batch["actions"], batch["rewards"], backward=False
+            features = batch["features"], actions = batch["actions"], rewards = batch["rewards"], backward=False
         )
         logits = model.predict_action(batch["features"])
         predicted = torch.argmax(logits, dim=1)
@@ -284,14 +287,17 @@ def _run_epoch(model: TensorModel, loader: DatasetLoader, backward: bool) -> flo
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
-    
+    np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed) 
-        
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed) # If using multi-GPU
+    
+    # Required for PyTorch to be truly deterministic on GPU
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    
+    # Prevents Python's hash randomization from changing dictionary/set iteration order
+    os.environ['PYTHONHASHSEED'] = str(seed)
     
 
 def main() -> None:

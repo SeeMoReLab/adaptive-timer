@@ -363,7 +363,7 @@ def _parse_timeout_ms(
         if raw_value is None or raw_value.strip() == "":
             continue
         try:
-            return int(raw_value)
+            return int(float(raw_value))
         except ValueError as exc:
             raise ValueError(
                 f"Invalid timeout '{field_name}' at CSV line {row_number}: {raw_value!r}"

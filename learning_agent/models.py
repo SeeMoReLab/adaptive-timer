@@ -723,18 +723,18 @@ class PPOTorchModel(TensorModel):
             return self.actor(features)
 
     def update_model(
-        self, features: torch.Tensor, action: torch.Tensor, reward: torch.Tensor | float, done: torch.Tensor | bool = False, backward: bool = True
+        self, features: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor | float, done: torch.Tensor | bool = False, backward: bool = True
     ) -> float:
         if not backward:
             return 0.
         if features.dim() > 1:
             self.batch_obs.extend(list(features))
-            self.batch_acts.extend(list(action))
+            self.batch_acts.extend(list(actions))
             
-            if isinstance(reward, torch.Tensor):
-                self.batch_rews.extend(reward.tolist())
+            if isinstance(rewards, torch.Tensor):
+                self.batch_rews.extend(rewards.tolist())
             else:
-                self.batch_rews.extend([float(reward)] * features.size(0))
+                self.batch_rews.extend([float(rewards)] * features.size(0))
                 
             if isinstance(done, torch.Tensor):
                 self.batch_dones.extend(done.tolist())
@@ -743,8 +743,8 @@ class PPOTorchModel(TensorModel):
                 
         else:
             self.batch_obs.append(features)
-            self.batch_acts.append(action)
-            self.batch_rews.append(float(reward))
+            self.batch_acts.append(actions)
+            self.batch_rews.append(float(rewards))
             self.batch_dones.append(bool(done))
 
         if backward:

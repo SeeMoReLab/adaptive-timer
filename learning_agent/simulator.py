@@ -35,6 +35,11 @@ from models import (
 from train_pipeline import _run_epoch, evaluate_linear_model_on_csv, set_seed, train_linear_model_from_csv
 from generator import DataGenerator
 
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
 
 PROTOCOL_NAME_TO_ENUM = {
     "pbft": agent_pb2.PROTOCOL_PBFT,
@@ -147,14 +152,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=Path(__file__).resolve().parent / "data",
         help="Observation Sample Directory path.",
     )
-
+    
     parser.add_argument(
         "--num-episodes",
         type=int,
         default=1000,
         help="Number of episodes per phase to generate"
     )
-
+    
     parser.add_argument(
         "--phases",
         type=str,
@@ -162,6 +167,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Phase sequence.",
     )
 
+    parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--eval-ratio", type=float, default=0.2)
@@ -177,10 +183,10 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 def generate_data(
-        generator: DataGenerator, protocol: str, phase: int, current_start_episode: int, scaler: RewardTransformer, batch_size: int
+        generator: DataGenerator, protocol: str, phase: int, current_start_episode: int, scaler: RewardTransformer, batch_size: int, num_episode:int = 1
         )-> DatasetLoader:
     
-    phase_data, new_start_episode = generator.generate_phase(phase_index=int(phase), current_start_episode=current_start_episode)
+    phase_data, new_start_episode = generator.generate_phase(phase_index=int(phase), current_start_episode=current_start_episode, num_episode=num_episode)
     parsed_data = _parse_data(
             reader=phase_data,
             protocol=PROTOCOL_NAME_TO_ENUM[protocol],
@@ -206,7 +212,6 @@ def train_model(
     train_loader: DatasetLoader,
     eval_loader: DatasetLoader,
     epochs: int,
-    verbose: bool,
     save_path: Optional[Path] = None,
     early_stop: Optional[int] = 20,
 ) -> Tuple[TensorModel, Dict]:
@@ -215,11 +220,9 @@ def train_model(
     best_eval_metrics = float("-inf")
     count = 0
 
-    show_progress = bool(verbose and tqdm is not None)
-    epochs_iter = tqdm(range(epochs), desc="Training") if show_progress else range(epochs)
 
     stats = {'best_epoch':0, 'best_accuracy':0.0, 'best_loss':0.0}
-    for e in epochs_iter:
+    for e in range(epochs):
         train_loss = _run_epoch(model, train_loader, backward=True)
     
         metrics = evaluate_linear_model_on_csv(
@@ -238,14 +241,7 @@ def train_model(
             count += 1
             if count == early_stop:
                 break
-
-
-        if show_progress:
-            epochs_iter.set_postfix(
-                Epoch=f"{e + 1}/{epochs}",
-                Train_Loss=f"{train_loss:.7f}",
-                Best_Accuracy=f"{best_eval_metrics:.7f}",
-            )
+            
     model.load(best_weights)
 
     if save_path is not None:
@@ -263,7 +259,6 @@ def main() -> None:
     generator = DataGenerator(
             protocol=args.protocol, 
             directory_path=args.data_dir, 
-            num_episode_each_phase=args.num_episodes
         )
     scaler = QuadraticRewardScaler.transform if args.reward_scaler == "quadratic" else None
 
@@ -274,44 +269,55 @@ def main() -> None:
     )
 
     current_start_episode = 0
-    accuracy = []
     idx = 0
-    for phase in args.phases.split(';'):
-        idx+=1
-        phase_loader, current_start_episode = generate_data(
-            generator=generator, 
-            protocol=args.protocol, 
-            phase=phase, 
-            current_start_episode=current_start_episode, 
-            scaler=scaler,
-            batch_size= args.batch_size
+    phases = args.phases.split(';')
+    use_tqdm = HAS_TQDM and args.verbose
+    accuracy = []
+    for phase in phases:
+        idx += 1
+        phase_accuracy, phase_loss = [], []
+        if use_tqdm:
+            episode_iterator = tqdm(
+                range(args.num_episodes), 
+                desc=f"PHASE {phase} ({idx}/{len(phases)})"
+            )
+        else:
+            episode_iterator = range(args.num_episodes)
+            
+        for phase_eps in episode_iterator:
+            phase_loader, current_start_episode = generate_data(
+                generator=generator, 
+                protocol=args.protocol, 
+                phase=phase, 
+                current_start_episode=current_start_episode, 
+                scaler=scaler,       
+                batch_size=args.batch_size,
+                num_episode=1
             )
 
-        metrics = evaluate_linear_model_on_csv(
-        model=model,
-        eval_loader=phase_loader,
-        )
+            metrics = evaluate_linear_model_on_csv(
+                model=model,         
+                eval_loader=phase_loader,
+            )
 
-        accuracy.append(metrics['accuracy'])
+            phase_accuracy.append(metrics['accuracy'])
+            phase_loss.append(metrics['weighted_loss'])
 
-        model, stats = train_model(
-            model=model,
-            train_loader=phase_loader,
-            eval_loader=phase_loader,
-            epochs=args.epochs,
-            verbose= False,
-        )
-        
-        print(
-            f"\n[PHASE {phase} ({idx}/{len(args.phases.split(';'))})] \n"
-            f"[Prediction:]\t"
-            f"accuracy={metrics['accuracy']:.4f}, "
-            f"weighted_loss={metrics['weighted_loss']:.6f}\n"
 
-            f"[Feedback:]\t"
-            f"accuracy={stats['best_accuracy']:.4f}, "
-            f"weighted_loss={stats['best_loss']:.6f}, "
-        )
+            model, _ = train_model(
+                model=model,
+                train_loader=phase_loader,
+                eval_loader=phase_loader,
+                epochs=args.epochs,
+            )
+            
+            if use_tqdm:
+                episode_iterator.set_postfix({
+                    'Pred Acc': f"{sum(phase_accuracy)/len(phase_accuracy):.4f}",
+                    'Pred Loss': f"{sum(phase_loss)/len(phase_loss):.4f}",
+                })
+
+        accuracy.append(sum(phase_accuracy)/len(phase_accuracy))
 
     print(
         f"\n[SUMMARY]]\n"

@@ -60,11 +60,10 @@ class BaseDataGenerator(ABC):
 
 
 class DataGenerator(BaseDataGenerator):
-    def __init__(self, protocol: str, directory_path: str, num_episode_each_phase:int = 1000) -> None:
+    def __init__(self, protocol: str, directory_path: str) -> None:
         self.directory_path = directory_path
         self.df: Optional[pd.DataFrame] = None
         self.protocol = protocol
-        self.num_episodes_per_phase = num_episode_each_phase
 
         if protocol.lower() == 'pbft':
             self.col_name = PBFT_FEATURE_FIELD
@@ -92,7 +91,7 @@ class DataGenerator(BaseDataGenerator):
         print(f"Successfully read {len(csv_files)} files!")
         return self.df
       
-    def generate_phase(self, phase_index: int = 0, current_start_episode: int = 0, verbose: bool = False)-> csv.DictReader:
+    def generate_phase(self, phase_index: int = 0, current_start_episode: int = 0, verbose: bool = False, num_episode:int = 1)-> csv.DictReader:
         if self.df is None or self.df.empty:
             print("No data available. Please run read_data() first.")
             return None
@@ -115,7 +114,7 @@ class DataGenerator(BaseDataGenerator):
         feature_cols = [c for c in self.col_name if c not in STRUCTURAL_COLUMNS]
         original_phase_data = grouped_df[feature_cols]
 
-        synthetic_episodes = np.arange(current_start_episode, current_start_episode + self.num_episodes_per_phase)
+        synthetic_episodes = np.arange(current_start_episode, current_start_episode + num_episode)
         skeleton_index = pd.MultiIndex.from_product(
             [synthetic_episodes, unique_nodes],
             names=['reward_episode', 'report_node_id']
@@ -159,8 +158,7 @@ class DataGenerator(BaseDataGenerator):
         csv_buffer.seek(0)
         reader = csv.DictReader(csv_buffer)
 
-        
-        current_start_episode += self.num_episodes_per_phase
+        current_start_episode += num_episode
             
         return reader, current_start_episode
 

@@ -6,6 +6,7 @@ import argparse
 
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import LinearRegression
 from scipy.stats import gaussian_kde
 import csv
 import io
@@ -64,7 +65,9 @@ class DataGenerator(BaseDataGenerator):
         self.directory_path = directory_path
         self.df: Optional[pd.DataFrame] = None
         self.protocol = protocol
-
+        self.reward_models = {}
+        self.reward_residuals = {}
+        
         if protocol.lower() == 'pbft':
             self.col_name = PBFT_FEATURE_FIELD
             self.col_ordinal = PBFT_REPORT_ORDINAL_COLUMNS
@@ -72,6 +75,7 @@ class DataGenerator(BaseDataGenerator):
             raise ValueError("Unknown protocol! Supported: pbft")
         
         self._read_data()
+        self._train_reward_models()
     
     def _read_data(self) -> Optional[pd.DataFrame]:
         csv_files = []
@@ -90,18 +94,50 @@ class DataGenerator(BaseDataGenerator):
 
         print(f"Successfully read {len(csv_files)} files!")
         return self.df
-      
+    
+    def _train_reward_models(self) -> None:
+        """
+        Trains a Linear Regression model for each phase found in the historical data
+        and caches them in memory.
+        """
+        if self.df is None or self.df.empty:
+            print("No data available to train reward models.")
+            return
+
+        feature_cols = [c for c in self.col_name if c not in STRUCTURAL_COLUMNS and c in self.df.columns]
+        phases = self.df['phase'].dropna().unique()
+
+        for phase in phases:
+            phase_df = self.df[self.df['phase'] == phase]
+            train_df = phase_df.dropna(subset=feature_cols + ['reward'])
+            
+            if train_df.empty:
+                print(f"Warning: Not enough valid data to train regression for phase {phase}.")
+                self.reward_models[phase] = None
+                self.reward_residuals[phase] = 0.05
+                continue
+            
+            X_train = train_df[feature_cols]
+            y_train = train_df['reward']
+            
+            model = LinearRegression()
+            model.fit(X_train, y_train)
+            
+            train_predictions = model.predict(X_train)
+            residuals = y_train - train_predictions
+            std_residual = np.std(residuals)
+            
+            self.reward_models[phase] = model
+            self.reward_residuals[phase] = std_residual if std_residual > 0 else 0.05
+            
+        print(f"Successfully trained reward models for {len(self.reward_models)} phases.")
+
     def generate_phase(self, phase_index: int = 0, current_start_episode: int = 0, verbose: bool = False, num_episode:int = 1, prev_timeout: Optional[List[int]] = None )-> csv.DictReader:
         if self.df is None or self.df.empty:
             print("No data available. Please run read_data() first.")
             return None
 
         grouped_df = self.df[self.df['phase'] == phase_index]
-
-        conf = {
-                timeout: group['reward'].dropna().values
-                for timeout, group in grouped_df.groupby('election_timeout_milliseconds_used')
-            }
         
         conf_stats = grouped_df.groupby('election_timeout_milliseconds_used')['reward'].agg(
                 ['mean', 'std', 'median', 'var', 'min', 'max']
@@ -140,11 +176,11 @@ class DataGenerator(BaseDataGenerator):
             trial['election_timeout_milliseconds_used'] = 300
 
         rewards = np.empty(total_rows)
-        for timeout_val, group_idx in trial.groupby('election_timeout_milliseconds_used').groups.items():
-            n = len(group_idx)
-            rewards[group_idx] = self._sample_reward_by_timeout(timeout_val, conf_stats, n)
 
-        trial['reward'] = rewards
+        trial['reward'] = self._sample_reward_by_regression(
+            phase_index=phase_index, 
+            synthetic_df=trial
+        )
         res = trial
         res = res.assign(phase=phase_index)
 
@@ -190,37 +226,57 @@ class DataGenerator(BaseDataGenerator):
 
         return pd.DataFrame(res)
     
-    def _sample_reward_by_timeout(
-            self, timeout_val: float, conf_stats: dict, n_samples: int, temperature:float = 1.5
-            ) -> np.ndarray:
-        """
-        Generates rewards using a Normal distribution based on historical mean and std, 
-        """
-        if n_samples == 0:
-            return np.array([])
+    # def _sample_reward_by_timeout(
+    #         self, timeout_val: float, conf_stats: dict, n_samples: int, temperature:float = 1.5
+    #         ) -> np.ndarray:
+    #     """
+    #     Generates rewards using a Normal distribution based on historical mean and std, 
+    #     """
+    #     if n_samples == 0:
+    #         return np.array([])
 
-        stats = conf_stats.get(timeout_val, {})
-        mean = stats.get('mean', 0.0)
-        std = stats.get('std', 0.0)
-        min_val = stats.get('min', 0.0)
-        max_val = stats.get('max', 0.0)
+    #     stats = conf_stats.get(timeout_val, {})
+    #     mean = stats.get('mean', 0.0)
+    #     std = stats.get('std', 0.0)
+    #     min_val = stats.get('min', 0.0)
+    #     max_val = stats.get('max', 0.0)
 
 
-        # Add randomness if sample data small
-        if pd.isna(std) or std == 0:
-            jitter = abs(mean * 0.05) 
-            jitter = jitter if jitter > 0 else 0.1 
-            return np.random.uniform(mean - jitter, mean + jitter, size=n_samples)
+    #     # Add randomness if sample data small
+    #     if pd.isna(std) or std == 0:
+    #         jitter = abs(mean * 0.05) 
+    #         jitter = jitter if jitter > 0 else 0.1 
+    #         return np.random.uniform(mean - jitter, mean + jitter, size=n_samples)
 
-        # Generate Normal/Gaussian distribution
-        sampled_rewards = np.random.normal(loc=mean, scale=(std * temperature), size=n_samples)
+    #     # Generate Normal/Gaussian distribution
+    #     sampled_rewards = np.random.normal(loc=mean, scale=(std * temperature), size=n_samples)
 
-        # Inject noise
-        anomaly_mask = np.random.rand(n_samples) < 0.1
-        if np.any(anomaly_mask):
-            num_anomalies = np.sum(anomaly_mask)
-            random_spikes = np.random.uniform(min_val, max_val, size=num_anomalies)
-            sampled_rewards[anomaly_mask] = random_spikes
+    #     # Inject noise
+    #     anomaly_mask = np.random.rand(n_samples) < 0.1
+    #     if np.any(anomaly_mask):
+    #         num_anomalies = np.sum(anomaly_mask)
+    #         random_spikes = np.random.uniform(min_val, max_val, size=num_anomalies)
+    #         sampled_rewards[anomaly_mask] = random_spikes
 
-        return sampled_rewards
+    #     return sampled_rewards
     
+    def _sample_reward_by_regression(self, phase_index: int, synthetic_df: pd.DataFrame) -> np.ndarray:
+        """
+        Predicts rewards using the pre-trained model for the specific phase.
+        """
+        model = self.reward_models.get(phase_index)
+        std_residual = self.reward_residuals.get(phase_index, 0.05)
+        
+        if model is None:
+            print(f"Warning: No trained model found for phase {phase_index}. Returning zeros.")
+            return np.zeros(len(synthetic_df))
+
+        feature_cols = [c for c in self.col_name if c not in STRUCTURAL_COLUMNS and c in synthetic_df.columns]
+        X_test = synthetic_df[feature_cols].fillna(0)
+        
+        predicted_rewards = model.predict(X_test)
+        
+        noise = np.random.normal(loc=0.0, scale=std_residual, size=len(predicted_rewards))
+        final_rewards = predicted_rewards + noise
+        
+        return final_rewards

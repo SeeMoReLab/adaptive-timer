@@ -32,6 +32,9 @@ TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(int(option) for option in TIMEOUT_OPT
 TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
     value_ms: idx for idx, value_ms in enumerate(TIMEOUT_VALUES_MS)
 }
+TIMEOUT_INDEX_TO_MS: Dict[int, int] = {
+    idx : value_ms for idx, value_ms in enumerate(TIMEOUT_VALUES_MS)
+}
 
 class PhaseMapping(IntEnum):
     PHASE_0 = TimeoutOption.TIMEOUT_300_MS
@@ -856,3 +859,45 @@ class PPOTorchModel(TensorModel):
                 updates_done += 1
                 
         return total_loss / (updates_done * 2)
+    
+class ThompsonSamplingModel(TensorModel): 
+    def __init__(
+        self, 
+        action_dim: int, 
+        n_features: int, 
+
+    ):
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        
+        self._act_dim = int(action_dim)
+        self._obs_dim = int(n_features)
+        
+
+
+    def predict_action(self, features: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            return self.actor(features)
+
+    def update_model(
+        self, features: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor | float, done: torch.Tensor | bool = False, backward: bool = True
+    ) -> float:
+            
+        return 0.0
+
+    def reset_model(self) -> None:
+      return
+
+    def save(self) -> Dict[str, Any]:
+        return {}
+
+    def load(self, checkpoint: Dict[str, Any]) -> None:
+        return
+    
+    def _init_buckets(self):
+        self.batch_obs = []
+        self.batch_acts = []
+        self.batch_rews = []
+        self.batch_dones = [] 
+
+

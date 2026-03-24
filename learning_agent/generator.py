@@ -91,7 +91,7 @@ class DataGenerator(BaseDataGenerator):
         print(f"Successfully read {len(csv_files)} files!")
         return self.df
       
-    def generate_phase(self, phase_index: int = 0, current_start_episode: int = 0, verbose: bool = False, num_episode:int = 1)-> csv.DictReader:
+    def generate_phase(self, phase_index: int = 0, current_start_episode: int = 0, verbose: bool = False, num_episode:int = 1, prev_timeout: Optional[List[int]] = None )-> csv.DictReader:
         if self.df is None or self.df.empty:
             print("No data available. Please run read_data() first.")
             return None
@@ -134,14 +134,10 @@ class DataGenerator(BaseDataGenerator):
         for col in feature_cols:
             trial[col] = synthetic_features[col].values
 
-        available_timeouts = list(conf.keys())
-
-        if current_start_episode ==0:
-            trial['election_timeout_milliseconds_used'] = 300
+        if prev_timeout != None:
+            trial['election_timeout_milliseconds_used'] = prev_timeout
         else:
-            trial['election_timeout_milliseconds_used'] = trial['election_timeout_milliseconds_used'].apply(
-                lambda t: min(available_timeouts, key=lambda x: abs(x - t))
-            )
+            trial['election_timeout_milliseconds_used'] = 300
 
         rewards = np.empty(total_rows)
         for timeout_val, group_idx in trial.groupby('election_timeout_milliseconds_used').groups.items():

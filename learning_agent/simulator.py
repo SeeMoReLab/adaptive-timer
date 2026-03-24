@@ -183,17 +183,16 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 def generate_data(
-        generator: DataGenerator, protocol: str, phase: int, current_start_episode: int, scaler: RewardTransformer, batch_size: int, num_episode:int = 1
+        generator: DataGenerator, protocol: str, phase: int, current_start_episode: int, scaler: RewardTransformer, batch_size: int, num_episode:int = 1, prev_timeout: List[int] = None
         )-> DatasetLoader:
-    
-    phase_data, new_start_episode = generator.generate_phase(phase_index=int(phase), current_start_episode=current_start_episode, num_episode=num_episode)
+    phase_data, new_start_episode = generator.generate_phase(phase_index=int(phase), current_start_episode=current_start_episode, num_episode=num_episode, prev_timeout = prev_timeout)
     parsed_data = _parse_data(
             reader=phase_data,
             protocol=PROTOCOL_NAME_TO_ENUM[protocol],
             feature_field_names=get_report_feature_field_names(PROTOCOL_NAME_TO_ENUM[protocol]),
             timeout_values_ms=TIMEOUT_VALUES_MS,
             phase_options=PHASE_INDEX_TO_TIMEOUT_INDEX, 
-            reward_transform= scaler
+            reward_transform= scaler,
     )  
 
     loader = DatasetLoader(
@@ -225,7 +224,7 @@ def train_model(
     for e in range(epochs):
         train_loss = _run_epoch(model, train_loader, backward=True)
     
-        metrics = evaluate_linear_model_on_csv(
+        metrics,_ = evaluate_linear_model_on_csv(
             model=model,
             eval_loader= eval_loader,
         )
@@ -272,6 +271,7 @@ def main() -> None:
     idx = 0
     phases = args.phases.split(';')
     use_tqdm = HAS_TQDM and args.verbose
+    curr_timeout = None
     accuracy = []
     for phase in phases:
         idx += 1
@@ -292,10 +292,11 @@ def main() -> None:
                 current_start_episode=current_start_episode, 
                 scaler=scaler,       
                 batch_size=args.batch_size,
-                num_episode=1
+                num_episode=1,
+                prev_timeout = curr_timeout
             )
 
-            metrics = evaluate_linear_model_on_csv(
+            metrics, curr_timeout = evaluate_linear_model_on_csv(
                 model=model,         
                 eval_loader=phase_loader,
             )

@@ -74,8 +74,9 @@ python learning_agent/simulator.py \
   --protocol pbft \
   --model linear \
   --data-dir learning_agent/data/pbft \
-  --num-episodes 1000 \
-  --phases "5;1;2;3;4;5;0;2;1;5;4;2;1"
+  --num-episodes 500 \
+  --phases "5;1;2;3;4;5;0;2;1;5;4;2;1" \
+  --verbose
 ```
 With $N$ agent observations located in ./data/pbft, each agent will have 1,000 episodes for each phase.
 

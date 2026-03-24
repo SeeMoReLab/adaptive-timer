@@ -1,6 +1,6 @@
 import argparse
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 import random
 import torch
 import numpy as np
@@ -12,6 +12,7 @@ from data_loader import DatasetLoader, load_training_data_from_csv, split_train_
 from models import (
     TIMEOUT_VALUES_MS,
     PHASE_INDEX_TO_TIMEOUT_INDEX,
+    TIMEOUT_INDEX_TO_MS,
     LinearTorchModel,
     SVMTorchModel,
     PPOTorchModel,
@@ -221,7 +222,7 @@ def train_linear_model_from_csv(
 
 def evaluate_linear_model_on_csv(
     model: TensorModel, eval_loader: DatasetLoader
-) -> Dict[str, float]:
+) -> Tuple[Dict[str, float], List[int]]:
 
     total = 0
     correct = 0
@@ -241,7 +242,7 @@ def evaluate_linear_model_on_csv(
         expected = torch.round(batch["labels"]).long()
         total += int(expected.numel())
         correct += int((predicted == expected).sum().item())
-
+        curr_timeout = [TIMEOUT_INDEX_TO_MS[idx] for idx in expected.tolist()]
         for c in range(num_classes):
             tp[c] += ((predicted == c) & (expected == c)).sum().item()
             fp[c] += ((predicted == c) & (expected != c)).sum().item()
@@ -266,7 +267,7 @@ def evaluate_linear_model_on_csv(
         "accuracy": float(accuracy),
         "f1_macro": float(f1),
         "weighted_loss": float(weighted_loss_sum / max(len(eval_loader), 1)),
-    }
+    }, curr_timeout
 
 
 def _run_epoch(model: TensorModel, loader: DatasetLoader, backward: bool) -> float:

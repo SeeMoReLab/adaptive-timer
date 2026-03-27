@@ -72,7 +72,7 @@ To generate synthetic dataset from the observed environment dataset:
 ```bash
 python learning_agent/simulator.py \
   --protocol pbft \
-  --model linear \
+  --model cmab \
   --data-dir learning_agent/data/pbft \
   --num-episodes 500 \
   --phases "5;1;2;3;4;5;0;2;1;5;4;2;1" \

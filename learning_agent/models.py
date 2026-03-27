@@ -4,13 +4,11 @@ from enum import IntEnum
 import time
 from pathlib import Path
 from typing import Dict, Generic, List, Optional, Tuple, TypeVar, Any
-from torch.distributions import MultivariateNormal
-
+from sklearn.tree import  DecisionTreeRegressor
+from collections import deque
 import torch
 import torch.nn.functional as F
 import numpy as np
-import pickle
-import io
 
 import agent_pb2
 
@@ -684,7 +682,7 @@ class PPOTorchModel(TensorModel):
         gamma: float = 0.95, 
         clip: float = 0.2, 
         n_updates_per_iteration: int = 5,
-        batch_size: int = 4000,
+        batch_size: int = 10000,
         minibatch_size: int = 128,
         hidden_dim: int = 256
     ):
@@ -804,7 +802,6 @@ class PPOTorchModel(TensorModel):
         dist = torch.distributions.Categorical(logits=logits)
         
         log_probs = dist.log_prob(batch_acts.long()) 
-        
         return V, log_probs
 
     def _learn(self) -> float:
@@ -829,7 +826,6 @@ class PPOTorchModel(TensorModel):
             
             for start in range(0, current_batch_size, self.minibatch_size):
                 mb_indices = indices[start:start + self.minibatch_size]
-                
                 mb_obs = obs_tensor[mb_indices]
                 mb_acts = act_tensor[mb_indices]
                 mb_rtgs = batch_rtgs[mb_indices]
@@ -859,12 +855,13 @@ class PPOTorchModel(TensorModel):
                 updates_done += 1
                 
         return total_loss / (updates_done * 2)
-    
+
 class ThompsonSamplingModel(TensorModel): 
     def __init__(
         self, 
         action_dim: int, 
         n_features: int, 
+        lr:float
 
     ):
         if action_dim <= 0:
@@ -873,20 +870,81 @@ class ThompsonSamplingModel(TensorModel):
         self._act_dim = int(action_dim)
         self._obs_dim = int(n_features)
         
+        self.models = [
+            DecisionTreeRegressor(
+                criterion='squared_error',
+                max_depth=4,              
+                min_samples_leaf=20,    
+                min_impurity_decrease=0.01,    
+                random_state=42
+            ) for _ in range(self._act_dim)]
 
+        self.is_fitted = [False] * self._act_dim
+        self._max_bucket_size = 10000
+        self._init_buckets()
 
     def predict_action(self, features: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            return self.actor(features)
+        features_np = features.cpu().numpy()
+        if features_np.ndim == 1:
+            features_np = features_np.reshape(1, -1)
+            
+        predictions = []
+        batch_size = features_np.shape[0]
+    
+        for i, model in enumerate(self.models):
+            if not self.is_fitted[i]:
+                pred = np.full(batch_size, float('inf'))
+            else:
+                pred = model.predict(features_np)
+                
+            predictions.append(pred)
+            
+        predictions_stacked = np.column_stack(predictions)
+        return torch.tensor(predictions_stacked, device=features.device, dtype=torch.float32)
 
     def update_model(
-        self, features: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor | float, done: torch.Tensor | bool = False, backward: bool = True
+        self, features: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor | float, backward: bool = True
     ) -> float:
             
+        features_np = features.cpu().numpy()
+        if features_np.ndim == 1:
+            features_np = features_np.reshape(1, -1)
+            
+        if isinstance(actions, torch.Tensor):
+            actions_np = actions.cpu().numpy().astype(int).flatten()
+        else:
+            actions_np = np.array([int(actions)])
+            
+        if isinstance(rewards, torch.Tensor):
+            rewards_np = rewards.cpu().numpy().flatten()
+        else:
+            rewards_np = np.full(len(actions_np), float(rewards))
+
+        
+        for i in range(len(actions_np)):
+            act = actions_np[i]
+           
+
+            if backward :
+                if 0 <= act < self._act_dim:
+                    self.buckets[act]["features"].append(features_np[i])
+                    self.buckets[act]["rewards"].append(rewards_np[i])
+                    X =np.array(self.buckets[act]["features"])
+                    y = np.array(self.buckets[act]["rewards"])
+                    self.models[act].fit(X, y)
+                    self.is_fitted[act] = True
         return 0.0
 
     def reset_model(self) -> None:
-      return
+        self.models = [
+            DecisionTreeRegressor(
+                criterion='squared_error', 
+                max_depth=5, 
+                random_state=42
+            ) for _ in range(self._act_dim)]
+        
+        self.is_fitted = [False] * self._act_dim
+        self._init_buckets()
 
     def save(self) -> Dict[str, Any]:
         return {}
@@ -895,9 +953,13 @@ class ThompsonSamplingModel(TensorModel):
         return
     
     def _init_buckets(self):
-        self.batch_obs = []
-        self.batch_acts = []
-        self.batch_rews = []
-        self.batch_dones = [] 
+        self.buckets = [
+            {
+                "features": deque(maxlen=self._max_bucket_size), 
+                "rewards": deque(maxlen=self._max_bucket_size)
+            } 
+            for _ in range(self._act_dim)
+        ]
+
 
 

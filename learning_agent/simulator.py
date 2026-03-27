@@ -5,6 +5,8 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import torch
 from tqdm import tqdm
 import numpy as np
+import os
+import random
 
 import agent_pb2
 from data_loader import (
@@ -21,9 +23,11 @@ from data_loader import (
 from models import (
     TIMEOUT_VALUES_MS,
     PHASE_INDEX_TO_TIMEOUT_INDEX,
+    TIMEOUT_INDEX_TO_MS,
     LinearTorchModel,
     SVMTorchModel,
     PPOTorchModel,
+    ThompsonSamplingModel,
     TensorModel,
     QuadraticRewardScaler,
     RewardTransformer,
@@ -32,7 +36,6 @@ from models import (
     get_report_feature_field_names,
 )
 
-from train_pipeline import _run_epoch, evaluate_linear_model_on_csv, set_seed, train_linear_model_from_csv
 from generator import DataGenerator
 
 try:
@@ -51,8 +54,20 @@ PROTOCOL_NAME_TO_ENUM = {
 MODEL_NAME_TO_TENSORMODEL = {
     "linear": LinearTorchModel,
     "svm": SVMTorchModel,
-    "ppo": PPOTorchModel
+    "ppo": PPOTorchModel,
+    "cmab": ThompsonSamplingModel
 }
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed) 
+    
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
 
 def _parse_protocol(value: str) -> int:
     protocol = PROTOCOL_NAME_TO_ENUM.get(value.strip().lower().replace("-", "_"))
@@ -66,7 +81,7 @@ def _parse_protocol(value: str) -> int:
 def _parse_model(value: str) -> TensorModel:
     model = MODEL_NAME_TO_TENSORMODEL.get(value.strip().lower())
     if model is None:
-        valid = ", ".join(sorted({"linear", 'svm'}))
+        valid = ", ".join(sorted({"linear", 'svm',"ppo","cmab"}))
         raise argparse.ArgumentTypeError(
             f"Unsupported model '{value}'. Valid options: {valid}"
         )
@@ -168,7 +183,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--eval-ratio", type=float, default=0.2)
     parser.add_argument("--lr", type=float, default=0.0001)
@@ -219,12 +234,10 @@ def train_model(
     best_eval_metrics = float("-inf")
     count = 0
 
-
     stats = {'best_epoch':0, 'best_accuracy':0.0, 'best_loss':0.0}
     for e in range(epochs):
         train_loss = _run_epoch(model, train_loader, backward=True)
-    
-        metrics,_ = evaluate_linear_model_on_csv(
+        metrics,_ = evaluate_model(
             model=model,
             eval_loader= eval_loader,
         )
@@ -248,6 +261,52 @@ def train_model(
         torch.save(best_weights, save_path)
 
     return model, stats
+
+def _run_epoch(model: TensorModel, loader: DatasetLoader, backward: bool) -> float:
+    loss_sum = 0.0
+    batch_count = 0
+
+    for batch in loader:
+        loss_sum += model.update_model(
+            batch["features"],
+            batch["actions"],
+            batch["rewards"],
+            backward=backward,
+        )
+        batch_count += 1
+
+    if batch_count == 0:
+        return 0.0
+    
+    return loss_sum / batch_count
+
+def evaluate_model(
+    model: TensorModel, eval_loader: DatasetLoader
+) -> Tuple[Dict[str, float], List[int]]:
+
+    total = 0
+    correct = 0
+    weighted_loss_sum = 0.0
+
+    for batch in eval_loader:
+        weighted_loss_sum += model.update_model(
+            features = batch["features"], actions = batch["actions"], rewards = batch["rewards"], backward=False
+        )
+        logits = model.predict_action(batch["features"])
+        predicted = torch.argmax(logits, dim=1)
+        expected = torch.round(batch["labels"]).long()
+        total += int(expected.numel())
+        correct += int((predicted == expected).sum().item())
+        curr_timeout = [TIMEOUT_INDEX_TO_MS[idx] for idx in predicted.tolist()]
+
+    accuracy = (correct / total) if total else 0.0
+
+    return {
+        "test samples": float(total),
+        "accuracy": float(accuracy),
+        "weighted_loss": float(weighted_loss_sum / max(len(eval_loader), 1)),
+
+    }, curr_timeout
 
 def main() -> None:
     set_seed(11)
@@ -295,15 +354,12 @@ def main() -> None:
                 num_episode=1,
                 prev_timeout = curr_timeout
             )
-
-            metrics, curr_timeout = evaluate_linear_model_on_csv(
+            metrics, curr_timeout = evaluate_model(
                 model=model,         
                 eval_loader=phase_loader,
             )
 
             phase_accuracy.append(metrics['accuracy'])
-            phase_loss.append(metrics['weighted_loss'])
-
 
             model, _ = train_model(
                 model=model,
@@ -315,7 +371,6 @@ def main() -> None:
             if use_tqdm:
                 episode_iterator.set_postfix({
                     'Pred Acc': f"{sum(phase_accuracy)/len(phase_accuracy):.4f}",
-                    'Pred Loss': f"{sum(phase_loss)/len(phase_loss):.4f}",
                 })
 
         accuracy.append(sum(phase_accuracy)/len(phase_accuracy))

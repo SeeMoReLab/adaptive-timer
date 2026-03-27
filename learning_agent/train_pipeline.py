@@ -242,7 +242,7 @@ def evaluate_linear_model_on_csv(
         expected = torch.round(batch["labels"]).long()
         total += int(expected.numel())
         correct += int((predicted == expected).sum().item())
-        curr_timeout = [TIMEOUT_INDEX_TO_MS[idx] for idx in expected.tolist()]
+        curr_timeout = [TIMEOUT_INDEX_TO_MS[idx] for idx in predicted.tolist()]
         for c in range(num_classes):
             tp[c] += ((predicted == c) & (expected == c)).sum().item()
             fp[c] += ((predicted == c) & (expected != c)).sum().item()

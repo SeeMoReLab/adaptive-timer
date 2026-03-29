@@ -103,7 +103,7 @@ if (( has_peers == 1 )); then
   echo "Multi-node targets detected; skipping node0->peer SSH bootstrap."
 fi
 
-echo "Installing Java 17 and pip on all nodes in parallel..."
+echo "Installing PBFT + Tendermint dependencies on all nodes in parallel..."
 pids=()
 nodes=()
 while read -r node host user; do
@@ -113,7 +113,14 @@ set -euo pipefail
 
 if command -v apt-get >/dev/null 2>&1; then
   sudo DEBIAN_FRONTEND=noninteractive apt-get update
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-17-jre-headless python3-pip tmux
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    openjdk-17-jre-headless \
+    python3-pip \
+    tmux \
+    golang-go \
+    build-essential \
+    curl \
+    tar
 else
   echo "apt-get not found on $(hostname); expected Ubuntu nodes." >&2
   exit 1
@@ -122,6 +129,10 @@ fi
 java -version >/dev/null 2>&1
 python3 -m pip --version >/dev/null 2>&1
 tmux -V >/dev/null 2>&1
+go version >/dev/null 2>&1
+make --version >/dev/null 2>&1
+curl --version >/dev/null 2>&1
+tar --version >/dev/null 2>&1
 REMOTE
   ) &
   pids+=("$!")

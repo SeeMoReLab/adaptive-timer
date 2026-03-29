@@ -340,6 +340,65 @@ def _build_ip_faults(
     return ip_faults
 
 
+def _log_phase_rule_plan(
+    *,
+    phase_index: int,
+    src_replica_id: int,
+    hosts: Dict[int, HostEntry],
+    ip_faults: Dict[str, DelayLoss],
+) -> None:
+    replicas_by_ip: Dict[str, List[int]] = {}
+    for dst_replica_id, entry in sorted(hosts.items()):
+        if dst_replica_id == src_replica_id:
+            continue
+        replicas_by_ip.setdefault(entry.ip, []).append(dst_replica_id)
+
+    for dst_ip, fault in sorted(ip_faults.items()):
+        dst_replicas = replicas_by_ip.get(dst_ip, [])
+        _log(
+            f"Phase #{phase_index} rule: src={src_replica_id} "
+            f"dst_replicas={dst_replicas} dst_ip={dst_ip} "
+            f"delay_ms={fault.delay_ms:g} loss_pct={fault.loss_pct:g}"
+        )
+
+
+def _log_tc_state(
+    *,
+    interface: str,
+    tc_bin: str,
+    use_sudo: bool,
+    dry_run: bool,
+    netns: str | None,
+) -> None:
+    if dry_run:
+        return
+
+    probes = [
+        ("qdisc", [tc_bin, "qdisc", "show", "dev", interface]),
+        ("class", [tc_bin, "class", "show", "dev", interface]),
+        ("filter", [tc_bin, "filter", "show", "dev", interface, "parent", "1:"]),
+    ]
+    for label, cmd in probes:
+        result = _run_command(
+            cmd,
+            use_sudo=use_sudo,
+            dry_run=False,
+            check=False,
+            netns=netns,
+        )
+        if result.returncode != 0:
+            _log(
+                f"tc {label} probe failed (rc={result.returncode}) for {interface}: "
+                f"{result.stderr.strip()}"
+            )
+            continue
+        output = result.stdout.strip()
+        if output:
+            _log(f"tc {label} on {interface}:\n{output}")
+        else:
+            _log(f"tc {label} on {interface}: <empty>")
+
+
 def _apply_phase(
     *,
     phase_index: int,
@@ -357,6 +416,12 @@ def _apply_phase(
     _log(
         f"Applying phase #{phase_index} at t={phase.at_time_s:.3f}s "
         f"on {interface}; rules={len(ip_faults)}"
+    )
+    _log_phase_rule_plan(
+        phase_index=phase_index,
+        src_replica_id=src_replica_id,
+        hosts=hosts,
+        ip_faults=ip_faults,
     )
 
     _clear_tc(
@@ -476,6 +541,14 @@ def _apply_phase(
             dry_run=dry_run,
             netns=netns,
         )
+
+    _log_tc_state(
+        interface=interface,
+        tc_bin=tc_bin,
+        use_sudo=use_sudo,
+        dry_run=dry_run,
+        netns=netns,
+    )
 
 
 def _compute_start_mono(start_unix_ms: int | None) -> float:

@@ -19,7 +19,7 @@ TARGETS_FILE="${TARGETS_FILE_DEFAULT}"
 EXPERIMENT_TIME_S=300
 CLIENT_START_DELAY_S=10
 START_OFFSET_AFTER_CLIENT_LAUNCH_S=20
-OUTPUT_LOCAL="${REPO_ROOT}/scripts/cloudlab/tmp/output.txt"
+OUTPUT_LOCAL="${REPO_ROOT}/scripts/cloudlab/tmp/pbft_output.txt"
 DATASET_ENABLED=0
 LOG_ENABLED=0
 TRIM_OUTPUT=0
@@ -31,6 +31,7 @@ OVERLAY_HOST_OFFSET=10
 LOG_LEVEL="INFO"
 AGENT_MODEL_TYPE="random"
 AGENT_MODEL_SET=0
+ARTIFACT_FETCH_MAX_PARALLEL=8
 
 mode_enables_learning_agent() {
   case "$1" in
@@ -231,6 +232,53 @@ REMOTE
   done
 }
 
+queue_artifact_download() {
+  local node="$1"
+  local host="$2"
+  local user="$3"
+  local remote_check_path="$4"
+  local remote_copy_path="$5"
+  local local_path="$6"
+  local artifact_label="$7"
+  local artifact_kind="$8"
+  local missing_ok="${9:-0}"
+
+  rm -f "${local_path}"
+
+  # Avoid overwhelming sshd (CloudLab nodes may reset connections when too many
+  # concurrent SSH/SCP handshakes are opened at once).
+  while true; do
+    running_jobs="$(jobs -pr | wc -l | tr -d '[:space:]')"
+    if [[ -z "${running_jobs}" ]]; then
+      running_jobs=0
+    fi
+    if (( running_jobs < ARTIFACT_FETCH_MAX_PARALLEL )); then
+      break
+    fi
+    sleep 0.05
+  done
+
+  (
+    if ssh "${SSH_OPTS[@]}" "${user}@${host}" "test -f ${remote_check_path}"; then
+      if scp "${SSH_OPTS[@]}" "${user}@${host}:${remote_copy_path}" "${local_path}"; then
+        echo "  - copied ${artifact_label} from ${node}"
+      else
+        echo "  - failed to copy ${artifact_label} from ${node}" >&2
+        exit 1
+      fi
+    else
+      echo "  - missing ${artifact_label} on ${node}" >&2
+      if (( missing_ok == 1 )); then
+        exit 0
+      fi
+      exit 1
+    fi
+  ) &
+
+  artifact_fetch_pids+=("$!")
+  artifact_fetch_kinds+=("${artifact_kind}")
+}
+
 usage() {
   cat <<EOF
 Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--trim-output] [--log-level <TRACE|DEBUG|INFO|WARN|ERROR>] [--model <random|linear>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
@@ -242,8 +290,8 @@ Arguments:
 
 Flags:
   --dataset         Collect per-replica learning-agent dataset CSVs as agentN.csv.
-  --log             Download per-replica logs (server, and mode-specific dataexchange/agent logs) to scripts/cloudlab/tmp/.
-  --trim-output     Post-process output.txt: keep lines 1..19, then only lines containing "-- Monitor".
+  --log             Download per-replica logs (server, applier, and mode-specific dataexchange/agent logs) to scripts/cloudlab/tmp/.
+  --trim-output     Post-process pbft_output.txt: keep lines 1..19, then only lines containing "-- Monitor".
   --log-level       Logging level applied to root, bftsmart and bftsmart.proxy in staged logback.xml (default: INFO).
   --model           Learning-agent model for learning/sharing modes: random|linear (default: random).
   -f <int>          Fault tolerance f passed to prepare_pbft.sh (default: 1).
@@ -573,12 +621,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
+remove_path_with_sudo_fallback() {
+  local target="$1"
+  if [[ ! -e "${target}" ]]; then
+    return 0
+  fi
+  if rm -rf "${target}" 2>/dev/null; then
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    sudo -n rm -rf "${target}"
+    return 0
+  fi
+  echo "Failed to remove ${target} on $(hostname); permission denied and passwordless sudo is unavailable." >&2
+  return 1
+}
+
 shopt -s nullglob
-rm -rf "$HOME/library"
-rm -rf "$HOME/learning_agent"
-rm -rf "$HOME"/smallbank[0-9]*
-rm -rf "$HOME"/dataexchange[0-9]*
+stale_paths=("$HOME/library" "$HOME/learning_agent" "$HOME"/smallbank[0-9]* "$HOME"/dataexchange[0-9]*)
 shopt -u nullglob
+for stale_path in "${stale_paths[@]}"; do
+  remove_path_with_sudo_fallback "${stale_path}"
+done
 
 mkdir -p "$tmp_extract_dir"
 
@@ -1083,6 +1147,25 @@ elif [[ "${mode}" == "scheduled" ]]; then
   agent_mode_args="--model-type scheduled --schedule-file learning_agent/config/schedule_pbft.csv"
 fi
 
+remove_path_with_sudo_fallback() {
+  local target="$1"
+  if rm -rf "${target}" 2>/dev/null; then
+    return 0
+  fi
+  if [[ ! -e "${target}" ]]; then
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    sudo -n rm -rf "${target}"
+    return 0
+  fi
+  echo "Failed to remove ${target} on $(hostname); permission denied and passwordless sudo is unavailable." >&2
+  return 1
+}
+
+run_as_user="$(id -un)"
+run_as_home="${HOME}"
+
 for ((n = 0; n < replicas_per_machine; n++)); do
   replica_id=$((machine_idx * replicas_per_machine + n))
   ns_name="pbft-r${replica_id}"
@@ -1090,12 +1173,12 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   agent_log="$HOME/library/agent_${replica_id}.log"
   dataset_args=""
   if [[ "${dataset_enabled}" == "1" ]]; then
-    rm -f "$HOME/agent${replica_id}.csv"
+    remove_path_with_sudo_fallback "$HOME/agent${replica_id}.csv"
     dataset_args="--dataset-csv agent${replica_id}.csv"
   fi
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   tmux new-session -d -s "${session_name}" \
-    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"$HOME\" && exec python3 learning_agent/main.py --node-id ${replica_id} --hosts-config \"$HOME/library/smallbank/hosts.config\" --failure-spec \"$HOME/library/config/failure_spec.xml\" --injection-start-unix-ms ${start_unix_ms} ${agent_mode_args} ${dataset_args}' > \"${agent_log}\" 2>&1"
+    "sudo -n ip netns exec ${ns_name} sudo -n -u ${run_as_user} env HOME=${run_as_home} PYTHONDONTWRITEBYTECODE=1 bash -lc 'cd \"${run_as_home}\" && exec python3 learning_agent/main.py --node-id ${replica_id} --hosts-config \"${run_as_home}/library/smallbank/hosts.config\" --failure-spec \"${run_as_home}/library/config/failure_spec.xml\" --injection-start-unix-ms ${start_unix_ms} ${agent_mode_args} ${dataset_args}' > \"${agent_log}\" 2>&1"
 done
 
 sleep 2
@@ -1256,7 +1339,7 @@ fi
 
 tmux kill-session -t pbft_client >/dev/null 2>&1 || true
 tmux new-session -d -s pbft_client \
-  "cd \"$HOME/library\" && bash smartrun.sh bftsmart.demo.smallbank.SmallBankClient --config-dir client --create --execute --start-unix-ms ${start_unix_ms} > output.txt 2>&1"
+  "cd \"$HOME/library\" && bash smartrun.sh bftsmart.demo.smallbank.SmallBankClient --config-dir client --create --execute --start-unix-ms ${start_unix_ms} > pbft_output.txt 2>&1"
 REMOTE
 
 EXPERIMENT_END_UNIX_MS="$((START_UNIX_MS + EXPERIMENT_TIME_S * 1000))"
@@ -1395,21 +1478,37 @@ REMOTE
   fi
 fi
 
-mkdir -p "$(dirname "${OUTPUT_LOCAL}")"
-rm -f "${OUTPUT_LOCAL}"
-echo "Fetching client output to ${OUTPUT_LOCAL}..."
-scp "${SSH_OPTS[@]}" "${node0_user}@${node0_host}:~/library/output.txt" "${OUTPUT_LOCAL}"
-if (( TRIM_OUTPUT == 1 )); then
-  echo "Trimming ${OUTPUT_LOCAL}: preserving first 19 lines, then only '-- Monitor' lines..."
-  trim_client_output_file "${OUTPUT_LOCAL}" 19
-fi
+OUTPUT_LOCAL_DIR="$(dirname "${OUTPUT_LOCAL}")"
+mkdir -p "${OUTPUT_LOCAL_DIR}"
+
+artifact_fetch_pids=()
+artifact_fetch_kinds=()
+output_fetch_failed=0
+server_log_fetch_failed=0
+dataexchange_log_fetch_failed=0
+agent_log_fetch_failed=0
+dataset_fetch_failed=0
+applier_log_fetch_failed=0
+
+echo "Fetching artifacts in parallel..."
+echo "  - client output: ${OUTPUT_LOCAL}"
+queue_artifact_download \
+  "node0" "${node0_host}" "${node0_user}" \
+  "\$HOME/library/pbft_output.txt" \
+  "library/pbft_output.txt" \
+  "${OUTPUT_LOCAL}" \
+  "pbft_output.txt" \
+  "pbft_output"
 
 if (( LOG_ENABLED == 1 )); then
   SERVER_LOGS_LOCAL_DIR="${REPO_ROOT}/scripts/cloudlab/tmp/server_logs"
-  echo "Fetching server logs to ${SERVER_LOGS_LOCAL_DIR}..."
+  APPLIER_LOGS_LOCAL_DIR="${REPO_ROOT}/scripts/cloudlab/tmp/applier_logs"
+  echo "  - server logs: ${SERVER_LOGS_LOCAL_DIR}"
+  echo "  - applier logs: ${APPLIER_LOGS_LOCAL_DIR}"
   rm -rf "${SERVER_LOGS_LOCAL_DIR}"
+  rm -rf "${APPLIER_LOGS_LOCAL_DIR}"
   mkdir -p "${SERVER_LOGS_LOCAL_DIR}"
-  server_log_fetch_failed=0
+  mkdir -p "${APPLIER_LOGS_LOCAL_DIR}"
   for i in "${!server_nodes[@]}"; do
     node="${server_nodes[$i]}"
     host="${server_hosts[$i]}"
@@ -1420,30 +1519,32 @@ if (( LOG_ENABLED == 1 )); then
       remote_log_path="\$HOME/library/server_${replica_id}.log"
       remote_log_rel="library/server_${replica_id}.log"
       local_log="${SERVER_LOGS_LOCAL_DIR}/server_${replica_id}.log"
-      rm -f "${local_log}"
-      if ssh "${SSH_OPTS[@]}" "${user}@${host}" "test -f ${remote_log_path}"; then
-        if scp "${SSH_OPTS[@]}" "${user}@${host}:${remote_log_rel}" "${local_log}"; then
-          echo "  - copied server_${replica_id}.log from ${node}"
-        else
-          echo "  - failed to copy server_${replica_id}.log from ${node}" >&2
-          server_log_fetch_failed=1
-        fi
-      else
-        echo "  - missing server_${replica_id}.log on ${node}" >&2
-        server_log_fetch_failed=1
-      fi
+      queue_artifact_download \
+        "${node}" "${host}" "${user}" \
+        "${remote_log_path}" \
+        "${remote_log_rel}" \
+        "${local_log}" \
+        "server_${replica_id}.log" \
+        "server_log"
+
+      remote_applier_log_path="\$HOME/library/applier_${replica_id}.log"
+      remote_applier_log_rel="library/applier_${replica_id}.log"
+      local_applier_log="${APPLIER_LOGS_LOCAL_DIR}/applier_${replica_id}.log"
+      queue_artifact_download \
+        "${node}" "${host}" "${user}" \
+        "${remote_applier_log_path}" \
+        "${remote_applier_log_rel}" \
+        "${local_applier_log}" \
+        "applier_${replica_id}.log" \
+        "applier_log"
     done
   done
-  if (( server_log_fetch_failed != 0 )); then
-    echo "Some server logs could not be fetched." >&2
-  fi
 
   if [[ "${MODE}" == "sharing" ]]; then
     DATAEXCHANGE_LOGS_LOCAL_DIR="${REPO_ROOT}/scripts/cloudlab/tmp/dataexchange_logs"
-    echo "Fetching data-exchange server logs to ${DATAEXCHANGE_LOGS_LOCAL_DIR}..."
+    echo "  - data-exchange logs: ${DATAEXCHANGE_LOGS_LOCAL_DIR}"
     rm -rf "${DATAEXCHANGE_LOGS_LOCAL_DIR}"
     mkdir -p "${DATAEXCHANGE_LOGS_LOCAL_DIR}"
-    dataexchange_log_fetch_failed=0
     for i in "${!server_nodes[@]}"; do
       node="${server_nodes[$i]}"
       host="${server_hosts[$i]}"
@@ -1454,31 +1555,22 @@ if (( LOG_ENABLED == 1 )); then
         remote_log_path="\$HOME/library/dataexchange_${replica_id}.log"
         remote_log_rel="library/dataexchange_${replica_id}.log"
         local_log="${DATAEXCHANGE_LOGS_LOCAL_DIR}/dataexchange_${replica_id}.log"
-        rm -f "${local_log}"
-        if ssh "${SSH_OPTS[@]}" "${user}@${host}" "test -f ${remote_log_path}"; then
-          if scp "${SSH_OPTS[@]}" "${user}@${host}:${remote_log_rel}" "${local_log}"; then
-            echo "  - copied dataexchange_${replica_id}.log from ${node}"
-          else
-            echo "  - failed to copy dataexchange_${replica_id}.log from ${node}" >&2
-            dataexchange_log_fetch_failed=1
-          fi
-        else
-          echo "  - missing dataexchange_${replica_id}.log on ${node}" >&2
-          dataexchange_log_fetch_failed=1
-        fi
+        queue_artifact_download \
+          "${node}" "${host}" "${user}" \
+          "${remote_log_path}" \
+          "${remote_log_rel}" \
+          "${local_log}" \
+          "dataexchange_${replica_id}.log" \
+          "dataexchange_log"
       done
     done
-    if (( dataexchange_log_fetch_failed != 0 )); then
-      echo "Some data-exchange logs could not be fetched." >&2
-    fi
   fi
 
   if [[ "${MODE}" == "learning" || "${MODE}" == "scheduled" || "${MODE}" == "sharing" ]]; then
     AGENT_LOGS_LOCAL_DIR="${REPO_ROOT}/scripts/cloudlab/tmp/agent_logs"
-    echo "Fetching learning-agent logs to ${AGENT_LOGS_LOCAL_DIR}..."
+    echo "  - learning-agent logs: ${AGENT_LOGS_LOCAL_DIR}"
     rm -rf "${AGENT_LOGS_LOCAL_DIR}"
     mkdir -p "${AGENT_LOGS_LOCAL_DIR}"
-    agent_log_fetch_failed=0
     for i in "${!server_nodes[@]}"; do
       node="${server_nodes[$i]}"
       host="${server_hosts[$i]}"
@@ -1489,29 +1581,20 @@ if (( LOG_ENABLED == 1 )); then
         remote_log_path="\$HOME/library/agent_${replica_id}.log"
         remote_log_rel="library/agent_${replica_id}.log"
         local_log="${AGENT_LOGS_LOCAL_DIR}/agent_${replica_id}.log"
-        rm -f "${local_log}"
-        if ssh "${SSH_OPTS[@]}" "${user}@${host}" "test -f ${remote_log_path}"; then
-          if scp "${SSH_OPTS[@]}" "${user}@${host}:${remote_log_rel}" "${local_log}"; then
-            echo "  - copied agent_${replica_id}.log from ${node}"
-          else
-            echo "  - failed to copy agent_${replica_id}.log from ${node}" >&2
-            agent_log_fetch_failed=1
-          fi
-        else
-          echo "  - missing agent_${replica_id}.log on ${node}" >&2
-          agent_log_fetch_failed=1
-        fi
+        queue_artifact_download \
+          "${node}" "${host}" "${user}" \
+          "${remote_log_path}" \
+          "${remote_log_rel}" \
+          "${local_log}" \
+          "agent_${replica_id}.log" \
+          "agent_log"
       done
     done
-    if (( agent_log_fetch_failed != 0 )); then
-      echo "Some learning-agent logs could not be fetched." >&2
-    fi
   fi
 fi
 
 if (( LEARNING_AGENT_ENABLED == 1 )) && (( DATASET_ENABLED == 1 )); then
-  echo "Fetching learning-agent dataset CSVs..."
-  dataset_fetch_failed=0
+  echo "  - learning-agent datasets: ${OUTPUT_LOCAL_DIR}"
   for i in "${!server_nodes[@]}"; do
     node="${server_nodes[$i]}"
     host="${server_hosts[$i]}"
@@ -1521,23 +1604,68 @@ if (( LEARNING_AGENT_ENABLED == 1 )) && (( DATASET_ENABLED == 1 )); then
       replica_id=$((machine_idx * replicas_per_server_machine + n))
       remote_csv_path="\$HOME/agent${replica_id}.csv"
       remote_csv_rel="agent${replica_id}.csv"
-      local_csv="$(dirname "${OUTPUT_LOCAL}")/agent${replica_id}.csv"
-      rm -f "${local_csv}"
-      if ssh "${SSH_OPTS[@]}" "${user}@${host}" "test -f ${remote_csv_path}"; then
-        if scp "${SSH_OPTS[@]}" "${user}@${host}:${remote_csv_rel}" "${local_csv}"; then
-          echo "  - copied agent${replica_id}.csv from ${node}"
-        else
-          echo "  - failed to copy agent${replica_id}.csv from ${node}" >&2
-          dataset_fetch_failed=1
-        fi
-      else
-        echo "  - missing agent${replica_id}.csv on ${node}" >&2
-      fi
+      local_csv="${OUTPUT_LOCAL_DIR}/agent${replica_id}.csv"
+      queue_artifact_download \
+        "${node}" "${host}" "${user}" \
+        "${remote_csv_path}" \
+        "${remote_csv_rel}" \
+        "${local_csv}" \
+        "agent${replica_id}.csv" \
+        "dataset" \
+        1
     done
   done
-  if (( dataset_fetch_failed != 0 )); then
-    echo "Some dataset files could not be fetched." >&2
+fi
+
+for i in "${!artifact_fetch_pids[@]}"; do
+  if ! wait "${artifact_fetch_pids[$i]}"; then
+    case "${artifact_fetch_kinds[$i]}" in
+      output)
+        output_fetch_failed=1
+        ;;
+      server_log)
+        server_log_fetch_failed=1
+        ;;
+      applier_log)
+        applier_log_fetch_failed=1
+        ;;
+      dataexchange_log)
+        dataexchange_log_fetch_failed=1
+        ;;
+      agent_log)
+        agent_log_fetch_failed=1
+        ;;
+      dataset)
+        dataset_fetch_failed=1
+        ;;
+    esac
   fi
+done
+
+if (( output_fetch_failed != 0 )); then
+  echo "Failed to fetch client output to ${OUTPUT_LOCAL}." >&2
+  exit 1
+fi
+
+if (( TRIM_OUTPUT == 1 )); then
+  echo "Trimming ${OUTPUT_LOCAL}: preserving first 19 lines, then only '-- Monitor' lines..."
+  trim_client_output_file "${OUTPUT_LOCAL}" 19
+fi
+
+if (( server_log_fetch_failed != 0 )); then
+  echo "Some server logs could not be fetched." >&2
+fi
+if (( applier_log_fetch_failed != 0 )); then
+  echo "Some applier logs could not be fetched." >&2
+fi
+if (( dataexchange_log_fetch_failed != 0 )); then
+  echo "Some data-exchange logs could not be fetched." >&2
+fi
+if (( agent_log_fetch_failed != 0 )); then
+  echo "Some learning-agent logs could not be fetched." >&2
+fi
+if (( dataset_fetch_failed != 0 )); then
+  echo "Some dataset files could not be fetched." >&2
 fi
 
 if (( stop_failed != 0 )); then

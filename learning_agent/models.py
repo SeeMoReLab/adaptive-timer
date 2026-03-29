@@ -3,10 +3,12 @@ import csv
 from enum import IntEnum
 import time
 from pathlib import Path
-from typing import Dict, Generic, List, Optional, Tuple, TypeVar
-
+from typing import Dict, Generic, List, Optional, Tuple, TypeVar, Any
+from sklearn.tree import  DecisionTreeRegressor
+from collections import deque
 import torch
 import torch.nn.functional as F
+import numpy as np
 
 import agent_pb2
 
@@ -27,6 +29,9 @@ TIMEOUT_OPTIONS: Tuple[TimeoutOption, ...] = (
 TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(int(option) for option in TIMEOUT_OPTIONS)
 TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
     value_ms: idx for idx, value_ms in enumerate(TIMEOUT_VALUES_MS)
+}
+TIMEOUT_INDEX_TO_MS: Dict[int, int] = {
+    idx : value_ms for idx, value_ms in enumerate(TIMEOUT_VALUES_MS)
 }
 
 class PhaseMapping(IntEnum):
@@ -332,13 +337,20 @@ class TensorModel(ABC):
     def reset_model(self) -> None:
         pass
 
+    @abstractmethod
+    def save(self) -> None:
+        pass
+
+    @abstractmethod
+    def load(self) -> None:
+        pass
+
 class RewardTransformer(ABC):
     """Converts throughput result into float reward."""
 
     @abstractmethod
     def transform(self, throughput: float) -> float:
         pass
-
 
 class ProtocolReportFeatureExtractor(FeatureExtractor[object]):
     def __init__(self, protocol: int):
@@ -370,8 +382,7 @@ class QuadraticRewardScaler(RewardTransformer):
         value = float(max(0, throughput))
         if value < 1000.0:
             return (value / 1000.0) ** 2 * 1000.0
-        return value
-            
+        return value          
 
 class LinearTorchModel(TensorModel):
     """Linear classifier over protocol-specific discrete timeout options."""
@@ -381,7 +392,7 @@ class LinearTorchModel(TensorModel):
             raise ValueError(f"action_dim must be > 0, got {action_dim}")
         self._action_dim = int(action_dim)
         self.weights = torch.zeros((self._action_dim, n_features), requires_grad=True)
-        self.optimizer = torch.optim.SGD([self.weights], lr=lr)
+        self.optimizer = torch.optim.AdamW([self.weights], lr=lr,  weight_decay=0.01)
 
     def predict_action(self, features: torch.Tensor) -> torch.Tensor:
         if features.dim() == 1:
@@ -435,6 +446,12 @@ class LinearTorchModel(TensorModel):
     def reset_model(self) -> None:
         torch.nn.init.zeros_(self.weights)
 
+    def save(self) -> torch.Tensor:
+        return self.weights.clone().detach()
+
+    def load(self, weights: torch.Tensor) -> None:
+        with torch.no_grad():
+            self.weights.copy_(weights)
 
 class RandomTimeoutModel(TensorModel):
     """Selects a random timeout action index each prediction."""
@@ -469,7 +486,6 @@ class RandomTimeoutModel(TensorModel):
 
     def reset_model(self) -> None:
         self._rng.manual_seed(self._initial_seed)
-
 
 class ScheduledTimeoutModel(TensorModel):
     """Returns protocol-specific timeout option indices from a time-based schedule."""
@@ -596,3 +612,354 @@ class ScheduledTimeoutModel(TensorModel):
     def reset_model(self) -> None:
         self._start_time = time.monotonic()
         self._active_row = -1
+
+class SVMTorchModel(TensorModel):
+    """Linear SVM classifier over protocol-specific discrete timeout options."""
+
+    def __init__(self, action_dim: int, n_features: int, lr: float = 0.01, margin: float = 1.0):
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        self._action_dim = int(action_dim)
+        self.margin = margin
+        self.weights = torch.nn.Parameter(torch.randn(self._action_dim, n_features) * 0.01)
+        self.optimizer = torch.optim.AdamW([self.weights], lr=lr, weight_decay=0.01)
+
+    def predict_action(self, features: torch.Tensor) -> torch.Tensor:
+        if features.dim() == 1:
+            return torch.mv(self.weights, features)
+        return torch.matmul(features, self.weights.t())
+
+    def update_model(
+        self,
+        features: torch.Tensor,
+        actions: torch.Tensor,
+        rewards: torch.Tensor | float,
+        backward: bool = True,
+    ) -> float:
+        with torch.set_grad_enabled(backward):
+            if features.dim() == 1:
+                features = features.unsqueeze(0)
+
+            actions_tensor = torch.as_tensor(actions, dtype=torch.long).view(-1)
+            rewards_tensor = torch.as_tensor(rewards, dtype=torch.float32).view(-1)
+            
+            logits = self.predict_action(features)
+
+            target_scores = logits.gather(1, actions_tensor.unsqueeze(1))
+            
+            margins = torch.clamp(logits - target_scores + self.margin, min=0.0)
+            
+            margins.scatter_(1, actions_tensor.unsqueeze(1), 0.0)
+            
+            loss_vector = margins.sum(dim=1)
+            
+            reward_scales = torch.clamp(rewards_tensor, min=0.0) / 1000.0
+            loss = (loss_vector * reward_scales).mean()
+
+            if backward and loss > 0.0:
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+            return float(loss.item())
+
+    def reset_model(self) -> None:
+        torch.nn.init.xavier_uniform_(self.weights)
+
+    def save(self) -> torch.Tensor:
+        return self.weights.clone().detach()
+
+    def load(self, weights: torch.Tensor) -> None:
+        with torch.no_grad():
+            self.weights.copy_(weights)
+
+class PPOTorchModel(TensorModel): 
+    def __init__(
+        self, 
+        action_dim: int, 
+        n_features: int, 
+        lr: float = 0.01, 
+        gamma: float = 0.95, 
+        clip: float = 0.2, 
+        n_updates_per_iteration: int = 5,
+        batch_size: int = 10000,
+        minibatch_size: int = 128,
+        hidden_dim: int = 256
+    ):
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        
+        self._act_dim = int(action_dim)
+        self._obs_dim = int(n_features)
+        
+        self.gamma = gamma
+        self.clip = clip
+        self.n_updates_per_iteration = n_updates_per_iteration
+        self.batch_size = batch_size
+        self.minibatch_size = minibatch_size 
+
+        self.actor = torch.nn.Sequential(
+            torch.nn.Linear(self._obs_dim, hidden_dim),
+            torch.nn.Tanh(),
+            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.Tanh(),
+            torch.nn.Linear(hidden_dim, self._act_dim)
+        )
+        
+        self.critic = torch.nn.Sequential(
+            torch.nn.Linear(self._obs_dim, hidden_dim),
+            torch.nn.Tanh(),
+            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.Tanh(),
+            torch.nn.Linear(hidden_dim, 1)
+        )
+        
+        self.actor_optim = torch.optim.AdamW(self.actor.parameters(), lr=lr)
+        self.critic_optim = torch.optim.AdamW(self.critic.parameters(), lr=lr)
+
+        self._reset_buffers()
+
+    def predict_action(self, features: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            return self.actor(features)
+
+    def update_model(
+        self, features: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor | float, done: torch.Tensor | bool = False, backward: bool = True
+    ) -> float:
+        if not backward:
+            return 0.
+        if features.dim() > 1:
+            self.batch_obs.extend(list(features))
+            self.batch_acts.extend(list(actions))
+            
+            if isinstance(rewards, torch.Tensor):
+                self.batch_rews.extend(rewards.tolist())
+            else:
+                self.batch_rews.extend([float(rewards)] * features.size(0))
+                
+            if isinstance(done, torch.Tensor):
+                self.batch_dones.extend(done.tolist())
+            else:
+                self.batch_dones.extend([bool(done)] * features.size(0))
+                
+        else:
+            self.batch_obs.append(features)
+            self.batch_acts.append(actions)
+            self.batch_rews.append(float(rewards))
+            self.batch_dones.append(bool(done))
+
+        if backward:
+            if len(self.batch_obs) >= self.batch_size:
+                avg_loss = self._learn()
+                self._reset_buffers()
+                return avg_loss
+            
+        return 0.0
+
+    def reset_model(self) -> None:
+        def init_weights(m):
+            if isinstance(m, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+                torch.nn.init.zeros_(m.bias)
+                
+        self.actor.apply(init_weights)
+        self.critic.apply(init_weights)
+        self._reset_buffers()
+
+    def save(self) -> Dict[str, Any]:
+        return {
+            'actor_state_dict': {k: v.cpu().clone() for k, v in self.actor.state_dict().items()},
+            'critic_state_dict': {k: v.cpu().clone() for k, v in self.critic.state_dict().items()},
+        }
+
+    def load(self, checkpoint: Dict[str, Any]) -> None:
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.critic.load_state_dict(checkpoint['critic_state_dict'])
+
+    def _reset_buffers(self):
+        self.batch_obs = []
+        self.batch_acts = []
+        self.batch_rews = []
+        self.batch_dones = [] 
+
+    def _compute_rtgs(self, batch_rews: list, batch_dones: list) -> torch.Tensor:
+        batch_rtgs = []
+        discounted_reward = 0
+        
+        #Reset discounted reward at the end of an episode
+        for rew, done in zip(reversed(batch_rews), reversed(batch_dones)):
+            if done:
+                discounted_reward = 0
+            discounted_reward = rew + discounted_reward * self.gamma
+            batch_rtgs.insert(0, discounted_reward)
+            
+        return torch.tensor(batch_rtgs, dtype=torch.float)
+
+    def _evaluate(self, batch_obs: torch.Tensor, batch_acts: torch.Tensor):
+        V = self.critic(batch_obs).squeeze()
+        logits = self.actor(batch_obs)
+        
+        dist = torch.distributions.Categorical(logits=logits)
+        
+        log_probs = dist.log_prob(batch_acts.long()) 
+        return V, log_probs
+
+    def _learn(self) -> float:
+        obs_tensor = torch.stack(self.batch_obs)
+        act_tensor = torch.stack(self.batch_acts)
+        
+        #compute RTGs
+        batch_rtgs = self._compute_rtgs(self.batch_rews, self.batch_dones)
+        batch_rtgs = (batch_rtgs - batch_rtgs.mean()) / (batch_rtgs.std() + 1e-8)
+        with torch.no_grad():
+            V_old, old_log_probs = self._evaluate(obs_tensor, act_tensor)
+            A_k = batch_rtgs - V_old
+            A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
+
+        total_loss = 0.0
+        updates_done = 0
+        
+        current_batch_size = len(self.batch_obs)
+        
+        for _ in range(self.n_updates_per_iteration):
+            indices = torch.randperm(current_batch_size)
+            
+            for start in range(0, current_batch_size, self.minibatch_size):
+                mb_indices = indices[start:start + self.minibatch_size]
+                mb_obs = obs_tensor[mb_indices]
+                mb_acts = act_tensor[mb_indices]
+                mb_rtgs = batch_rtgs[mb_indices]
+                mb_A_k = A_k[mb_indices]
+                mb_old_log_probs = old_log_probs[mb_indices]
+
+                V, curr_log_probs = self._evaluate(mb_obs, mb_acts)
+                
+                ratios = torch.exp(curr_log_probs - mb_old_log_probs)
+                
+                surr1 = ratios * mb_A_k
+                surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * mb_A_k
+                
+                actor_loss = (-torch.min(surr1, surr2)).mean()
+                critic_loss = 0.5 * torch.nn.MSELoss()(V, mb_rtgs)
+                
+                self.actor_optim.zero_grad()
+                actor_loss.backward(retain_graph=True) 
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
+                self.actor_optim.step()
+                
+                self.critic_optim.zero_grad()
+                critic_loss.backward()
+                self.critic_optim.step()
+                
+                total_loss += (actor_loss.item() + critic_loss.item())
+                updates_done += 1
+                
+        return total_loss / (updates_done * 2)
+
+class ThompsonSamplingModel(TensorModel): 
+    def __init__(
+        self, 
+        action_dim: int, 
+        n_features: int, 
+        lr:float
+
+    ):
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        
+        self._act_dim = int(action_dim)
+        self._obs_dim = int(n_features)
+        
+        self.models = [
+            DecisionTreeRegressor(
+                criterion='squared_error',
+                max_depth=4,              
+                min_samples_leaf=20,    
+                min_impurity_decrease=0.01,    
+                random_state=42
+            ) for _ in range(self._act_dim)]
+
+        self.is_fitted = [False] * self._act_dim
+        self._max_bucket_size = 10000
+        self._init_buckets()
+
+    def predict_action(self, features: torch.Tensor) -> torch.Tensor:
+        features_np = features.cpu().numpy()
+        if features_np.ndim == 1:
+            features_np = features_np.reshape(1, -1)
+            
+        predictions = []
+        batch_size = features_np.shape[0]
+    
+        for i, model in enumerate(self.models):
+            if not self.is_fitted[i]:
+                pred = np.full(batch_size, float('inf'))
+            else:
+                pred = model.predict(features_np)
+                
+            predictions.append(pred)
+            
+        predictions_stacked = np.column_stack(predictions)
+        return torch.tensor(predictions_stacked, device=features.device, dtype=torch.float32)
+
+    def update_model(
+        self, features: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor | float, backward: bool = True
+    ) -> float:
+            
+        features_np = features.cpu().numpy()
+        if features_np.ndim == 1:
+            features_np = features_np.reshape(1, -1)
+            
+        if isinstance(actions, torch.Tensor):
+            actions_np = actions.cpu().numpy().astype(int).flatten()
+        else:
+            actions_np = np.array([int(actions)])
+            
+        if isinstance(rewards, torch.Tensor):
+            rewards_np = rewards.cpu().numpy().flatten()
+        else:
+            rewards_np = np.full(len(actions_np), float(rewards))
+
+        
+        for i in range(len(actions_np)):
+            act = actions_np[i]
+           
+
+            if backward :
+                if 0 <= act < self._act_dim:
+                    self.buckets[act]["features"].append(features_np[i])
+                    self.buckets[act]["rewards"].append(rewards_np[i])
+                    X =np.array(self.buckets[act]["features"])
+                    y = np.array(self.buckets[act]["rewards"])
+                    self.models[act].fit(X, y)
+                    self.is_fitted[act] = True
+        return 0.0
+
+    def reset_model(self) -> None:
+        self.models = [
+            DecisionTreeRegressor(
+                criterion='squared_error', 
+                max_depth=5, 
+                random_state=42
+            ) for _ in range(self._act_dim)]
+        
+        self.is_fitted = [False] * self._act_dim
+        self._init_buckets()
+
+    def save(self) -> Dict[str, Any]:
+        return {}
+
+    def load(self, checkpoint: Dict[str, Any]) -> None:
+        return
+    
+    def _init_buckets(self):
+        self.buckets = [
+            {
+                "features": deque(maxlen=self._max_bucket_size), 
+                "rewards": deque(maxlen=self._max_bucket_size)
+            } 
+            for _ in range(self._act_dim)
+        ]
+
+
+

@@ -65,6 +65,21 @@ If you change `proto/agent.proto`, regenerate Python stubs:
 bash compile_proto.sh
 ```
 
+### Run Agent Simulation
+
+To generate synthetic dataset from the observed environment dataset:
+
+```bash
+python learning_agent/simulator.py \
+  --protocol pbft \
+  --model cmab \
+  --data-dir learning_agent/data/pbft \
+  --num-episodes 500 \
+  --phases "5;1;2;3;4;5;0;2;1;5;4;2;1" \
+  --verbose
+```
+With $N$ agent observations located in ./data/pbft, each agent will have 1,000 episodes for each phase.
+
 ## PBFT Run
 
 These scripts run SmallBank PBFT with:

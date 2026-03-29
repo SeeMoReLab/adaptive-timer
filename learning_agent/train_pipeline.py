@@ -1,14 +1,22 @@
 import argparse
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional, Tuple
+import random
+import torch
+import numpy as np
+import os
+
 
 import agent_pb2
-import torch
 from data_loader import DatasetLoader, load_training_data_from_csv, split_train_eval_loaders
 from models import (
     TIMEOUT_VALUES_MS,
     PHASE_INDEX_TO_TIMEOUT_INDEX,
+    TIMEOUT_INDEX_TO_MS,
     LinearTorchModel,
+    SVMTorchModel,
+    PPOTorchModel,
+    TensorModel,
     QuadraticRewardScaler,
     get_action_space_size,
     get_report_feature_dim,
@@ -27,6 +35,12 @@ PROTOCOL_NAME_TO_ENUM = {
     "sbft": agent_pb2.PROTOCOL_SBFT,
 }
 
+MODEL_NAME_TO_TENSORMODEL = {
+    "linear": LinearTorchModel,
+    "svm": SVMTorchModel,
+    "ppo": PPOTorchModel
+}
+
 
 def _parse_protocol(value: str) -> int:
     protocol = PROTOCOL_NAME_TO_ENUM.get(value.strip().lower().replace("-", "_"))
@@ -37,6 +51,14 @@ def _parse_protocol(value: str) -> int:
         )
     return protocol
 
+def _parse_model(value: str) -> TensorModel:
+    model = MODEL_NAME_TO_TENSORMODEL.get(value.strip().lower())
+    if model is None:
+        valid = ", ".join(sorted({"linear", 'svm'}))
+        raise argparse.ArgumentTypeError(
+            f"Unsupported model '{value}'. Valid options: {valid}"
+        )
+    return model
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -49,9 +71,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Protocol: pbft | two_pc_over_pbft | sbft",
     )
     parser.add_argument(
+        "--model",
+        type=_parse_model,
+        default='linear',
+        help="Model: linear | svm",
+    )
+    parser.add_argument(
         "--train-csv",
         type=Path,
-        default=Path(__file__).resolve().parent / "data" / "sample_pbft.csv",
+        default=Path(__file__).resolve().parent / "data" / "pbft_original.csv",
         help="Training CSV path.",
     )
     parser.add_argument(
@@ -60,10 +88,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional test CSV path. If omitted, train CSV is reused.",
     )
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=16)
+
+    parser.add_argument(
+        "--save-path",
+        type=Path,
+        default=Path(__file__).resolve().parent / "pretrained_models" / "linear.pt",
+        help="Pretrained weight path.",
+    )
+
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--eval-ratio", type=float, default=0.2)
-    parser.add_argument("--lr", type=float, default=0.01)
+    parser.add_argument("--lr", type=float, default=0.0001)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--reward-scaler",
@@ -77,6 +113,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def run_pipeline(
     protocol: int,
+    model: TensorModel,
     train_csv: Path,
     test_csv: Optional[Path],
     epochs: int,
@@ -86,52 +123,12 @@ def run_pipeline(
     seed: int,
     reward_scaler: str,
     verbose: bool,
+    save_path: Optional[Path] = None,
 ) -> None:
     protocol = int(protocol)
     reward_transform = (
         QuadraticRewardScaler.transform if reward_scaler == "quadratic" else None
     )
-    model = train_linear_model_from_csv(
-        protocol=protocol,
-        train_csv=train_csv,
-        lr=lr,
-        epochs=epochs,
-        batch_size=batch_size,
-        eval_ratio=eval_ratio,
-        verbose=verbose,
-        reward_transform=reward_transform,
-        seed=seed,
-    )
-    metrics = evaluate_linear_model_on_csv(
-        model=model,
-        protocol=protocol,
-        path=test_csv or train_csv,
-        batch_size=batch_size,
-    )
-    protocol_name = agent_pb2.Protocol.Name(protocol)
-    print(
-        "[csv-train-test] "
-        f"protocol={protocol_name}, "
-        f"train_csv={train_csv}, "
-        f"test_csv={test_csv or train_csv}, "
-        f"samples={int(metrics['samples'])}, "
-        f"accuracy={metrics['accuracy']:.4f}, "
-        f"f1_macro={metrics['f1_macro']:.4f}, "
-        f"weighted_loss={metrics['weighted_loss']:.6f}"
-    )
-
-
-def train_linear_model_from_csv(
-    protocol: int,
-    train_csv: Path,
-    lr: float,
-    epochs: int,
-    batch_size: int,
-    eval_ratio: float,
-    verbose: bool,
-    reward_transform: Optional[Callable[[float], float]],
-    seed: Optional[int],
-) -> LinearTorchModel:
     data = load_training_data_from_csv(
         path=train_csv,
         protocol=protocol,
@@ -140,62 +137,92 @@ def train_linear_model_from_csv(
         phase_options=PHASE_INDEX_TO_TIMEOUT_INDEX,
         reward_transform=reward_transform,
     )
+
     train_loader, eval_loader = split_train_eval_loaders(
         data=data,
         batch_size=batch_size,
         eval_ratio=eval_ratio,
         seed=seed,
     )
-    model = LinearTorchModel(
+
+    model = train_linear_model_from_csv(
+        protocol=protocol,
+        model=model,
+        train_loader=train_loader,
+        eval_loader=eval_loader,
+        lr=lr,
+        epochs=epochs,
+        verbose=verbose,
+        save_path = save_path
+    )
+    metrics = evaluate_linear_model_on_csv(
+        model=model,
+        eval_loader=eval_loader,
+    )
+    protocol_name = agent_pb2.Protocol.Name(protocol)
+    print(
+        "[csv-train-test] "
+        f"protocol={protocol_name}, "
+        f"model={model.__class__.__name__}, "
+        f"train_csv={train_csv}, "
+        f"test_csv={test_csv or train_csv}, "
+        f"accuracy={metrics['accuracy']:.4f}, "
+        f"f1_macro={metrics['f1_macro']:.4f}, "
+        f"weighted_loss={metrics['weighted_loss']:.6f}"
+    )
+
+
+def train_linear_model_from_csv(
+    protocol: int,
+    model: TensorModel,
+    train_loader: DatasetLoader,
+    eval_loader: DatasetLoader,
+    lr: float,
+    epochs: int,
+    verbose: bool,
+    save_path: Optional[Path] = None,
+) -> TensorModel:
+    
+    tensor_model = model(
         action_dim=get_action_space_size(protocol),
         n_features=get_report_feature_dim(protocol),
         lr=lr,
     )
-    best_weights = model.weights.clone().detach()
-    best_eval_loss = float("inf")
+    best_weights = tensor_model.save()
+    best_eval_loss = float("-inf")
 
     show_progress = bool(verbose and tqdm is not None)
     epochs_iter = tqdm(range(epochs), desc="Training") if show_progress else range(epochs)
     for e in epochs_iter:
-        train_loss = _run_epoch(model, train_loader, backward=True)
-        eval_loss = (
-            train_loss
-            if eval_loader is None
-            else _run_epoch(model, eval_loader, backward=False)
+        train_loss = _run_epoch(tensor_model, train_loader, backward=True)
+    
+        metrics = evaluate_linear_model_on_csv(
+            model=tensor_model,
+            eval_loader= eval_loader,
         )
-        if eval_loss < best_eval_loss:
-            best_eval_loss = eval_loss
-            best_weights = model.weights.clone().detach()
+        if metrics['f1_macro'] > best_eval_loss:
+            best_eval_loss = metrics['f1_macro']
+            best_weights = tensor_model.save()
         if show_progress:
             epochs_iter.set_postfix(
                 Epoch=f"{e + 1}/{epochs}",
                 Train_Loss=f"{train_loss:.7f}",
-                Eval_Loss=f"{eval_loss:.7f}",
+                Best_F1=f"{best_eval_loss:.7f}",
             )
 
-    with torch.no_grad():
-        model.weights.copy_(best_weights)
-    return model
+   
+    tensor_model.load(best_weights)
+
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(best_weights, save_path)
+
+    return tensor_model
 
 
 def evaluate_linear_model_on_csv(
-    model: LinearTorchModel, protocol: int, path: Path, batch_size: int = 64
-) -> Dict[str, float]:
-    data = load_training_data_from_csv(
-        path=path,
-        protocol=protocol,
-        feature_field_names=get_report_feature_field_names(protocol),
-        timeout_values_ms=TIMEOUT_VALUES_MS,
-        phase_options=PHASE_INDEX_TO_TIMEOUT_INDEX
-    )
-    loader = DatasetLoader(
-        features=data.features,
-        actions=data.actions,
-        rewards=data.rewards,
-        labels=data.labels,
-        batch_size=batch_size,
-        shuffle=False,
-    )
+    model: TensorModel, eval_loader: DatasetLoader
+) -> Tuple[Dict[str, float], List[int]]:
 
     total = 0
     correct = 0
@@ -206,39 +233,44 @@ def evaluate_linear_model_on_csv(
     f1_sum = 0.0
 
     weighted_loss_sum = 0.0
-    for batch in loader:
+    for batch in eval_loader:
         weighted_loss_sum += model.update_model(
-            batch["features"], batch["actions"], batch["rewards"], backward=False
+            features = batch["features"], actions = batch["actions"], rewards = batch["rewards"], backward=False
         )
         logits = model.predict_action(batch["features"])
         predicted = torch.argmax(logits, dim=1)
         expected = torch.round(batch["labels"]).long()
         total += int(expected.numel())
         correct += int((predicted == expected).sum().item())
-
+        curr_timeout = [TIMEOUT_INDEX_TO_MS[idx] for idx in predicted.tolist()]
         for c in range(num_classes):
-            tp[c] += ((predicted == c) & (expected == c)).sum()
-            fp[c] += ((predicted == c) & (expected != c)).sum()
-            fn[c] += ((predicted != c) & (expected == c)).sum()
+            tp[c] += ((predicted == c) & (expected == c)).sum().item()
+            fp[c] += ((predicted == c) & (expected != c)).sum().item()
+            fn[c] += ((predicted != c) & (expected == c)).sum().item()
 
-            precision = tp[c] / (tp[c] + fp[c]) if (tp[c] + fp[c]) else 0.0
-            recall = tp[c] / (tp[c] + fn[c]) if (tp[c] + fn[c]) else 0.0
-            f1_class = 2 * (precision * recall) / (precision + recall) if (precision + recall) else 0.0
-            f1_sum += f1_class
-                
+    for c in range(num_classes):
+        p_denom = tp[c] + fp[c]
+        r_denom = tp[c] + fn[c]
+
+        precision = tp[c] / p_denom if p_denom > 0 else 0.0
+        recall = tp[c] / r_denom if r_denom > 0 else 0.0
+
+        f1_denom = precision + recall
+        f1_class = 2 * (precision * recall) / f1_denom if f1_denom > 0 else 0.0
+        f1_sum += f1_class
 
     accuracy = (correct / total) if total else 0.0
     f1 = f1_sum / num_classes
 
     return {
-        "samples": float(total),
+        "test samples": float(total),
         "accuracy": float(accuracy),
         "f1_macro": float(f1),
-        "weighted_loss": float(weighted_loss_sum / max(len(loader), 1)),
-    }
+        "weighted_loss": float(weighted_loss_sum / max(len(eval_loader), 1)),
+    }, curr_timeout
 
 
-def _run_epoch(model: LinearTorchModel, loader: DatasetLoader, backward: bool) -> float:
+def _run_epoch(model: TensorModel, loader: DatasetLoader, backward: bool) -> float:
     loss_sum = 0.0
     batch_count = 0
     for batch in loader:
@@ -254,10 +286,27 @@ def _run_epoch(model: LinearTorchModel, loader: DatasetLoader, backward: bool) -
     return loss_sum / batch_count
 
 
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed) # If using multi-GPU
+    
+    # Required for PyTorch to be truly deterministic on GPU
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Prevents Python's hash randomization from changing dictionary/set iteration order
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+
 def main() -> None:
     args = _build_parser().parse_args()
+    set_seed(11)
     run_pipeline(
         protocol=args.protocol,
+        model=args.model,
         train_csv=args.train_csv,
         test_csv=args.test_csv,
         epochs=args.epochs,
@@ -266,7 +315,8 @@ def main() -> None:
         lr=args.lr,
         seed=args.seed,
         reward_scaler=args.reward_scaler,
-        verbose=args.verbose,
+        verbose=True,
+        save_path= args.save_path
     )
 
 

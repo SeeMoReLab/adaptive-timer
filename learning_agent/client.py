@@ -9,7 +9,7 @@ from google.protobuf import empty_pb2
 import agent_pb2
 import agent_pb2_grpc
 
-TIMEOUT_OPTIONS_MS = (300, 600, 1200)
+TIMEOUT_OPTIONS_MS = (150, 400, 900)
 PROTOCOL_NAME_TO_ENUM = {
     "pbft": agent_pb2.PROTOCOL_PBFT,
     "two_pc_over_pbft": agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT,

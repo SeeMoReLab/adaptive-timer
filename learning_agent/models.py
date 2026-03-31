@@ -17,14 +17,14 @@ A = TypeVar("A")  # generic action type
 
 
 class TimeoutOption(IntEnum):
-    TIMEOUT_300_MS = 300
-    TIMEOUT_600_MS = 600
-    TIMEOUT_1200_MS = 1200
+    TIMEOUT_150_MS = 150
+    TIMEOUT_400_MS = 400
+    TIMEOUT_900_MS = 900
 
 TIMEOUT_OPTIONS: Tuple[TimeoutOption, ...] = (
-    TimeoutOption.TIMEOUT_300_MS,
-    TimeoutOption.TIMEOUT_600_MS,
-    TimeoutOption.TIMEOUT_1200_MS,
+    TimeoutOption.TIMEOUT_150_MS,
+    TimeoutOption.TIMEOUT_400_MS,
+    TimeoutOption.TIMEOUT_900_MS,
 )
 TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(int(option) for option in TIMEOUT_OPTIONS)
 TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
@@ -35,16 +35,12 @@ TIMEOUT_INDEX_TO_MS: Dict[int, int] = {
 }
 
 class PhaseMapping(IntEnum):
-    PHASE_0 = TimeoutOption.TIMEOUT_300_MS
-    PHASE_1 = TimeoutOption.TIMEOUT_300_MS
-    PHASE_2 = TimeoutOption.TIMEOUT_300_MS
-    PHASE_3 = TimeoutOption.TIMEOUT_300_MS
-    PHASE_4 = TimeoutOption.TIMEOUT_600_MS
-    PHASE_5 = TimeoutOption.TIMEOUT_600_MS
-    PHASE_6 = TimeoutOption.TIMEOUT_600_MS
-    PHASE_7 = TimeoutOption.TIMEOUT_1200_MS
-    PHASE_8 = TimeoutOption.TIMEOUT_1200_MS
-    PHASE_9 = TimeoutOption.TIMEOUT_1200_MS
+    PHASE_0 = TimeoutOption.TIMEOUT_150_MS
+    PHASE_1 = TimeoutOption.TIMEOUT_150_MS
+    PHASE_2 = TimeoutOption.TIMEOUT_150_MS
+    PHASE_3 = TimeoutOption.TIMEOUT_400_MS
+    PHASE_4 = TimeoutOption.TIMEOUT_400_MS
+    PHASE_5 = TimeoutOption.TIMEOUT_900_MS
 
 PHASE_OPTIONS: Tuple[PhaseMapping, ...] = (
     PhaseMapping.PHASE_0,
@@ -53,10 +49,6 @@ PHASE_OPTIONS: Tuple[PhaseMapping, ...] = (
     PhaseMapping.PHASE_3,
     PhaseMapping.PHASE_4,
     PhaseMapping.PHASE_5,
-    PhaseMapping.PHASE_6,
-    PhaseMapping.PHASE_7,
-    PhaseMapping.PHASE_8,
-    PhaseMapping.PHASE_9,
 )
 
 PHASE_VALUES_MS: Tuple[int, ...] = tuple(int(option) for option in PHASE_OPTIONS)
@@ -487,6 +479,12 @@ class RandomTimeoutModel(TensorModel):
     def reset_model(self) -> None:
         self._rng.manual_seed(self._initial_seed)
 
+    def save(self) -> Dict[str, Any]:
+        pass
+
+    def load(self, checkpoint: Dict[str, Any]) -> None:
+        pass
+
 class ScheduledTimeoutModel(TensorModel):
     """Returns protocol-specific timeout option indices from a time-based schedule."""
 
@@ -612,6 +610,12 @@ class ScheduledTimeoutModel(TensorModel):
     def reset_model(self) -> None:
         self._start_time = time.monotonic()
         self._active_row = -1
+
+    def save(self) -> Dict[str, Any]:
+        pass
+
+    def load(self, checkpoint: Dict[str, Any]) -> None:
+        pass
 
 class SVMTorchModel(TensorModel):
     """Linear SVM classifier over protocol-specific discrete timeout options."""

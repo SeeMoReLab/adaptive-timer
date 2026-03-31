@@ -387,19 +387,17 @@ def _timeout_ms_to_index(
 
 
 def _extract_reward(row: Dict[str, str], row_number: int) -> float:
-    for field_name in ("reward", "total_transactions"):
-        raw_value = row.get(field_name)
-        if raw_value is None or raw_value.strip() == "":
-            continue
-        try:
-            return float(raw_value)
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid reward value for '{field_name}' at CSV line {row_number}: {raw_value!r}"
-            ) from exc
-    raise ValueError(
-        f"Missing reward value at CSV line {row_number}. Tried: reward,total_transactions"
-    )
+    raw_value = row.get("reward")
+    if raw_value is None or raw_value.strip() == "":
+        raise ValueError(
+            f"Missing reward value at CSV line {row_number}. Tried: reward"
+        )
+    try:
+        return float(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid reward value for 'reward' at CSV line {row_number}: {raw_value!r}"
+        ) from exc
 
 def _extract_label(row: Dict[str, str], phase_options: Dict[int, int], row_number: int) -> float:
     for field_name in ("phase"):

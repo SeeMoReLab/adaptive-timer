@@ -1,5 +1,6 @@
 import argparse
 import base64
+import builtins
 import csv
 import random
 import re
@@ -8,6 +9,7 @@ import time
 import xml.etree.ElementTree as ET
 from concurrent import futures
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -37,6 +39,22 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
 
+_ORIGINAL_PRINT = builtins.print
+
+
+def _timestamped_print(*args, **kwargs) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if args:
+        first, *rest = args
+        _ORIGINAL_PRINT(f"[{timestamp}] {first}", *rest, **kwargs)
+        return
+    _ORIGINAL_PRINT(f"[{timestamp}]", **kwargs)
+
+
+def _install_timestamped_print() -> None:
+    builtins.print = _timestamped_print
+
+
 def _parse_bool(value: str) -> bool:
     lowered = value.strip().lower()
     if lowered in ("true", "1", "yes", "y", "on"):
@@ -46,7 +64,7 @@ def _parse_bool(value: str) -> bool:
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
-def reward_engineering(throughput: int) -> float:
+def reward_engineering(throughput: float) -> float:
     """Quadratic shaping below 1000, linear above (prior-work style)."""
     value = float(max(0, throughput))
     if value < 1000.0:
@@ -183,6 +201,9 @@ def _extract_reward_payload(protocol: int, reward: agent_pb2.Reward) -> Optional
 
 def _report_total_transactions(report: object) -> int:
     return int(getattr(report, "total_transactions", 0))
+
+def _report_throughput_tps(report: object) -> float:
+    return float(getattr(report, "throughput_tps", 0.0))
 
 
 @dataclass(frozen=True)
@@ -876,7 +897,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 report_node_id,
                 *report_values,
                 *timeout_values,
-                _report_total_transactions(reward_report),
+                _report_throughput_tps(reward_report),
                 int(matched),
             ]
         )
@@ -1315,7 +1336,8 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             return
 
         total_transactions = _report_total_transactions(reward_report)
-        engineered_reward = reward_engineering(total_transactions)
+        throughput_tps = _report_throughput_tps(reward_report)
+        engineered_reward = reward_engineering(throughput_tps)
         features = self._feature_extractor.featurize(matched_state)
         action = torch.tensor(float(action_index), dtype=torch.float32)
         self._model.update_model(features, action, engineered_reward)
@@ -1339,9 +1361,15 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         print(
             "[learning] applied reward update "
             f"(episode={reward_episode}, timeout={reward_timeout}, "
+            f"throughput_tps={throughput_tps:.6f}, "
             f"total_tx={total_transactions}, "
             f"reward={engineered_reward:.2f})"
         )
+
+    def _dataset_phase_for_episode_locked(self) -> int:
+        if isinstance(self._model, ScheduledTimeoutModel) and self._model.is_warmup_active():
+            return -1
+        return self._current_injection_phase_index_locked()
 
     def _predict_timeout_locked(
         self, episode: int, report: object, start_tick: int, report_seq: int
@@ -1352,7 +1380,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             )
         cached_report = _copy_state(report)
         self._state_by_episode[episode] = cached_report
-        self._phase_by_episode[episode] = self._current_injection_phase_index_locked()
+        self._phase_by_episode[episode] = self._dataset_phase_for_episode_locked()
 
         pending_reward = self._pending_rewards_by_episode.get(episode)
         if pending_reward is not None:
@@ -1441,7 +1469,9 @@ def serve(
         if schedule_file is None:
             raise ValueError("--schedule-file is required when --model-type=scheduled")
         model = ScheduledTimeoutModel.from_csv(
-            protocol, schedule_file, start_monotonic=start_mono
+            protocol,
+            schedule_file,
+            start_monotonic=start_mono,
         )
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
@@ -1497,6 +1527,8 @@ def serve(
 
 
 def main():
+    _install_timestamped_print()
+
     parser = argparse.ArgumentParser(description="LearningAgent server")
     parser.add_argument(
         "--node-id",
@@ -1601,6 +1633,8 @@ def main():
             "Path to schedule CSV. PBFT format: time_s,election_timeout_ms. "
             "2PC-over-PBFT format: time_s,election_timeout_ms,prepare_timeout_ms. "
             "SBFT format: time_s,election_timeout_ms,slow_path_timeout_ms,batch_timeout_ms. "
+            "Negative time_s values are allowed for pre-start offsets; schedule "
+            "activations are shifted so the earliest entry begins at time 0. "
             "Required when --model-type=scheduled."
         ),
     )

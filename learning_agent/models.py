@@ -497,9 +497,13 @@ class ScheduledTimeoutModel(TensorModel):
         self._protocol = _validate_protocol(protocol)
         if not schedule:
             raise ValueError("Schedule must contain at least one entry.")
-        self._schedule = sorted(schedule, key=lambda entry: entry[0])
-        if self._schedule[0][0] < 0:
-            raise ValueError("Schedule times must be >= 0 seconds.")
+        self._schedule = sorted(
+            [(float(time_s), int(option_index)) for time_s, option_index in schedule],
+            key=lambda entry: entry[0],
+        )
+        self._effective_schedule: List[Tuple[float, int]] = []
+        self._schedule_time_shift_s = 0.0
+        self._rebuild_effective_schedule()
         self._start_time = (
             time.monotonic() if start_monotonic is None else float(start_monotonic)
         )
@@ -528,10 +532,6 @@ class ScheduledTimeoutModel(TensorModel):
                     raise ValueError(
                         f"Invalid schedule time at line {lineno}: {row}"
                     ) from exc
-                if time_s < 0:
-                    raise ValueError(
-                        f"Invalid schedule at line {lineno}: time_s must be >= 0."
-                    )
 
                 if protocol == agent_pb2.PROTOCOL_PBFT:
                     if len(row) < 2:
@@ -572,6 +572,16 @@ class ScheduledTimeoutModel(TensorModel):
             raise ValueError(f"No schedule entries found in {path}.")
         return cls(protocol, schedule, start_monotonic=start_monotonic)
 
+    def _rebuild_effective_schedule(self) -> None:
+        if not self._schedule:
+            raise ValueError("Schedule must contain at least one entry.")
+        first_switch_time_s = float(self._schedule[0][0])
+        self._schedule_time_shift_s = -min(0.0, first_switch_time_s)
+        self._effective_schedule = [
+            (switch_time_s + self._schedule_time_shift_s, option_index)
+            for switch_time_s, option_index in self._schedule
+        ]
+
     def set_start_monotonic(self, start_monotonic: float) -> None:
         self._start_time = float(start_monotonic)
         self._active_row = -1
@@ -579,22 +589,32 @@ class ScheduledTimeoutModel(TensorModel):
     def _current_option_index(self) -> int:
         elapsed_s = time.monotonic() - self._start_time
         active_row = 0
-        option_index = self._schedule[0][1]
-        for row_idx, (switch_time_s, schedule_option_index) in enumerate(self._schedule):
+        option_index = self._effective_schedule[0][1]
+        for row_idx, (switch_time_s, schedule_option_index) in enumerate(
+            self._effective_schedule
+        ):
             if elapsed_s >= switch_time_s:
                 active_row = row_idx
                 option_index = schedule_option_index
             else:
                 break
         if active_row != self._active_row:
-            switch_time_s, active_option_index = self._schedule[active_row]
+            switch_time_s, active_option_index = self._effective_schedule[active_row]
+            source_switch_time_s, _ = self._schedule[active_row]
             print(
                 "[scheduled-model] active schedule: "
                 f"time_s>={switch_time_s:g}, "
+                f"source_time_s={source_switch_time_s:g}, "
                 f"{describe_action(self._protocol, active_option_index)}"
             )
             self._active_row = active_row
         return option_index
+
+    def is_warmup_active(self) -> bool:
+        if self._schedule_time_shift_s <= 0.0:
+            return False
+        elapsed_s = time.monotonic() - self._start_time
+        return 0.0 <= elapsed_s < self._schedule_time_shift_s
 
     def predict_action(self, features: torch.Tensor) -> torch.Tensor:
         del features
@@ -964,6 +984,3 @@ class ThompsonSamplingModel(TensorModel):
             } 
             for _ in range(self._act_dim)
         ]
-
-
-

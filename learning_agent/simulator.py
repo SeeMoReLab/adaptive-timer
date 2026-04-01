@@ -7,6 +7,7 @@ from tqdm import tqdm
 import numpy as np
 import os
 import random
+import matplotlib.pyplot as plt
 
 import agent_pb2
 from data_loader import (
@@ -167,7 +168,27 @@ def _build_parser() -> argparse.ArgumentParser:
         default=Path(__file__).resolve().parent / "data",
         help="Observation Sample Directory path.",
     )
+    parser.add_argument(
+        "--plot-dir",
+        type=str,
+        default=Path(__file__).resolve().parent / "plot",
+        help="Plot Image Directory path.",
+    )
     
+    parser.add_argument(
+        "--summary-plot-filename",
+        type=str,
+        default= 'lineplot.png',
+        help="Summary plot Image Filename.",
+    )
+
+    parser.add_argument(
+        "--complete-plot-filename",
+        type=str,
+        default= 'complet_lineplot.png',
+        help="Stages plot Image Filename.",
+    )
+
     parser.add_argument(
         "--num-episodes",
         type=int,
@@ -308,6 +329,109 @@ def evaluate_model(
 
     }, curr_timeout
 
+def plot_accuracy(result: Dict[str, float], save_path: str = 'accuracy_plot.pdf') -> None:
+    plt.rcParams.update({
+        'font.family': 'serif',
+        'font.serif': ['Times New Roman', 'DejaVu Serif'],
+        'font.size': 12,            
+        'axes.labelsize': 14,         
+        'axes.titlesize': 14,
+        'xtick.labelsize': 11,
+        'ytick.labelsize': 11,
+        'legend.fontsize': 11,
+        'axes.linewidth': 1.0,       
+        'lines.linewidth': 2.0,       
+        'lines.markersize': 7,        
+        'figure.figsize': (10.0, 6.0), 
+        'axes.spines.top': False,     
+        'axes.spines.right': False
+    })
+    
+    phases = [str(p[1]) for p in list(result.keys())] 
+    accuracies = list(result.values())
+
+    x_positions = range(len(accuracies))
+
+    fig, ax = plt.subplots()
+    
+    ax.plot(x_positions, accuracies, marker='o', color='#1f77b4', linestyle='-', label='Accuracy')
+    
+    ax.set_xticks(x_positions)
+    
+    ax.set_ylim(0, 1.1)
+    ax.set_xlabel('Phase')
+    ax.set_ylabel('Accuracy')
+
+    ax.grid(True, linestyle='--', alpha=0.4)
+    ax.legend(frameon=False)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+def plot_stage_accuracies(data_dict: Dict[Tuple[int, str], List[float]], save_path: str = 'stage_accuracies.pdf') -> None:
+    plt.rcParams.update({
+        'font.family': 'serif',
+        'font.serif': ['Times New Roman', 'DejaVu Serif'],
+        'font.size': 12,              
+        'axes.labelsize': 14,         
+        'axes.titlesize': 14,
+        'xtick.labelsize': 11,
+        'ytick.labelsize': 11,
+        'legend.fontsize': 11,
+        'axes.linewidth': 1.0,        
+        'lines.linewidth': 1,       
+        'lines.markersize': 3,    
+        'figure.figsize': (12.0, 6.0), 
+        'axes.spines.top': False,     
+        'axes.spines.right': False
+    })
+
+    fig, ax = plt.subplots()
+    
+    current_x = 0
+    x_ticks = []
+    x_labels = []
+    
+    single_color = '#1f77b4' 
+    
+    for i, (key, accuracies) in enumerate(data_dict.items()):
+        stage_idx, phase_id = key
+        n_points = len(accuracies)
+        
+        x_coords = range(current_x, current_x + n_points)
+        
+        label = 'Accuracy' if i == 0 else None
+        
+        ax.plot(x_coords, accuracies, marker='o', linestyle='-', 
+                color=single_color, 
+                label=label,
+                alpha=0.5,
+                linewidth=0.5) 
+        
+        middle_x = current_x + (n_points / 2) - 0.5
+        x_ticks.append(middle_x)
+        x_labels.append(f'{phase_id}')
+        
+        current_x += n_points
+        if i < len(data_dict) - 1:
+            ax.axvline(x=current_x - 0.5, color='gray', linestyle='--', alpha=1.0)
+
+    ax.set_ylim(-0.05, 1.1)
+    ax.set_xlabel('Phase')
+    ax.set_ylabel('Accuracy')
+    
+    ax.set_xticks(x_ticks)
+    ax.set_xticklabels(x_labels)
+    
+    ax.grid(True, linestyle=':', alpha=0.6, axis='y')
+    ax.legend(frameon=False, loc='lower right')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    
+
 def main() -> None:
     set_seed(11)
 
@@ -326,12 +450,15 @@ def main() -> None:
         lr=args.lr,
     )
 
+    os.makedirs(args.plot_dir, exist_ok=True)
     current_start_episode = 0
     idx = 0
     phases = args.phases.split(';')
     use_tqdm = HAS_TQDM and args.verbose
     curr_timeout = None
     accuracy = []
+    result= {}
+    raw_result = {}
     for phase in phases:
         idx += 1
         phase_accuracy, phase_loss = [], []
@@ -342,7 +469,8 @@ def main() -> None:
             )
         else:
             episode_iterator = range(args.num_episodes)
-            
+        
+        raw_result[(idx,phase)] = []
         for phase_eps in episode_iterator:
             phase_loader, current_start_episode = generate_data(
                 generator=generator, 
@@ -360,6 +488,7 @@ def main() -> None:
             )
 
             phase_accuracy.append(metrics['accuracy'])
+            raw_result[(idx,phase)].append(metrics['accuracy'])
 
             model, _ = train_model(
                 model=model,
@@ -372,8 +501,14 @@ def main() -> None:
                 episode_iterator.set_postfix({
                     'Pred Acc': f"{sum(phase_accuracy)/len(phase_accuracy):.4f}",
                 })
-
+            
+        
+        result[(idx,phase)] = sum(phase_accuracy)/len(phase_accuracy)
         accuracy.append(sum(phase_accuracy)/len(phase_accuracy))
+
+        
+    plot_accuracy(result= result, save_path = os.path.join(args.plot_dir, args.summary_plot_filename))
+    plot_stage_accuracies(data_dict= raw_result, save_path = os.path.join(args.plot_dir, args.complete_plot_filename))
 
     print(
         f"\n[SUMMARY]]\n"
@@ -382,7 +517,9 @@ def main() -> None:
         f"num_episodes={args.num_episodes}, "
         f"phases={args.phases}, "
         f"accuracy={(sum(accuracy) / len(accuracy)):.4f}, "
-        f"std={np.std(accuracy):.4f}"
+        f"std={np.std(accuracy):.4f},"
+        f'plot filename: {os.path.join(args.plot_dir, args.summary_plot_filename)}\t'
+
 
         f"[Model Configs:]\t"
         f"model={model.__class__.__name__}, "

@@ -213,6 +213,7 @@ class DataGenerator(BaseDataGenerator):
         max_val = stats.get('max', 0.0)
 
         if pd.isna(std) or std == 0:
+            print(1)
             jitter = abs(mean * temperature) 
             return np.random.uniform(mean - jitter, mean + jitter, size=n_samples)
         else:

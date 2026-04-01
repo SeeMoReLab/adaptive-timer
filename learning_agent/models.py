@@ -904,7 +904,7 @@ class ThompsonSamplingModel(TensorModel):
             ) for _ in range(self._act_dim)]
 
         self.is_fitted = [False] * self._act_dim
-        self._max_bucket_size = 10000
+        self._max_bucket_size = 2500
         self._init_buckets()
 
     def predict_action(self, features: torch.Tensor) -> torch.Tensor:

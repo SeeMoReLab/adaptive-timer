@@ -886,7 +886,7 @@ class ThompsonSamplingModel(TensorModel):
         action_dim: int, 
         n_features: int, 
         lr:float,
-        k:int = 8
+        k:int = 1
 
     ):
         del lr

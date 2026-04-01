@@ -140,7 +140,7 @@ class DataGenerator(BaseDataGenerator):
 
         for idx, row in trial.iterrows():
             timeout_val = row['election_timeout_milliseconds_used']
-            single_reward = self._sample_reward_by_timeout(timeout_val, conf_stats, n_samples=1)[0]
+            single_reward = self._sample_reward_by_timeout(phase_index,timeout_val, conf_stats, n_samples=1)[0]
             trial.at[idx, 'reward'] = single_reward
 
         res = trial.assign(phase=phase_index)
@@ -198,7 +198,7 @@ class DataGenerator(BaseDataGenerator):
         return pd.DataFrame(res)
     
     def _sample_reward_by_timeout(
-            self, timeout_val: float, conf_stats: dict, n_samples: int, temperature:float = 0.25
+            self, idx, timeout_val: float, conf_stats: dict, n_samples: int, temperature:float = 0.25
             ) -> np.ndarray:
         """
         Generates rewards using a Normal distribution based on historical mean and std, 

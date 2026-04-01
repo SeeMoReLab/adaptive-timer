@@ -885,9 +885,11 @@ class ThompsonSamplingModel(TensorModel):
         self, 
         action_dim: int, 
         n_features: int, 
-        lr:float
+        lr:float,
+        k:int = 8
 
     ):
+        del lr
         if action_dim <= 0:
             raise ValueError(f"action_dim must be > 0, got {action_dim}")
         
@@ -897,7 +899,7 @@ class ThompsonSamplingModel(TensorModel):
         self.models = [
             DecisionTreeRegressor(
                 criterion='squared_error',
-                max_depth=4,              
+                max_depth=6,              
                 min_samples_leaf=20,    
                 min_impurity_decrease=0.01,    
                 random_state=42
@@ -949,14 +951,17 @@ class ThompsonSamplingModel(TensorModel):
             act = actions_np[i]
            
 
-            if backward :
+            if backward:
                 if 0 <= act < self._act_dim:
                     self.buckets[act]["features"].append(features_np[i])
                     self.buckets[act]["rewards"].append(rewards_np[i])
-                    X =np.array(self.buckets[act]["features"])
-                    y = np.array(self.buckets[act]["rewards"])
-                    self.models[act].fit(X, y)
-                    self.is_fitted[act] = True
+                    if self.global_step % self.k == 0:
+                        X =np.array(self.buckets[act]["features"])
+                        y = np.array(self.buckets[act]["rewards"])
+                        self.models[act].fit(X, y)
+                        self.is_fitted[act] = True
+
+        self.global_step +=1
         return 0.0
 
     def reset_model(self) -> None:

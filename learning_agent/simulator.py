@@ -462,7 +462,6 @@ def main() -> None:
     for phase in phases:
         idx += 1
         phase_accuracy, phase_loss = [], []
-        print('='*100)
         if use_tqdm:
             episode_iterator = tqdm(
                 range(args.num_episodes), 
@@ -508,6 +507,7 @@ def main() -> None:
         accuracy.append(sum(phase_accuracy)/len(phase_accuracy))
 
         
+    
     plot_accuracy(result= result, save_path = os.path.join(args.plot_dir, args.summary_plot_filename))
     plot_stage_accuracies(data_dict= raw_result, save_path = os.path.join(args.plot_dir, args.complete_plot_filename))
 

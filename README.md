@@ -76,7 +76,8 @@ python learning_agent/simulator.py \
   --data-dir learning_agent/data/pbft \
   --num-episodes 500 \
   --phases "5;1;2;3;4;5;0;2;1;5;4;2;1" \
-  --plot-filename line.png \
+  --summary-plot-filename line.png \
+  --complete-plot-filename full_line.png \
   --verbose
 ```
 With $N$ agent observations located in ./data/pbft, each agent will have 1,000 episodes for each phase.

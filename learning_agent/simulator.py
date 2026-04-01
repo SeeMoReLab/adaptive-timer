@@ -462,6 +462,7 @@ def main() -> None:
     for phase in phases:
         idx += 1
         phase_accuracy, phase_loss = [], []
+        print('='*100)
         if use_tqdm:
             episode_iterator = tqdm(
                 range(args.num_episodes), 

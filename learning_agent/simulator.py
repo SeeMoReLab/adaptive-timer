@@ -322,7 +322,10 @@ def evaluate_model(
 
     }, curr_timeout
 
-def plot_accuracy(result: Dict[str, float], save_path: str = 'accuracy_plot.png') -> None:
+import matplotlib.pyplot as plt
+from typing import Dict, Tuple
+
+def plot_accuracy(result: Dict[Tuple[int, str], float], save_path: str = 'accuracy_plot.pdf') -> None:
     plt.rcParams.update({
         'font.family': 'serif',
         'font.serif': ['Times New Roman', 'DejaVu Serif'],
@@ -340,23 +343,36 @@ def plot_accuracy(result: Dict[str, float], save_path: str = 'accuracy_plot.png'
         'axes.spines.right': False
     })
     
-    phases = [str(p[1]) for p in list(result.keys())] 
-    accuracies = list(result.values())
-
-    x_positions = range(len(accuracies))
-
     fig, ax = plt.subplots()
     
-    ax.plot(x_positions, accuracies, marker='o', color='#1f77b4', linestyle='-', label='Accuracy')
+    sorted_items = sorted(result.items(), key=lambda item: item[0][0])
     
-    ax.set_xticks(x_positions)
+    phases = [str(k[1]) for k, v in sorted_items]
+    accuracies = [v for k, v in sorted_items]
+
+    x_coords = list(range(len(accuracies)))
+    single_color = '#1f77b4'
+
+    ax.plot(x_coords, accuracies, marker='o', linestyle='-', 
+            color=single_color, label='Accuracy', alpha=0.8)
     
-    ax.set_ylim(0, 1.1)
+    x_ticks = []
+    x_labels = []
+    
+    for i in range(len(accuracies)):
+        x_ticks.append(i)
+        x_labels.append(phases[i])
+
+            
+    ax.set_ylim(-0.05, 1.1)
     ax.set_xlabel('Phase')
     ax.set_ylabel('Accuracy')
 
-    ax.grid(True, linestyle='--', alpha=0.4)
-    ax.legend(frameon=False)
+    ax.set_xticks(x_ticks)
+    ax.set_xticklabels(x_labels)
+
+    ax.grid(True, linestyle=':', alpha=0.6, axis='y')
+    ax.legend(frameon=False, loc='lower right')
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')

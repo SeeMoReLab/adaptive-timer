@@ -886,8 +886,6 @@ class ThompsonSamplingModel(TensorModel):
         action_dim: int, 
         n_features: int, 
         lr:float,
-        k:int = 1
-
     ):
         del lr
         if action_dim <= 0:
@@ -955,13 +953,12 @@ class ThompsonSamplingModel(TensorModel):
                 if 0 <= act < self._act_dim:
                     self.buckets[act]["features"].append(features_np[i])
                     self.buckets[act]["rewards"].append(rewards_np[i])
-                    if self.global_step % self.k == 0:
-                        X =np.array(self.buckets[act]["features"])
-                        y = np.array(self.buckets[act]["rewards"])
-                        self.models[act].fit(X, y)
-                        self.is_fitted[act] = True
 
-        self.global_step +=1
+                    X =np.array(self.buckets[act]["features"])
+                    y = np.array(self.buckets[act]["rewards"])
+                    self.models[act].fit(X, y)
+                    self.is_fitted[act] = True
+
         return 0.0
 
     def reset_model(self) -> None:

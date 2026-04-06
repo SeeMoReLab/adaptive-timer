@@ -29,6 +29,7 @@ from models import (
     ProtocolTimeoutActionDecoder,
     RandomTimeoutModel,
     ScheduledTimeoutModel,
+    ThompsonSamplingModel,
     TensorModel,
     get_action_space_size,
     get_report_feature_dim,
@@ -239,8 +240,40 @@ def _parse_required_int(parent: ET.Element, tag: str) -> int:
         raise ValueError(f"Invalid integer in <{tag}>: {node.text!r}") from exc
 
 
-def load_agent_injection_schedule(path: Path) -> List[AgentInjectionPhase]:
+def _parse_optional_float(parent: ET.Element, tag: str) -> Optional[float]:
+    node = parent.find(tag)
+    if node is None or node.text is None:
+        return None
+    try:
+        return float(node.text.strip())
+    except ValueError as exc:
+        raise ValueError(f"Invalid float in <{tag}>: {node.text!r}") from exc
+
+
+def _parse_optional_int(parent: ET.Element, tag: str) -> Optional[int]:
+    node = parent.find(tag)
+    if node is None or node.text is None:
+        return None
+    try:
+        return int(node.text.strip())
+    except ValueError as exc:
+        raise ValueError(f"Invalid integer in <{tag}>: {node.text!r}") from exc
+
+
+def _parse_warmup_seconds(root: ET.Element) -> float:
+    warmup_ms = _parse_optional_int(root, "warmUpTimeMs")
+    if warmup_ms is not None:
+        return max(0.0, warmup_ms / 1000.0)
+
+    warmup_s = _parse_optional_float(root, "warmUpTime")
+    if warmup_s is None:
+        return 0.0
+    return max(0.0, warmup_s)
+
+
+def load_agent_injection_schedule(path: Path) -> Tuple[float, List[AgentInjectionPhase]]:
     root = ET.parse(path).getroot()
+    warmup_s = _parse_warmup_seconds(root)
     phase_nodes = root.findall("./phases/phase")
     if not phase_nodes:
         raise ValueError(f"No <phase> entries found in {path}")
@@ -298,7 +331,7 @@ def load_agent_injection_schedule(path: Path) -> List[AgentInjectionPhase]:
     if not has_at_time:
         print("[injection] no <atTime> found; using legacy duration semantics from <time>")
 
-    return phases
+    return warmup_s, phases
 
 
 def _compute_start_monotonic(start_unix_ms: Optional[int]) -> float:
@@ -446,6 +479,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         dataset_csv: Optional[Path],
         agent_injection_schedule: Optional[List[AgentInjectionPhase]],
         injection_start_mono: float,
+        injection_warmup_s: float,
     ):
         self._protocol = int(protocol)
         self.node_id = node_id
@@ -501,6 +535,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             list(agent_injection_schedule) if agent_injection_schedule else []
         )
         self._injection_start_mono = injection_start_mono
+        self._injection_warmup_s = max(0.0, float(injection_warmup_s))
         self._active_injection_phase_index = -1
         self._current_episode = 0
         self._sealed_through_episode = 0
@@ -607,9 +642,12 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         if not self._agent_injection_schedule:
             return -1
         elapsed_s = max(0.0, time.monotonic() - self._injection_start_mono)
+        elapsed_injection_s = elapsed_s - self._injection_warmup_s
+        if elapsed_injection_s < 0.0:
+            return -1
         active_index = -1
         for idx, phase in enumerate(self._agent_injection_schedule):
-            if elapsed_s >= phase.at_time_s:
+            if elapsed_injection_s >= phase.at_time_s:
                 active_index = idx
             else:
                 break
@@ -974,6 +1012,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                     state,
                     int(local_report.start_tick),
                     int(local_report.report_seq),
+                    self.node_id,
                 )
                 self._timeouts_by_episode[local_report.episode] = TimeoutDecision(
                     timeout=timeout,
@@ -1084,6 +1123,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 aggregated_report,
                 start_tick,
                 report_seq,
+                self.node_id,
             )
             self._timeouts_by_episode[request.episode] = TimeoutDecision(
                 timeout=timeout,
@@ -1339,13 +1379,6 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         total_transactions = _report_total_transactions(reward_report)
         throughput_tps = _report_throughput_tps(reward_report)
         engineered_reward = reward_engineering(throughput_tps)
-        features = self._feature_extractor.featurize(matched_state)
-        action = torch.tensor(float(action_index), dtype=torch.float32)
-        self._model.update_model(features, action, engineered_reward)
-        # Reward for this episode has been consumed.
-        self._state_by_episode.pop(reward_episode, None)
-        self._phase_by_episode.pop(reward_episode, None)
-        self._pending_rewards_by_episode.pop(reward_episode, None)
         if self._protocol == agent_pb2.PROTOCOL_PBFT:
             reward_timeout = f"{timeout_used.election_timeout_milliseconds}"
         elif self._protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
@@ -1359,21 +1392,74 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 f"{timeout_used.slow_path_timeout_milliseconds}/"
                 f"{timeout_used.batch_timeout_milliseconds}"
             )
-        print(
-            "[learning] applied reward update "
-            f"(episode={reward_episode}, timeout={reward_timeout}, "
-            f"throughput_tps={throughput_tps:.6f}, "
-            f"total_tx={total_transactions}, "
-            f"reward={engineered_reward:.2f})"
-        )
+
+        if phase == -1:
+            print(
+                "[learning] skipped model update during warmup "
+                f"(episode={reward_episode}, timeout={reward_timeout}, "
+                f"throughput_tps={throughput_tps:.6f}, "
+                f"total_tx={total_transactions}, "
+                f"reward={engineered_reward:.2f})"
+            )
+        else:
+            features = self._feature_extractor.featurize(matched_state)
+            action = torch.tensor(float(action_index), dtype=torch.float32)
+            self._model.update_model(features, action, engineered_reward)
+            print(
+                "[learning] applied reward update "
+                f"(episode={reward_episode}, timeout={reward_timeout}, "
+                f"throughput_tps={throughput_tps:.6f}, "
+                f"total_tx={total_transactions}, "
+                f"reward={engineered_reward:.2f})"
+            )
+
+        # Reward for this episode has been consumed.
+        self._state_by_episode.pop(reward_episode, None)
+        self._phase_by_episode.pop(reward_episode, None)
+        self._pending_rewards_by_episode.pop(reward_episode, None)
 
     def _dataset_phase_for_episode_locked(self) -> int:
+        elapsed_s = max(0.0, time.monotonic() - self._injection_start_mono)
+        if elapsed_s < self._injection_warmup_s:
+            return -1
         if isinstance(self._model, ScheduledTimeoutModel) and self._model.is_warmup_active():
             return -1
         return self._current_injection_phase_index_locked()
 
+    def _log_report_row_locked(
+        self,
+        phase: int,
+        report_node_id: int,
+        episode: int,
+        timeout: agent_pb2.Timeout,
+        report_state: object,
+    ) -> None:
+        if self._dataset_writer is None or self._dataset_handle is None:
+            return
+        try:
+            timeout_inner = _timeout_from_status(self._protocol, timeout)
+        except ValueError:
+            return
+        report_values = [
+            getattr(report_state, field_name)
+            for field_name in self._report_feature_field_names
+        ]
+        timeout_values = _dataset_timeout_values(self._protocol, timeout_inner)
+        self._dataset_writer.writerow(
+            [
+                episode,
+                phase,
+                report_node_id,
+                *report_values,
+                *timeout_values,
+                "",
+                0,
+            ]
+        )
+        self._dataset_handle.flush()
+
     def _predict_timeout_locked(
-        self, episode: int, report: object, start_tick: int, report_seq: int
+        self, episode: int, report: object, start_tick: int, report_seq: int, report_node_id: int
     ) -> agent_pb2.Timeout:
         if report_seq <= start_tick:
             raise ValueError(
@@ -1383,19 +1469,29 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._state_by_episode[episode] = cached_report
         self._phase_by_episode[episode] = self._dataset_phase_for_episode_locked()
 
+        features = self._feature_extractor.featurize(report)
+        action = self._model.predict_action(features)
+        timeout = self._action_decoder.decode(action)
+
+        self._log_report_row_locked(
+            phase=self._phase_by_episode[episode],
+            report_node_id=report_node_id,
+            episode=episode,
+            timeout=timeout,
+            report_state=cached_report,
+        )
+
         pending_reward = self._pending_rewards_by_episode.get(episode)
         if pending_reward is not None:
-            report_node_id, reward_report, timeout_used = pending_reward
+            rn_id, reward_report, timeout_used = pending_reward
             self._apply_reward_payload_locked(
-                report_node_id=report_node_id,
+                report_node_id=rn_id,
                 reward_episode=episode,
                 reward_report=reward_report,
                 timeout_used=timeout_used,
             )
 
-        features = self._feature_extractor.featurize(report)
-        action = self._model.predict_action(features)
-        return self._action_decoder.decode(action)
+        return timeout
 
 
 def serve(
@@ -1470,6 +1566,7 @@ def serve(
         model = CMABModel(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
+            lr=0.05,
         )
     elif model_type == "scheduled":
         if schedule_file is None:
@@ -1491,13 +1588,17 @@ def serve(
     else:
         raise ValueError(f"Unsupported aggregation function: {aggregate_function}")
 
-    agent_injection_schedule = (
-        load_agent_injection_schedule(failure_spec) if failure_spec is not None else None
-    )
+    injection_warmup_s = 0.0
+    agent_injection_schedule = None
+    if failure_spec is not None:
+        injection_warmup_s, agent_injection_schedule = load_agent_injection_schedule(
+            failure_spec
+        )
     if agent_injection_schedule:
         print(
             "[injection] loaded schedule "
-            f"(phases={len(agent_injection_schedule)}, start_unix_ms={injection_start_unix_ms})"
+            f"(phases={len(agent_injection_schedule)}, warmup_s={injection_warmup_s:g}, "
+            f"start_unix_ms={injection_start_unix_ms})"
         )
     servicer = LearningAgentServicer(
         protocol=protocol,
@@ -1518,6 +1619,7 @@ def serve(
         dataset_csv=dataset_csv,
         agent_injection_schedule=agent_injection_schedule,
         injection_start_mono=start_mono,
+        injection_warmup_s=injection_warmup_s,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))

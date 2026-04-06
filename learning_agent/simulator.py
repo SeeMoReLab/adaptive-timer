@@ -8,6 +8,7 @@ import numpy as np
 import os
 import random
 import matplotlib.pyplot as plt
+import time
 
 import agent_pb2
 from data_loader import (
@@ -118,6 +119,7 @@ def _parse_data(
             feature_field_names=feature_field_names,
             row_number=row_number,
         )
+        
         action_index = _extract_action_index(
             protocol=protocol,
             row=row,
@@ -322,8 +324,7 @@ def evaluate_model(
 
     }, curr_timeout
 
-import matplotlib.pyplot as plt
-from typing import Dict, Tuple
+
 
 def plot_accuracy(result: Dict[Tuple[int, str], float], save_path: str = 'accuracy_plot.pdf') -> None:
     plt.rcParams.update({
@@ -514,16 +515,18 @@ def plot_prediction_phases(data_dict: Dict[Tuple[int, str], List[float]], save_p
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
 
+
 def main() -> None:
     set_seed(11)
 
     args = _build_parser().parse_args()
     print(f'Initiating Experiment [Model:] {args.model} [Protocol:] {args.protocol} [Phases:] {args.phases}')
 
+    # 1. Initialization
     generator = DataGenerator(
-            protocol=args.protocol, 
-            directory_path=args.data_dir, 
-        )
+        protocol=args.protocol, 
+        directory_path=args.data_dir, 
+    )
     scaler = QuadraticRewardScaler.transform if args.reward_scaler == "quadratic" else None
 
     model = args.model(
@@ -533,7 +536,6 @@ def main() -> None:
     )
 
     os.makedirs(args.plot_dir, exist_ok=True)
-
     exp_path = os.path.join(args.plot_dir, args.experiment_name)
     os.makedirs(exp_path, exist_ok=True)
 
@@ -542,13 +544,28 @@ def main() -> None:
     phases = args.phases.split(';')
     use_tqdm = HAS_TQDM and args.verbose
     curr_timeout = None
+    
     accuracy = []
-    result= {}
+    result = {}
     raw_result = {}
     predictions = {}
+    
+    # Convergence conf
+    convergence_stats = {} 
+    patience = 5  
+
     for phase in phases:
         idx += 1
-        phase_accuracy, phase_loss = [], []
+        phase_accuracy = []
+        
+        phase_converged = False
+        stable_count = 0
+        last_pred = None
+        converged_ep = -1
+        converged_time_ms = -1.0
+        
+        phase_start_time = time.perf_counter() 
+        
         if use_tqdm:
             episode_iterator = tqdm(
                 range(args.num_episodes), 
@@ -557,8 +574,9 @@ def main() -> None:
         else:
             episode_iterator = range(args.num_episodes)
         
-        raw_result[(idx,phase)] = []
-        predictions[(idx,phase)] = []
+        raw_result[(idx, phase)] = []
+        predictions[(idx, phase)] = []
+        
         for phase_eps in episode_iterator:
             phase_loader, current_start_episode = generate_data(
                 generator=generator, 
@@ -568,15 +586,29 @@ def main() -> None:
                 scaler=scaler,       
                 batch_size=args.batch_size,
                 num_episode=1,
-                prev_timeout = curr_timeout
+                prev_timeout=curr_timeout
             )
+            
             metrics, curr_timeout = evaluate_model(
                 model=model,         
                 eval_loader=phase_loader,
             )
-            predictions[(idx,phase)].append((curr_timeout))
+            
+            predictions[(idx, phase)].append(curr_timeout)
             phase_accuracy.append(metrics['accuracy'])
-            raw_result[(idx,phase)].append(metrics['accuracy'])
+            raw_result[(idx, phase)].append(metrics['accuracy'])
+
+            if not phase_converged:
+                if curr_timeout == last_pred:
+                    stable_count += 1
+                else:
+                    stable_count = 1  
+                    last_pred = curr_timeout
+
+                if stable_count >= patience:
+                    phase_converged = True
+                    converged_ep = (phase_eps + 1) - patience + 1 
+                    converged_time_ms = (time.perf_counter() - phase_start_time) * 1000 
 
             model, _ = train_model(
                 model=model,
@@ -590,33 +622,49 @@ def main() -> None:
                     'Pred Acc': f"{sum(phase_accuracy)/len(phase_accuracy):.4f}",
                 })
             
+        if not phase_converged:
+            converged_ep = args.num_episodes
+            converged_time_ms = (time.perf_counter() - phase_start_time) * 1000
+            
+        convergence_stats[(idx, phase)] = {
+            'ep': converged_ep, 
+            'time_ms': converged_time_ms, 
+            'converged': phase_converged
+        }
         
-        result[(idx,phase)] = sum(phase_accuracy)/len(phase_accuracy)
-        accuracy.append(sum(phase_accuracy)/len(phase_accuracy))
+        phase_avg_acc = sum(phase_accuracy) / len(phase_accuracy)
+        result[(idx, phase)] = phase_avg_acc
+        accuracy.append(phase_avg_acc)
 
-        
+    plot_accuracy(result=result, save_path=os.path.join(exp_path, 'summary_accuracies.png'))
+    plot_stage_accuracies(data_dict=raw_result, save_path=os.path.join(exp_path, 'episode_accuracies.png'))
+    plot_prediction_phases(data_dict=predictions, save_path=os.path.join(exp_path, 'predictions.png'), y_ticks=[150, 400, 900])
+
+    print(f"\n[SUMMARY]")
+    print(f"[Experiment Configs:]\tprotocol={args.protocol}, num_episodes={args.num_episodes}, phases={args.phases}")
+    avg_eps = sum(stat['ep'] for stat in convergence_stats.values()) / len(convergence_stats)
+    avg_ms = sum(stat['time_ms'] for stat in convergence_stats.values()) / len(convergence_stats)
+    print(
+        f"[Overall Metrics:]\t"
+        f"accuracy={(sum(accuracy) / len(accuracy)):.4f}, "
+        f"std={np.std(accuracy):.4f}, "
+        f"conv_eps={avg_eps:.1f}, "
+        f"conv_time={avg_ms:.2f}"
+    )
     
-    plot_accuracy(result= result, save_path = os.path.join(exp_path, 'summary_accuracies.png'))
-    plot_stage_accuracies(data_dict= raw_result, save_path = os.path.join(exp_path, 'episode_accuracies.png'))
-    plot_prediction_phases(data_dict=predictions, save_path=os.path.join(exp_path, 'predictions.png'), y_ticks= [150,400,900])
+    print(f"\n[Convergence Metrics per Phase:]")
+    for (i, p), stats in convergence_stats.items():
+        status = "Converged" if stats['converged'] else "Failed to Converge"
+        print(f"  Phase {p} ({i}/{len(phases)}): {status} at Episode {stats['ep']} | Converge Time: {stats['time_ms']:.2f} ms")
 
     print(
-        f"\n[SUMMARY]]\n"
-        f"[Experiment Configs:]\t"
-        f"protocol={args.protocol}, "
-        f"num_episodes={args.num_episodes}, "
-        f"phases={args.phases}, "
-        f"accuracy={(sum(accuracy) / len(accuracy)):.4f}, "
-        f"std={np.std(accuracy):.4f},"
-
-
-        f"[Model Configs:]\t"
+        f"\n[Model Configs:]\t"
         f"model={model.__class__.__name__}, "
         f"lr={args.lr}, "
         f"epochs={args.epochs}, "
         f"batch_size={args.batch_size}, "
-        f"seed={args.seed}, "
-        )
+        f"seed={args.seed}"
+    )
         
 
 if __name__ == "__main__":

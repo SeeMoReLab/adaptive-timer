@@ -198,7 +198,7 @@ class DataGenerator(BaseDataGenerator):
         return pd.DataFrame(res)
     
     def _sample_reward_by_timeout(
-            self, idx, timeout_val: float, conf_stats: dict, n_samples: int, temperature:float = 0.25
+            self, idx, timeout_val: float, conf_stats: dict, n_samples: int, temperature:float = 0.5
             ) -> np.ndarray:
         """
         Generates rewards using a Normal distribution based on historical mean and std, 
@@ -213,7 +213,6 @@ class DataGenerator(BaseDataGenerator):
         max_val = stats.get('max', 0.0)
 
         if pd.isna(std) or std == 0:
-            print(1)
             jitter = abs(mean * temperature) 
             return np.random.uniform(mean - jitter, mean + jitter, size=n_samples)
         else:

@@ -904,7 +904,7 @@ class ThompsonSamplingModel(TensorModel):
             ) for _ in range(self._act_dim)]
 
         self.is_fitted = [False] * self._act_dim
-        self._max_bucket_size = 2500
+        self._max_bucket_size = 64
         self._init_buckets()
 
     def predict_action(self, features: torch.Tensor) -> torch.Tensor:
@@ -920,16 +920,15 @@ class ThompsonSamplingModel(TensorModel):
                 pred = np.full(batch_size, float('inf'))
             else:
                 pred = model.predict(features_np)
-                
-            predictions.append(pred)
             
+            predictions.append(pred)
+        
         predictions_stacked = np.column_stack(predictions)
         return torch.tensor(predictions_stacked, device=features.device, dtype=torch.float32)
 
     def update_model(
         self, features: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor | float, backward: bool = True
     ) -> float:
-            
         features_np = features.cpu().numpy()
         if features_np.ndim == 1:
             features_np = features_np.reshape(1, -1)
@@ -947,19 +946,36 @@ class ThompsonSamplingModel(TensorModel):
         
         for i in range(len(actions_np)):
             act = actions_np[i]
-           
-
             if backward:
                 if 0 <= act < self._act_dim:
                     self.buckets[act]["features"].append(features_np[i])
-                    self.buckets[act]["rewards"].append(rewards_np[i])
+                    self.buckets[act]["rewards"].append(self.normalize_reward_ema(act, rewards_np[i]))
 
-                    X =np.array(self.buckets[act]["features"])
-                    y = np.array(self.buckets[act]["rewards"])
-                    self.models[act].fit(X, y)
-                    self.is_fitted[act] = True
+        if backward:
+            X =np.array(self.buckets[act]["features"])
+            y = np.array(self.buckets[act]["rewards"])
+            self.models[act].fit(X, y)
+            self.is_fitted[act] = True
 
         return 0.0
+
+    
+    def normalize_reward_ema(self,action:int, raw_reward:float)->float:
+        self.alpha = 0.1
+        if self.ema_mean is None:
+            self.ema_mean = raw_reward
+            return 0.0  
+
+        delta = raw_reward - self.ema_mean
+        
+        self.ema_mean += self.alpha * delta
+        
+        delta2 = raw_reward - self.ema_mean
+        self.ema_var = (1 - self.alpha) * self.ema_var + self.alpha * (delta * delta2)
+
+        std = max(self.ema_var ** 0.5, 1.0)
+        norm = (raw_reward - self.ema_mean) / std
+        return norm
 
     def reset_model(self) -> None:
         self.models = [
@@ -986,3 +1002,7 @@ class ThompsonSamplingModel(TensorModel):
             } 
             for _ in range(self._act_dim)
         ]
+
+        self.ema_mean  = 0
+        self.ema_var = 1
+

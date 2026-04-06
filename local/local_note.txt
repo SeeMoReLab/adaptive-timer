@@ -1,0 +1,36 @@
+python scripts/cloudlab/extract_ssh_targets.py \
+  --manifest scripts/cloudlab/cloudlab.manifest \
+  --username yosefnw
+
+bash scripts/cloudlab/setup.sh ~/ws/creds-cloudlab/ssh
+
+bash scripts/cloudlab/run_pbft.sh /home/yosef/ws/creds-cloudlab/ssh learning --model cmab --dataset --log --trim-output -t 180
+
+bash scripts/cloudlab/run_tendermint.sh /home/yosef/ws/creds-cloudlab/ssh learning --model cmab --dataset --log -t 5400
+
+bash scripts/cloudlab/run_tendermint_static.sh /home/yosef/ws/creds-cloudlab/ssh --log -t 5400 --timeout 150
+
+
+New file: scripts/cloudlab/run_tendermint_static.sh (gitignored)
+
+A static-timeout, no-learning duplicate of run_tendermint.sh. It runs CometBFT in normal mode (learning agent never started) but injects the same fault curriculum (failure_spec fault injection isn't mode-gated), so it's a directly comparable baseline against the learning runs.
+
+New flags:
+- --timeout <ms> — fixed timeout applied to all three consensus timers (propose/prevote/precommit). Required.
+- --timeout-propose/--timeout-prevote/--timeout-precommit <ms> — optional per-timer overrides (each defaults to --timeout).
+
+Example:
+scripts/cloudlab/run_tendermint_static.sh ~/.ssh/key --timeout 900 -t 10800 --log
+
+How it works: the timeout values are validated locally, passed through the SSH call as positional args $12–$14, and on the remote the script rewrites the [consensus] timeout_propose/prevote/precommit keys in the extracted master config.toml before apply_master_config propagates them to every node. Only the run-root copy is touched — the tracked config/tendermint/config.toml is never modified, so no config duplication was needed. I verified the sed leaves the *_delta keys intact.
+
+Changes
+
+- .gitignore — added the duplicate (plus pre-emptive entries for the _2t variant) so it won't get pushed. .gitignore itself is the only tracked file modified.
+- Removed an orphan run_tendermint_2t.sh (an unmodified copy left over from the earlier interrupted task — its learning_agent_2t/ dir had been rolled back, leaving it broken).
+
+Verified
+
+- bash -n passes; tracked run_tendermint.sh contains none of my changes (the pre-existing M on it is unrelated SSH/log-fetch edits from before this session); git status correctly hides the static script; exec bit preserved.
+
+Note on relevance to the analysis: a --timeout 900 static run is exactly the baseline our earlier finding pointed to — it tests whether a fixed high timeout beats the churning bandit under the fault curriculum.

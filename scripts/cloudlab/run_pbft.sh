@@ -281,7 +281,7 @@ queue_artifact_download() {
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--trim-output] [--log-level <TRACE|DEBUG|INFO|WARN|ERROR>] [--model <random|linear>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--trim-output] [--log-level <TRACE|DEBUG|INFO|WARN|ERROR>] [--model <random|linear|cmab>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -293,7 +293,7 @@ Flags:
   --log             Download per-replica logs (server, applier, and mode-specific dataexchange/agent logs) to scripts/cloudlab/tmp/.
   --trim-output     Post-process pbft_output.txt: keep lines 1..19, then only lines containing "-- Monitor".
   --log-level       Logging level applied to root, bftsmart and bftsmart.proxy in staged logback.xml (default: INFO).
-  --model           Learning-agent model for learning/sharing modes: random|linear (default: random).
+  --model           Learning-agent model for learning/sharing modes: random|linear|cmab (default: random).
   -f <int>          Fault tolerance f passed to prepare_pbft.sh (default: 1).
   -t <int>          Seconds to run experiment before stopping tmux sessions (default: 60).
 EOF
@@ -398,7 +398,7 @@ if ! LOG_LEVEL="$(normalize_log_level "${LOG_LEVEL}")"; then
   exit 2
 fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear|cmab." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then

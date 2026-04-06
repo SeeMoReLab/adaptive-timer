@@ -28,6 +28,8 @@ CLIENT_START_DELAY_S=10
 START_OFFSET_AFTER_CLIENT_LAUNCH_S=10
 DATASET_ENABLED=0
 LOG_ENABLED=0
+AGENT_MODEL_TYPE="random"
+AGENT_MODEL_SET=0
 
 OVERLAY_OCTET_A=10
 OVERLAY_OCTET_B=251
@@ -167,7 +169,7 @@ wait_for_server_endpoints_or_fail() {
 
 usage() {
   cat <<EOF
-Usage: $0 [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [-f <fault_tolerance>] [-t <experiment_seconds>]
+Usage: $0 [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--model <random|linear|cmab>] [-f <fault_tolerance>] [-t <experiment_seconds>]
 
 Arguments:
   mode              Optional; one of normal|heuristic|learning|sharing|scheduled|cmab (default: normal).
@@ -175,6 +177,7 @@ Arguments:
 Flags:
   --dataset         Collect per-replica learning-agent dataset CSVs as agentN.csv.
   --log             Collect per-replica server logs under scripts/local/tmp/server_logs/.
+  --model           Learning-agent model for learning/sharing modes: random|linear|cmab (default: random).
   -f <int>          Fault tolerance f passed to prepare_pbft.sh (default: 1).
   -t <int>          Seconds to run experiment before stopping tmux sessions (default: 300).
 EOF
@@ -184,6 +187,19 @@ mode_enables_learning_agent() {
   case "$1" in
     heuristic|learning|sharing|scheduled|cmab)
       return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+normalize_agent_model_type() {
+  local model_lower
+  model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
+  case "${model_lower}" in
+    random|linear|cmab)
+      printf '%s\n' "${model_lower}"
       ;;
     *)
       return 1
@@ -223,7 +239,17 @@ while [[ $# -gt 0 ]]; do
       LOG_ENABLED=1
       shift
       ;;
-    normal|heuristic|learning|sharing|scheduled|cmab)
+    --model)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --model." >&2
+        usage >&2
+        exit 2
+      fi
+      AGENT_MODEL_TYPE="${2}"
+      AGENT_MODEL_SET=1
+      shift 2
+      ;;
+    normal|heuristic|learning|sharing|scheduled)
       MODE="$1"
       shift
       ;;
@@ -274,6 +300,14 @@ if ! mode_enables_learning_agent "${MODE}"; then
 else
   LEARNING_AGENT_ENABLED=1
 fi
+if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear|cmab." >&2
+  exit 2
+fi
+if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
+  echo "--model is only supported with learning or sharing mode." >&2
+  exit 2
+fi
 if (( DATASET_ENABLED == 1 )) && (( LEARNING_AGENT_ENABLED == 0 )); then
   echo "--dataset requires a learning-agent mode: heuristic|learning|sharing|scheduled." >&2
   exit 2
@@ -298,6 +332,9 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
 fi
 if [[ "${MODE}" == "sharing" ]]; then
   AGENT_SHARING_FLAG="--sharing true"
+  AGENT_MODEL_ARGS="--model-type ${AGENT_MODEL_TYPE}"
+elif [[ "${MODE}" == "learning" ]]; then
+  AGENT_MODEL_ARGS="--model-type ${AGENT_MODEL_TYPE}"
 fi
 if [[ "${MODE}" == "scheduled" ]]; then
   AGENT_MODEL_ARGS="--model-type scheduled --schedule-file learning_agent/config/schedule_pbft.csv"
@@ -320,6 +357,9 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
 fi
 
 echo "Selected mode: ${MODE}"
+if [[ "${MODE}" == "learning" || "${MODE}" == "sharing" ]]; then
+  echo "Learning-agent model: ${AGENT_MODEL_TYPE}"
+fi
 echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (dataset=${DATASET_ENABLED}, log=${LOG_ENABLED})"
 echo "Preparing PBFT configs in local mode with f=${F}..."
 "${PREPARE_SCRIPT}" local -f "${F}"

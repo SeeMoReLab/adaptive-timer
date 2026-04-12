@@ -27,8 +27,6 @@ from models import (
     PHASE_INDEX_TO_TIMEOUT_INDEX,
     TIMEOUT_INDEX_TO_MS,
     LinearTorchModel,
-    SVMTorchModel,
-    PPOTorchModel,
     ThompsonSamplingModel,
     TensorModel,
     QuadraticRewardScaler,
@@ -55,8 +53,6 @@ PROTOCOL_NAME_TO_ENUM = {
 
 MODEL_NAME_TO_TENSORMODEL = {
     "linear": LinearTorchModel,
-    "svm": SVMTorchModel,
-    "ppo": PPOTorchModel,
     "cmab": ThompsonSamplingModel
 }
 
@@ -202,7 +198,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--eval-ratio", type=float, default=0.2)
-    parser.add_argument("--lr", type=float, default=0.0001)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--reward-scaler",
@@ -246,7 +241,6 @@ def train_model(
     early_stop: Optional[int] = 20,
 ) -> Tuple[TensorModel, Dict]:
     
-    best_weights = model.save()
     best_eval_metrics = float("-inf")
     count = 0
 
@@ -259,7 +253,6 @@ def train_model(
         )
         if metrics['accuracy'] > best_eval_metrics:
             best_eval_metrics = metrics['accuracy']
-            best_weights = model.save()
 
             stats['best_epoch'] = e
             stats['best_accuracy'] = metrics['accuracy']
@@ -269,12 +262,6 @@ def train_model(
             count += 1
             if count == early_stop:
                 break
-            
-    model.load(best_weights)
-
-    if save_path is not None:
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(best_weights, save_path)
 
     return model, stats
 
@@ -520,7 +507,7 @@ def main() -> None:
     set_seed(11)
 
     args = _build_parser().parse_args()
-    print(f'Initiating Experiment [Model:] {args.model} [Protocol:] {args.protocol} [Phases:] {args.phases}')
+    print(f'Initiating Experiment [Model:] {args.model} [Protocol:] {args.protocol} [Phases:] {args.phases} ')
 
     # 1. Initialization
     generator = DataGenerator(
@@ -529,10 +516,15 @@ def main() -> None:
     )
     scaler = QuadraticRewardScaler.transform if args.reward_scaler == "quadratic" else None
 
-    model = args.model(
+    if args.model == ThompsonSamplingModel:
+        model = args.model(
+            action_dim=get_action_space_size(_parse_protocol(args.protocol)),
+            n_features=get_report_feature_dim(_parse_protocol(args.protocol)),
+        )
+    else:
+        model = args.model(
         action_dim=get_action_space_size(_parse_protocol(args.protocol)),
         n_features=get_report_feature_dim(_parse_protocol(args.protocol)),
-        lr=args.lr,
     )
 
     os.makedirs(args.plot_dir, exist_ok=True)
@@ -550,9 +542,12 @@ def main() -> None:
     raw_result = {}
     predictions = {}
     
-    # Convergence conf
+
     convergence_stats = {} 
     patience = 5  
+
+    overall_inference_times = []
+    overall_training_times = []
 
     for phase in phases:
         idx += 1
@@ -589,10 +584,12 @@ def main() -> None:
                 prev_timeout=curr_timeout
             )
             
+            inf_start_t = time.perf_counter()
             metrics, curr_timeout = evaluate_model(
                 model=model,         
                 eval_loader=phase_loader,
             )
+            overall_inference_times.append((time.perf_counter() - inf_start_t) * 1000)
             
             predictions[(idx, phase)].append(curr_timeout)
             phase_accuracy.append(metrics['accuracy'])
@@ -610,12 +607,14 @@ def main() -> None:
                     converged_ep = (phase_eps + 1) - patience + 1 
                     converged_time_ms = (time.perf_counter() - phase_start_time) * 1000 
 
+            train_start_t = time.perf_counter()
             model, _ = train_model(
                 model=model,
                 train_loader=phase_loader,
                 eval_loader=phase_loader,
                 epochs=args.epochs,
             )
+            overall_training_times.append((time.perf_counter() - train_start_t) * 1000)
             
             if use_tqdm:
                 episode_iterator.set_postfix({
@@ -626,10 +625,17 @@ def main() -> None:
             converged_ep = args.num_episodes
             converged_time_ms = (time.perf_counter() - phase_start_time) * 1000
             
+        #  Action Entropy
+        phase_preds = predictions[(idx, phase)]
+        counts = np.unique(phase_preds, return_counts=True)[1]
+        probs = counts / len(phase_preds)
+        phase_entropy = -np.sum(probs * np.log2(probs + 1e-9)) # Shannon entropy
+        
         convergence_stats[(idx, phase)] = {
             'ep': converged_ep, 
             'time_ms': converged_time_ms, 
-            'converged': phase_converged
+            'converged': phase_converged,
+            'entropy': phase_entropy 
         }
         
         phase_avg_acc = sum(phase_accuracy) / len(phase_accuracy)
@@ -642,14 +648,39 @@ def main() -> None:
 
     print(f"\n[SUMMARY]")
     print(f"[Experiment Configs:]\tprotocol={args.protocol}, num_episodes={args.num_episodes}, phases={args.phases}")
-    avg_eps = sum(stat['ep'] for stat in convergence_stats.values()) / len(convergence_stats)
-    avg_ms = sum(stat['time_ms'] for stat in convergence_stats.values()) / len(convergence_stats)
+    
+    eps_values = [stat['ep'] for stat in convergence_stats.values()]
+    time_values = [stat['time_ms'] for stat in convergence_stats.values()]
+
+    avg_eps = np.mean(eps_values)
+    std_eps = np.std(eps_values)
+    med_eps = np.median(eps_values)
+    max_eps = np.max(eps_values)
+
+    avg_ms = np.mean(time_values)
+    std_ms = np.std(time_values)
+    med_ms = np.median(time_values)
+    max_ms = np.max(time_values)
+    
+
+    avg_inf = np.mean(overall_inference_times)
+    std_inf = np.std(overall_inference_times)
+    med_inf = np.median(overall_inference_times)
+    max_inf = np.max(overall_inference_times)
+
+    avg_train = np.mean(overall_training_times)
+    std_train = np.std(overall_training_times)
+    med_train = np.median(overall_training_times)
+    max_train = np.max(overall_training_times)
+
     print(
         f"[Overall Metrics:]\t"
-        f"accuracy={(sum(accuracy) / len(accuracy)):.4f}, "
-        f"std={np.std(accuracy):.4f}, "
-        f"conv_eps={avg_eps:.1f}, "
-        f"conv_time={avg_ms:.2f}"
+        f"accuracy={(sum(accuracy) / len(accuracy)):.4f} (std={np.std(accuracy):.4f}), "
+        f"conv_eps={avg_eps:.1f} (std={std_eps:.1f}, med={med_eps:.1f}, max={max_eps:.1f}), "
+        f"conv_time={avg_ms:.2f} (std={std_ms:.2f}, med={med_ms:.2f}, max={max_ms:.2f}), "
+        f"[Computation Overheads:]\t"
+        f"inference={avg_inf:.2f}ms (std={std_inf:.2f}, med={med_inf:.2f}, max={max_inf:.2f}), "
+        f"training={avg_train:.2f}ms (std={std_train:.2f}, med={med_train:.2f}, max={max_train:.2f})"
     )
     
     print(f"\n[Convergence Metrics per Phase:]")
@@ -660,12 +691,11 @@ def main() -> None:
     print(
         f"\n[Model Configs:]\t"
         f"model={model.__class__.__name__}, "
-        f"lr={args.lr}, "
         f"epochs={args.epochs}, "
         f"batch_size={args.batch_size}, "
-        f"seed={args.seed}"
+        f"seed={args.seed}, "
+        f"Data Generation temperature= 0.5"
     )
-        
 
 if __name__ == "__main__":
     main()

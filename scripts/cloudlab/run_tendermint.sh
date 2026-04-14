@@ -12,6 +12,12 @@ MODE="normal"
 F=1
 EXPERIMENT_TIME_S=60
 LOG_ENABLED=0
+DATASET_ENABLED=0
+AGENT_MODEL_TYPE="random"
+AGENT_MODEL_SET=0
+LOAD_CONNECTIONS=5
+LOAD_RATE=50
+LOAD_SEND_PERIOD_MS=50
 
 LOCAL_TMP_DIR="${REPO_ROOT}/scripts/cloudlab/tmp"
 OUTPUT_LOCAL="${LOCAL_TMP_DIR}/tendermint_output.txt"
@@ -20,18 +26,44 @@ LOCAL_PAYLOAD="${REPO_ROOT}/scripts/tmp/tendermint_cloudlab_payload.tar.gz"
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--log] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--model <random|linear|cmab>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
-  mode              Optional; one of normal|heuristic|learning|sharing|scheduled (default: normal).
+  mode              Optional; one of normal|learning|sharing|scheduled (default: normal).
   targets_file      Optional path to cloudlab SSH targets file.
 
 Flags:
+  --dataset         Collect per-replica learning-agent dataset CSVs as agentN.csv.
   --log             Fetch remote Tendermint and ABCI logs into scripts/cloudlab/tmp/tendermint_logs/.
+  --model           Learning-agent model for learning/sharing modes: random|linear|cmab (default: random).
   -f <int>          Fault tolerance f. Number of nodes is derived as 3f+1 (default: 1).
   -t <int>          Load-generation duration in seconds (default: 60).
 EOF
+}
+
+mode_enables_learning_agent() {
+  case "$1" in
+    learning|sharing|scheduled)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+normalize_agent_model_type() {
+  local model_lower
+  model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
+  case "${model_lower}" in
+    random|linear|cmab)
+      printf '%s\n' "${model_lower}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -72,7 +104,21 @@ while [[ $# -gt 0 ]]; do
       LOG_ENABLED=1
       shift
       ;;
-    normal|heuristic|learning|sharing|scheduled)
+    --dataset)
+      DATASET_ENABLED=1
+      shift
+      ;;
+    --model)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --model." >&2
+        usage >&2
+        exit 2
+      fi
+      AGENT_MODEL_TYPE="${2}"
+      AGENT_MODEL_SET=1
+      shift 2
+      ;;
+    normal|learning|sharing|scheduled)
       MODE="$1"
       shift
       ;;
@@ -102,8 +148,25 @@ if ! [[ "${EXPERIMENT_TIME_S}" =~ ^[0-9]+$ ]] || (( EXPERIMENT_TIME_S < 1 )); th
   exit 2
 fi
 
-if [[ "${MODE}" != "normal" ]]; then
-  echo "Mode '${MODE}' is not implemented yet. Supported mode right now: normal." >&2
+if [[ "${MODE}" != "normal" && "${MODE}" != "learning" && "${MODE}" != "sharing" && "${MODE}" != "scheduled" ]]; then
+  echo "Mode '${MODE}' is not implemented. Supported modes: normal, learning, sharing, scheduled." >&2
+  exit 2
+fi
+if ! mode_enables_learning_agent "${MODE}"; then
+  LEARNING_AGENT_ENABLED=0
+else
+  LEARNING_AGENT_ENABLED=1
+fi
+if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear|cmab." >&2
+  exit 2
+fi
+if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
+  echo "--model is only supported with learning or sharing mode." >&2
+  exit 2
+fi
+if (( DATASET_ENABLED == 1 )) && (( LEARNING_AGENT_ENABLED == 0 )); then
+  echo "--dataset requires a learning-agent mode: learning|sharing|scheduled." >&2
   exit 2
 fi
 
@@ -119,9 +182,25 @@ if [[ ! -f "${TARGETS_FILE}" ]]; then
   exit 1
 fi
 
-if [[ ! -d "${REPO_ROOT}/tendermint" ]]; then
-  echo "Local tendermint directory not found: ${REPO_ROOT}/tendermint" >&2
+if [[ ! -d "${REPO_ROOT}/cometbft" ]]; then
+  echo "Local cometbft directory not found: ${REPO_ROOT}/cometbft" >&2
   exit 1
+fi
+if [[ ! -f "${REPO_ROOT}/config/tendermint/config.toml" ]]; then
+  echo "Master Tendermint config not found: ${REPO_ROOT}/config/tendermint/config.toml" >&2
+  exit 1
+fi
+if (( LEARNING_AGENT_ENABLED == 1 )); then
+  if [[ ! -d "${REPO_ROOT}/learning_agent" ]]; then
+    echo "Local learning_agent directory not found: ${REPO_ROOT}/learning_agent" >&2
+    exit 1
+  fi
+fi
+if [[ "${MODE}" == "scheduled" ]]; then
+  if [[ ! -f "${REPO_ROOT}/learning_agent/config/schedule_tendermint.csv" ]]; then
+    echo "Missing Tendermint schedule file: ${REPO_ROOT}/learning_agent/config/schedule_tendermint.csv" >&2
+    exit 1
+  fi
 fi
 
 targets_nodes=()
@@ -156,26 +235,43 @@ fi
 
 mkdir -p "${LOCAL_TMP_DIR}" "$(dirname "${LOCAL_PAYLOAD}")"
 rm -f "${LOCAL_PAYLOAD}" "${OUTPUT_LOCAL}"
+: > "${OUTPUT_LOCAL}"
+LOCAL_NUM_NODES=$((F * 3 + 1))
+if (( DATASET_ENABLED == 1 )); then
+  rm -f "${LOCAL_TMP_DIR}"/agent*.csv
+fi
 if (( LOG_ENABLED == 1 )); then
   rm -rf "${LOGS_LOCAL_DIR}"
   mkdir -p "${LOGS_LOCAL_DIR}"
 fi
 
-echo "Creating Tendermint payload tarball..."
-tar -C "${REPO_ROOT}" -czf "${LOCAL_PAYLOAD}" \
-  --exclude='tendermint/mytestnet' \
-  --exclude='tendermint/logs' \
-  --exclude='tendermint/build' \
-  tendermint
+echo "Creating CometBFT payload tarball..."
+if (( LEARNING_AGENT_ENABLED == 1 )); then
+  tar -C "${REPO_ROOT}" -czf "${LOCAL_PAYLOAD}" \
+    --exclude='cometbft/mytestnet' \
+    --exclude='cometbft/logs' \
+    --exclude='cometbft/build' \
+    --exclude='learning_agent/__pycache__' \
+    cometbft \
+    config/tendermint \
+    learning_agent
+else
+  tar -C "${REPO_ROOT}" -czf "${LOCAL_PAYLOAD}" \
+    --exclude='cometbft/mytestnet' \
+    --exclude='cometbft/logs' \
+    --exclude='cometbft/build' \
+    cometbft \
+    config/tendermint
+fi
 
 REMOTE_PAYLOAD="/tmp/tendermint_cloudlab_payload_$$.tar.gz"
 
 echo "Copying payload to ${remote_user}@${remote_host}..."
 scp "${SSH_OPTS[@]}" "${LOCAL_PAYLOAD}" "${remote_user}@${remote_host}:${REMOTE_PAYLOAD}"
 
-echo "Running remote Tendermint experiment on ${remote_host} (mode=${MODE}, f=${F}, t=${EXPERIMENT_TIME_S}s)..."
+echo "Running remote CometBFT experiment on ${remote_host} (mode=${MODE}, f=${F}, t=${EXPERIMENT_TIME_S}s)..."
 remote_failed=0
-if ! ssh "${SSH_OPTS[@]}" "${remote_user}@${remote_host}" "bash -s" -- "${REMOTE_PAYLOAD}" "${F}" "${EXPERIMENT_TIME_S}" "${MODE}" "${LOG_ENABLED}" <<'REMOTE'
+if ! ssh "${SSH_OPTS[@]}" "${remote_user}@${remote_host}" "bash -s" -- "${REMOTE_PAYLOAD}" "${F}" "${EXPERIMENT_TIME_S}" "${MODE}" "${LOG_ENABLED}" "${DATASET_ENABLED}" "${LOAD_CONNECTIONS}" "${LOAD_RATE}" "${LOAD_SEND_PERIOD_MS}" "${AGENT_MODEL_TYPE}" <<'REMOTE'
 set -euo pipefail
 
 payload_path="$1"
@@ -183,9 +279,14 @@ fault_tolerance="$2"
 experiment_time_s="$3"
 mode="$4"
 log_enabled="$5"
+dataset_enabled="$6"
+load_connections="$7"
+load_rate="$8"
+load_send_period_ms="$9"
+agent_model_type="${10}"
 
-if [[ "${mode}" != "normal" ]]; then
-  echo "Unsupported mode on remote: ${mode}" >&2
+if [[ "${mode}" != "normal" && "${mode}" != "learning" && "${mode}" != "sharing" && "${mode}" != "scheduled" ]]; then
+  echo "Unsupported mode on remote: ${mode} (supported: normal, learning, sharing, scheduled)" >&2
   exit 2
 fi
 if ! [[ "${fault_tolerance}" =~ ^[0-9]+$ ]] || (( fault_tolerance < 1 )); then
@@ -196,29 +297,135 @@ if ! [[ "${experiment_time_s}" =~ ^[0-9]+$ ]] || (( experiment_time_s < 1 )); th
   echo "Invalid experiment_time_s: ${experiment_time_s}" >&2
   exit 2
 fi
+if ! [[ "${dataset_enabled}" =~ ^[0-9]+$ ]] || (( dataset_enabled < 0 || dataset_enabled > 1 )); then
+  echo "Invalid dataset_enabled: ${dataset_enabled}" >&2
+  exit 2
+fi
+if ! [[ "${load_connections}" =~ ^[0-9]+$ ]] || (( load_connections < 1 )); then
+  echo "Invalid load_connections: ${load_connections}" >&2
+  exit 2
+fi
+if ! [[ "${load_rate}" =~ ^[0-9]+$ ]] || (( load_rate < 1 )); then
+  echo "Invalid load_rate: ${load_rate}" >&2
+  exit 2
+fi
+if ! [[ "${load_send_period_ms}" =~ ^[0-9]+$ ]] || (( load_send_period_ms < 1 )); then
+  echo "Invalid load_send_period_ms: ${load_send_period_ms}" >&2
+  exit 2
+fi
+if [[ "${agent_model_type}" != "random" && "${agent_model_type}" != "linear" && "${agent_model_type}" != "cmab" ]]; then
+  echo "Invalid agent_model_type: ${agent_model_type}. Use random|linear|cmab." >&2
+  exit 2
+fi
+if [[ "${mode}" != "learning" && "${mode}" != "sharing" && "${agent_model_type}" != "random" ]]; then
+  echo "agent_model_type is only supported with learning/sharing mode." >&2
+  exit 2
+fi
+if (( dataset_enabled == 1 )) && [[ "${mode}" != "learning" && "${mode}" != "sharing" && "${mode}" != "scheduled" ]]; then
+  echo "dataset_enabled requires learning-agent mode." >&2
+  exit 2
+fi
 
 num_nodes=$((fault_tolerance * 3 + 1))
-maverick_nodes=0
+learning_agent_enabled=0
+if [[ "${mode}" == "learning" || "${mode}" == "sharing" || "${mode}" == "scheduled" ]]; then
+  learning_agent_enabled=1
+fi
 
 run_root="$HOME/tendermint_cloudlab"
-src_dir="${run_root}/tendermint"
+src_dir="${run_root}/cometbft"
+learning_agent_dir="${run_root}/learning_agent"
+master_config="${run_root}/config/tendermint/config.toml"
 testnet_dir="${run_root}/mytestnet"
 logs_dir="${run_root}/logs"
 output_file="$HOME/tendermint_output.txt"
 results_csv="$HOME/results.csv"
+agent_hosts_config="${run_root}/agent_hosts.config"
+schedule_file="${learning_agent_dir}/config/schedule_tendermint.csv"
 
-load_rate=200
-load_connections=1
 load_size=500
 post_peer_connect_delay=5
+start_align_delay_ms=15000
 buildvcs_flag="-buildvcs=false"
+failure_spec="${run_root}/config/tendermint/failure_spec.xml"
+report_state_log="${logs_dir}/node_0.log"
 
 # Ensure caller can always try to fetch a run log, even on early failures.
 : > "${output_file}"
+{
+  echo "==> remote run initialized"
+  echo "==> mode=${mode}"
+  echo "==> f=${fault_tolerance} n=${num_nodes}"
+  echo "==> duration=${experiment_time_s}s"
+} >> "${output_file}"
 
 p2p_port() { echo $((26656 + $1 * 3)); }
 rpc_port() { echo $((26657 + $1 * 3)); }
 abci_port() { echo $((26658 + $1 * 3)); }
+agent_port() { echo $((50000 + $1)); }
+
+apply_master_config() {
+  local master_cfg="$1"
+  local node_cfg="$2"
+  python3 - "$master_cfg" "$node_cfg" <<'PY'
+import re
+import sys
+
+master_path = sys.argv[1]
+node_path = sys.argv[2]
+
+section_re = re.compile(r'^\s*\[([^\]]+)\]\s*$')
+assign_re = re.compile(r'^([A-Za-z0-9_.-]+)\s*=\s*(.*)$')
+line_assign_re = re.compile(r'^(\s*)([A-Za-z0-9_.-]+)(\s*=\s*)(.*?)(\s*(?:#.*)?)\n?$')
+
+def collect_assignments(path):
+    assignments = {}
+    section = ""
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            sm = section_re.match(line)
+            if sm:
+                section = sm.group(1).strip()
+                continue
+            am = assign_re.match(line)
+            if am:
+                key = am.group(1)
+                value = am.group(2)
+                assignments[(section, key)] = value
+    return assignments
+
+master_values = collect_assignments(master_path)
+
+out_lines = []
+section = ""
+with open(node_path, "r", encoding="utf-8") as fh:
+    for raw in fh:
+        stripped = raw.strip()
+        sm = section_re.match(stripped)
+        if sm:
+            section = sm.group(1).strip()
+            out_lines.append(raw)
+            continue
+
+        lm = line_assign_re.match(raw)
+        if not lm:
+            out_lines.append(raw)
+            continue
+
+        indent, key, equals, _, trailing = lm.groups()
+        replacement = master_values.get((section, key))
+        if replacement is None:
+            out_lines.append(raw)
+            continue
+        out_lines.append(f"{indent}{key}{equals}{replacement}{trailing}\n")
+
+with open(node_path, "w", encoding="utf-8") as fh:
+    fh.writelines(out_lines)
+PY
+}
 
 kill_run_sessions() {
   if ! command -v tmux >/dev/null 2>&1; then
@@ -230,14 +437,84 @@ kill_run_sessions() {
   fi
   while read -r session_name; do
     [[ -z "${session_name}" ]] && continue
-    if [[ "${session_name}" == tm_tendermint_node_* || "${session_name}" == tm_abci_* ]]; then
+    if [[ "${session_name}" == tm_tendermint_node_* || "${session_name}" == tm_abci_* || "${session_name}" == tm_tendermint_agent_* ]]; then
       tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
     fi
   done <<< "${sessions}"
 }
 
+collect_run_pids() {
+  ps ax -o pid= -o command= | awk -v root="${testnet_dir}" '
+    /cometbft node/ && index($0, root "/node") { print $1 }
+  '
+  for ((k = 0; k < num_nodes; k++)); do
+    local port
+    port="$(abci_port "${k}")"
+    ps ax -o pid= -o command= | awk -v addr="tcp://127.0.0.1:""${port}" '
+      /abci-cli kvstore/ && index($0, addr) { print $1 }
+    '
+  done
+}
+
+force_stop_run_processes() {
+  local pids
+  pids="$(collect_run_pids | awk '!seen[$1]++')"
+  if [[ -z "${pids}" ]]; then
+    return 0
+  fi
+
+  while read -r pid; do
+    [[ -z "${pid}" ]] && continue
+    kill "${pid}" >/dev/null 2>&1 || true
+  done <<< "${pids}"
+
+  for _ in $(seq 1 6); do
+    sleep 1
+    pids="$(collect_run_pids | awk '!seen[$1]++')"
+    [[ -z "${pids}" ]] && return 0
+  done
+
+  while read -r pid; do
+    [[ -z "${pid}" ]] && continue
+    kill -9 "${pid}" >/dev/null 2>&1 || true
+  done <<< "${pids}"
+}
+
+run_report_with_retry() {
+  local max_attempts=30
+  local attempt=1
+  local tmp_out=""
+  while true; do
+    tmp_out="$(mktemp)"
+    if report "$@" >"${tmp_out}" 2>&1; then
+      cat "${tmp_out}"
+      rm -f "${tmp_out}"
+      return 0
+    fi
+
+    if grep -q "resource temporarily unavailable" "${tmp_out}"; then
+      if (( attempt == 1 )); then
+        echo "Report DB is still locked; waiting for node shutdown to complete..."
+      fi
+      rm -f "${tmp_out}"
+      if (( attempt >= max_attempts )); then
+        echo "Report failed after ${max_attempts} attempts waiting for DB lock release."
+        return 1
+      fi
+      sleep 1
+      attempt=$((attempt + 1))
+      continue
+    fi
+
+    cat "${tmp_out}"
+    rm -f "${tmp_out}"
+    return 1
+  done
+}
+
 cleanup() {
   kill_run_sessions
+  force_stop_run_processes
   rm -f "${payload_path}"
 }
 trap cleanup EXIT
@@ -249,13 +526,34 @@ for cmd in go tmux curl python3 tar awk sed; do
   fi
 done
 
+start_unix_ms="$(( $(python3 -c 'import time; print(int(time.time() * 1000))') + start_align_delay_ms ))"
+
 rm -rf "${run_root}"
 mkdir -p "${run_root}" "${logs_dir}"
 tar -xzf "${payload_path}" -C "${run_root}"
 
 if [[ ! -d "${src_dir}" ]]; then
-  echo "Extracted tendermint directory missing: ${src_dir}" >&2
+  echo "Extracted cometbft directory missing: ${src_dir}" >&2
   exit 1
+fi
+if [[ ! -f "${master_config}" ]]; then
+  echo "Extracted master config missing: ${master_config}" >&2
+  exit 1
+fi
+if (( learning_agent_enabled == 1 )); then
+  if [[ ! -f "${learning_agent_dir}/main.py" ]]; then
+    echo "Extracted learning_agent missing: ${learning_agent_dir}/main.py" >&2
+    exit 1
+  fi
+  if [[ ! -f "${schedule_file}" ]]; then
+    echo "Missing Tendermint schedule file: ${schedule_file}" >&2
+    exit 1
+  fi
+  if ! python3 -c "import grpc, torch, sklearn, cryptography" >/dev/null 2>&1; then
+    echo "Learning-agent mode requires grpc/torch/sklearn/cryptography in python3." >&2
+    echo "Run scripts/cloudlab/setup.sh first." >&2
+    exit 1
+  fi
 fi
 
 cd "${src_dir}"
@@ -266,21 +564,28 @@ go install "${buildvcs_flag}" ./abci/cmd/abci-cli
 go install "${buildvcs_flag}" ./test/loadtime/cmd/load
 go install "${buildvcs_flag}" ./test/loadtime/cmd/report
 
-echo "Building tendermint binary..."
+echo "Building cometbft binary..."
 GOFLAGS="${GOFLAGS:-} ${buildvcs_flag}" make build
 
-tendermint_bin="${src_dir}/build/tendermint"
-if [[ ! -x "${tendermint_bin}" ]]; then
-  echo "Missing built tendermint binary: ${tendermint_bin}" >&2
+cometbft_bin="${src_dir}/build/cometbft"
+if [[ ! -x "${cometbft_bin}" ]]; then
+  echo "Missing built cometbft binary: ${cometbft_bin}" >&2
   exit 1
 fi
 
-echo "Generating local testnet config (n=${num_nodes}, maverick=${maverick_nodes})..."
-"${tendermint_bin}" testnet \
+if [[ ! -f "${failure_spec}" ]]; then
+  echo "Missing failure spec: ${failure_spec}" >&2
+  exit 1
+fi
+
+echo "Generating local testnet config (n=${num_nodes})..."
+"${cometbft_bin}" testnet \
   --v "${num_nodes}" \
   --o "${testnet_dir}" \
   --populate-persistent-peers \
   --starting-ip-address 127.0.0.1
+
+echo "Applying master Tendermint config: ${master_config}"
 
 for ((i = 0; i < num_nodes; i++)); do
   config_file="${testnet_dir}/node${i}/config/config.toml"
@@ -288,13 +593,59 @@ for ((i = 0; i < num_nodes; i++)); do
     echo "Missing config file: ${config_file}" >&2
     exit 1
   fi
+  apply_master_config "${master_config}" "${config_file}"
   for ((j = 1; j < num_nodes; j++)); do
     sed -i "s|@127.0.0.$((j + 1)):26656|@127.0.0.1:$(p2p_port "${j}")|g" "${config_file}"
   done
+  if (( learning_agent_enabled == 1 )); then
+    agent_p="$(agent_port "${i}")"
+    sed -i "s|adaptive_timer_addr = \".*\"|adaptive_timer_addr = \"127.0.0.1:${agent_p}\"|" "${config_file}"
+    sed -i "s|adaptive_timer_node_index = .*|adaptive_timer_node_index = ${i}|" "${config_file}"
+  else
+    sed -i "s|adaptive_timer_addr = \".*\"|adaptive_timer_addr = \"\"|" "${config_file}"
+    sed -i "s|adaptive_timer_node_index = .*|adaptive_timer_node_index = 0|" "${config_file}"
+  fi
 done
 
-echo "Starting ${num_nodes} kvstore and Tendermint nodes in tmux..."
+if (( learning_agent_enabled == 1 )); then
+  : > "${agent_hosts_config}"
+  for ((i = 0; i < num_nodes; i++)); do
+    echo "${i} 127.0.0.1 0 0 $(agent_port "${i}") $(rpc_port "${i}")" >> "${agent_hosts_config}"
+  done
+fi
+
+echo "Starting ${num_nodes} kvstore and CometBFT nodes in tmux..."
 kill_run_sessions
+if (( learning_agent_enabled == 1 )); then
+  agent_mode_args=""
+  if [[ "${mode}" == "sharing" ]]; then
+    agent_mode_args="--sharing true --model-type ${agent_model_type}"
+  elif [[ "${mode}" == "learning" ]]; then
+    agent_mode_args="--model-type ${agent_model_type}"
+  elif [[ "${mode}" == "scheduled" ]]; then
+    agent_mode_args="--model-type scheduled --schedule-file \"${schedule_file}\""
+  fi
+  for ((i = 0; i < num_nodes; i++)); do
+    agent_session="tm_tendermint_agent_${i}"
+    agent_log="${logs_dir}/agent_${i}.log"
+    dataset_args=""
+    if (( dataset_enabled == 1 )); then
+      rm -f "${run_root}/agent${i}.csv"
+      dataset_args="--dataset-csv \"${run_root}/agent${i}.csv\""
+    fi
+    tmux new-session -d -s "${agent_session}" \
+      "python3 \"${learning_agent_dir}/main.py\" --node-id \"${i}\" --protocol tendermint --hosts-config \"${agent_hosts_config}\" --failure-spec \"${failure_spec}\" --injection-start-unix-ms \"${start_unix_ms}\" ${agent_mode_args} ${dataset_args} > \"${agent_log}\" 2>&1"
+  done
+  sleep 1
+  for ((i = 0; i < num_nodes; i++)); do
+    agent_session="tm_tendermint_agent_${i}"
+    if ! tmux has-session -t "${agent_session}" 2>/dev/null; then
+      echo "Learning-agent session exited early: ${agent_session}" >&2
+      tail -n 80 "${logs_dir}/agent_${i}.log" >&2 || true
+      exit 1
+    fi
+  done
+fi
 for ((i = 0; i < num_nodes; i++)); do
   abci_session="tm_abci_${i}"
   node_session="tm_tendermint_node_${i}"
@@ -308,7 +659,7 @@ for ((i = 0; i < num_nodes; i++)); do
   tmux new-session -d -s "${abci_session}" \
     "abci-cli kvstore --address tcp://127.0.0.1:${abci_p} > \"${abci_log}\" 2>&1"
   tmux new-session -d -s "${node_session}" \
-    "\"${tendermint_bin}\" node --home \"${node_home}\" --proxy_app tcp://127.0.0.1:${abci_p} --p2p.laddr tcp://0.0.0.0:${p2p_p} --rpc.laddr tcp://0.0.0.0:${rpc_p} > \"${node_log}\" 2>&1"
+    "COMETBFT_NODE_INDEX=${i} COMETBFT_PROPOSE_DELAY_FAILURE_SPEC=\"${failure_spec}\" COMETBFT_PROPOSE_DELAY_FAULTY_NODES=${fault_tolerance} COMETBFT_PROPOSE_DELAY_START_UNIX_MS=${start_unix_ms} \"${cometbft_bin}\" node --home \"${node_home}\" --proxy_app tcp://127.0.0.1:${abci_p} --p2p.laddr tcp://0.0.0.0:${p2p_p} --rpc.laddr tcp://0.0.0.0:${rpc_p} > \"${node_log}\" 2>&1"
 done
 
 for ((i = 0; i < num_nodes; i++)); do
@@ -345,27 +696,37 @@ fi
   echo "==> mode=${mode}"
   echo "==> f=${fault_tolerance} n=${num_nodes}"
   echo "==> post-peer-connect wait: ${post_peer_connect_delay}s"
-  echo "==> load: rate=${load_rate} tx/s, duration=${experiment_time_s}s, connections=${load_connections}, size=${load_size}B"
+  echo "==> synced start-unix-ms: ${start_unix_ms}"
+  echo "==> load: duration=${experiment_time_s}s, connections=${load_connections}, rate=${load_rate}, send-period=${load_send_period_ms}ms, size=${load_size}B"
 } > "${output_file}"
 
 load \
   --endpoints "ws://127.0.0.1:${rpc0}/websocket" \
-  --broadcast-tx-method async \
+  --start-unix-ms "${start_unix_ms}" \
   --connections "${load_connections}" \
   --rate "${load_rate}" \
+  --send-period "${load_send_period_ms}ms" \
   --time "${experiment_time_s}" \
   --size "${load_size}" >> "${output_file}" 2>&1
 
 echo "" >> "${output_file}"
 echo "==> Stopping nodes..." >> "${output_file}"
 kill_run_sessions
+force_stop_run_processes
 sleep 2
 
 {
   echo ""
   echo "==> Latency report:"
-  report --data-dir "${testnet_dir}/node0/data" --database-type goleveldb --csv "${results_csv}"
-  report --data-dir "${testnet_dir}/node0/data" --database-type goleveldb
+  if [[ -f "${report_state_log}" ]]; then
+    echo "Using state log for wall-clock latency: ${report_state_log}"
+    run_report_with_retry --data-dir "${testnet_dir}/node0/data" --database-type goleveldb --state-log "${report_state_log}" --csv "${results_csv}"
+    run_report_with_retry --data-dir "${testnet_dir}/node0/data" --database-type goleveldb --state-log "${report_state_log}"
+  else
+    echo "State log for node0 not found; falling back to chain block timestamp latency."
+    run_report_with_retry --data-dir "${testnet_dir}/node0/data" --database-type goleveldb --csv "${results_csv}"
+    run_report_with_retry --data-dir "${testnet_dir}/node0/data" --database-type goleveldb
+  fi
   echo ""
   echo "==> Throughput:"
   awk -F',' '
@@ -393,11 +754,25 @@ then
 fi
 
 echo "Fetching tendermint output to ${OUTPUT_LOCAL}..."
-if ! scp "${SSH_OPTS[@]}" "${remote_user}@${remote_host}:tendermint_output.txt" "${OUTPUT_LOCAL}"; then
-  if (( remote_failed == 1 )); then
-    echo "Remote run failed before tendermint_output.txt could be fetched from ${remote_host}." >&2
-  else
-    echo "Failed to fetch tendermint_output.txt from ${remote_host}." >&2
+fetched_output=0
+for remote_output_path in \
+  "tendermint_output.txt" \
+  "~/tendermint_output.txt" \
+  "/home/${remote_user}/tendermint_output.txt" \
+  "tendermint_cloudlab/tendermint_output.txt"; do
+  if scp "${SSH_OPTS[@]}" "${remote_user}@${remote_host}:${remote_output_path}" "${OUTPUT_LOCAL}" >/dev/null 2>&1; then
+    fetched_output=1
+    break
+  fi
+done
+if (( fetched_output == 0 )); then
+  {
+    echo "Failed to fetch remote output file from ${remote_host}."
+    echo "Tried: tendermint_output.txt, ~/tendermint_output.txt, /home/${remote_user}/tendermint_output.txt, tendermint_cloudlab/tendermint_output.txt"
+    echo "remote_failed=${remote_failed}"
+  } > "${OUTPUT_LOCAL}"
+  if (( remote_failed == 0 )); then
+    echo "Failed to fetch tendermint output from ${remote_host}." >&2
     exit 1
   fi
 fi
@@ -408,6 +783,16 @@ if (( LOG_ENABLED == 1 )); then
     echo "Failed to fetch some/all logs from ${remote_host}." >&2
   fi
 fi
+if (( DATASET_ENABLED == 1 )); then
+  echo "Fetching learning-agent datasets to ${LOCAL_TMP_DIR}..."
+  for ((i = 0; i < LOCAL_NUM_NODES; i++)); do
+    local_csv="${LOCAL_TMP_DIR}/agent${i}.csv"
+    rm -f "${local_csv}"
+    if ! scp "${SSH_OPTS[@]}" "${remote_user}@${remote_host}:tendermint_cloudlab/agent${i}.csv" "${local_csv}"; then
+      echo "Missing or failed to fetch agent${i}.csv from ${remote_host}." >&2
+    fi
+  done
+fi
 
 if (( remote_failed == 1 )); then
   echo "Remote run failed. Retrieved output file may contain failure details: ${OUTPUT_LOCAL}" >&2
@@ -417,4 +802,7 @@ fi
 echo "Done. Client output saved to ${OUTPUT_LOCAL}."
 if (( LOG_ENABLED == 1 )); then
   echo "Logs saved to ${LOGS_LOCAL_DIR}."
+fi
+if (( DATASET_ENABLED == 1 )); then
+  echo "Datasets saved to ${LOCAL_TMP_DIR}/agentN.csv."
 fi

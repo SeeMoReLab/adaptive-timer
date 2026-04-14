@@ -1,7 +1,6 @@
 syntax = "proto3";
 
-option java_multiple_files = true;
-option java_package = "bftsmart.rlrpc";
+option go_package = "github.com/tendermint/tendermint/proto/adaptive_timers;adaptivetimers";
 
 import "google/protobuf/empty.proto";
 
@@ -10,6 +9,7 @@ enum Protocol {
     PROTOCOL_PBFT = 1;
     PROTOCOL_TWO_PC_OVER_PBFT = 2;
     PROTOCOL_SBFT = 3;
+    PROTOCOL_TENDERMINT = 4;
 }
 
 // PBFT-specific state report.
@@ -126,6 +126,34 @@ message SbftReport {
     uint32 regency_change_count = 11;
 }
 
+message TendermintReport {
+    // Workload size in the learning window.
+    uint32 total_transactions = 1;
+    uint32 total_consensus_instances = 2;
+
+    // End-to-end SBFT consensus latency summaries (milliseconds).
+    float avg_consensus_latency_ms = 3;
+    float p95_consensus_latency_ms = 4;
+    float p99_consensus_latency_ms = 5;
+
+    // Throughput and core rates.
+    float throughput_tps = 6;
+    float timeout_violation_rate = 7;
+
+    // Batch characteristics.
+    float avg_batch_size = 8;
+    float p95_batch_size = 9;
+
+    // Leadership dynamics.
+    uint32 leader_change_count = 10;
+    uint32 regency_change_count = 11;
+
+    // Phase-wise latency
+    float propose_latency_ms = 12;
+    float prevote_latency_ms = 13;
+    float precommit_latency_ms = 14;
+}
+
 // One report from a local node for one episode.
 message ReportLocal {
     uint32 node_id = 1;
@@ -139,6 +167,7 @@ message ReportLocal {
         PbftReport pbft_state = 10;
         TwoPcOverPbftReport two_pc_over_pbft_state = 11;
         SbftReport sbft_state = 12;
+        TendermintReport tendermint_state = 13;
     }
     optional Reward reward = 4;
     bytes signature = 5;
@@ -165,12 +194,20 @@ message SbftReward {
     SbftTimeout timeout_used = 3;
 }
 
+// Tendermint action/reward feedback.
+message TendermintReward {
+    uint32 episode = 1;
+    TendermintReport report = 2;
+    TendermintTimeout timeout_used = 3;
+}
+
 // Reward for a prior episode, sent alongside the next report.
 message Reward {
     oneof value {
         PbftReward pbft = 1;
         TwoPcOverPbftReward two_pc_over_pbft = 2;
         SbftReward sbft = 3;
+        TendermintReward tendermint = 4;
     }
 }
 
@@ -196,12 +233,19 @@ message SbftTimeout {
     uint32 batch_timeout_milliseconds = 3;
 }
 
+message TendermintTimeout {
+    uint32 propose_timeout_milliseconds = 1;
+    uint32 prevote_timeout_milliseconds = 2;
+    uint32 precommit_timeout_milliseconds = 3;
+}
+
 // Timeout recommendation.
 message Timeout {
     oneof value {
         PbftTimeout pbft = 1;
         TwoPcOverPbftTimeout two_pc_over_pbft = 2;
         SbftTimeout sbft = 3;
+        TendermintTimeout tendermint = 4;
     }
 }
 

@@ -1,6 +1,6 @@
 [submodule "bft-smart"]
 	path = bft-smart
 	url = https://github.com/SeeMoReLab/bft-smart.git
-[submodule "tendermint"]
-	path = tendermint
-	url = https://github.com/SeeMoReLab/tendermint.git
+[submodule "cometbft"]
+	path = cometbft
+	url = https://github.com/SeeMoReLab/cometbft.git

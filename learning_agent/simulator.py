@@ -211,7 +211,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def generate_data(
         generator: DataGenerator, protocol: str, phase: int, current_start_episode: int, scaler: RewardTransformer, batch_size: int, num_episode:int = 1, prev_timeout: List[int] = None
         )-> DatasetLoader:
-    phase_data, new_start_episode = generator.generate_phase(phase_index=int(phase), current_start_episode=current_start_episode, num_episode=num_episode, prev_timeout = prev_timeout)
+    phase_data, new_start_episode = generator.generate_local_report(phase_index=int(phase), current_start_episode=current_start_episode, num_episode=num_episode, prev_timeout = prev_timeout)
     parsed_data = _parse_data(
             reader=phase_data,
             protocol=PROTOCOL_NAME_TO_ENUM[protocol],
@@ -310,8 +310,6 @@ def evaluate_model(
         "weighted_loss": float(weighted_loss_sum / max(len(eval_loader), 1)),
 
     }, curr_timeout
-
-
 
 def plot_accuracy(result: Dict[Tuple[int, str], float], save_path: str = 'accuracy_plot.pdf') -> None:
     plt.rcParams.update({
@@ -502,7 +500,6 @@ def plot_prediction_phases(data_dict: Dict[Tuple[int, str], List[float]], save_p
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
 
-
 def main() -> None:
     set_seed(11)
 
@@ -625,17 +622,11 @@ def main() -> None:
             converged_ep = args.num_episodes
             converged_time_ms = (time.perf_counter() - phase_start_time) * 1000
             
-        #  Action Entropy
-        phase_preds = predictions[(idx, phase)]
-        counts = np.unique(phase_preds, return_counts=True)[1]
-        probs = counts / len(phase_preds)
-        phase_entropy = -np.sum(probs * np.log2(probs + 1e-9)) # Shannon entropy
-        
+
         convergence_stats[(idx, phase)] = {
             'ep': converged_ep, 
             'time_ms': converged_time_ms, 
             'converged': phase_converged,
-            'entropy': phase_entropy 
         }
         
         phase_avg_acc = sum(phase_accuracy) / len(phase_accuracy)

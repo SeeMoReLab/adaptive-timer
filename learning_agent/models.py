@@ -329,9 +329,6 @@ class TensorModel(ABC):
     def reset_model(self) -> None:
         pass
 
-    @abstractmethod
-    def load(self) -> None:
-        pass
 
 class RewardTransformer(ABC):
     """Converts throughput result into float reward."""
@@ -633,7 +630,7 @@ class ScheduledTimeoutModel(TensorModel):
     def load(self, checkpoint: Dict[str, Any]) -> None:
         pass
 
-class ThompsonSamplingModel: 
+class ThompsonSamplingModel(TensorModel): 
     def __init__(
         self, 
         action_dim: int, 
@@ -644,17 +641,9 @@ class ThompsonSamplingModel:
         
         self._act_dim = int(action_dim)
         self._obs_dim = int(n_features)
-        
-        self.model = DecisionTreeRegressor(
-            criterion='squared_error',
-            max_depth=6,              
-            min_samples_leaf=2,    
-            min_impurity_decrease=0.01,    
-            random_state=42
-        )
-        self.is_fitted = False
         self._max_bucket_size = 256
-        self._init_buckets()
+
+        self.reset_model()
 
     def predict_action(self, features: torch.Tensor) -> torch.Tensor:
         features_np = features.cpu().numpy()
@@ -742,4 +731,107 @@ class ThompsonSamplingModel:
             "features": deque(maxlen=self._max_bucket_size), 
             "actions": deque(maxlen=self._max_bucket_size),
             "rewards": deque(maxlen=self._max_bucket_size)
+        }
+
+class MultiHeadThompsonSamplingModel(TensorModel): 
+    def __init__(
+        self, 
+        action_dim: int, 
+        n_features: int,
+        n_heads: int = 10,
+    ):
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        
+        self._act_dim = int(action_dim)
+        self._obs_dim = int(n_features)
+        self._n_heads = int(n_heads)
+        self._max_bucket_size = 256
+
+        self.reset_model()
+
+    def predict_action(self, features: torch.Tensor) -> torch.Tensor:
+        features_np = features.cpu().numpy().reshape(1, -1)  
+
+        head_predictions = np.zeros((self._n_heads, self._act_dim))
+
+        for k in range(self._n_heads):
+            if not self.is_fitted[k]:
+                head_predictions[k] = 1e9
+            else:
+                for act in range(self._act_dim):
+                    action_col = np.array([[act]])
+                    state_action_input = np.hstack((features_np, action_col))
+                    head_predictions[k, act] = self.models[k].predict(state_action_input)[0]
+
+        k = np.random.randint(0, self._n_heads)
+        sampled_pred = head_predictions[k]
+
+        tied = np.flatnonzero(np.isclose(sampled_pred, np.max(sampled_pred)))
+        if len(tied) > 1:
+            sampled_pred[np.random.choice(tied)] += 1e-5
+
+        q_values = torch.tensor(
+            head_predictions[:, np.newaxis, :], device=features.device, dtype=torch.float32
+        )
+        return q_values
+
+    def update_model(
+        self, features: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor | float, backward: bool = True
+    ) -> float:
+        features_np = features.cpu().numpy()
+        if features_np.ndim == 1:
+            features_np = features_np.reshape(self._n_heads, -1)
+
+        if isinstance(actions, torch.Tensor):
+            actions_np = actions.cpu().numpy().astype(int).flatten()
+        else:
+            actions_np = np.full(self._n_heads, int(actions))
+
+        if isinstance(rewards, torch.Tensor):
+            rewards_np = rewards.cpu().numpy().flatten()
+        else:
+            rewards_np = np.full(self._n_heads, float(rewards))
+
+        for k in range(self._n_heads):
+            sample_features = np.concatenate([features_np[k], [actions_np[k]]])  # [features | action]
+            self.memory[k]["features"].append(sample_features)
+            self.memory[k]["rewards"].append(rewards_np[k])
+
+        if backward:
+            for k in range(self._n_heads):
+                bucket = self.memory[k]
+                if len(bucket["rewards"]) == 0:
+                    continue
+
+                X = np.array(bucket["features"]) 
+                y = np.array(bucket["rewards"])
+
+                idx = np.random.choice(len(X), size=len(X), replace=True)
+                self.models[k].fit(X[idx], y[idx])
+                self.is_fitted[k] = True
+
+        return 0.0
+
+    def reset_model(self) -> None:
+        self.models = [
+            DecisionTreeRegressor(
+                criterion='squared_error',
+                max_depth=6,
+                min_samples_leaf=2,
+                min_impurity_decrease=0.01,
+                random_state=k,  
+            )
+            for k in range(self._n_heads)
+        ]
+        self.is_fitted = [False] * self._n_heads
+        self._init_buckets()
+
+    def _init_buckets(self):
+        self.memory = {
+            k: {
+                "features": deque(maxlen=self._max_bucket_size),  
+                "rewards":  deque(maxlen=self._max_bucket_size),
+            }
+            for k in range(self._n_heads)
         }

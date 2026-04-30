@@ -807,6 +807,7 @@ class MultiHeadThompsonSamplingModel(TensorModel):
                 X = np.array(bucket["features"]) 
                 y = np.array(bucket["rewards"])
 
+                # Bootstrapping data
                 idx = np.random.choice(len(X), size=len(X), replace=True)
                 self.models[k].fit(X[idx], y[idx])
                 self.is_fitted[k] = True

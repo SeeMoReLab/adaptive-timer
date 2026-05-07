@@ -170,7 +170,7 @@ usage() {
 Usage: $0 [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [-f <fault_tolerance>] [-t <experiment_seconds>]
 
 Arguments:
-  mode              Optional; one of normal|heuristic|learning|sharing|scheduled (default: normal).
+  mode              Optional; one of normal|heuristic|learning|sharing|scheduled|thompson (default: normal).
 
 Flags:
   --dataset         Collect per-replica learning-agent dataset CSVs as agentN.csv.
@@ -182,7 +182,7 @@ EOF
 
 mode_enables_learning_agent() {
   case "$1" in
-    heuristic|learning|sharing|scheduled)
+    heuristic|learning|sharing|scheduled|thompson)
       return 0
       ;;
     *)
@@ -223,7 +223,7 @@ while [[ $# -gt 0 ]]; do
       LOG_ENABLED=1
       shift
       ;;
-    normal|heuristic|learning|sharing|scheduled)
+    normal|heuristic|learning|sharing|scheduled|thompson)
       MODE="$1"
       shift
       ;;
@@ -301,6 +301,9 @@ if [[ "${MODE}" == "sharing" ]]; then
 fi
 if [[ "${MODE}" == "scheduled" ]]; then
   AGENT_MODEL_ARGS="--model-type scheduled --schedule-file learning_agent/config/schedule_pbft.csv"
+fi
+if [[ "${MODE}" == "thompson" ]]; then
+  AGENT_MODEL_ARGS="--model-type thompson"
 fi
 
 if (( LEARNING_AGENT_ENABLED == 1 )); then

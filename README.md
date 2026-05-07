@@ -75,9 +75,12 @@ python learning_agent/simulator.py \
   --model cmab \
   --data-dir learning_agent/data/pbft \
   --num-episodes 500 \
-  --phases "5;1;2;3;4;5;0;2;1;5;4;2;1" \
-  --verbose
+  --phases "5;0;0;5;1;2;3;4;5;3;0;5;0;3;4;2;1;5;4;0" \
+  --experiment-name full-sequence \
+  --verbose \
+  --reward-scaler quadratic \
 ```
+
 With $N$ agent observations located in ./data/pbft, each agent will have 1,000 episodes for each phase.
 
 ## PBFT Run

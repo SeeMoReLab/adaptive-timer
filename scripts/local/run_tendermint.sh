@@ -24,7 +24,7 @@ OUTPUT_LOCAL="${LOCAL_TMP_DIR}/tendermint_output.txt"
 LOGS_LOCAL_DIR="${LOCAL_TMP_DIR}/tendermint_logs"
 
 LOAD_CONNECTIONS=5
-LOAD_RATE=100
+LOAD_RATE=10
 LOAD_SEND_PERIOD_MS=100
 LOAD_SIZE=500
 POST_PEER_CONNECT_DELAY=5
@@ -39,7 +39,7 @@ Arguments:
 
 Flags:
   --dataset         Collect per-replica learning-agent datasets as scripts/local/tmp/agentN.csv.
-  --log             Keep per-node logs under scripts/local/tmp/tendermint_logs/.
+  --log             Keep per-node and client logs under scripts/local/tmp/tendermint_logs/.
   --model           Learning-agent model for learning/sharing modes: random|linear|cmab (default: random).
   -f <int>          Fault tolerance f. Number of nodes is derived as 3f+1 (default: 1).
   -t <int>          Load-generation duration in seconds (default: 60).
@@ -153,7 +153,6 @@ if (( DATASET_ENABLED == 1 )) && (( LEARNING_AGENT_ENABLED == 0 )); then
   echo "--dataset requires a learning-agent mode: learning|sharing|scheduled." >&2
   exit 2
 fi
-
 if [[ ! -d "${COMETBFT_SRC}" ]]; then
   echo "Missing cometbft directory: ${COMETBFT_SRC}" >&2
   exit 1
@@ -193,6 +192,7 @@ testnet_dir="${run_root}/mytestnet"
 logs_dir="${run_root}/logs"
 output_file="${run_root}/tendermint_output.txt"
 results_csv="${run_root}/results.csv"
+client_log="${logs_dir}/client.log"
 agent_hosts_config="${run_root}/agent_hosts.config"
 schedule_file="${SCHEDULE_TENDERMINT}"
 buildvcs_flag="-buildvcs=false"
@@ -201,6 +201,16 @@ p2p_port() { echo $((26656 + $1 * 3)); }
 rpc_port() { echo $((26657 + $1 * 3)); }
 abci_port() { echo $((26658 + $1 * 3)); }
 agent_port() { echo $((50000 + $1)); }
+load_endpoints_csv() {
+  local endpoints=()
+  local i rpc_p
+  for ((i = 0; i < num_nodes; i++)); do
+    rpc_p="$(rpc_port "${i}")"
+    endpoints+=("ws://127.0.0.1:${rpc_p}/websocket")
+  done
+  local IFS=,
+  echo "${endpoints[*]}"
+}
 
 sed_in_place() {
   local expr="$1"
@@ -357,6 +367,192 @@ run_report_with_retry() {
   done
 }
 
+append_node_phase_commit_summary() {
+  local out_file="$1"
+  local node_logs_dir="$2"
+  local nodes="$3"
+  python3 - "$node_logs_dir" "$nodes" >> "${out_file}" <<'PY'
+import datetime
+import os
+import re
+import sys
+
+logs_dir = sys.argv[1]
+num_nodes = int(sys.argv[2])
+
+ts_re = re.compile(r'^[A-Z]\[(?:(\d{4}-\d{2}-\d{2})\|)?(\d{2}:\d{2}:\d{2}\.\d{3})\]')
+new_height_re = re.compile(r'phase enter\s+module=consensus\s+height=(\d+)\s+round=\d+\s+phase=RoundStepNewHeight\b')
+new_round_re = re.compile(r'phase enter\s+module=consensus\s+height=(\d+)\s+round=\d+\s+phase=RoundStepNewRound\b')
+finalize_re = re.compile(r'finalizing commit of block\s+module=consensus\s+height=(\d+)\b.*\bnum_txs=(\d+)\b')
+committed_re = re.compile(r'committed state\s+module=state\s+height=(\d+)\b')
+
+def parse_ts(line):
+    m = ts_re.search(line)
+    if not m:
+        return None
+    date_part = m.group(1)
+    time_part = m.group(2)
+    if date_part:
+        return datetime.datetime.strptime(f"{date_part} {time_part}", "%Y-%m-%d %H:%M:%S.%f")
+    return datetime.datetime.strptime(time_part, "%H:%M:%S.%f")
+
+print("==> Per-height per-node commit summary (RoundStepNewRound -> committed state):")
+per_node = []
+all_heights = set()
+
+for node_idx in range(num_nodes):
+    path = os.path.join(logs_dir, f"node_{node_idx}.log")
+    if not os.path.isfile(path):
+        per_node.append({
+            "rows": {},
+            "committed": {},
+            "new_height_start": {},
+        })
+        continue
+
+    new_height_start = {}
+    new_round_start = {}
+    finalized_txs = {}
+    committed = {}
+
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            ts = parse_ts(line)
+            if ts is None:
+                continue
+
+            m_nh = new_height_re.search(line)
+            if m_nh:
+                h = int(m_nh.group(1))
+                if h not in new_height_start:
+                    new_height_start[h] = ts
+                continue
+
+            m_nr = new_round_re.search(line)
+            if m_nr:
+                h = int(m_nr.group(1))
+                if h not in new_round_start:
+                    new_round_start[h] = ts
+                continue
+
+            m_fc = finalize_re.search(line)
+            if m_fc:
+                h = int(m_fc.group(1))
+                txs = int(m_fc.group(2))
+                if h not in finalized_txs:
+                    finalized_txs[h] = txs
+                continue
+
+            m_cs = committed_re.search(line)
+            if m_cs:
+                h = int(m_cs.group(1))
+                if h not in committed:
+                    committed[h] = ts
+
+    node_rows = {}
+    for h, commit_ts in committed.items():
+        start_ts = new_round_start.get(h)
+        txs = finalized_txs.get(h, "-")
+        if start_ts is None:
+            lat = "NA"
+        else:
+            latency_ms = int(round((commit_ts - start_ts).total_seconds() * 1000.0))
+            if latency_ms < 0:
+                # Handle midnight rollover for time-only logs.
+                if latency_ms < -12 * 60 * 60 * 1000:
+                    latency_ms += 24 * 60 * 60 * 1000
+                else:
+                    latency_ms = 0
+            lat = str(latency_ms)
+        node_rows[h] = (lat, str(txs))
+        all_heights.add(h)
+    per_node.append({
+        "rows": node_rows,
+        "committed": committed,
+        "new_height_start": new_height_start,
+    })
+
+if not all_heights:
+    print("  no committed heights found")
+else:
+    heights = sorted(all_heights)
+    headers = ["height", "prev_h_commit_to_new_h_ms"]
+    for i in range(num_nodes):
+        headers.append(f"n{i}_lat_ms")
+    headers.extend(["lat_min_ms", "lat_max_ms", "lat_avg_ms"])
+    for i in range(num_nodes):
+        headers.append(f"n{i}_txs")
+
+    rows = []
+    for h in heights:
+        row = [str(h)]
+
+        gap_values = []
+        if h > 1:
+            for i in range(num_nodes):
+                prev_commit = per_node[i]["committed"].get(h - 1)
+                curr_new_height = per_node[i]["new_height_start"].get(h)
+                if prev_commit is None or curr_new_height is None:
+                    continue
+                gap_ms = int(round((curr_new_height - prev_commit).total_seconds() * 1000.0))
+                if gap_ms < 0:
+                    if gap_ms < -12 * 60 * 60 * 1000:
+                        gap_ms += 24 * 60 * 60 * 1000
+                    else:
+                        gap_ms = 0
+                gap_values.append(gap_ms)
+        if gap_values:
+            row.append(f"{(sum(gap_values) / len(gap_values)):.1f}")
+        else:
+            row.append("-")
+
+        lat_cells = []
+        tx_cells = []
+        lat_values = []
+        for i in range(num_nodes):
+            item = per_node[i]["rows"].get(h)
+            if item is None:
+                lat_cells.append("-")
+                tx_cells.append("-")
+            else:
+                lat, txs = item
+                lat_cells.append(lat)
+                tx_cells.append(txs)
+                try:
+                    lat_values.append(int(lat))
+                except ValueError:
+                    pass
+
+        if lat_values:
+            lat_min = str(min(lat_values))
+            lat_max = str(max(lat_values))
+            lat_avg = f"{(sum(lat_values) / len(lat_values)):.1f}"
+        else:
+            lat_min = "-"
+            lat_max = "-"
+            lat_avg = "-"
+
+        row.extend(lat_cells)
+        row.extend([lat_min, lat_max, lat_avg])
+        row.extend(tx_cells)
+        rows.append(row)
+
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            if len(cell) > widths[idx]:
+                widths[idx] = len(cell)
+
+    def fmt_row(cells):
+        return " | ".join(cells[i].ljust(widths[i]) for i in range(len(cells)))
+
+    print(fmt_row(headers))
+    print("-+-".join("-" * w for w in widths))
+    for row in rows:
+        print(fmt_row(row))
+PY
+}
+
 cleanup() {
   local exit_code=$?
   kill_run_sessions
@@ -511,6 +707,7 @@ done
 
 expected_peers=$((num_nodes - 1))
 rpc0="$(rpc_port 0)"
+load_endpoints="$(load_endpoints_csv)"
 echo "==> Waiting for peers to connect (expecting ${expected_peers})..."
 for attempt in $(seq 1 30); do
   peers="$(curl -sf "http://127.0.0.1:${rpc0}/net_info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["n_peers"])' 2>/dev/null || echo "0")"
@@ -530,16 +727,17 @@ fi
   echo "==> post-peer-connect wait: ${POST_PEER_CONNECT_DELAY}s"
   echo "==> synced start-unix-ms: ${start_unix_ms}"
   echo "==> load: duration=${EXPERIMENT_TIME_S}s, connections=${LOAD_CONNECTIONS}, rate=${LOAD_RATE}, send-period=${LOAD_SEND_PERIOD_MS}ms, size=${LOAD_SIZE}B"
+  echo "==> client log: ${client_log}"
 } > "${output_file}"
 
 load \
-  --endpoints "ws://127.0.0.1:${rpc0}/websocket" \
+  --endpoints "${load_endpoints}" \
   --start-unix-ms "${start_unix_ms}" \
   --connections "${LOAD_CONNECTIONS}" \
   --rate "${LOAD_RATE}" \
   --send-period "${LOAD_SEND_PERIOD_MS}ms" \
   --time "${EXPERIMENT_TIME_S}" \
-  --size "${LOAD_SIZE}" >> "${output_file}" 2>&1
+  --size "${LOAD_SIZE}" 2>&1 | tee "${client_log}" | awk '/^-- Monitor / { print }' >> "${output_file}"
 
 echo "" >> "${output_file}"
 echo "==> Stopping nodes..." >> "${output_file}"
@@ -575,6 +773,8 @@ report_state_log="${logs_dir}/node_0.log"
         print "Not enough data"
     }
   ' "${results_csv}"
+  echo ""
+  append_node_phase_commit_summary "${output_file}" "${logs_dir}" "${num_nodes}"
 } >> "${output_file}" 2>&1
 
 mkdir -p "${LOCAL_TMP_DIR}"
@@ -583,6 +783,7 @@ if (( LOG_ENABLED == 1 )); then
   rm -rf "${LOGS_LOCAL_DIR}"
   mkdir -p "${LOGS_LOCAL_DIR}"
   cp -a "${logs_dir}/." "${LOGS_LOCAL_DIR}/"
+  rm -f "${LOGS_LOCAL_DIR}"/abci_*.log
 else
   rm -f "${results_csv}"
 fi
@@ -603,5 +804,5 @@ fi
 
 echo "Done. Client output saved to ${OUTPUT_LOCAL}."
 if (( LOG_ENABLED == 1 )); then
-  echo "Logs saved to ${LOGS_LOCAL_DIR}."
+  echo "Logs saved to ${LOGS_LOCAL_DIR} (including client.log)."
 fi

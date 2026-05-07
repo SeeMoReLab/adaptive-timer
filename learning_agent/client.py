@@ -14,6 +14,7 @@ PROTOCOL_NAME_TO_ENUM = {
     "pbft": agent_pb2.PROTOCOL_PBFT,
     "two_pc_over_pbft": agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT,
     "sbft": agent_pb2.PROTOCOL_SBFT,
+    "tendermint": agent_pb2.PROTOCOL_TENDERMINT,
 }
 
 
@@ -59,6 +60,8 @@ class LearningAgentClient:
             local_report.two_pc_over_pbft_state.CopyFrom(report)
         elif protocol == agent_pb2.PROTOCOL_SBFT:
             local_report.sbft_state.CopyFrom(report)
+        elif protocol == agent_pb2.PROTOCOL_TENDERMINT:
+            local_report.tendermint_state.CopyFrom(report)
         else:
             raise ValueError(f"Unsupported protocol: {protocol}")
 
@@ -305,6 +308,8 @@ def _random_report(protocol: int, rng: random.Random) -> object:
         return _random_two_pc_report(rng)
     if protocol == agent_pb2.PROTOCOL_SBFT:
         return _random_sbft_report(rng)
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        return _random_tendermint_report(rng)
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -327,6 +332,14 @@ def _random_timeout_used(protocol: int, rng: random.Random) -> object:
             election_timeout_milliseconds=election_timeout_ms,
             slow_path_timeout_milliseconds=slow_path_timeout_ms,
             batch_timeout_milliseconds=batch_timeout_ms,
+        )
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        prevote_timeout_ms = rng.choice(TIMEOUT_OPTIONS_MS)
+        precommit_timeout_ms = rng.choice(TIMEOUT_OPTIONS_MS)
+        return agent_pb2.TendermintTimeout(
+            propose_timeout_milliseconds=election_timeout_ms,
+            prevote_timeout_milliseconds=prevote_timeout_ms,
+            precommit_timeout_milliseconds=precommit_timeout_ms,
         )
     raise ValueError(f"Unsupported protocol: {protocol}")
 
@@ -357,7 +370,7 @@ def _print_sent_payload(
             f"prepare_timeout_rate={float(report.prepare_timeout_rate):.3f}",
             f"commit_rate={float(report.commit_rate):.3f}",
         )
-    else:
+    elif protocol == agent_pb2.PROTOCOL_SBFT:
         print(
             "Sent ReportLocal:",
             f"node_id={node_id}",
@@ -366,6 +379,18 @@ def _print_sent_payload(
             f"total_transactions={int(report.total_transactions)}",
             f"throughput_tps={float(report.throughput_tps):.2f}",
             f"timeout_violation_rate={float(report.timeout_violation_rate):.3f}",
+        )
+    else:
+        print(
+            "Sent ReportLocal:",
+            f"node_id={node_id}",
+            f"episode={episode}",
+            f"protocol={agent_pb2.Protocol.Name(protocol)}",
+            f"total_transactions={int(report.total_transactions)}",
+            f"throughput_tps={float(report.throughput_tps):.2f}",
+            f"propose_latency_ms={float(report.propose_latency_ms):.2f}",
+            f"prevote_latency_ms={float(report.prevote_latency_ms):.2f}",
+            f"precommit_latency_ms={float(report.precommit_latency_ms):.2f}",
         )
     if reward is None:
         return
@@ -395,6 +420,16 @@ def _print_sent_payload(
             f"reward.election_timeout_ms={election_timeout_ms} "
             f"reward.slow_path_timeout_ms={slow_path_timeout_ms} "
             f"reward.batch_timeout_ms={batch_timeout_ms}"
+        )
+    elif reward.HasField("tendermint"):
+        propose_timeout_ms = reward.tendermint.timeout_used.propose_timeout_milliseconds
+        prevote_timeout_ms = reward.tendermint.timeout_used.prevote_timeout_milliseconds
+        precommit_timeout_ms = reward.tendermint.timeout_used.precommit_timeout_milliseconds
+        reward_episode = reward.tendermint.episode
+        timeout_desc = (
+            f"reward.propose_timeout_ms={propose_timeout_ms} "
+            f"reward.prevote_timeout_ms={prevote_timeout_ms} "
+            f"reward.precommit_timeout_ms={precommit_timeout_ms}"
         )
     else:
         reward_episode = -1
@@ -444,7 +479,62 @@ def _print_timeout_status(status: agent_pb2.TimeoutStatus) -> None:
             window_desc,
         )
         return
+    if status.timeout.HasField("tendermint"):
+        print(
+            "Timeout ready:",
+            "propose_timeout_ms="
+            f"{status.timeout.tendermint.propose_timeout_milliseconds}",
+            "prevote_timeout_ms="
+            f"{status.timeout.tendermint.prevote_timeout_milliseconds}",
+            "precommit_timeout_ms="
+            f"{status.timeout.tendermint.precommit_timeout_milliseconds}",
+            window_desc,
+        )
+        return
     print("Timeout status:", agent_pb2.TimeoutStatus.Status.Name(status.status))
+
+
+def _random_tendermint_report(rng: random.Random) -> agent_pb2.TendermintReport:
+    total_transactions = rng.randint(500, 20000)
+    avg_batch_size = rng.uniform(1.0, 200.0)
+    total_consensus_instances = max(
+        1, int(round(total_transactions / max(avg_batch_size, 1.0)))
+    )
+    avg_consensus_latency_ms = rng.uniform(1.0, 250.0)
+    p95_consensus_latency_ms = rng.uniform(
+        avg_consensus_latency_ms,
+        max(avg_consensus_latency_ms, avg_consensus_latency_ms * 2.0),
+    )
+    p99_consensus_latency_ms = rng.uniform(
+        p95_consensus_latency_ms,
+        max(p95_consensus_latency_ms, p95_consensus_latency_ms * 1.5),
+    )
+    throughput_tps = total_transactions / rng.uniform(0.5, 5.0)
+    timeout_violation_rate = rng.uniform(0.0, 0.2)
+    p95_batch_size = rng.uniform(
+        avg_batch_size, max(avg_batch_size, avg_batch_size * 1.5)
+    )
+    leader_change_count = rng.randint(0, 8)
+    regency_change_count = rng.randint(0, 8)
+    propose_latency_ms = rng.uniform(0.0, avg_consensus_latency_ms)
+    prevote_latency_ms = rng.uniform(0.0, avg_consensus_latency_ms)
+    precommit_latency_ms = rng.uniform(0.0, avg_consensus_latency_ms)
+    return agent_pb2.TendermintReport(
+        total_transactions=total_transactions,
+        total_consensus_instances=total_consensus_instances,
+        avg_consensus_latency_ms=avg_consensus_latency_ms,
+        p95_consensus_latency_ms=p95_consensus_latency_ms,
+        p99_consensus_latency_ms=p99_consensus_latency_ms,
+        throughput_tps=throughput_tps,
+        timeout_violation_rate=timeout_violation_rate,
+        avg_batch_size=avg_batch_size,
+        p95_batch_size=p95_batch_size,
+        leader_change_count=leader_change_count,
+        regency_change_count=regency_change_count,
+        propose_latency_ms=propose_latency_ms,
+        prevote_latency_ms=prevote_latency_ms,
+        precommit_latency_ms=precommit_latency_ms,
+    )
 
 
 def main() -> None:
@@ -456,7 +546,7 @@ def main() -> None:
         "--protocol",
         type=_parse_protocol,
         default=agent_pb2.PROTOCOL_PBFT,
-        help="Protocol: pbft, two_pc_over_pbft (alias: 2pc), or sbft.",
+        help="Protocol: pbft, two_pc_over_pbft (alias: 2pc), sbft, or tendermint.",
     )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
@@ -520,11 +610,19 @@ def main() -> None:
                         timeout_used=timeout_used,
                     )
                 )
-            else:
+            elif args.protocol == agent_pb2.PROTOCOL_SBFT:
                 reward = agent_pb2.Reward(
                     sbft=agent_pb2.SbftReward(
                         episode=args.episode - 1,
                         report=_random_sbft_report(rng),
+                        timeout_used=timeout_used,
+                    )
+                )
+            else:
+                reward = agent_pb2.Reward(
+                    tendermint=agent_pb2.TendermintReward(
+                        episode=args.episode - 1,
+                        report=_random_tendermint_report(rng),
                         timeout_used=timeout_used,
                     )
                 )

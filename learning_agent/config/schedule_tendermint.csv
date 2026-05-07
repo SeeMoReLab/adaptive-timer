@@ -1,0 +1,5 @@
+# time_s,propose_timeout_ms,prevote_timeout_ms,precommit_timeout_ms
+-10,400,400,400
+0,150,150,150
+60,400,400,400
+120,900,900,900

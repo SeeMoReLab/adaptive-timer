@@ -4,6 +4,7 @@ import builtins
 import csv
 import random
 import re
+import statistics
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -78,6 +79,7 @@ PROTOCOL_NAME_TO_ENUM = {
     "pbft": agent_pb2.PROTOCOL_PBFT,
     "two_pc_over_pbft": agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT,
     "sbft": agent_pb2.PROTOCOL_SBFT,
+    "tendermint": agent_pb2.PROTOCOL_TENDERMINT,
 }
 
 
@@ -111,6 +113,12 @@ def _dataset_timeout_field_names(protocol: int) -> Tuple[str, ...]:
             "slow_path_timeout_milliseconds_used",
             "batch_timeout_milliseconds_used",
         )
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        return (
+            "propose_timeout_milliseconds_used",
+            "prevote_timeout_milliseconds_used",
+            "precommit_timeout_milliseconds_used",
+        )
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -128,6 +136,12 @@ def _dataset_timeout_values(protocol: int, timeout_used: object) -> Tuple[object
             getattr(timeout_used, "slow_path_timeout_milliseconds", ""),
             getattr(timeout_used, "batch_timeout_milliseconds", ""),
         )
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        return (
+            getattr(timeout_used, "propose_timeout_milliseconds", ""),
+            getattr(timeout_used, "prevote_timeout_milliseconds", ""),
+            getattr(timeout_used, "precommit_timeout_milliseconds", ""),
+        )
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -144,6 +158,10 @@ def _extract_state(report: agent_pb2.ReportLocal, protocol: int) -> object:
         if not report.HasField("sbft_state"):
             raise ValueError("ReportLocal missing sbft_state")
         return report.sbft_state
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        if not report.HasField("tendermint_state"):
+            raise ValueError("ReportLocal missing tendermint_state")
+        return report.tendermint_state
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -156,6 +174,9 @@ def _set_state(report: agent_pb2.ReportLocal, protocol: int, state: object) -> N
         return
     if protocol == agent_pb2.PROTOCOL_SBFT:
         report.sbft_state.CopyFrom(state)
+        return
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        report.tendermint_state.CopyFrom(state)
         return
     raise ValueError(f"Unsupported protocol: {protocol}")
 
@@ -179,6 +200,10 @@ def _timeout_from_status(protocol: int, timeout: agent_pb2.Timeout) -> object:
         if not timeout.HasField("sbft"):
             raise ValueError("Timeout payload missing sbft")
         return timeout.sbft
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        if not timeout.HasField("tendermint"):
+            raise ValueError("Timeout payload missing tendermint")
+        return timeout.tendermint
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -197,6 +222,11 @@ def _extract_reward_payload(protocol: int, reward: agent_pb2.Reward) -> Optional
         if not reward.HasField("sbft"):
             return None
         payload = reward.sbft
+        return payload.episode, payload.report, payload.timeout_used
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        if not reward.HasField("tendermint"):
+            return None
+        payload = reward.tendermint
         return payload.episode, payload.report, payload.timeout_used
     return None
 
@@ -592,10 +622,13 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
     def _derive_window_from_reports(
         self, reports: List[agent_pb2.ReportLocal]
     ) -> Tuple[int, int]:
-        # Consensus winner for an episode is keyed by report_seq; use the
-        # shortest window among participants (highest start tick).
-        report_seq = max(int(report.report_seq) for report in reports)
-        start_tick = max(int(report.start_tick) for report in reports)
+        # Derive a robust consensus window from participant reports.
+        report_seq = int(
+            statistics.median_low([int(report.report_seq) for report in reports])
+        )
+        start_tick = int(
+            statistics.median_low([int(report.start_tick) for report in reports])
+        )
         if report_seq - start_tick <= 0:
             raise ValueError(
                 f"Invalid consensus report window: start={start_tick}, seq={report_seq}"
@@ -782,6 +815,62 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         )
         return dirty_report
 
+    def _dirty_tendermint_state(
+        self, state: agent_pb2.TendermintReport
+    ) -> agent_pb2.TendermintReport:
+        baseline_total_tx = max(int(state.total_transactions), 1)
+        baseline_total_cons = max(int(state.total_consensus_instances), 1)
+        dirty_report = agent_pb2.TendermintReport()
+        dirty_report.CopyFrom(state)
+        dirty_report.total_transactions = self._rng.randint(0, baseline_total_tx * 3)
+        dirty_report.total_consensus_instances = self._rng.randint(0, baseline_total_cons * 3)
+        dirty_report.avg_consensus_latency_ms = float(
+            max(0.0, float(state.avg_consensus_latency_ms) * self._rng.uniform(0.4, 2.0))
+        )
+        dirty_report.p95_consensus_latency_ms = float(
+            max(
+                dirty_report.avg_consensus_latency_ms,
+                float(state.p95_consensus_latency_ms) * self._rng.uniform(0.4, 2.2),
+            )
+        )
+        dirty_report.p99_consensus_latency_ms = float(
+            max(
+                dirty_report.p95_consensus_latency_ms,
+                float(state.p99_consensus_latency_ms) * self._rng.uniform(0.4, 2.4),
+            )
+        )
+        dirty_report.throughput_tps = float(
+            max(0.0, float(state.throughput_tps) * self._rng.uniform(0.4, 1.8))
+        )
+        dirty_report.timeout_violation_rate = float(
+            min(1.0, max(0.0, float(state.timeout_violation_rate) + self._rng.uniform(-0.1, 0.2)))
+        )
+        dirty_report.avg_batch_size = float(
+            max(0.0, float(state.avg_batch_size) * self._rng.uniform(0.4, 1.6))
+        )
+        dirty_report.p95_batch_size = float(
+            max(
+                float(dirty_report.avg_batch_size),
+                float(state.p95_batch_size) * self._rng.uniform(0.4, 1.8),
+            )
+        )
+        dirty_report.leader_change_count = self._rng.randint(
+            0, max(int(state.leader_change_count), 1) * 3
+        )
+        dirty_report.regency_change_count = self._rng.randint(
+            0, max(int(state.regency_change_count), 1) * 3
+        )
+        dirty_report.propose_latency_ms = float(
+            max(0.0, float(state.propose_latency_ms) * self._rng.uniform(0.4, 2.0))
+        )
+        dirty_report.prevote_latency_ms = float(
+            max(0.0, float(state.prevote_latency_ms) * self._rng.uniform(0.4, 2.0))
+        )
+        dirty_report.precommit_latency_ms = float(
+            max(0.0, float(state.precommit_latency_ms) * self._rng.uniform(0.4, 2.0))
+        )
+        return dirty_report
+
     def _dirty_two_pc_over_pbft_state(
         self, state: agent_pb2.TwoPcOverPbftReport
     ) -> agent_pb2.TwoPcOverPbftReport:
@@ -907,6 +996,8 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             return self._dirty_two_pc_over_pbft_state(state)
         if self._protocol == agent_pb2.PROTOCOL_SBFT:
             return self._dirty_sbft_state(state)
+        if self._protocol == agent_pb2.PROTOCOL_TENDERMINT:
+            return self._dirty_tendermint_state(state)
         raise ValueError(f"Unsupported protocol: {self._protocol}")
 
     def _log_reward_row_locked(
@@ -1080,7 +1171,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                     f"commit_rate={local.commit_rate:.6f} "
                     f"avg_e2e_latency_ms={local.avg_end_to_end_latency_ms:.6f}"
                 )
-            else:
+            elif self._protocol == agent_pb2.PROTOCOL_SBFT:
                 print(
                     f"node={report.node_id} "
                     f"total_tx={local.total_transactions} "
@@ -1088,6 +1179,16 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                     f"avg_latency_ms={local.avg_consensus_latency_ms:.6f} "
                     f"p95_latency_ms={local.p95_consensus_latency_ms:.6f} "
                     f"timeout_violation_rate={local.timeout_violation_rate:.6f}"
+                )
+            else:
+                print(
+                    f"node={report.node_id} "
+                    f"total_tx={local.total_transactions} "
+                    f"throughput={local.throughput_tps:.6f} "
+                    f"avg_latency_ms={local.avg_consensus_latency_ms:.6f} "
+                    f"propose_latency_ms={local.propose_latency_ms:.6f} "
+                    f"prevote_latency_ms={local.prevote_latency_ms:.6f} "
+                    f"precommit_latency_ms={local.precommit_latency_ms:.6f}"
                 )
 
         aggregated_report = self._aggregator.aggregate(
@@ -1386,11 +1487,17 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 f"{timeout_used.election_timeout_milliseconds}/"
                 f"{timeout_used.prepare_timeout_milliseconds}"
             )
-        else:
+        elif self._protocol == agent_pb2.PROTOCOL_SBFT:
             reward_timeout = (
                 f"{timeout_used.election_timeout_milliseconds}/"
                 f"{timeout_used.slow_path_timeout_milliseconds}/"
                 f"{timeout_used.batch_timeout_milliseconds}"
+            )
+        else:
+            reward_timeout = (
+                f"{timeout_used.propose_timeout_milliseconds}/"
+                f"{timeout_used.prevote_timeout_milliseconds}/"
+                f"{timeout_used.precommit_timeout_milliseconds}"
             )
 
         if phase == -1:
@@ -1708,14 +1815,21 @@ def main():
         "--protocol",
         type=_parse_protocol,
         default=agent_pb2.PROTOCOL_PBFT,
-        help="Protocol for this agent: pbft, two_pc_over_pbft (alias: 2pc), or sbft.",
+        help=(
+            "Protocol for this agent: pbft, two_pc_over_pbft (alias: 2pc), "
+            "sbft, or tendermint."
+        ),
     )
     parser.add_argument(
         "--model-type",
         type=str,
-        choices=("random", "linear", "scheduled","cmab"),
-        default="cmab",
-        help="random: random timeout selection; linear: learned linear model; scheduled: timeout from a time-based schedule CSV.",
+        choices=("random", "linear", "cmab", "scheduled"),
+        default="random",
+        help=(
+            "random: random timeout selection; linear: learned linear model; "
+            "cmab: contextual multi-armed bandit (Thompson sampling); "
+            "scheduled: timeout from a time-based schedule CSV."
+        ),
     )
 
     parser.add_argument(
@@ -1741,6 +1855,7 @@ def main():
             "Path to schedule CSV. PBFT format: time_s,election_timeout_ms. "
             "2PC-over-PBFT format: time_s,election_timeout_ms,prepare_timeout_ms. "
             "SBFT format: time_s,election_timeout_ms,slow_path_timeout_ms,batch_timeout_ms. "
+            "Tendermint format: time_s,propose_timeout_ms,prevote_timeout_ms,precommit_timeout_ms. "
             "Negative time_s values are allowed for pre-start offsets; schedule "
             "activations are shifted so the earliest entry begins at time 0. "
             "Required when --model-type=scheduled."
@@ -1776,6 +1891,8 @@ def main():
         ),
     )
     args = parser.parse_args()
+    if args.model_type == "thompson":
+        args.model_type = "cmab"
 
     serve(
         protocol=args.protocol,

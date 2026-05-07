@@ -352,6 +352,43 @@ def _extract_action_index(
         base = len(timeout_values_ms)
         return (election_idx * base * base) + (slow_idx * base) + batch_idx
 
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        propose_timeout_ms = _parse_timeout_ms(
+            row=row,
+            candidates=(
+                "propose_timeout_milliseconds_used",
+                "propose_timeout_milliseconds",
+            ),
+            row_number=row_number,
+        )
+        prevote_timeout_ms = _parse_timeout_ms(
+            row=row,
+            candidates=(
+                "prevote_timeout_milliseconds_used",
+                "prevote_timeout_milliseconds",
+            ),
+            row_number=row_number,
+        )
+        precommit_timeout_ms = _parse_timeout_ms(
+            row=row,
+            candidates=(
+                "precommit_timeout_milliseconds_used",
+                "precommit_timeout_milliseconds",
+            ),
+            row_number=row_number,
+        )
+        propose_idx = _timeout_ms_to_index(
+            propose_timeout_ms, timeout_values_ms, row_number
+        )
+        prevote_idx = _timeout_ms_to_index(
+            prevote_timeout_ms, timeout_values_ms, row_number
+        )
+        precommit_idx = _timeout_ms_to_index(
+            precommit_timeout_ms, timeout_values_ms, row_number
+        )
+        base = len(timeout_values_ms)
+        return (propose_idx * base * base) + (prevote_idx * base) + precommit_idx
+
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 

@@ -36,6 +36,7 @@ ARTIFACT_FETCH_MAX_PARALLEL=8
 mode_enables_learning_agent() {
   case "$1" in
     heuristic|learning|sharing|scheduled)
+    heuristic|learning|sharing|scheduled)
       return 0
       ;;
     *)
@@ -281,7 +282,7 @@ queue_artifact_download() {
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--trim-output] [--log-level <TRACE|DEBUG|INFO|WARN|ERROR>] [--model <random|linear|cmab>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--trim-output] [--log-level <TRACE|DEBUG|INFO|WARN|ERROR>] [--model <random|linear>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -364,6 +365,7 @@ while [[ $# -gt 0 ]]; do
       AGENT_MODEL_SET=1
       shift 2
       ;;
+    normal|heuristic|learning|sharing|scheduled)
     normal|heuristic|learning|sharing|scheduled)
       MODE="$1"
       shift

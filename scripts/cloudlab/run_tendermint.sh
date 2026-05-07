@@ -1127,6 +1127,7 @@ if (( LOG_ENABLED == 1 )); then
   if ! scp -r "${SSH_OPTS[@]}" "${remote_user}@${remote_host}:tendermint_cloudlab/logs/." "${LOGS_LOCAL_DIR}/"; then
     echo "Failed to fetch some/all logs from ${remote_host}." >&2
   fi
+  rm -f "${LOGS_LOCAL_DIR}"/abci_*.log
 fi
 if (( DATASET_ENABLED == 1 )); then
   echo "Fetching learning-agent datasets to ${LOCAL_TMP_DIR}..."

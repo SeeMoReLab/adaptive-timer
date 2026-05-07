@@ -109,55 +109,103 @@
 
         <!-- Small proposal delay -->
         <phase>
-            <atTime>100</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>0</delayMs>
-                    <lossPct>0</lossPct>
-                </global>
-            </network>
-
-            <pbft>
-                <proposalDelay>
-                    <replicas>
-                        <replica>
-                            <id>leader</id>
-                            <delayMs>300</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </pbft>
-        </phase>
-
-        <phase>
-            <atTime>200</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>0</delayMs>
-                    <lossPct>0</lossPct>
-                </global>
-            </network>
-
-            <pbft>
-                <proposalDelay>
-                    <replicas>
-                        <replica>
-                            <id>leader</id>
-                            <delayMs>300</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </pbft>
-        </phase>
-
-        <phase>
             <atTime>300</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>0</delayMs>
+                    <lossPct>0</lossPct>
+                </global>
+            </network>
+
+            <pbft>
+                <proposalDelay>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>300</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+
+        <phase>
+            <atTime>420</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>0</delayMs>
+                    <lossPct>0</lossPct>
+                </global>
+            </network>
+
+            <pbft>
+                <proposalDelay>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>300</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+
+        <phase>
+            <atTime>540</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>0</delayMs>
+                    <lossPct>0</lossPct>
+                </global>
+            </network>
+
+            <pbft>
+                <proposalDelay>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>300</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+
+        <phase>
+            <atTime>660</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>0</delayMs>
+                    <lossPct>0</lossPct>
+                </global>
+            </network>
+
+            <pbft>
+                <proposalDelay>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>300</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+
+        <phase>
+            <atTime>780</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -182,7 +230,7 @@
 
         <!-- Large proposal delay -->
         <phase>
-            <atTime>400</atTime>
+            <atTime>900</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -197,7 +245,7 @@
                 <proposalDelay>
                     <replicas>
                         <replica>
-                            <id>0</id>
+                            <id>leader</id>
                             <delayMs>900</delayMs>
                         </replica>
                     </replicas>
@@ -206,7 +254,7 @@
         </phase>
 
         <phase>
-            <atTime>500</atTime>
+            <atTime>1020</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -221,7 +269,7 @@
                 <proposalDelay>
                     <replicas>
                         <replica>
-                            <id>0</id>
+                            <id>leader</id>
                             <delayMs>900</delayMs>
                         </replica>
                     </replicas>
@@ -230,7 +278,7 @@
         </phase>
 
         <phase>
-            <atTime>600</atTime>
+            <atTime>1140</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -245,7 +293,55 @@
                 <proposalDelay>
                     <replicas>
                         <replica>
-                            <id>0</id>
+                            <id>leader</id>
+                            <delayMs>900</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+
+        <phase>
+            <atTime>1260</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>0</delayMs>
+                    <lossPct>0</lossPct>
+                </global>
+            </network>
+
+            <pbft>
+                <proposalDelay>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>900</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+
+        <phase>
+            <atTime>1380</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>0</delayMs>
+                    <lossPct>0</lossPct>
+                </global>
+            </network>
+
+            <pbft>
+                <proposalDelay>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
                             <delayMs>900</delayMs>
                         </replica>
                     </replicas>
@@ -255,7 +351,7 @@
 
         <!-- Small network delay -->
         <phase>
-            <atTime>700</atTime>
+            <atTime>1500</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -269,7 +365,7 @@
 
         <!-- Small network delay + small proposal delay -->
         <phase>
-            <atTime>1300</atTime>
+            <atTime>1800</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -284,7 +380,7 @@
                 <proposalDelay>
                     <replicas>
                         <replica>
-                            <id>0</id>
+                            <id>leader</id>
                             <delayMs>300</delayMs>
                         </replica>
                     </replicas>
@@ -293,7 +389,7 @@
         </phase>
 
         <phase>
-            <atTime>1900</atTime>
+            <atTime>1920</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -308,7 +404,7 @@
                 <proposalDelay>
                     <replicas>
                         <replica>
-                            <id>0</id>
+                            <id>leader</id>
                             <delayMs>300</delayMs>
                         </replica>
                     </replicas>
@@ -317,7 +413,7 @@
         </phase>
 
         <phase>
-            <atTime>2500</atTime>
+            <atTime>2040</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -332,7 +428,55 @@
                 <proposalDelay>
                     <replicas>
                         <replica>
-                            <id>0</id>
+                            <id>leader</id>
+                            <delayMs>300</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+
+        <phase>
+            <atTime>2160</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>50</delayMs>
+                    <lossPct>0</lossPct>
+                </global>
+            </network>
+
+            <pbft>
+                <proposalDelay>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>300</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+
+        <phase>
+            <atTime>2280</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>50</delayMs>
+                    <lossPct>0</lossPct>
+                </global>
+            </network>
+
+            <pbft>
+                <proposalDelay>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
                             <delayMs>300</delayMs>
                         </replica>
                     </replicas>
@@ -342,13 +486,26 @@
 
         <!-- Large network delay -->
         <phase>
-            <atTime>3100</atTime>
+            <atTime>2400</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
 
                 <global>
                     <delayMs>150</delayMs>
+                    <lossPct>0</lossPct>
+                </global>
+            </network>
+        </phase>
+
+        <phase>
+            <atTime>3300</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>0</delayMs>
                     <lossPct>0</lossPct>
                 </global>
             </network>

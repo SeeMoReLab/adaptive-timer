@@ -35,7 +35,7 @@ ARTIFACT_FETCH_MAX_PARALLEL=8
 
 mode_enables_learning_agent() {
   case "$1" in
-    heuristic|learning|sharing|scheduled|thompson)
+    heuristic|learning|sharing|scheduled)
       return 0
       ;;
     *)
@@ -285,7 +285,7 @@ Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--da
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
-  mode              Optional; one of normal|heuristic|learning|sharing|scheduled|thompson (default: normal).
+  mode              Optional; one of normal|heuristic|learning|sharing|scheduled (default: normal).
   targets_file      Optional path to cloudlab SSH targets file.
 
 Flags:
@@ -293,7 +293,7 @@ Flags:
   --log             Download per-replica logs (server, applier, and mode-specific dataexchange/agent logs) to scripts/cloudlab/tmp/.
   --trim-output     Post-process pbft_output.txt: keep lines 1..19, then only lines containing "-- Monitor".
   --log-level       Logging level applied to root, bftsmart and bftsmart.proxy in staged logback.xml (default: INFO).
-  --model           Learning-agent model for learning/sharing modes: random|linear|cmab (default: random).
+  --model           Learning-agent model for learning/sharing modes: random|linear|cmab (cmab uses Thompson sampling; default: random).
   -f <int>          Fault tolerance f passed to prepare_pbft.sh (default: 1).
   -t <int>          Seconds to run experiment before stopping tmux sessions (default: 60).
 EOF
@@ -364,7 +364,7 @@ while [[ $# -gt 0 ]]; do
       AGENT_MODEL_SET=1
       shift 2
       ;;
-    normal|heuristic|learning|sharing|scheduled|thompson)
+    normal|heuristic|learning|sharing|scheduled)
       MODE="$1"
       shift
       ;;
@@ -1145,8 +1145,6 @@ elif [[ "${mode}" == "learning" ]]; then
   agent_mode_args="--model-type ${model_type}"
 elif [[ "${mode}" == "scheduled" ]]; then
   agent_mode_args="--model-type scheduled --schedule-file learning_agent/config/schedule_pbft.csv"
-elif [[ "${mode}" == "thompson" ]]; then
-  agent_mode_args="--model-type thompson"
 fi
 
 remove_path_with_sudo_fallback() {
@@ -1568,7 +1566,7 @@ if (( LOG_ENABLED == 1 )); then
     done
   fi
 
-  if [[ "${MODE}" == "learning" || "${MODE}" == "scheduled" || "${MODE}" == "sharing" || "${MODE}" == "thompson" ]]; then
+  if [[ "${MODE}" == "learning" || "${MODE}" == "scheduled" || "${MODE}" == "sharing" ]]; then
     AGENT_LOGS_LOCAL_DIR="${REPO_ROOT}/scripts/cloudlab/tmp/agent_logs"
     echo "  - learning-agent logs: ${AGENT_LOGS_LOCAL_DIR}"
     rm -rf "${AGENT_LOGS_LOCAL_DIR}"

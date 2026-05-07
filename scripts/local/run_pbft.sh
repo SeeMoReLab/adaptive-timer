@@ -172,12 +172,12 @@ usage() {
 Usage: $0 [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--model <random|linear|cmab>] [-f <fault_tolerance>] [-t <experiment_seconds>]
 
 Arguments:
-  mode              Optional; one of normal|heuristic|learning|sharing|scheduled|cmab (default: normal).
+  mode              Optional; one of normal|heuristic|learning|sharing|scheduled (default: normal).
 
 Flags:
   --dataset         Collect per-replica learning-agent dataset CSVs as agentN.csv.
   --log             Collect per-replica server logs under scripts/local/tmp/server_logs/.
-  --model           Learning-agent model for learning/sharing modes: random|linear|cmab (default: random).
+  --model           Learning-agent model for learning/sharing modes: random|linear|cmab (cmab uses Thompson sampling; default: random).
   -f <int>          Fault tolerance f passed to prepare_pbft.sh (default: 1).
   -t <int>          Seconds to run experiment before stopping tmux sessions (default: 300).
 EOF
@@ -185,7 +185,7 @@ EOF
 
 mode_enables_learning_agent() {
   case "$1" in
-    heuristic|learning|sharing|scheduled|cmab)
+    heuristic|learning|sharing|scheduled)
       return 0
       ;;
     *)
@@ -338,9 +338,6 @@ elif [[ "${MODE}" == "learning" ]]; then
 fi
 if [[ "${MODE}" == "scheduled" ]]; then
   AGENT_MODEL_ARGS="--model-type scheduled --schedule-file learning_agent/config/schedule_pbft.csv"
-fi
-if [[ "${MODE}" == "cmab" ]]; then
-  AGENT_MODEL_ARGS="--model-type cmab"
 fi
 
 if (( LEARNING_AGENT_ENABLED == 1 )); then

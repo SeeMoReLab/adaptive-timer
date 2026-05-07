@@ -36,6 +36,7 @@ ARTIFACT_FETCH_MAX_PARALLEL=8
 mode_enables_learning_agent() {
   case "$1" in
     heuristic|learning|sharing|scheduled)
+    heuristic|learning|sharing|scheduled)
       return 0
       ;;
     *)
@@ -281,10 +282,11 @@ queue_artifact_download() {
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--trim-output] [--log-level <TRACE|DEBUG|INFO|WARN|ERROR>] [--model <random|linear|cmab>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--trim-output] [--log-level <TRACE|DEBUG|INFO|WARN|ERROR>] [--model <random|linear>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
+  mode              Optional; one of normal|heuristic|learning|sharing|scheduled (default: normal).
   mode              Optional; one of normal|heuristic|learning|sharing|scheduled|cmab (default: normal).
   targets_file      Optional path to cloudlab SSH targets file.
 
@@ -293,7 +295,7 @@ Flags:
   --log             Download per-replica logs (server, applier, and mode-specific dataexchange/agent logs) to scripts/cloudlab/tmp/.
   --trim-output     Post-process pbft_output.txt: keep lines 1..19, then only lines containing "-- Monitor".
   --log-level       Logging level applied to root, bftsmart and bftsmart.proxy in staged logback.xml (default: INFO).
-  --model           Learning-agent model for learning/sharing modes: random|linear|cmab (default: random).
+  --model           Learning-agent model for learning/sharing modes: random|linear (cmab uses Thompson sampling; default: random).
   -f <int>          Fault tolerance f passed to prepare_pbft.sh (default: 1).
   -t <int>          Seconds to run experiment before stopping tmux sessions (default: 60).
 EOF
@@ -364,6 +366,7 @@ while [[ $# -gt 0 ]]; do
       AGENT_MODEL_SET=1
       shift 2
       ;;
+    normal|heuristic|learning|sharing|scheduled)
     normal|heuristic|learning|sharing|scheduled)
       MODE="$1"
       shift
@@ -1572,7 +1575,7 @@ if (( LOG_ENABLED == 1 )); then
     done
   fi
 
-  if [[ "${MODE}" == "learning" || "${MODE}" == "scheduled" || "${MODE}" == "sharing" || "${MODE}" == "cmab" ]]; then
+  if [[ "${MODE}" == "learning" || "${MODE}" == "scheduled" || "${MODE}" == "sharing" ]]; then
     AGENT_LOGS_LOCAL_DIR="${REPO_ROOT}/scripts/cloudlab/tmp/agent_logs"
     echo "  - learning-agent logs: ${AGENT_LOGS_LOCAL_DIR}"
     rm -rf "${AGENT_LOGS_LOCAL_DIR}"

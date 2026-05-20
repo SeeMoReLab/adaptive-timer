@@ -147,6 +147,37 @@ TENDERMINT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "precommit_latency_ms",
 )
 
+HOTSTUFF_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
+    "total_transactions",
+    "total_consensus_instances",
+    "avg_consensus_latency_ms",
+    "p95_consensus_latency_ms",
+    "p99_consensus_latency_ms",
+    "throughput_tps",
+    "timeout_violation_rate",
+    "avg_batch_size",
+    "view_change_count",
+    "prepare_latency_ms",
+    "precommit_latency_ms",
+    "commit_latency_ms",
+    "decide_latency_ms",
+)
+
+ZYZZYVA_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
+    "total_transactions",
+    "total_consensus_instances",
+    "avg_consensus_latency_ms",
+    "p95_consensus_latency_ms",
+    "p99_consensus_latency_ms",
+    "throughput_tps",
+    "timeout_violation_rate",
+    "avg_batch_size",
+    "view_change_count",
+    "speculative_exec_latency_ms",
+    "commit_cert_latency_ms",
+    "fast_path_rate",
+)
+
 
 def _protocol_name(protocol: int) -> str:
     try:
@@ -155,13 +186,30 @@ def _protocol_name(protocol: int) -> str:
         return f"UNKNOWN({protocol})"
 
 
+_HOTSTUFF_PROTOCOLS = frozenset({
+    agent_pb2.PROTOCOL_HOTSTUFF,
+    agent_pb2.PROTOCOL_HOTSTUFF2,
+    agent_pb2.PROTOCOL_CHAINED_HOTSTUFF,
+})
+
+_SUPPORTED_PROTOCOLS = frozenset({
+    agent_pb2.PROTOCOL_PBFT,
+    agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT,
+    agent_pb2.PROTOCOL_SBFT,
+    agent_pb2.PROTOCOL_TENDERMINT,
+    agent_pb2.PROTOCOL_HOTSTUFF,
+    agent_pb2.PROTOCOL_HOTSTUFF2,
+    agent_pb2.PROTOCOL_CHAINED_HOTSTUFF,
+    agent_pb2.PROTOCOL_ZYZZYVA,
+})
+
+
+def _is_hotstuff(protocol: int) -> bool:
+    return protocol in _HOTSTUFF_PROTOCOLS
+
+
 def _validate_protocol(protocol: int) -> int:
-    if protocol not in (
-        agent_pb2.PROTOCOL_PBFT,
-        agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT,
-        agent_pb2.PROTOCOL_SBFT,
-        agent_pb2.PROTOCOL_TENDERMINT,
-    ):
+    if protocol not in _SUPPORTED_PROTOCOLS:
         raise ValueError(f"Unsupported protocol: {_protocol_name(protocol)}")
     return int(protocol)
 
@@ -174,6 +222,10 @@ def get_report_feature_field_names(protocol: int) -> Tuple[str, ...]:
         return TWO_PC_OVER_PBFT_REPORT_FEATURE_FIELD_NAMES
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
         return TENDERMINT_REPORT_FEATURE_FIELD_NAMES
+    if _is_hotstuff(protocol):
+        return HOTSTUFF_REPORT_FEATURE_FIELD_NAMES
+    if protocol == agent_pb2.PROTOCOL_ZYZZYVA:
+        return ZYZZYVA_REPORT_FEATURE_FIELD_NAMES
     return SBFT_REPORT_FEATURE_FIELD_NAMES
 
 
@@ -237,6 +289,20 @@ def _tendermint_index_to_triple(index: int) -> Tuple[int, int, int]:
     )
 
 
+def _zyzzyva_pair_to_index(speculative_timeout_ms: int, commit_cert_timeout_ms: int) -> int:
+    spec_idx = timeout_ms_to_index(speculative_timeout_ms)
+    cert_idx = timeout_ms_to_index(commit_cert_timeout_ms)
+    return spec_idx * len(TIMEOUT_VALUES_MS) + cert_idx
+
+
+def _zyzzyva_index_to_pair(index: int) -> Tuple[int, int]:
+    total = len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS)
+    bounded = max(0, min(index, total - 1))
+    spec_idx = bounded // len(TIMEOUT_VALUES_MS)
+    cert_idx = bounded % len(TIMEOUT_VALUES_MS)
+    return timeout_index_to_ms(spec_idx), timeout_index_to_ms(cert_idx)
+
+
 def _sbft_triple_to_index(
     election_timeout_ms: int, slow_path_timeout_ms: int, batch_timeout_ms: int
 ) -> int:
@@ -266,9 +332,15 @@ def get_action_space_size(protocol: int) -> int:
     protocol = _validate_protocol(protocol)
     if protocol == agent_pb2.PROTOCOL_PBFT:
         return len(TIMEOUT_VALUES_MS)
+    if _is_hotstuff(protocol):
+        # HotStuff family: single election/pacemaker timeout
+        return len(TIMEOUT_VALUES_MS)
     if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
         return len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS)
-    # SBFT and TENDERMINT both have 3 independent timeouts → 3³ actions
+    if protocol == agent_pb2.PROTOCOL_ZYZZYVA:
+        # Zyzzyva: speculative + commit-cert timeouts → N² actions
+        return len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS)
+    # SBFT and TENDERMINT both have 3 independent timeouts → N³ actions
     return len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS)
 
 
@@ -281,36 +353,41 @@ def report_to_feature_values(protocol: int, state: object) -> List[float]:
 def timeout_to_action_index(protocol: int, timeout_used: object) -> int:
     protocol = _validate_protocol(protocol)
     if protocol == agent_pb2.PROTOCOL_PBFT:
-        timeout_msg = timeout_used
-        return timeout_ms_to_index(int(timeout_msg.election_timeout_milliseconds))
+        return timeout_ms_to_index(int(timeout_used.election_timeout_milliseconds))
+    if _is_hotstuff(protocol):
+        return timeout_ms_to_index(int(timeout_used.election_timeout_milliseconds))
     if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
-        timeout_msg = timeout_used
         return _two_pc_pair_to_index(
-            int(timeout_msg.election_timeout_milliseconds),
-            int(timeout_msg.prepare_timeout_milliseconds),
+            int(timeout_used.election_timeout_milliseconds),
+            int(timeout_used.prepare_timeout_milliseconds),
         )
-
+    if protocol == agent_pb2.PROTOCOL_ZYZZYVA:
+        return _zyzzyva_pair_to_index(
+            int(timeout_used.speculative_timeout_milliseconds),
+            int(timeout_used.commit_cert_timeout_milliseconds),
+        )
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
-        timeout_msg = timeout_used
         return _tendermint_triple_to_index(
-            int(timeout_msg.propose_timeout_milliseconds),
-            int(timeout_msg.prevote_timeout_milliseconds),
-            int(timeout_msg.precommit_timeout_milliseconds),
+            int(timeout_used.propose_timeout_milliseconds),
+            int(timeout_used.prevote_timeout_milliseconds),
+            int(timeout_used.precommit_timeout_milliseconds),
         )
-    timeout_msg = timeout_used
     return _sbft_triple_to_index(
-        int(timeout_msg.election_timeout_milliseconds),
-        int(timeout_msg.slow_path_timeout_milliseconds),
-        int(timeout_msg.batch_timeout_milliseconds),
+        int(timeout_used.election_timeout_milliseconds),
+        int(timeout_used.slow_path_timeout_milliseconds),
+        int(timeout_used.batch_timeout_milliseconds),
     )
 
 
 def action_index_to_timeout(protocol: int, index: int) -> agent_pb2.Timeout:
     protocol = _validate_protocol(protocol)
     if protocol == agent_pb2.PROTOCOL_PBFT:
-        timeout_ms = timeout_index_to_ms(index)
         return agent_pb2.Timeout(
-            pbft=agent_pb2.PbftTimeout(election_timeout_milliseconds=timeout_ms)
+            pbft=agent_pb2.PbftTimeout(election_timeout_milliseconds=timeout_index_to_ms(index))
+        )
+    if _is_hotstuff(protocol):
+        return agent_pb2.Timeout(
+            hotstuff=agent_pb2.HotstuffTimeout(election_timeout_milliseconds=timeout_index_to_ms(index))
         )
     if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
         election_timeout_ms, prepare_timeout_ms = _two_pc_index_to_pair(index)
@@ -320,7 +397,14 @@ def action_index_to_timeout(protocol: int, index: int) -> agent_pb2.Timeout:
                 prepare_timeout_milliseconds=prepare_timeout_ms,
             )
         )
-
+    if protocol == agent_pb2.PROTOCOL_ZYZZYVA:
+        speculative_timeout_ms, commit_cert_timeout_ms = _zyzzyva_index_to_pair(index)
+        return agent_pb2.Timeout(
+            zyzzyva=agent_pb2.ZyzzyvaTimeout(
+                speculative_timeout_milliseconds=speculative_timeout_ms,
+                commit_cert_timeout_milliseconds=commit_cert_timeout_ms,
+            )
+        )
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
         propose_timeout_ms, prevote_timeout_ms, precommit_timeout_ms = _tendermint_index_to_triple(index)
         return agent_pb2.Timeout(
@@ -344,11 +428,19 @@ def describe_action(protocol: int, index: int) -> str:
     protocol = _validate_protocol(protocol)
     if protocol == agent_pb2.PROTOCOL_PBFT:
         return f"election_timeout_ms={timeout_index_to_ms(index)}"
+    if _is_hotstuff(protocol):
+        return f"election_timeout_ms={timeout_index_to_ms(index)}"
     if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
         election_timeout_ms, prepare_timeout_ms = _two_pc_index_to_pair(index)
         return (
             f"election_timeout_ms={election_timeout_ms}, "
             f"prepare_timeout_ms={prepare_timeout_ms}"
+        )
+    if protocol == agent_pb2.PROTOCOL_ZYZZYVA:
+        speculative_ms, commit_cert_ms = _zyzzyva_index_to_pair(index)
+        return (
+            f"speculative_timeout_ms={speculative_ms}, "
+            f"commit_cert_timeout_ms={commit_cert_ms}"
         )
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
         propose_ms, prevote_ms, precommit_ms = _tendermint_index_to_triple(index)
@@ -549,13 +641,13 @@ class ScheduledTimeoutModel(TensorModel):
                         f"Invalid schedule at line {lineno}: time_s must be >= 0."
                     )
 
-                if protocol == agent_pb2.PROTOCOL_PBFT:
+                if protocol == agent_pb2.PROTOCOL_PBFT or _is_hotstuff(protocol):
                     if len(row) < 2:
                         raise ValueError(
-                            f"Invalid PBFT schedule at line {lineno}: expected 2 columns time_s,election_timeout_ms."
+                            f"Invalid schedule at line {lineno}: expected 2 columns "
+                            "time_s,election_timeout_ms."
                         )
-                    timeout_ms = int(row[1].strip())
-                    option_index = timeout_ms_to_index(timeout_ms)
+                    option_index = timeout_ms_to_index(int(row[1].strip()))
                 elif protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
                     if len(row) < 3:
                         raise ValueError(
@@ -563,10 +655,18 @@ class ScheduledTimeoutModel(TensorModel):
                             f"{lineno}: expected 3 columns "
                             "time_s,election_timeout_ms,prepare_timeout_ms."
                         )
-                    election_timeout_ms = int(row[1].strip())
-                    prepare_timeout_ms = int(row[2].strip())
                     option_index = _two_pc_pair_to_index(
-                        election_timeout_ms, prepare_timeout_ms
+                        int(row[1].strip()), int(row[2].strip())
+                    )
+                elif protocol == agent_pb2.PROTOCOL_ZYZZYVA:
+                    if len(row) < 3:
+                        raise ValueError(
+                            "Invalid Zyzzyva schedule at line "
+                            f"{lineno}: expected 3 columns "
+                            "time_s,speculative_timeout_ms,commit_cert_timeout_ms."
+                        )
+                    option_index = _zyzzyva_pair_to_index(
+                        int(row[1].strip()), int(row[2].strip())
                     )
                 elif protocol == agent_pb2.PROTOCOL_TENDERMINT:
                     if len(row) < 4:
@@ -575,13 +675,8 @@ class ScheduledTimeoutModel(TensorModel):
                             f"{lineno}: expected 4 columns "
                             "time_s,propose_timeout_ms,prevote_timeout_ms,precommit_timeout_ms."
                         )
-                    propose_timeout_ms = int(row[1].strip())
-                    prevote_timeout_ms = int(row[2].strip())
-                    precommit_timeout_ms = int(row[3].strip())
                     option_index = _tendermint_triple_to_index(
-                        propose_timeout_ms,
-                        prevote_timeout_ms,
-                        precommit_timeout_ms,
+                        int(row[1].strip()), int(row[2].strip()), int(row[3].strip())
                     )
                 else:
                     if len(row) < 4:
@@ -590,13 +685,8 @@ class ScheduledTimeoutModel(TensorModel):
                             f"{lineno}: expected 4 columns "
                             "time_s,election_timeout_ms,slow_path_timeout_ms,batch_timeout_ms."
                         )
-                    election_timeout_ms = int(row[1].strip())
-                    slow_path_timeout_ms = int(row[2].strip())
-                    batch_timeout_ms = int(row[3].strip())
                     option_index = _sbft_triple_to_index(
-                        election_timeout_ms,
-                        slow_path_timeout_ms,
-                        batch_timeout_ms,
+                        int(row[1].strip()), int(row[2].strip()), int(row[3].strip())
                     )
                 schedule.append((time_s, option_index))
         if not schedule:

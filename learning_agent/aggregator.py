@@ -28,11 +28,27 @@ def _extract_state(report_local: agent_pb2.ReportLocal, protocol: int) -> object
             )
         return report_local.sbft_state
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
-        if not report_local.HasField("tendermint_state"):
+        if not report_local.HasField("tendermint_report"):
             raise ValueError(
-                f"ReportLocal for node {report_local.node_id} missing tendermint_state"
+                f"ReportLocal for node {report_local.node_id} missing tendermint_report"
             )
-        return report_local.tendermint_state
+        return report_local.tendermint_report
+    if protocol in (
+        agent_pb2.PROTOCOL_HOTSTUFF,
+        agent_pb2.PROTOCOL_HOTSTUFF2,
+        agent_pb2.PROTOCOL_CHAINED_HOTSTUFF,
+    ):
+        if not report_local.HasField("hotstuff_state"):
+            raise ValueError(
+                f"ReportLocal for node {report_local.node_id} missing hotstuff_state"
+            )
+        return report_local.hotstuff_state
+    if protocol == agent_pb2.PROTOCOL_ZYZZYVA:
+        if not report_local.HasField("zyzzyva_state"):
+            raise ValueError(
+                f"ReportLocal for node {report_local.node_id} missing zyzzyva_state"
+            )
+        return report_local.zyzzyva_state
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -53,6 +69,7 @@ def _array_to_report(protocol: int, values: np.ndarray) -> object:
         "total_consensus_instances",
         "leader_change_count",
         "regency_change_count",
+        "view_change_count",
         "single_shard_transactions",
         "cross_shard_transactions",
         "prepare_ok_count",
@@ -81,6 +98,16 @@ def _array_to_report(protocol: int, values: np.ndarray) -> object:
         return agent_pb2.TwoPcOverPbftReport(**kwargs)
     if protocol == agent_pb2.PROTOCOL_SBFT:
         return agent_pb2.SbftReport(**kwargs)
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        return agent_pb2.TendermintReport(**kwargs)
+    if protocol in (
+        agent_pb2.PROTOCOL_HOTSTUFF,
+        agent_pb2.PROTOCOL_HOTSTUFF2,
+        agent_pb2.PROTOCOL_CHAINED_HOTSTUFF,
+    ):
+        return agent_pb2.HotstuffReport(**kwargs)
+    if protocol == agent_pb2.PROTOCOL_ZYZZYVA:
+        return agent_pb2.ZyzzyvaReport(**kwargs)
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -100,6 +127,10 @@ class BaseAggregator(ABC):
             agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT,
             agent_pb2.PROTOCOL_SBFT,
             agent_pb2.PROTOCOL_TENDERMINT,
+            agent_pb2.PROTOCOL_HOTSTUFF,
+            agent_pb2.PROTOCOL_HOTSTUFF2,
+            agent_pb2.PROTOCOL_CHAINED_HOTSTUFF,
+            agent_pb2.PROTOCOL_ZYZZYVA,
         ):
             raise ValueError(f"Unsupported protocol: {protocol}")
         self.protocol = protocol

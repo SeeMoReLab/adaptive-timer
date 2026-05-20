@@ -1,0 +1,6 @@
+# time_s,speculative_timeout_ms,commit_cert_timeout_ms
+# Valid timeout values: 300, 600, 1800
+0,300,300
+10,300,600
+100,600,1800
+1000,1800,1800

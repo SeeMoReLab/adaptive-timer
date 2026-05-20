@@ -1,0 +1,6 @@
+# time_s,election_timeout_ms
+# Valid timeout values: 300, 600, 1800
+0,300
+10,300
+100,600
+1000,1800

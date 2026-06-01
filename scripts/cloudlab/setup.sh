@@ -126,10 +126,83 @@ else
   exit 1
 fi
 
+go_version_at_least() {
+  local min_version="$1"
+  python3 - "$min_version" <<'PY'
+import re
+import subprocess
+import sys
+
+min_major, min_minor = [int(x) for x in sys.argv[1].split(".", 1)]
+out = subprocess.check_output(["go", "version"], text=True)
+m = re.search(r"go(\d+)\.(\d+)", out)
+if not m:
+    raise SystemExit(1)
+major = int(m.group(1))
+minor = int(m.group(2))
+raise SystemExit(0 if (major, minor) >= (min_major, min_minor) else 1)
+PY
+}
+
+ensure_modern_go_toolchain() {
+  local min_go="1.22"
+  local desired_go="${GO_BOOTSTRAP_VERSION:-1.25.7}"
+  if go_version_at_least "${min_go}"; then
+    return 0
+  fi
+
+  local arch
+  case "$(uname -m)" in
+    x86_64|amd64)
+      arch="amd64"
+      ;;
+    aarch64|arm64)
+      arch="arm64"
+      ;;
+    *)
+      echo "Unsupported CPU architecture for Go bootstrap: $(uname -m)" >&2
+      return 1
+      ;;
+  esac
+
+  local install_root="${HOME}/.local/go-${desired_go}"
+  local go_bin="${install_root}/go/bin/go"
+  local archive="/tmp/go${desired_go}.linux-${arch}.tar.gz"
+  local url="https://go.dev/dl/go${desired_go}.linux-${arch}.tar.gz"
+
+  if [[ ! -x "${go_bin}" ]]; then
+    rm -rf "${install_root}"
+    mkdir -p "${install_root}"
+    curl -fsSL "${url}" -o "${archive}"
+    tar -xzf "${archive}" -C "${install_root}"
+    rm -f "${archive}"
+  fi
+
+  export PATH="${install_root}/go/bin:${PATH}"
+  hash -r
+  if ! go_version_at_least "${min_go}"; then
+    echo "Go bootstrap failed. Active go: $(go version 2>/dev/null || echo unavailable)" >&2
+    return 1
+  fi
+
+  # CloudLab run scripts prepend $HOME/go/bin to PATH on remote execution.
+  # Ensure that path resolves to the bootstrapped modern toolchain.
+  mkdir -p "${HOME}/go/bin"
+  ln -sf "${install_root}/go/bin/go" "${HOME}/go/bin/go"
+  ln -sf "${install_root}/go/bin/gofmt" "${HOME}/go/bin/gofmt"
+}
+
+ensure_modern_go_toolchain
+
+# Allow module-aware commands to auto-fix go.mod/go.sum during build/install.
+# This avoids failures like:
+#   "go: updates to go.mod needed; to update it: go mod tidy"
+go env -w GOFLAGS=-mod=mod
+
 java -version >/dev/null 2>&1
 python3 -m pip --version >/dev/null 2>&1
 tmux -V >/dev/null 2>&1
-go version >/dev/null 2>&1
+go version
 make --version >/dev/null 2>&1
 curl --version >/dev/null 2>&1
 tar --version >/dev/null 2>&1

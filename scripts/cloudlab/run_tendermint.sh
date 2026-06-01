@@ -16,13 +16,14 @@ DATASET_ENABLED=0
 AGENT_MODEL_TYPE="random"
 AGENT_MODEL_SET=0
 LOAD_CONNECTIONS=5
-LOAD_RATE=50
-LOAD_SEND_PERIOD_MS=50
+LOAD_RATE=20
+LOAD_SEND_PERIOD_MS=100
 
 LOCAL_TMP_DIR="${REPO_ROOT}/scripts/cloudlab/tmp"
 OUTPUT_LOCAL="${LOCAL_TMP_DIR}/tendermint_output.txt"
 LOGS_LOCAL_DIR="${LOCAL_TMP_DIR}/tendermint_logs"
 LOCAL_PAYLOAD="${REPO_ROOT}/scripts/tmp/tendermint_cloudlab_payload.tar.gz"
+APPLIER_LOCAL_PATH="${REPO_ROOT}/scripts/apply_network_failures.py"
 
 usage() {
   cat <<EOF
@@ -189,6 +190,10 @@ if [[ ! -f "${REPO_ROOT}/config/tendermint/config.toml" ]]; then
   echo "Master Tendermint config not found: ${REPO_ROOT}/config/tendermint/config.toml" >&2
   exit 1
 fi
+if [[ ! -f "${APPLIER_LOCAL_PATH}" ]]; then
+  echo "Network applier script not found: ${APPLIER_LOCAL_PATH}" >&2
+  exit 1
+fi
 if (( LEARNING_AGENT_ENABLED == 1 )); then
   if [[ ! -d "${REPO_ROOT}/learning_agent" ]]; then
     echo "Local learning_agent directory not found: ${REPO_ROOT}/learning_agent" >&2
@@ -246,7 +251,7 @@ fi
 
 echo "Creating CometBFT payload tarball..."
 if (( LEARNING_AGENT_ENABLED == 1 )); then
-  tar -C "${REPO_ROOT}" -czf "${LOCAL_PAYLOAD}" \
+  COPYFILE_DISABLE=1 tar -C "${REPO_ROOT}" -czf "${LOCAL_PAYLOAD}" \
     --exclude='cometbft/mytestnet' \
     --exclude='cometbft/logs' \
     --exclude='cometbft/build' \
@@ -255,7 +260,7 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
     config/tendermint \
     learning_agent
 else
-  tar -C "${REPO_ROOT}" -czf "${LOCAL_PAYLOAD}" \
+  COPYFILE_DISABLE=1 tar -C "${REPO_ROOT}" -czf "${LOCAL_PAYLOAD}" \
     --exclude='cometbft/mytestnet' \
     --exclude='cometbft/logs' \
     --exclude='cometbft/build' \
@@ -264,25 +269,28 @@ else
 fi
 
 REMOTE_PAYLOAD="/tmp/tendermint_cloudlab_payload_$$.tar.gz"
+REMOTE_APPLIER="/tmp/tendermint_apply_network_failures_$$.py"
 
 echo "Copying payload to ${remote_user}@${remote_host}..."
 scp "${SSH_OPTS[@]}" "${LOCAL_PAYLOAD}" "${remote_user}@${remote_host}:${REMOTE_PAYLOAD}"
+scp "${SSH_OPTS[@]}" "${APPLIER_LOCAL_PATH}" "${remote_user}@${remote_host}:${REMOTE_APPLIER}"
 
 echo "Running remote CometBFT experiment on ${remote_host} (mode=${MODE}, f=${F}, t=${EXPERIMENT_TIME_S}s)..."
 remote_failed=0
-if ! ssh "${SSH_OPTS[@]}" "${remote_user}@${remote_host}" "bash -s" -- "${REMOTE_PAYLOAD}" "${F}" "${EXPERIMENT_TIME_S}" "${MODE}" "${LOG_ENABLED}" "${DATASET_ENABLED}" "${LOAD_CONNECTIONS}" "${LOAD_RATE}" "${LOAD_SEND_PERIOD_MS}" "${AGENT_MODEL_TYPE}" <<'REMOTE'
+if ! ssh "${SSH_OPTS[@]}" "${remote_user}@${remote_host}" "bash -s" -- "${REMOTE_PAYLOAD}" "${REMOTE_APPLIER}" "${F}" "${EXPERIMENT_TIME_S}" "${MODE}" "${LOG_ENABLED}" "${DATASET_ENABLED}" "${LOAD_CONNECTIONS}" "${LOAD_RATE}" "${LOAD_SEND_PERIOD_MS}" "${AGENT_MODEL_TYPE}" <<'REMOTE'
 set -euo pipefail
 
 payload_path="$1"
-fault_tolerance="$2"
-experiment_time_s="$3"
-mode="$4"
-log_enabled="$5"
-dataset_enabled="$6"
-load_connections="$7"
-load_rate="$8"
-load_send_period_ms="$9"
-agent_model_type="${10}"
+applier_path="$2"
+fault_tolerance="$3"
+experiment_time_s="$4"
+mode="$5"
+log_enabled="$6"
+dataset_enabled="$7"
+load_connections="$8"
+load_rate="$9"
+load_send_period_ms="${10}"
+agent_model_type="${11}"
 
 if [[ "${mode}" != "normal" && "${mode}" != "learning" && "${mode}" != "sharing" && "${mode}" != "scheduled" ]]; then
   echo "Unsupported mode on remote: ${mode} (supported: normal, learning, sharing, scheduled)" >&2
@@ -342,6 +350,8 @@ results_csv="$HOME/results.csv"
 client_log="${logs_dir}/client.log"
 agent_hosts_config="${run_root}/agent_hosts.config"
 schedule_file="${learning_agent_dir}/config/schedule_tendermint.csv"
+applier_hosts_config="${run_root}/applier_hosts.config"
+applier_script="${run_root}/apply_network_failures.py"
 
 load_size=500
 post_peer_connect_delay=5
@@ -349,6 +359,16 @@ start_align_delay_ms=15000
 buildvcs_flag="-buildvcs=false"
 failure_spec="${run_root}/config/tendermint/failure_spec.xml"
 report_state_log="${logs_dir}/node_0.log"
+overlay_a=10
+overlay_b=251
+overlay_subnet=1
+overlay_mask=24
+overlay_host_offset=10
+overlay_bridge_name="br-tendermint"
+overlay_bridge_ip="${overlay_a}.${overlay_b}.${overlay_subnet}.1"
+max_overlay_nodes=$((255 - overlay_host_offset))
+run_as_user="$(id -un)"
+run_as_home="${HOME}"
 
 # Ensure caller can always try to fetch a run log, even on early failures.
 : > "${output_file}"
@@ -363,15 +383,29 @@ p2p_port() { echo $((26656 + $1 * 3)); }
 rpc_port() { echo $((26657 + $1 * 3)); }
 abci_port() { echo $((26658 + $1 * 3)); }
 agent_port() { echo $((50000 + $1)); }
+node_ip() { echo "${overlay_a}.${overlay_b}.${overlay_subnet}.$((overlay_host_offset + $1))"; }
+ns_name() { echo "tm-r$1"; }
+ns_host_if() { echo "tm-vh$1"; }
+ns_inner_if() { echo "tm-vn$1"; }
 load_endpoints_csv() {
   local endpoints=()
-  local i rpc_p
+  local i rpc_p ip
   for ((i = 0; i < num_nodes; i++)); do
     rpc_p="$(rpc_port "${i}")"
-    endpoints+=("ws://127.0.0.1:${rpc_p}/websocket")
+    ip="$(node_ip "${i}")"
+    endpoints+=("ws://${ip}:${rpc_p}/websocket")
   done
   local IFS=,
   echo "${endpoints[*]}"
+}
+
+write_applier_hosts_config() {
+  : > "${applier_hosts_config}"
+  local i ip
+  for ((i = 0; i < num_nodes; i++)); do
+    ip="$(node_ip "${i}")"
+    echo "${i} ${ip}" >> "${applier_hosts_config}"
+  done
 }
 
 apply_master_config() {
@@ -447,7 +481,7 @@ kill_run_sessions() {
   fi
   while read -r session_name; do
     [[ -z "${session_name}" ]] && continue
-    if [[ "${session_name}" == tm_tendermint_node_* || "${session_name}" == tm_abci_* || "${session_name}" == tm_tendermint_agent_* ]]; then
+    if [[ "${session_name}" == tm_tendermint_node_* || "${session_name}" == tm_abci_* || "${session_name}" == tm_tendermint_agent_* || "${session_name}" == tm_applier_* ]]; then
       tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
     fi
   done <<< "${sessions}"
@@ -488,6 +522,97 @@ force_stop_run_processes() {
     [[ -z "${pid}" ]] && continue
     kill -9 "${pid}" >/dev/null 2>&1 || true
   done <<< "${pids}"
+}
+
+setup_network_namespaces() {
+  if ! sudo -n true >/dev/null 2>&1; then
+    echo "Namespace setup requires passwordless sudo on remote host." >&2
+    echo "Verify with: ssh <node> 'sudo -n true'" >&2
+    return 1
+  fi
+
+  existing_ns="$(ip netns list | awk '/^tm-r[0-9]+/ {print $1}')"
+  if [[ -n "${existing_ns}" ]]; then
+    printf '%s\n' "${existing_ns}" | while read -r name; do
+      [[ -z "${name}" ]] && continue
+      sudo -n ip netns del "${name}" >/dev/null 2>&1 || true
+    done
+  fi
+
+  stale_veths="$(ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*//' | awk '/^tm-vh[0-9]+$/')"
+  if [[ -n "${stale_veths}" ]]; then
+    printf '%s\n' "${stale_veths}" | while read -r if_name; do
+      [[ -z "${if_name}" ]] && continue
+      sudo -n ip link del "${if_name}" >/dev/null 2>&1 || true
+    done
+  fi
+
+  sudo -n ip link set "${overlay_bridge_name}" down >/dev/null 2>&1 || true
+  sudo -n ip link del "${overlay_bridge_name}" type bridge >/dev/null 2>&1 || true
+  sudo -n ip link add name "${overlay_bridge_name}" type bridge
+  sudo -n ip addr replace "${overlay_bridge_ip}/${overlay_mask}" dev "${overlay_bridge_name}"
+  sudo -n ip link set "${overlay_bridge_name}" up
+  sudo -n sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+  local i ns host_if inner_if ip
+  for ((i = 0; i < num_nodes; i++)); do
+    ns="$(ns_name "${i}")"
+    host_if="$(ns_host_if "${i}")"
+    inner_if="$(ns_inner_if "${i}")"
+    ip="$(node_ip "${i}")"
+
+    sudo -n ip netns del "${ns}" >/dev/null 2>&1 || true
+    sudo -n ip link del "${host_if}" >/dev/null 2>&1 || true
+    sudo -n ip netns add "${ns}"
+    sudo -n ip link add "${host_if}" type veth peer name "${inner_if}"
+    sudo -n ip link set "${inner_if}" netns "${ns}"
+    sudo -n ip link set "${host_if}" master "${overlay_bridge_name}"
+    sudo -n ip link set "${host_if}" up
+    sudo -n ip netns exec "${ns}" ip link set lo up
+    sudo -n ip netns exec "${ns}" ip addr replace "${ip}/${overlay_mask}" dev "${inner_if}"
+    sudo -n ip netns exec "${ns}" ip link set "${inner_if}" up
+    sudo -n ip netns exec "${ns}" ip route replace default via "${overlay_bridge_ip}"
+  done
+}
+
+teardown_network_namespaces() {
+  local existing_ns
+  existing_ns="$(ip netns list | awk '/^tm-r[0-9]+/ {print $1}')"
+  if [[ -n "${existing_ns}" ]]; then
+    printf '%s\n' "${existing_ns}" | while read -r name; do
+      [[ -z "${name}" ]] && continue
+      sudo -n ip netns del "${name}" >/dev/null 2>&1 || true
+    done
+  fi
+
+  sudo -n ip link set "${overlay_bridge_name}" down >/dev/null 2>&1 || true
+  sudo -n ip link del "${overlay_bridge_name}" type bridge >/dev/null 2>&1 || true
+}
+
+start_network_appliers() {
+  local i ns iface session applier_log
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "tmux not found; cannot start network appliers." >&2
+    return 1
+  fi
+  if [[ ! -f "${applier_script}" ]]; then
+    echo "Missing network applier script: ${applier_script}" >&2
+    return 1
+  fi
+  if [[ ! -f "${applier_hosts_config}" ]]; then
+    echo "Missing applier hosts config: ${applier_hosts_config}" >&2
+    return 1
+  fi
+
+  for ((i = 0; i < num_nodes; i++)); do
+    ns="$(ns_name "${i}")"
+    iface="$(ns_inner_if "${i}")"
+    session="tm_applier_${i}"
+    applier_log="${logs_dir}/applier_${i}.log"
+    tmux kill-session -t "${session}" >/dev/null 2>&1 || true
+    tmux new-session -d -s "${session}" \
+      "cd \"${run_root}\" && python3 \"${applier_script}\" --failure-spec \"${failure_spec}\" --hosts-config \"${applier_hosts_config}\" --replica-id ${i} --netns ${ns} --interface ${iface} --start-unix-ms ${start_unix_ms} > \"${applier_log}\" 2>&1"
+  done
 }
 
 run_report_with_retry() {
@@ -711,11 +836,13 @@ PY
 cleanup() {
   kill_run_sessions
   force_stop_run_processes
+  teardown_network_namespaces
   rm -f "${payload_path}"
+  rm -f "${applier_path}"
 }
 trap cleanup EXIT
 
-for cmd in go tmux curl python3 tar awk sed; do
+for cmd in go tmux curl python3 tar awk sed ip sudo; do
   if ! command -v "${cmd}" >/dev/null 2>&1; then
     echo "Required command not found on remote host: ${cmd}" >&2
     exit 1
@@ -727,6 +854,8 @@ start_unix_ms="$(( $(python3 -c 'import time; print(int(time.time() * 1000))') +
 rm -rf "${run_root}"
 mkdir -p "${run_root}" "${logs_dir}"
 tar -xzf "${payload_path}" -C "${run_root}"
+cp -a "${applier_path}" "${applier_script}"
+chmod +x "${applier_script}"
 
 if [[ ! -d "${src_dir}" ]]; then
   echo "Extracted cometbft directory missing: ${src_dir}" >&2
@@ -773,13 +902,20 @@ if [[ ! -f "${failure_spec}" ]]; then
   echo "Missing failure spec: ${failure_spec}" >&2
   exit 1
 fi
+if (( num_nodes > max_overlay_nodes )); then
+  echo "Too many nodes (${num_nodes}) for overlay host offset ${overlay_host_offset} in /24 subnet." >&2
+  exit 1
+fi
+
+echo "Setting up per-node network namespaces..."
+setup_network_namespaces
 
 echo "Generating local testnet config (n=${num_nodes})..."
 "${cometbft_bin}" testnet \
   --v "${num_nodes}" \
   --o "${testnet_dir}" \
   --populate-persistent-peers \
-  --starting-ip-address 127.0.0.1
+  --starting-ip-address "$(node_ip 0)"
 
 echo "Applying master Tendermint config: ${master_config}"
 
@@ -791,11 +927,11 @@ for ((i = 0; i < num_nodes; i++)); do
   fi
   apply_master_config "${master_config}" "${config_file}"
   for ((j = 1; j < num_nodes; j++)); do
-    sed -i "s|@127.0.0.$((j + 1)):26656|@127.0.0.1:$(p2p_port "${j}")|g" "${config_file}"
+    sed -i "s|@$(node_ip "${j}"):26656|@$(node_ip "${j}"):$(p2p_port "${j}")|g" "${config_file}"
   done
   if (( learning_agent_enabled == 1 )); then
     agent_p="$(agent_port "${i}")"
-    sed -i "s|adaptive_timer_addr = \".*\"|adaptive_timer_addr = \"127.0.0.1:${agent_p}\"|" "${config_file}"
+    sed -i "s|adaptive_timer_addr = \".*\"|adaptive_timer_addr = \"$(node_ip "${i}"):${agent_p}\"|" "${config_file}"
     sed -i "s|adaptive_timer_node_index = .*|adaptive_timer_node_index = ${i}|" "${config_file}"
   else
     sed -i "s|adaptive_timer_addr = \".*\"|adaptive_timer_addr = \"\"|" "${config_file}"
@@ -806,10 +942,9 @@ done
 if (( learning_agent_enabled == 1 )); then
   : > "${agent_hosts_config}"
   for ((i = 0; i < num_nodes; i++)); do
-    echo "${i} 127.0.0.1 0 0 $(agent_port "${i}") $(rpc_port "${i}")" >> "${agent_hosts_config}"
+    echo "${i} $(node_ip "${i}") 0 0 $(agent_port "${i}") $(rpc_port "${i}")" >> "${agent_hosts_config}"
   done
 fi
-
 echo "Starting ${num_nodes} kvstore and CometBFT nodes in tmux..."
 kill_run_sessions
 if (( learning_agent_enabled == 1 )); then
@@ -823,6 +958,7 @@ if (( learning_agent_enabled == 1 )); then
   fi
   for ((i = 0; i < num_nodes; i++)); do
     agent_session="tm_tendermint_agent_${i}"
+    ns="$(ns_name "${i}")"
     agent_log="${logs_dir}/agent_${i}.log"
     dataset_args=""
     if (( dataset_enabled == 1 )); then
@@ -830,7 +966,7 @@ if (( learning_agent_enabled == 1 )); then
       dataset_args="--dataset-csv \"${run_root}/agent${i}.csv\""
     fi
     tmux new-session -d -s "${agent_session}" \
-      "python3 \"${learning_agent_dir}/main.py\" --node-id \"${i}\" --protocol tendermint --hosts-config \"${agent_hosts_config}\" --failure-spec \"${failure_spec}\" --injection-start-unix-ms \"${start_unix_ms}\" ${agent_mode_args} ${dataset_args} > \"${agent_log}\" 2>&1"
+      "sudo -n ip netns exec ${ns} sudo -n -u ${run_as_user} env HOME=${run_as_home} PATH=${run_as_home}/go/bin:${PATH} PYTHONDONTWRITEBYTECODE=1 bash -lc 'cd \"${run_root}\" && exec python3 \"${learning_agent_dir}/main.py\" --node-id \"${i}\" --protocol tendermint --hosts-config \"${agent_hosts_config}\" --failure-spec \"${failure_spec}\" --injection-start-unix-ms \"${start_unix_ms}\" ${agent_mode_args} ${dataset_args}' > \"${agent_log}\" 2>&1"
   done
   sleep 1
   for ((i = 0; i < num_nodes; i++)); do
@@ -845,6 +981,7 @@ fi
 for ((i = 0; i < num_nodes; i++)); do
   abci_session="tm_abci_${i}"
   node_session="tm_tendermint_node_${i}"
+  ns="$(ns_name "${i}")"
   abci_log="${logs_dir}/abci_${i}.log"
   node_log="${logs_dir}/node_${i}.log"
   abci_p="$(abci_port "${i}")"
@@ -853,16 +990,21 @@ for ((i = 0; i < num_nodes; i++)); do
   node_home="${testnet_dir}/node${i}"
 
   tmux new-session -d -s "${abci_session}" \
-    "abci-cli kvstore --address tcp://127.0.0.1:${abci_p} > \"${abci_log}\" 2>&1"
+    "sudo -n ip netns exec ${ns} sudo -n -u ${run_as_user} env HOME=${run_as_home} PATH=${run_as_home}/go/bin:${PATH} bash -lc 'cd \"${src_dir}\" && exec abci-cli kvstore --address tcp://127.0.0.1:${abci_p}' > \"${abci_log}\" 2>&1"
   tmux new-session -d -s "${node_session}" \
-    "COMETBFT_NODE_INDEX=${i} COMETBFT_PROPOSE_DELAY_FAILURE_SPEC=\"${failure_spec}\" COMETBFT_PROPOSE_DELAY_FAULTY_NODES=${fault_tolerance} COMETBFT_PROPOSE_DELAY_START_UNIX_MS=${start_unix_ms} \"${cometbft_bin}\" node --home \"${node_home}\" --proxy_app tcp://127.0.0.1:${abci_p} --p2p.laddr tcp://0.0.0.0:${p2p_p} --rpc.laddr tcp://0.0.0.0:${rpc_p} > \"${node_log}\" 2>&1"
+    "sudo -n ip netns exec ${ns} sudo -n -u ${run_as_user} env HOME=${run_as_home} PATH=${run_as_home}/go/bin:${PATH} COMETBFT_NODE_INDEX=${i} COMETBFT_PROPOSE_DELAY_FAILURE_SPEC=\"${failure_spec}\" COMETBFT_PROPOSE_DELAY_FAULTY_NODES=${fault_tolerance} COMETBFT_PROPOSE_DELAY_START_UNIX_MS=${start_unix_ms} bash -lc 'cd \"${src_dir}\" && exec \"${cometbft_bin}\" node --home \"${node_home}\" --proxy_app tcp://127.0.0.1:${abci_p} --p2p.laddr tcp://0.0.0.0:${p2p_p} --rpc.laddr tcp://0.0.0.0:${rpc_p}' > \"${node_log}\" 2>&1"
 done
 
+write_applier_hosts_config
+echo "Starting per-replica network failure appliers in tmux..."
+start_network_appliers
+
 for ((i = 0; i < num_nodes; i++)); do
+  ip="$(node_ip "${i}")"
   rpc_p="$(rpc_port "${i}")"
   ready=0
   for attempt in $(seq 1 60); do
-    if curl -sf "http://127.0.0.1:${rpc_p}/status" >/dev/null 2>&1; then
+    if curl -sf "http://${ip}:${rpc_p}/status" >/dev/null 2>&1; then
       ready=1
       break
     fi
@@ -876,9 +1018,10 @@ done
 
 expected_peers=$((num_nodes - 1))
 rpc0="$(rpc_port 0)"
+rpc0_ip="$(node_ip 0)"
 load_endpoints="$(load_endpoints_csv)"
 for attempt in $(seq 1 30); do
-  peers="$(curl -sf "http://127.0.0.1:${rpc0}/net_info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["n_peers"])' 2>/dev/null || echo "0")"
+  peers="$(curl -sf "http://${rpc0_ip}:${rpc0}/net_info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["n_peers"])' 2>/dev/null || echo "0")"
   if [[ "${peers}" =~ ^[0-9]+$ ]] && (( peers >= expected_peers )); then
     break
   fi
@@ -982,7 +1125,6 @@ if (( LOG_ENABLED == 1 )); then
   if ! scp -r "${SSH_OPTS[@]}" "${remote_user}@${remote_host}:tendermint_cloudlab/logs/." "${LOGS_LOCAL_DIR}/"; then
     echo "Failed to fetch some/all logs from ${remote_host}." >&2
   fi
-  rm -f "${LOGS_LOCAL_DIR}"/abci_*.log
 fi
 if (( DATASET_ENABLED == 1 )); then
   echo "Fetching learning-agent datasets to ${LOCAL_TMP_DIR}..."

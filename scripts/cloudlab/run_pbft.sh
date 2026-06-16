@@ -1575,7 +1575,7 @@ if (( LOG_ENABLED == 1 )); then
     done
   fi
 
-  if [[ "${MODE}" == "learning" || "${MODE}" == "scheduled" || "${MODE}" == "sharing" ]]; then
+  if [[ "${MODE}" == "learning" || "${MODE}" == "scheduled" || "${MODE}" == "sharing" || "${MODE}" == "thompson" ]]; then
     AGENT_LOGS_LOCAL_DIR="${REPO_ROOT}/scripts/cloudlab/tmp/agent_logs"
     echo "  - learning-agent logs: ${AGENT_LOGS_LOCAL_DIR}"
     rm -rf "${AGENT_LOGS_LOCAL_DIR}"

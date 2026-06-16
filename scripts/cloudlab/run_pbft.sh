@@ -982,6 +982,12 @@ if [[ ! -f "$HOME/library/apply_network_failures.py" ]]; then
   echo "applier missing on $(hostname): $HOME/library/apply_network_failures.py" >&2
   exit 1
 fi
+failure_spec_path="$HOME/library/config/failure_spec.xml"
+if [[ -f "${failure_spec_path}" ]]; then
+  echo "failure spec found on $(hostname): ${failure_spec_path}"
+else
+  echo "failure spec not found on $(hostname): ${failure_spec_path}" >&2
+fi
 
 for ((n = 0; n < replicas_per_machine; n++)); do
   replica_id=$((machine_idx * replicas_per_machine + n))

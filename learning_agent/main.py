@@ -25,7 +25,7 @@ from models import (
     ActionDecoder,
     FeatureExtractor,
     LinearTorchModel,
-    ThompsonSamplingModel,
+    CMABModel,
     ProtocolReportFeatureExtractor,
     ProtocolTimeoutActionDecoder,
     RandomTimeoutModel,
@@ -1640,7 +1640,6 @@ def serve(
             f"{entry.host}:{entry.consensus_port}"
         )
         consensus_stub = agent_pb2_grpc.ConsensusStub(consensus_channel)
-
     if model_type == "random":
         model = RandomTimeoutModel(
             action_dim=get_action_space_size(protocol),
@@ -1651,8 +1650,9 @@ def serve(
             n_features=get_report_feature_dim(protocol),
             lr=0.05,
         )
-    elif model_type in ("cmab", "thompson"):
-        model = ThompsonSamplingModel(
+    elif model_type == "cmab":
+
+        model = CMABModel(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
         )
@@ -1804,14 +1804,9 @@ def main():
     parser.add_argument(
         "--model-type",
         type=str,
-        choices=("random", "linear", "cmab", "scheduled", "thompson"),
-        default="random",
-        help=(
-            "random: random timeout selection; linear: learned linear model; "
-            "cmab: contextual multi-armed bandit (Thompson sampling); "
-            "thompson: deprecated alias for cmab; "
-            "scheduled: timeout from a time-based schedule CSV."
-        ),
+        choices=("random", "linear", "scheduled","cmab"),
+        default="cmab",
+        help="random: random timeout selection; linear: learned linear model; scheduled: timeout from a time-based schedule CSV.",
     )
 
     parser.add_argument(

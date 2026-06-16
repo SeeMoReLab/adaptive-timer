@@ -25,7 +25,7 @@ from data_loader import (
 from models import (
     PHASE_INDEX_TO_TIMEOUT_INDEX,
     LinearTorchModel,
-    ThompsonSamplingModel,
+    CMABModel,
     TensorModel,
     QuadraticRewardScaler,
     RewardTransformer,
@@ -54,7 +54,7 @@ PROTOCOL_NAME_TO_ENUM = {
 
 MODEL_NAME_TO_TENSORMODEL = {
     "linear": LinearTorchModel,
-    "cmab": ThompsonSamplingModel
+    "cmab": CMABModel
 }
 
 def set_seed(seed: int) -> None:
@@ -296,9 +296,9 @@ def evaluate_model(
     weighted_loss_sum = 0.0
 
     for batch in eval_loader:
-        weighted_loss_sum += model.update_model(
-            features = batch["features"], actions = batch["actions"], rewards = batch["rewards"], backward=False
-        )
+        # weighted_loss_sum += model.update_model(
+        #     features = batch["features"], actions = batch["actions"], rewards = batch["rewards"], backward=False
+        # )
         logits = model.predict_action(batch["features"])
         predicted = torch.argmax(logits, dim=1)
         expected = torch.round(batch["labels"]).long()
@@ -520,7 +520,7 @@ def main() -> None:
     )
     scaler = QuadraticRewardScaler.transform if args.reward_scaler == "quadratic" else None
 
-    if args.model == ThompsonSamplingModel:
+    if args.model == CMABModel:
         model = args.model(
             action_dim=get_action_space_size(_parse_protocol(args.protocol)),
             n_features=get_report_feature_dim(_parse_protocol(args.protocol)),

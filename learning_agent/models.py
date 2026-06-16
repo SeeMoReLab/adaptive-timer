@@ -772,52 +772,66 @@ class ScheduledTimeoutModel(TensorModel):
     def load(self, checkpoint: Dict[str, Any]) -> None:
         pass
 
-class ThompsonSamplingModel(TensorModel): 
+class CMABModel(TensorModel):
+    """Contextual multi-armed bandit (CMAB) model.
+
+    Solved with bootstrapped Thompson sampling over an ensemble of
+    decision-tree reward regressors.
+    """
+
     def __init__(
-        self, 
-        action_dim: int, 
-        n_features: int, 
+        self,
+        action_dim: int,
+        n_features: int,
+        n_estimators: int = 5,
     ):
         if action_dim <= 0:
             raise ValueError(f"action_dim must be > 0, got {action_dim}")
-        
+        if n_estimators <= 0:
+            raise ValueError(f"n_estimators must be > 0, got {n_estimators}")
+
         self._act_dim = int(action_dim)
         self._obs_dim = int(n_features)
-        self._max_bucket_size = 256
+        self._n_estimators = int(n_estimators)
+        self._max_bucket_size = 128
 
         self.reset_model()
+
+    def _predict_head(self, head: int, features_np: np.ndarray) -> np.ndarray:
+        """Per-action reward predictions for one tree. Shape (batch, act_dim)."""
+        batch_size = features_np.shape[0]
+        if not self.is_fitted[head]:
+            return np.full((batch_size, self._act_dim), 1e9)
+
+        preds = np.empty((batch_size, self._act_dim))
+        for act in range(self._act_dim):
+            action_col = np.full((batch_size, 1), act)
+            state_action_input = np.hstack((features_np, action_col))
+            preds[:, act] = self.models[head].predict(state_action_input)
+        return preds
 
     def predict_action(self, features: torch.Tensor) -> torch.Tensor:
         features_np = features.cpu().numpy()
         if features_np.ndim == 1:
             features_np = features_np.reshape(1, -1)
-            
+
         batch_size = features_np.shape[0]
-        predictions = []
-    
-        for act in range(self._act_dim):
-            if not self.is_fitted:
-                pred = np.full(batch_size, 1e9)
-            else:
-                action_col = np.full((batch_size, 1), act)
-                state_action_input = np.hstack((features_np, action_col))
-                pred = self.model.predict(state_action_input)
-            
-            predictions.append(pred)
-        
-        predictions_stacked = np.column_stack(predictions)
-        
-        # Exploration
+        q_values_np = np.empty((batch_size, self._act_dim))
+
+        # Thompson sampling: draw a fresh posterior sample (tree) per decision.
         for i in range(batch_size):
-            row_preds = predictions_stacked[i]
+            head = np.random.randint(self._n_estimators)
+            row_preds = self._predict_head(head, features_np[i : i + 1])[0]
+
             tied_indices = np.flatnonzero(np.isclose(row_preds, np.max(row_preds)))
-            
             if len(tied_indices) > 1:
                 best_index = np.random.choice(tied_indices, replace=True)
-                predictions_stacked[i, best_index] += 1e-5
+                # Magnitude-relative nudge so the random tie-break survives the
+                row_preds[best_index] += 1e-5 * max(1.0, abs(np.max(row_preds)))
 
-        q_values = torch.tensor(predictions_stacked, device=features.device, dtype=torch.float32)
-        return q_values
+            q_values_np[i] = row_preds
+
+        return torch.tensor(q_values_np, device=features.device, dtype=torch.float32)
 
     def update_model(
         self, features: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor | float, backward: bool = True
@@ -825,12 +839,12 @@ class ThompsonSamplingModel(TensorModel):
         features_np = features.cpu().numpy()
         if features_np.ndim == 1:
             features_np = features_np.reshape(1, -1)
-            
+
         if isinstance(actions, torch.Tensor):
             actions_np = actions.cpu().numpy().astype(int).flatten()
         else:
             actions_np = np.array([int(actions)])
-            
+
         if isinstance(rewards, torch.Tensor):
             rewards_np = rewards.cpu().numpy().flatten()
         else:
@@ -840,116 +854,18 @@ class ThompsonSamplingModel(TensorModel):
             self.memory["features"].append(features_np[i])
             self.memory["actions"].append(actions_np[i])
             self.memory["rewards"].append(rewards_np[i])
-        
+
         if backward and len(self.memory["rewards"]) > 0:
             X_features = np.array(self.memory["features"])
             X_actions = np.array(self.memory["actions"]).reshape(-1, 1)
-            
+
             # X [features, action]
             X = np.hstack((X_features, X_actions))
             y = np.array(self.memory["rewards"])
-            
-            # Bootstrapping data
-            idx = np.random.choice(len(X), size=len(X), replace=True)
-            
-            self.model.fit(X[idx], y[idx])
-            self.is_fitted = True
 
-        return 0.0
-
-    def reset_model(self) -> None:
-        self.model = DecisionTreeRegressor(
-            criterion='squared_error',
-            max_depth=6,              
-            min_samples_leaf=2,    
-            min_impurity_decrease=0.01,    
-            random_state=42
-        )
-        self.is_fitted = False
-        self._init_buckets()
-
-    def _init_buckets(self):
-        self.memory = {
-            "features": deque(maxlen=self._max_bucket_size), 
-            "actions": deque(maxlen=self._max_bucket_size),
-            "rewards": deque(maxlen=self._max_bucket_size)
-        }
-
-class MultiHeadThompsonSamplingModel(TensorModel): 
-    def __init__(
-        self, 
-        action_dim: int, 
-        n_features: int,
-        n_heads: int = 10,
-    ):
-        if action_dim <= 0:
-            raise ValueError(f"action_dim must be > 0, got {action_dim}")
-        
-        self._act_dim = int(action_dim)
-        self._obs_dim = int(n_features)
-        self._n_heads = int(n_heads)
-        self._max_bucket_size = 256
-
-        self.reset_model()
-
-    def predict_action(self, features: torch.Tensor) -> torch.Tensor:
-        features_np = features.cpu().numpy().reshape(1, -1)  
-
-        head_predictions = np.zeros((self._n_heads, self._act_dim))
-
-        for k in range(self._n_heads):
-            if not self.is_fitted[k]:
-                head_predictions[k] = 1e9
-            else:
-                for act in range(self._act_dim):
-                    action_col = np.array([[act]])
-                    state_action_input = np.hstack((features_np, action_col))
-                    head_predictions[k, act] = self.models[k].predict(state_action_input)[0]
-
-        k = np.random.randint(0, self._n_heads)
-        sampled_pred = head_predictions[k]
-
-        tied = np.flatnonzero(np.isclose(sampled_pred, np.max(sampled_pred)))
-        if len(tied) > 1:
-            sampled_pred[np.random.choice(tied)] += 1e-5
-
-        q_values = torch.tensor(
-            head_predictions[:, np.newaxis, :], device=features.device, dtype=torch.float32
-        )
-        return q_values
-
-    def update_model(
-        self, features: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor | float, backward: bool = True
-    ) -> float:
-        features_np = features.cpu().numpy()
-        if features_np.ndim == 1:
-            features_np = features_np.reshape(self._n_heads, -1)
-
-        if isinstance(actions, torch.Tensor):
-            actions_np = actions.cpu().numpy().astype(int).flatten()
-        else:
-            actions_np = np.full(self._n_heads, int(actions))
-
-        if isinstance(rewards, torch.Tensor):
-            rewards_np = rewards.cpu().numpy().flatten()
-        else:
-            rewards_np = np.full(self._n_heads, float(rewards))
-
-        for k in range(self._n_heads):
-            sample_features = np.concatenate([features_np[k], [actions_np[k]]])  # [features | action]
-            self.memory[k]["features"].append(sample_features)
-            self.memory[k]["rewards"].append(rewards_np[k])
-
-        if backward:
-            for k in range(self._n_heads):
-                bucket = self.memory[k]
-                if len(bucket["rewards"]) == 0:
-                    continue
-
-                X = np.array(bucket["features"]) 
-                y = np.array(bucket["rewards"])
-
-                # Bootstrapping data
+            # Each tree sees an independent bootstrap resample, so the
+            # ensemble approximates the posterior over the reward function.
+            for k in range(self._n_estimators):
                 idx = np.random.choice(len(X), size=len(X), replace=True)
                 self.models[k].fit(X[idx], y[idx])
                 self.is_fitted[k] = True
@@ -963,18 +879,104 @@ class MultiHeadThompsonSamplingModel(TensorModel):
                 max_depth=6,
                 min_samples_leaf=2,
                 min_impurity_decrease=0.01,
-                random_state=k,  
+                random_state=k,
             )
-            for k in range(self._n_heads)
+            for k in range(self._n_estimators)
         ]
-        self.is_fitted = [False] * self._n_heads
+        self.is_fitted = [False] * self._n_estimators
         self._init_buckets()
 
     def _init_buckets(self):
         self.memory = {
-            k: {
-                "features": deque(maxlen=self._max_bucket_size),  
-                "rewards":  deque(maxlen=self._max_bucket_size),
-            }
-            for k in range(self._n_heads)
+            "features": deque(maxlen=self._max_bucket_size),
+            "actions": deque(maxlen=self._max_bucket_size),
+            "rewards": deque(maxlen=self._max_bucket_size)
         }
+
+class MultiHeadCMABModel(TensorModel):
+    """Per-timer factored CMAB (Thompson sampling) for protocols with multiple timers."""
+
+    def __init__(
+        self,
+        action_dim: int,
+        n_features: int,
+        n_heads: int,
+        n_estimators: int = 10,
+    ):
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        if n_heads <= 0:
+            raise ValueError(f"n_heads must be > 0, got {n_heads}")
+        if n_estimators <= 0:
+            raise ValueError(f"n_estimators must be > 0, got {n_estimators}")
+
+        # action_dim is the *joint* size (k**m); recover the per-timer base k.
+        n_options = int(round(action_dim ** (1.0 / n_heads)))
+        if n_options ** n_heads != action_dim:
+            raise ValueError(
+                f"action_dim ({action_dim}) must equal n_options**n_heads; "
+                f"got n_heads={n_heads}, inferred n_options={n_options}"
+            )
+
+        self._act_dim = int(action_dim)
+        self._obs_dim = int(n_features)
+        self._n_heads = int(n_heads)
+        self._n_options = n_options
+        self._n_estimators = int(n_estimators)
+
+        self._weights = [
+            self._n_options ** (self._n_heads - 1 - k) for k in range(self._n_heads)
+        ]
+
+        self.reset_model()
+
+    def predict_action(self, features: torch.Tensor) -> torch.Tensor:
+        batch_size = 1 if features.dim() == 1 else features.shape[0]
+
+        # Each head draws its own fresh Thompson sample over its timer's options.
+        joint = torch.zeros(batch_size, dtype=torch.long, device=features.device)
+        for k, head in enumerate(self.heads):
+            head_q = head.predict_action(features)          # (batch, n_options)
+            choice = torch.argmax(head_q, dim=1)            # (batch,)
+            joint = joint + choice.to(joint.device) * self._weights[k]
+
+        # Emit a peaked vector over the joint space so the existing decoder's
+        # argmax recovers the composed joint index unchanged.
+        q_values = torch.zeros(batch_size, self._act_dim, device=features.device)
+        q_values[torch.arange(batch_size, device=features.device), joint] = 1.0
+        return q_values
+
+    def update_model(
+        self,
+        features: torch.Tensor,
+        actions: torch.Tensor,
+        rewards: torch.Tensor | float,
+        backward: bool = True,
+    ) -> float:
+        if isinstance(actions, torch.Tensor):
+            actions_np = actions.cpu().numpy().astype(int).flatten()
+        else:
+            actions_np = np.array([int(actions)])
+
+        # Factor the joint action into per-timer choices and route the *same*
+        # state and global reward to each head with its own timer's value.
+        for k, head in enumerate(self.heads):
+            head_actions = (actions_np // self._weights[k]) % self._n_options
+            head.update_model(
+                features,
+                torch.tensor(head_actions.astype(np.float32)),
+                rewards,
+                backward=backward,
+            )
+
+        return 0.0
+
+    def reset_model(self) -> None:
+        self.heads = [
+            ThompsonSamplingModel(
+                action_dim=self._n_options,
+                n_features=self._obs_dim,
+                n_estimators=self._n_estimators,
+            )
+            for _ in range(self._n_heads)
+        ]

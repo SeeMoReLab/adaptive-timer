@@ -1817,7 +1817,6 @@ def main():
         choices=("random", "linear", "scheduled","cmab"),
         default="cmab",
         help="random: random timeout selection; linear: learned linear model; scheduled: timeout from a time-based schedule CSV.",
->>>>>>> 024484e (feat: updated cmab to have n_estimators from n bootstrapped buckets)
     )
 
     parser.add_argument(

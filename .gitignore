@@ -55,3 +55,5 @@ Thumbs.db
 # Other files to ignore
 config/keys/
 tmp/
+
+local_note.txt

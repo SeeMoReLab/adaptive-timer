@@ -35,7 +35,7 @@ ARTIFACT_FETCH_MAX_PARALLEL=8
 
 mode_enables_learning_agent() {
   case "$1" in
-    heuristic|learning|sharing|scheduled|thompson)
+    heuristic|learning|sharing|scheduled)
       return 0
       ;;
     *)
@@ -61,7 +61,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|linear)
+        random|linear|cmab)
       printf '%s\n' "${model_lower}"
       ;;
     *)
@@ -285,7 +285,7 @@ Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--da
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
-  mode              Optional; one of normal|heuristic|learning|sharing|scheduled|thompson (default: normal).
+  mode              Optional; one of normal|heuristic|learning|sharing|scheduled|cmab (default: normal).
   targets_file      Optional path to cloudlab SSH targets file.
 
 Flags:
@@ -364,7 +364,7 @@ while [[ $# -gt 0 ]]; do
       AGENT_MODEL_SET=1
       shift 2
       ;;
-    normal|heuristic|learning|sharing|scheduled|thompson)
+    normal|heuristic|learning|sharing|scheduled)
       MODE="$1"
       shift
       ;;
@@ -982,6 +982,12 @@ if [[ ! -f "$HOME/library/apply_network_failures.py" ]]; then
   echo "applier missing on $(hostname): $HOME/library/apply_network_failures.py" >&2
   exit 1
 fi
+failure_spec_path="$HOME/library/config/failure_spec.xml"
+if [[ -f "${failure_spec_path}" ]]; then
+  echo "failure spec found on $(hostname): ${failure_spec_path}"
+else
+  echo "failure spec not found on $(hostname): ${failure_spec_path}" >&2
+fi
 
 for ((n = 0; n < replicas_per_machine; n++)); do
   replica_id=$((machine_idx * replicas_per_machine + n))
@@ -1145,8 +1151,6 @@ elif [[ "${mode}" == "learning" ]]; then
   agent_mode_args="--model-type ${model_type}"
 elif [[ "${mode}" == "scheduled" ]]; then
   agent_mode_args="--model-type scheduled --schedule-file learning_agent/config/schedule_pbft.csv"
-elif [[ "${mode}" == "thompson" ]]; then
-  agent_mode_args="--model-type thompson"
 fi
 
 remove_path_with_sudo_fallback() {
@@ -1568,7 +1572,7 @@ if (( LOG_ENABLED == 1 )); then
     done
   fi
 
-  if [[ "${MODE}" == "learning" || "${MODE}" == "scheduled" || "${MODE}" == "sharing" || "${MODE}" == "thompson" ]]; then
+  if [[ "${MODE}" == "learning" || "${MODE}" == "scheduled" || "${MODE}" == "sharing" || "${MODE}" == "cmab" ]]; then
     AGENT_LOGS_LOCAL_DIR="${REPO_ROOT}/scripts/cloudlab/tmp/agent_logs"
     echo "  - learning-agent logs: ${AGENT_LOGS_LOCAL_DIR}"
     rm -rf "${AGENT_LOGS_LOCAL_DIR}"

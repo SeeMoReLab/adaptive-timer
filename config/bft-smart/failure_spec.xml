@@ -109,7 +109,7 @@
 
         <!-- Small proposal delay -->
         <phase>
-            <atTime>900</atTime>
+            <atTime>100</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -133,7 +133,7 @@
         </phase>
 
         <phase>
-            <atTime>1200</atTime>
+            <atTime>200</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -157,7 +157,7 @@
         </phase>
 
         <phase>
-            <atTime>1500</atTime>
+            <atTime>300</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -182,7 +182,7 @@
 
         <!-- Large proposal delay -->
         <phase>
-            <atTime>1800</atTime>
+            <atTime>400</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -206,7 +206,7 @@
         </phase>
 
         <phase>
-            <atTime>2100</atTime>
+            <atTime>500</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -230,7 +230,7 @@
         </phase>
 
         <phase>
-            <atTime>2400</atTime>
+            <atTime>600</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -255,7 +255,7 @@
 
         <!-- Small network delay -->
         <phase>
-            <atTime>2700</atTime>
+            <atTime>700</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -269,7 +269,7 @@
 
         <!-- Small network delay + small proposal delay -->
         <phase>
-            <atTime>3600</atTime>
+            <atTime>1300</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -293,7 +293,7 @@
         </phase>
 
         <phase>
-            <atTime>3900</atTime>
+            <atTime>1900</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -317,7 +317,7 @@
         </phase>
 
         <phase>
-            <atTime>4200</atTime>
+            <atTime>2500</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -342,7 +342,7 @@
 
         <!-- Large network delay -->
         <phase>
-            <atTime>4500</atTime>
+            <atTime>3100</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -355,3 +355,88 @@
         </phase>
     </phases>
 </failureSpec>
+
+<!-- Phase 1: Base Case
+Start Time: 0 seconds
+
+Network: Normal operation. Global network delay is 0ms, and packet loss is 0%.
+
+PBFT/Agent: Normal operation. All fault injections (proposal delays, dirty reports, ignore reports) are commented out or disabled.
+
+Phase 2: Small Proposal Delay (Leader)
+Start Time: 100 seconds
+
+Network: Normal operation (0ms delay, 0% loss).
+
+PBFT: A small proposal delay of 300ms is applied specifically to the current leader node.
+
+Phase 3: Continued Small Proposal Delay (Leader)
+Start Time: 200 seconds
+
+Network: Normal operation.
+
+PBFT: Maintains the 300ms proposal delay for the leader node.
+
+Phase 4: Continued Small Proposal Delay (Leader)
+Start Time: 300 seconds
+
+Network: Normal operation.
+
+PBFT: Maintains the 300ms proposal delay for the leader node.
+
+Phase 5: Large Proposal Delay (Replica 0)
+Start Time: 400 seconds
+
+Network: Normal operation.
+
+PBFT: The fault target shifts. A large proposal delay of 900ms is applied specifically to Replica 0.
+
+Phase 6: Continued Large Proposal Delay (Replica 0)
+Start Time: 500 seconds
+
+Network: Normal operation.
+
+PBFT: Maintains the 900ms proposal delay for Replica 0.
+
+Phase 7: Continued Large Proposal Delay (Replica 0)
+Start Time: 600 seconds
+
+Network: Normal operation.
+
+PBFT: Maintains the 900ms proposal delay for Replica 0.
+
+Phase 8: Small Network Delay
+Start Time: 700 seconds
+
+Network: A small global network delay of 50ms is introduced across all directed edges.
+
+PBFT: Proposal delays are deactivated (back to normal).
+
+Phase 9: Small Network Delay + Small Proposal Delay
+Start Time: 1300 seconds
+
+Network: Maintains the global 50ms network delay.
+
+PBFT: Reintroduces a small proposal delay of 300ms specifically for Replica 0.
+
+Phase 10: Continued Network & Proposal Delays
+Start Time: 1900 seconds
+
+Network: Maintains the global 50ms network delay.
+
+PBFT: Maintains the 300ms proposal delay for Replica 0.
+
+Phase 11: Continued Network & Proposal Delays
+Start Time: 2500 seconds
+
+Network: Maintains the global 50ms network delay.
+
+PBFT: Maintains the 300ms proposal delay for Replica 0.
+
+Phase 12: Large Network Delay
+Start Time: 3100 seconds
+
+Network: A large global network delay of 150ms is introduced across all directed edges.
+
+PBFT: Proposal delays are deactivated once again.
+ -->

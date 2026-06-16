@@ -163,3 +163,20 @@ TODO:
 - Test feeding data to linear model
 - Make systems.config generation script and read from `consensus.config` and `data_exchange.config` instead of `system.config`
 - Try running end to end
+
+
+python scripts/cloudlab/extract_ssh_targets.py \
+  --manifest scripts/cloudlab/cloudlab.manifest \
+  --username yosefnw
+
+bash scripts/cloudlab/setup.sh ~/ws/creds-cloudlab/ssh
+
+bash ~/ws/creds-cloudlab/ssh
+bash scripts/cloudlab/run_pbft.sh scripts/cloudlab/setup.sh  cmab --dataset --log --trim-output -t 3610
+
+
+
+bash scripts/cloudlab/run_pbft.sh /home/yosef/ws/creds-cloudlab/ssh learning --model cmab --dataset --log --trim-output -t 3610
+
+
+bash scripts/cloudlab/run_pbft.sh /home/yosef/ws/creds-cloudlab/ssh sharing --model cmab --dataset --log --trim-output -t 60

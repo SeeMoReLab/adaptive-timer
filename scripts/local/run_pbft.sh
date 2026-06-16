@@ -172,7 +172,7 @@ usage() {
 Usage: $0 [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--model <random|linear|cmab>] [-f <fault_tolerance>] [-t <experiment_seconds>]
 
 Arguments:
-  mode              Optional; one of normal|heuristic|learning|sharing|scheduled (default: normal).
+  mode              Optional; one of normal|heuristic|learning|sharing|scheduled|cmab (default: normal).
 
 Flags:
   --dataset         Collect per-replica learning-agent dataset CSVs as agentN.csv.
@@ -185,7 +185,7 @@ EOF
 
 mode_enables_learning_agent() {
   case "$1" in
-    heuristic|learning|sharing|scheduled)
+    heuristic|learning|sharing|scheduled|cmab)
       return 0
       ;;
     *)
@@ -239,17 +239,7 @@ while [[ $# -gt 0 ]]; do
       LOG_ENABLED=1
       shift
       ;;
-    --model)
-      if [[ $# -lt 2 || -z "${2}" ]]; then
-        echo "Missing value for --model." >&2
-        usage >&2
-        exit 2
-      fi
-      AGENT_MODEL_TYPE="${2}"
-      AGENT_MODEL_SET=1
-      shift 2
-      ;;
-    normal|heuristic|learning|sharing|scheduled)
+    normal|heuristic|learning|sharing|scheduled|cmab)
       MODE="$1"
       shift
       ;;
@@ -338,6 +328,9 @@ elif [[ "${MODE}" == "learning" ]]; then
 fi
 if [[ "${MODE}" == "scheduled" ]]; then
   AGENT_MODEL_ARGS="--model-type scheduled --schedule-file learning_agent/config/schedule_pbft.csv"
+fi
+if [[ "${MODE}" == "cmab" ]]; then
+  AGENT_MODEL_ARGS="--model-type cmab"
 fi
 
 if (( LEARNING_AGENT_ENABLED == 1 )); then

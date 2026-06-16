@@ -351,7 +351,7 @@
 
         <!-- Small network delay -->
         <phase>
-            <atTime>1500</atTime>
+            <atTime>2700</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>

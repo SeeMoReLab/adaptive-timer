@@ -120,51 +120,36 @@ def _random_pbft_report(rng: random.Random) -> agent_pb2.PbftReport:
     p95_consensus_latency_ms = rng.uniform(
         avg_consensus_latency_ms, max(avg_consensus_latency_ms, avg_consensus_latency_ms * 2.0)
     )
-    p99_consensus_latency_ms = rng.uniform(
-        p95_consensus_latency_ms, max(p95_consensus_latency_ms, p95_consensus_latency_ms * 1.5)
-    )
+    p50_consensus_latency_ms = rng.uniform(avg_consensus_latency_ms, p95_consensus_latency_ms)
     throughput_tps = total_transactions / rng.uniform(0.5, 5.0)
-    timeout_violation_rate = rng.uniform(0.0, 0.2)
     p95_batch_size = rng.uniform(avg_batch_size, max(avg_batch_size, avg_batch_size * 1.5))
     leader_change_count = rng.randint(0, 8)
     regency_change_count = rng.randint(0, 8)
-    phase_propose_avg_delay_ms = rng.uniform(0.0, avg_consensus_latency_ms)
-    phase_propose_p95_delay_ms = rng.uniform(
-        phase_propose_avg_delay_ms, max(phase_propose_avg_delay_ms, phase_propose_avg_delay_ms * 2.0)
+    timeout_ms = rng.choice([100, 700, 1900])
+    avg_inter_commit_gap_ms = rng.uniform(1.0, 250.0)
+    p50_inter_commit_gap_ms = rng.uniform(1.0, avg_inter_commit_gap_ms)
+    p95_inter_commit_gap_ms = rng.uniform(
+        avg_inter_commit_gap_ms, max(avg_inter_commit_gap_ms, avg_inter_commit_gap_ms * 2.0)
     )
-    phase_write_avg_delay_ms = rng.uniform(0.0, avg_consensus_latency_ms)
-    phase_write_p95_delay_ms = rng.uniform(
-        phase_write_avg_delay_ms, max(phase_write_avg_delay_ms, phase_write_avg_delay_ms * 2.0)
-    )
-    phase_accept_avg_delay_ms = rng.uniform(0.0, avg_consensus_latency_ms)
-    phase_accept_p95_delay_ms = rng.uniform(
-        phase_accept_avg_delay_ms, max(phase_accept_avg_delay_ms, phase_accept_avg_delay_ms * 2.0)
-    )
-    phase_post_decision_avg_delay_ms = rng.uniform(0.0, avg_consensus_latency_ms)
-    phase_post_decision_p95_delay_ms = rng.uniform(
-        phase_post_decision_avg_delay_ms,
-        max(phase_post_decision_avg_delay_ms, phase_post_decision_avg_delay_ms * 2.0),
-    )
+    view_change_count = rng.randint(0, 8)
+    no_progress_view_change_count = rng.randint(0, view_change_count)
     return agent_pb2.PbftReport(
         total_transactions=total_transactions,
         total_consensus_instances=total_consensus_instances,
         avg_consensus_latency_ms=avg_consensus_latency_ms,
+        p50_consensus_latency_ms=p50_consensus_latency_ms,
         p95_consensus_latency_ms=p95_consensus_latency_ms,
-        p99_consensus_latency_ms=p99_consensus_latency_ms,
         throughput_tps=throughput_tps,
-        timeout_violation_rate=timeout_violation_rate,
         avg_batch_size=avg_batch_size,
         p95_batch_size=p95_batch_size,
         leader_change_count=leader_change_count,
         regency_change_count=regency_change_count,
-        phase_propose_avg_delay_ms=phase_propose_avg_delay_ms,
-        phase_propose_p95_delay_ms=phase_propose_p95_delay_ms,
-        phase_write_avg_delay_ms=phase_write_avg_delay_ms,
-        phase_write_p95_delay_ms=phase_write_p95_delay_ms,
-        phase_accept_avg_delay_ms=phase_accept_avg_delay_ms,
-        phase_accept_p95_delay_ms=phase_accept_p95_delay_ms,
-        phase_post_decision_avg_delay_ms=phase_post_decision_avg_delay_ms,
-        phase_post_decision_p95_delay_ms=phase_post_decision_p95_delay_ms,
+        timeout_ms=timeout_ms,
+        avg_inter_commit_gap_ms=avg_inter_commit_gap_ms,
+        p50_inter_commit_gap_ms=p50_inter_commit_gap_ms,
+        p95_inter_commit_gap_ms=p95_inter_commit_gap_ms,
+        view_change_count=view_change_count,
+        no_progress_view_change_count=no_progress_view_change_count,
     )
 
 

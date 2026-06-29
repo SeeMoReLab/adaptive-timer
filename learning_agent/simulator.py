@@ -23,9 +23,7 @@ from data_loader import (
     )
 
 from models import (
-    TIMEOUT_VALUES_MS,
     PHASE_INDEX_TO_TIMEOUT_INDEX,
-    TIMEOUT_INDEX_TO_MS,
     LinearTorchModel,
     ThompsonSamplingModel,
     TensorModel,
@@ -34,6 +32,8 @@ from models import (
     get_action_space_size,
     get_report_feature_dim,
     get_report_feature_field_names,
+    get_timeout_values_ms,
+    timeout_index_to_ms_for_protocol,
 )
 
 from generator import DataGenerator
@@ -217,7 +217,7 @@ def generate_data(
             reader=phase_data,
             protocol=PROTOCOL_NAME_TO_ENUM[protocol],
             feature_field_names=get_report_feature_field_names(PROTOCOL_NAME_TO_ENUM[protocol]),
-            timeout_values_ms=TIMEOUT_VALUES_MS,
+            timeout_values_ms=get_timeout_values_ms(PROTOCOL_NAME_TO_ENUM[protocol]),
             phase_options=PHASE_INDEX_TO_TIMEOUT_INDEX, 
             reward_transform= scaler,
     )  
@@ -234,6 +234,7 @@ def generate_data(
     return loader, new_start_episode
 
 def train_model(
+    protocol: int,
     model: TensorModel,
     train_loader: DatasetLoader,
     eval_loader: DatasetLoader,
@@ -249,6 +250,7 @@ def train_model(
     for e in range(epochs):
         train_loss = _run_epoch(model, train_loader, backward=True)
         metrics,_ = evaluate_model(
+            protocol=protocol,
             model=model,
             eval_loader= eval_loader,
         )
@@ -285,6 +287,7 @@ def _run_epoch(model: TensorModel, loader: DatasetLoader, backward: bool) -> flo
     return loss_sum / batch_count
 
 def evaluate_model(
+    protocol: int,
     model: TensorModel, eval_loader: DatasetLoader
 ) -> Tuple[Dict[str, float], List[int]]:
 
@@ -301,7 +304,10 @@ def evaluate_model(
         expected = torch.round(batch["labels"]).long()
         total += int(expected.numel())
         correct += int((predicted == expected).sum().item())
-        curr_timeout = [TIMEOUT_INDEX_TO_MS[idx] for idx in predicted.tolist()]
+        curr_timeout = [
+            timeout_index_to_ms_for_protocol(protocol, idx)
+            for idx in predicted.tolist()
+        ]
 
     accuracy = (correct / total) if total else 0.0
 
@@ -584,6 +590,7 @@ def main() -> None:
             
             inf_start_t = time.perf_counter()
             metrics, curr_timeout = evaluate_model(
+                protocol=PROTOCOL_NAME_TO_ENUM[args.protocol],
                 model=model,         
                 eval_loader=phase_loader,
             )
@@ -607,6 +614,7 @@ def main() -> None:
 
             train_start_t = time.perf_counter()
             model, _ = train_model(
+                protocol=PROTOCOL_NAME_TO_ENUM[args.protocol],
                 model=model,
                 train_loader=phase_loader,
                 eval_loader=phase_loader,
@@ -636,7 +644,7 @@ def main() -> None:
 
     plot_accuracy(result=result, save_path=os.path.join(exp_path, 'summary_accuracies.png'))
     plot_stage_accuracies(data_dict=raw_result, save_path=os.path.join(exp_path, 'episode_accuracies.png'))
-    plot_prediction_phases(data_dict=predictions, save_path=os.path.join(exp_path, 'predictions.png'), y_ticks=[150, 400, 900])
+    plot_prediction_phases(data_dict=predictions, save_path=os.path.join(exp_path, 'predictions.png'), y_ticks=[100, 700, 1900])
 
     print(f"\n[SUMMARY]")
     print(f"[Experiment Configs:]\tprotocol={args.protocol}, num_episodes={args.num_episodes}, phases={args.phases}")

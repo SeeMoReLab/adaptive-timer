@@ -10,9 +10,7 @@ import os
 import agent_pb2
 from data_loader import DatasetLoader, load_training_data_from_csv, split_train_eval_loaders
 from models import (
-    TIMEOUT_VALUES_MS,
     PHASE_INDEX_TO_TIMEOUT_INDEX,
-    TIMEOUT_INDEX_TO_MS,
     LinearTorchModel,
     SVMTorchModel,
     PPOTorchModel,
@@ -21,6 +19,8 @@ from models import (
     get_action_space_size,
     get_report_feature_dim,
     get_report_feature_field_names,
+    get_timeout_values_ms,
+    timeout_index_to_ms_for_protocol,
 )
 
 try:
@@ -134,7 +134,7 @@ def run_pipeline(
         path=train_csv,
         protocol=protocol,
         feature_field_names=get_report_feature_field_names(protocol),
-        timeout_values_ms=TIMEOUT_VALUES_MS,
+        timeout_values_ms=get_timeout_values_ms(protocol),
         phase_options=PHASE_INDEX_TO_TIMEOUT_INDEX,
         reward_transform=reward_transform,
     )
@@ -157,6 +157,7 @@ def run_pipeline(
         save_path = save_path
     )
     metrics = evaluate_linear_model_on_csv(
+        protocol=protocol,
         model=model,
         eval_loader=eval_loader,
     )
@@ -198,6 +199,7 @@ def train_linear_model_from_csv(
         train_loss = _run_epoch(tensor_model, train_loader, backward=True)
     
         metrics = evaluate_linear_model_on_csv(
+            protocol=protocol,
             model=tensor_model,
             eval_loader= eval_loader,
         )
@@ -222,12 +224,13 @@ def train_linear_model_from_csv(
 
 
 def evaluate_linear_model_on_csv(
+    protocol: int,
     model: TensorModel, eval_loader: DatasetLoader
 ) -> Tuple[Dict[str, float], List[int]]:
 
     total = 0
     correct = 0
-    num_classes = len(TIMEOUT_VALUES_MS)
+    num_classes = get_action_space_size(protocol)
     tp = torch.zeros(num_classes)
     fp = torch.zeros(num_classes)
     fn = torch.zeros(num_classes)
@@ -243,7 +246,10 @@ def evaluate_linear_model_on_csv(
         expected = torch.round(batch["labels"]).long()
         total += int(expected.numel())
         correct += int((predicted == expected).sum().item())
-        curr_timeout = [TIMEOUT_INDEX_TO_MS[idx] for idx in predicted.tolist()]
+        curr_timeout = [
+            timeout_index_to_ms_for_protocol(protocol, idx)
+            for idx in predicted.tolist()
+        ]
         for c in range(num_classes):
             tp[c] += ((predicted == c) & (expected == c)).sum().item()
             fp[c] += ((predicted == c) & (expected != c)).sum().item()

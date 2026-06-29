@@ -20,85 +20,93 @@ message PbftReport {
 
     // End-to-end PBFT consensus latency summaries (milliseconds).
     float avg_consensus_latency_ms = 3;
-    float p95_consensus_latency_ms = 4;
-    float p99_consensus_latency_ms = 5;
+    float p50_consensus_latency_ms = 4;
+    float p95_consensus_latency_ms = 5;
 
-    // Throughput and core rates.
+    // Throughput.
     float throughput_tps = 6;
-    float timeout_violation_rate = 7;
 
     // Batch characteristics.
-    float avg_batch_size = 8;
-    float p95_batch_size = 9;
+    float avg_batch_size = 7;
+    float p95_batch_size = 8;
 
     // Leadership dynamics.
-    uint32 leader_change_count = 10;
-    uint32 regency_change_count = 11;
+    uint32 leader_change_count = 9;
+    uint32 regency_change_count = 10;
 
-    // Phase delays (milliseconds).
-    float phase_propose_avg_delay_ms = 12;
-    float phase_propose_p95_delay_ms = 13;
-    float phase_write_avg_delay_ms = 14;
-    float phase_write_p95_delay_ms = 15;
-    float phase_accept_avg_delay_ms = 16;
-    float phase_accept_p95_delay_ms = 17;
-    float phase_post_decision_avg_delay_ms = 18;
-    float phase_post_decision_p95_delay_ms = 19;
+    // Timer and liveness context for the same learning window.
+    uint32 timeout_ms = 11;
+    float avg_inter_commit_gap_ms = 12;
+    float p50_inter_commit_gap_ms = 13;
+    float p95_inter_commit_gap_ms = 14;
+    uint32 view_change_count = 15;
+    uint32 no_progress_view_change_count = 16;
+}
+
+// 2PC-over-PBFT per-participant-shard metrics.
+message TwoPcNeighborReport {
+    uint32 participant_shard_id = 1;
+
+    // Workload composition for this participant shard.
+    uint32 cross_shard_transactions = 2;
+
+    // 2PC outcome counters scoped to this participant shard.
+    uint32 prepare_ok_count = 3;
+    uint32 prepare_fail_count = 4;
+    uint32 commit_ok_count = 5;
+    uint32 abort_count = 6;
+    uint32 in_doubt_count = 7;
+
+    // Timeout/unknown-outcome counters scoped to this participant shard.
+    uint32 prepare_timeout_count = 8;
+    uint32 commit_timeout_unknown_outcome_count = 9;
+    uint32 abort_best_effort_timeout_count = 10;
+
+    // Additional operational counters.
+    uint32 lock_contention_count = 11;
+
+    // Rate summaries.
+    float prepare_timeout_rate = 12;
+    float abort_rate = 13;
+    float commit_rate = 14;
+    float lock_contention_rate = 15;
+
+    // End-to-end and phase latency summaries in milliseconds.
+    float avg_end_to_end_latency_ms = 16;
+    float p95_end_to_end_latency_ms = 17;
+    float p99_end_to_end_latency_ms = 18;
+    float avg_prepare_latency_ms = 19;
+    float p95_prepare_latency_ms = 20;
+    float avg_commit_latency_ms = 21;
+    float p95_commit_latency_ms = 22;
+    float avg_lock_wait_ms = 23;
+    float p95_lock_wait_ms = 24;
+    float avg_lock_hold_ms = 25;
+    float p95_lock_hold_ms = 26;
+
+    // Standardized failure reason counters.
+    uint32 reason_prepare_lock_busy_count = 27;
+    uint32 reason_prepare_validation_fail_count = 28;
+    uint32 reason_prepare_timeout_count = 29;
+    uint32 reason_prepare_other_count = 30;
+    uint32 reason_commit_timeout_unknown_outcome_count = 31;
+    uint32 reason_abort_best_effort_timeout_count = 32;
+    uint32 reason_other_count = 33;
 }
 
 // 2PC-over-PBFT specific state report.
-// Includes workload composition, outcome counters, reason counters, and latency summaries.
+// Includes global workload composition plus per-neighbor 2PC metrics.
 message TwoPcOverPbftReport {
     // Base PBFT metrics for the same learning window.
     PbftReport pbft = 1;
 
-    // Workload composition for the learning window.
+    // Global workload composition for the learning window.
     uint32 total_transactions = 2;
     uint32 single_shard_transactions = 3;
     uint32 cross_shard_transactions = 4;
 
-    // 2PC outcome counters.
-    uint32 prepare_ok_count = 5;
-    uint32 prepare_fail_count = 6;
-    uint32 commit_ok_count = 7;
-    uint32 abort_count = 8;
-    uint32 in_doubt_count = 9;
-
-    // Timeout/unknown-outcome counters.
-    uint32 prepare_timeout_count = 10;
-    uint32 commit_timeout_unknown_outcome_count = 11;
-    uint32 abort_best_effort_timeout_count = 12;
-
-    // Additional operational counters.
-    uint32 lock_contention_count = 13;
-
-    // Rate summaries.
-    float prepare_timeout_rate = 14;
-    float abort_rate = 15;
-    float commit_rate = 16;
-    float lock_contention_rate = 17;
-
-    // End-to-end and phase latency summaries in milliseconds.
-    float avg_end_to_end_latency_ms = 18;
-    float p95_end_to_end_latency_ms = 19;
-    float p99_end_to_end_latency_ms = 20;
-    float avg_prepare_latency_ms = 21;
-    float p95_prepare_latency_ms = 22;
-    float avg_commit_latency_ms = 23;
-    float p95_commit_latency_ms = 24;
-    float avg_lock_wait_ms = 25;
-    float p95_lock_wait_ms = 26;
-    float avg_lock_hold_ms = 27;
-    float p95_lock_hold_ms = 28;
-
-    // Standardized failure reason counters.
-    uint32 reason_prepare_lock_busy_count = 29;
-    uint32 reason_prepare_validation_fail_count = 30;
-    uint32 reason_prepare_timeout_count = 31;
-    uint32 reason_prepare_other_count = 32;
-    uint32 reason_commit_timeout_unknown_outcome_count = 33;
-    uint32 reason_abort_best_effort_timeout_count = 34;
-    uint32 reason_other_count = 35;
+    // Per-participant-shard metrics used by neighbor-specific heads.
+    repeated TwoPcNeighborReport neighbor_reports = 5;
 }
 
 // SBFT-specific state report.
@@ -222,9 +230,14 @@ message PbftTimeout {
     uint32 election_timeout_milliseconds = 1;
 }
 
+message TwoPcNeighborPrepareTimeout {
+    uint32 participant_shard_id = 1;
+    uint32 prepare_timeout_milliseconds = 2;
+}
+
 message TwoPcOverPbftTimeout {
     uint32 election_timeout_milliseconds = 1;
-    uint32 prepare_timeout_milliseconds = 2;
+    repeated TwoPcNeighborPrepareTimeout prepare_timeouts = 2;
 }
 
 message SbftTimeout {

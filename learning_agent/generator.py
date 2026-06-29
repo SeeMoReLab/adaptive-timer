@@ -50,6 +50,14 @@ STRUCTURAL_COLUMNS_PBFT: List[str] = ['reward_episode', 'report_node_id']
 
 STRUCTURAL_COLUMNS_2PC_OVER_PBFT: List[str] = ['reward_episode', 'shard_id']
 
+
+def _matched_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if 'matched_episode_features' not in df.columns:
+        return df
+    matched = df['matched_episode_features'].astype(str).str.strip().str.lower()
+    return df[matched.isin({'1', 'true', 'yes', 'y'})]
+
+
 def seed_everything(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -114,6 +122,12 @@ class DataGenerator(BaseDataGenerator):
             return None
 
         grouped_df = self.df[self.df['phase'] == phase_index]
+        grouped_df = _matched_rows(grouped_df)
+        if grouped_df.empty:
+            raise ValueError(
+                f"No matched PBFT rows found for phase {phase_index}. "
+                "The simulator requires rows with matched_episode_features=1."
+            )
         
         conf_stats = grouped_df.groupby('election_timeout_milliseconds_used')['reward'].agg(
                 ['mean', 'std', 'median', 'var', 'min', 'max']
@@ -149,7 +163,7 @@ class DataGenerator(BaseDataGenerator):
         if prev_timeout != None:
             trial['election_timeout_milliseconds_used'] = prev_timeout
         else:
-            trial['election_timeout_milliseconds_used'] = 150
+            trial['election_timeout_milliseconds_used'] = 100
 
         trial['reward'] = 0.0 
 

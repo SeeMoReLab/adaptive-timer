@@ -12,16 +12,8 @@ import agent_pb2
 PBFT_LEGACY_FEATURE_ALIASES: Dict[str, Tuple[str, ...]] = {
     "total_transactions": ("processed_transactions",),
     "avg_consensus_latency_ms": ("avg_message_delay",),
+    "p50_consensus_latency_ms": ("median_message_delay", "p50_message_delay"),
     "p95_consensus_latency_ms": ("p95_message_delay",),
-    "p99_consensus_latency_ms": ("p99_message_delay",),
-    "phase_propose_avg_delay_ms": ("avg_propose_delay",),
-    "phase_propose_p95_delay_ms": ("avg_propose_delay",),
-    "phase_write_avg_delay_ms": ("avg_write_delay",),
-    "phase_write_p95_delay_ms": ("avg_write_delay",),
-    "phase_accept_avg_delay_ms": ("avg_accept_delay",),
-    "phase_accept_p95_delay_ms": ("avg_accept_delay",),
-    "phase_post_decision_avg_delay_ms": ("avg_post_decision_delay",),
-    "phase_post_decision_p95_delay_ms": ("avg_post_decision_delay",),
 }
 
 
@@ -437,7 +429,7 @@ def _extract_reward(row: Dict[str, str], row_number: int) -> float:
         ) from exc
 
 def _extract_label(row: Dict[str, str], phase_options: Dict[int, int], row_number: int) -> float:
-    for field_name in ("phase"):
+    for field_name in ("phase",):
         raw_value = row.get("phase")
         if raw_value is None or raw_value.strip() == "":
             continue

@@ -16,6 +16,28 @@ S = TypeVar("S")  # generic state type
 A = TypeVar("A")  # generic action type
 
 
+class PbftTimeoutOption(IntEnum):
+    TIMEOUT_100_MS = 100
+    TIMEOUT_700_MS = 700
+    TIMEOUT_1900_MS = 1900
+
+
+PBFT_TIMEOUT_OPTIONS: Tuple[PbftTimeoutOption, ...] = (
+    PbftTimeoutOption.TIMEOUT_100_MS,
+    PbftTimeoutOption.TIMEOUT_700_MS,
+    PbftTimeoutOption.TIMEOUT_1900_MS,
+)
+PBFT_TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(
+    int(option) for option in PBFT_TIMEOUT_OPTIONS
+)
+PBFT_TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
+    value_ms: idx for idx, value_ms in enumerate(PBFT_TIMEOUT_VALUES_MS)
+}
+PBFT_TIMEOUT_INDEX_TO_MS: Dict[int, int] = {
+    idx: value_ms for idx, value_ms in enumerate(PBFT_TIMEOUT_VALUES_MS)
+}
+
+
 class TimeoutOption(IntEnum):
     TIMEOUT_150_MS = 150
     TIMEOUT_400_MS = 400
@@ -35,12 +57,12 @@ TIMEOUT_INDEX_TO_MS: Dict[int, int] = {
 }
 
 class PhaseMapping(IntEnum):
-    PHASE_0 = TimeoutOption.TIMEOUT_150_MS
-    PHASE_1 = TimeoutOption.TIMEOUT_150_MS
-    PHASE_2 = TimeoutOption.TIMEOUT_150_MS
-    PHASE_3 = TimeoutOption.TIMEOUT_400_MS
-    PHASE_4 = TimeoutOption.TIMEOUT_400_MS
-    PHASE_5 = TimeoutOption.TIMEOUT_900_MS
+    PHASE_0 = PbftTimeoutOption.TIMEOUT_100_MS
+    PHASE_1 = PbftTimeoutOption.TIMEOUT_100_MS
+    PHASE_2 = PbftTimeoutOption.TIMEOUT_100_MS
+    PHASE_3 = PbftTimeoutOption.TIMEOUT_700_MS
+    PHASE_4 = PbftTimeoutOption.TIMEOUT_700_MS
+    PHASE_5 = PbftTimeoutOption.TIMEOUT_1900_MS
 
 PHASE_OPTIONS: Tuple[PhaseMapping, ...] = (
     PhaseMapping.PHASE_0,
@@ -53,29 +75,27 @@ PHASE_OPTIONS: Tuple[PhaseMapping, ...] = (
 
 PHASE_VALUES_MS: Tuple[int, ...] = tuple(int(option) for option in PHASE_OPTIONS)
 PHASE_INDEX_TO_TIMEOUT_INDEX: Dict[int, int] = {
-    idx: TIMEOUT_MS_TO_INDEX[value_ms] for idx, value_ms in enumerate(PHASE_VALUES_MS)
+    idx: PBFT_TIMEOUT_MS_TO_INDEX[value_ms]
+    for idx, value_ms in enumerate(PHASE_VALUES_MS)
 }
 
 PBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "total_transactions",
     "total_consensus_instances",
     "avg_consensus_latency_ms",
+    "p50_consensus_latency_ms",
     "p95_consensus_latency_ms",
-    "p99_consensus_latency_ms",
     "throughput_tps",
-    "timeout_violation_rate",
     "avg_batch_size",
     "p95_batch_size",
     "leader_change_count",
     "regency_change_count",
-    "phase_propose_avg_delay_ms",
-    "phase_propose_p95_delay_ms",
-    "phase_write_avg_delay_ms",
-    "phase_write_p95_delay_ms",
-    "phase_accept_avg_delay_ms",
-    "phase_accept_p95_delay_ms",
-    "phase_post_decision_avg_delay_ms",
-    "phase_post_decision_p95_delay_ms",
+    "timeout_ms",
+    "avg_inter_commit_gap_ms",
+    "p50_inter_commit_gap_ms",
+    "p95_inter_commit_gap_ms",
+    "view_change_count",
+    "no_progress_view_change_count",
 )
 TWO_PC_OVER_PBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "total_transactions",
@@ -177,6 +197,13 @@ def get_report_feature_dim(protocol: int) -> int:
     return len(get_report_feature_field_names(protocol))
 
 
+def get_timeout_values_ms(protocol: int) -> Tuple[int, ...]:
+    protocol = _validate_protocol(protocol)
+    if protocol == agent_pb2.PROTOCOL_PBFT:
+        return PBFT_TIMEOUT_VALUES_MS
+    return TIMEOUT_VALUES_MS
+
+
 def timeout_ms_to_index(timeout_ms: int) -> int:
     try:
         return TIMEOUT_MS_TO_INDEX[timeout_ms]
@@ -192,6 +219,31 @@ def timeout_index_to_ms(index: int) -> int:
     if index >= len(TIMEOUT_VALUES_MS):
         return TIMEOUT_VALUES_MS[-1]
     return TIMEOUT_VALUES_MS[index]
+
+
+def pbft_timeout_ms_to_index(timeout_ms: int) -> int:
+    try:
+        return PBFT_TIMEOUT_MS_TO_INDEX[timeout_ms]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported PBFT timeout {timeout_ms}ms. "
+            f"Valid options: {PBFT_TIMEOUT_VALUES_MS}"
+        ) from exc
+
+
+def pbft_timeout_index_to_ms(index: int) -> int:
+    if index < 0:
+        return PBFT_TIMEOUT_VALUES_MS[0]
+    if index >= len(PBFT_TIMEOUT_VALUES_MS):
+        return PBFT_TIMEOUT_VALUES_MS[-1]
+    return PBFT_TIMEOUT_VALUES_MS[index]
+
+
+def timeout_index_to_ms_for_protocol(protocol: int, index: int) -> int:
+    protocol = _validate_protocol(protocol)
+    if protocol == agent_pb2.PROTOCOL_PBFT:
+        return pbft_timeout_index_to_ms(index)
+    return timeout_index_to_ms(index)
 
 
 def _two_pc_pair_to_index(election_timeout_ms: int, prepare_timeout_ms: int) -> int:
@@ -261,7 +313,7 @@ def _tendermint_index_to_triple(index: int) -> Tuple[int, int, int]:
 def get_action_space_size(protocol: int) -> int:
     protocol = _validate_protocol(protocol)
     if protocol == agent_pb2.PROTOCOL_PBFT:
-        return len(TIMEOUT_VALUES_MS)
+        return len(PBFT_TIMEOUT_VALUES_MS)
     if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
         return len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS)
     if protocol in (agent_pb2.PROTOCOL_SBFT, agent_pb2.PROTOCOL_TENDERMINT):
@@ -279,7 +331,7 @@ def timeout_to_action_index(protocol: int, timeout_used: object) -> int:
     protocol = _validate_protocol(protocol)
     if protocol == agent_pb2.PROTOCOL_PBFT:
         timeout_msg = timeout_used
-        return timeout_ms_to_index(int(timeout_msg.election_timeout_milliseconds))
+        return pbft_timeout_ms_to_index(int(timeout_msg.election_timeout_milliseconds))
     if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
         timeout_msg = timeout_used
         return _two_pc_pair_to_index(
@@ -306,7 +358,7 @@ def timeout_to_action_index(protocol: int, timeout_used: object) -> int:
 def action_index_to_timeout(protocol: int, index: int) -> agent_pb2.Timeout:
     protocol = _validate_protocol(protocol)
     if protocol == agent_pb2.PROTOCOL_PBFT:
-        timeout_ms = timeout_index_to_ms(index)
+        timeout_ms = pbft_timeout_index_to_ms(index)
         return agent_pb2.Timeout(
             pbft=agent_pb2.PbftTimeout(election_timeout_milliseconds=timeout_ms)
         )
@@ -346,7 +398,7 @@ def action_index_to_timeout(protocol: int, index: int) -> agent_pb2.Timeout:
 def describe_action(protocol: int, index: int) -> str:
     protocol = _validate_protocol(protocol)
     if protocol == agent_pb2.PROTOCOL_PBFT:
-        return f"election_timeout_ms={timeout_index_to_ms(index)}"
+        return f"election_timeout_ms={pbft_timeout_index_to_ms(index)}"
     if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
         election_timeout_ms, prepare_timeout_ms = _two_pc_index_to_pair(index)
         return (
@@ -607,7 +659,7 @@ class ScheduledTimeoutModel(TensorModel):
                             f"Invalid PBFT schedule at line {lineno}: expected 2 columns time_s,election_timeout_ms."
                         )
                     timeout_ms = int(row[1].strip())
-                    option_index = timeout_ms_to_index(timeout_ms)
+                    option_index = pbft_timeout_ms_to_index(timeout_ms)
                 elif protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
                     if len(row) < 3:
                         raise ValueError(

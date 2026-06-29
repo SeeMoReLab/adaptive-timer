@@ -696,23 +696,20 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         dirty_report.avg_consensus_latency_ms = float(
             max(0.0, float(state.avg_consensus_latency_ms) * self._rng.uniform(0.4, 2.0))
         )
-        dirty_report.p95_consensus_latency_ms = float(
+        dirty_report.p50_consensus_latency_ms = float(
             max(
                 dirty_report.avg_consensus_latency_ms,
-                float(state.p95_consensus_latency_ms) * self._rng.uniform(0.4, 2.2),
+                float(state.p50_consensus_latency_ms) * self._rng.uniform(0.4, 2.1),
             )
         )
-        dirty_report.p99_consensus_latency_ms = float(
+        dirty_report.p95_consensus_latency_ms = float(
             max(
-                dirty_report.p95_consensus_latency_ms,
-                float(state.p99_consensus_latency_ms) * self._rng.uniform(0.4, 2.4),
+                dirty_report.p50_consensus_latency_ms,
+                float(state.p95_consensus_latency_ms) * self._rng.uniform(0.4, 2.2),
             )
         )
         dirty_report.throughput_tps = float(
             max(0.0, float(state.throughput_tps) * self._rng.uniform(0.4, 1.8))
-        )
-        dirty_report.timeout_violation_rate = float(
-            min(1.0, max(0.0, float(state.timeout_violation_rate) + self._rng.uniform(-0.1, 0.2)))
         )
         dirty_report.avg_batch_size = float(
             max(0.0, float(state.avg_batch_size) * self._rng.uniform(0.4, 1.6))
@@ -729,44 +726,27 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         dirty_report.regency_change_count = self._rng.randint(
             0, max(int(state.regency_change_count), 1) * 3
         )
-        dirty_report.phase_propose_avg_delay_ms = float(
-            max(0.0, float(state.phase_propose_avg_delay_ms) * self._rng.uniform(0.4, 2.0))
+        dirty_report.timeout_ms = max(0, int(round(float(state.timeout_ms) * self._rng.uniform(0.8, 1.2))))
+        dirty_report.avg_inter_commit_gap_ms = float(
+            max(0.0, float(state.avg_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.0))
         )
-        dirty_report.phase_propose_p95_delay_ms = float(
-            max(
-                dirty_report.phase_propose_avg_delay_ms,
-                float(state.phase_propose_p95_delay_ms) * self._rng.uniform(0.4, 2.2),
-            )
-        )
-        dirty_report.phase_write_avg_delay_ms = float(
-            max(0.0, float(state.phase_write_avg_delay_ms) * self._rng.uniform(0.4, 2.0))
-        )
-        dirty_report.phase_write_p95_delay_ms = float(
-            max(
-                dirty_report.phase_write_avg_delay_ms,
-                float(state.phase_write_p95_delay_ms) * self._rng.uniform(0.4, 2.2),
-            )
-        )
-        dirty_report.phase_accept_avg_delay_ms = float(
-            max(0.0, float(state.phase_accept_avg_delay_ms) * self._rng.uniform(0.4, 2.0))
-        )
-        dirty_report.phase_accept_p95_delay_ms = float(
-            max(
-                dirty_report.phase_accept_avg_delay_ms,
-                float(state.phase_accept_p95_delay_ms) * self._rng.uniform(0.4, 2.2),
-            )
-        )
-        dirty_report.phase_post_decision_avg_delay_ms = float(
+        dirty_report.p50_inter_commit_gap_ms = float(
             max(
                 0.0,
-                float(state.phase_post_decision_avg_delay_ms) * self._rng.uniform(0.4, 2.0),
+                float(state.p50_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.1),
             )
         )
-        dirty_report.phase_post_decision_p95_delay_ms = float(
+        dirty_report.p95_inter_commit_gap_ms = float(
             max(
-                dirty_report.phase_post_decision_avg_delay_ms,
-                float(state.phase_post_decision_p95_delay_ms) * self._rng.uniform(0.4, 2.2),
+                dirty_report.p50_inter_commit_gap_ms,
+                float(state.p95_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.2),
             )
+        )
+        dirty_report.view_change_count = self._rng.randint(
+            0, max(int(state.view_change_count), 1) * 3
+        )
+        dirty_report.no_progress_view_change_count = self._rng.randint(
+            0, max(int(state.no_progress_view_change_count), 1) * 3
         )
         return dirty_report
 
@@ -1052,7 +1032,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
 
         local_report = agent_pb2.ReportLocal(
-            node_id=self.node_id,
+            node_id=request.node_id,
             episode=request.episode,
             protocol=self._protocol,
             start_tick=request.start_tick,
@@ -1095,7 +1075,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             if not self._sharing:
                 print(
                     f"[episode {local_report.episode}] accepted valid local report "
-                    f"from node={self.node_id} (sharing=off)"
+                    f"from node={local_report.node_id} (sharing=off)"
                 )
                 state = _extract_state(local_report, self._protocol)
                 timeout = self._predict_timeout_locked(
@@ -1103,7 +1083,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                     state,
                     int(local_report.start_tick),
                     int(local_report.report_seq),
-                    self.node_id,
+                    int(local_report.node_id),
                 )
                 self._timeouts_by_episode[local_report.episode] = TimeoutDecision(
                     timeout=timeout,
@@ -1160,8 +1140,10 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                     f"total_tx={local.total_transactions} "
                     f"throughput={local.throughput_tps:.6f} "
                     f"avg_latency_ms={local.avg_consensus_latency_ms:.6f} "
+                    f"p50_latency_ms={local.p50_consensus_latency_ms:.6f} "
                     f"p95_latency_ms={local.p95_consensus_latency_ms:.6f} "
-                    f"timeout_violation_rate={local.timeout_violation_rate:.6f}"
+                    f"timeout_ms={local.timeout_ms} "
+                    f"view_changes={local.view_change_count}"
                 )
             elif self._protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
                 print(

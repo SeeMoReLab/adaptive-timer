@@ -1,6 +1,9 @@
-[submodule "bft-smart"]
-	path = bft-smart
-	url = https://github.com/SeeMoReLab/bft-smart.git
 [submodule "cometbft"]
 	path = cometbft
 	url = https://github.com/SeeMoReLab/cometbft.git
+[submodule "CppBedrock"]
+	path = CppBedrock
+	url = https://github.com/SeeMoReLab/CppBedrock.git
+[submodule "SmartBFT"]
+	path = SmartBFT
+	url = https://github.com/SeeMoReLab/SmartBFT.git

@@ -1655,7 +1655,6 @@ def serve(
         model = ThompsonSamplingModel(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
-            lr=0.05,
         )
     elif model_type == "scheduled":
         if schedule_file is None:

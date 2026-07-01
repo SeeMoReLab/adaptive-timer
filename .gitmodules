@@ -4,3 +4,4 @@
 [submodule "cometbft"]
 	path = cometbft
 	url = https://github.com/SeeMoReLab/cometbft.git
+	branch = integration

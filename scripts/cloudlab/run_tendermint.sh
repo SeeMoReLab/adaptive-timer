@@ -7,7 +7,10 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TARGETS_FILE_DEFAULT="${REPO_ROOT}/scripts/cloudlab/tmp/cloudlab_ssh_targets.txt"
 TARGETS_FILE="${TARGETS_FILE_DEFAULT}"
 
-SSH_OPTS=(-o StrictHostKeyChecking=accept-new)
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new \
+          -o ConnectTimeout=20 \
+          -o ServerAliveInterval=30 \
+          -o ServerAliveCountMax=4)
 MODE="normal"
 F=1
 EXPERIMENT_TIME_S=60
@@ -1122,7 +1125,7 @@ fi
 
 if (( LOG_ENABLED == 1 )); then
   echo "Fetching logs to ${LOGS_LOCAL_DIR}..."
-  if ! scp -r "${SSH_OPTS[@]}" "${remote_user}@${remote_host}:tendermint_cloudlab/logs/." "${LOGS_LOCAL_DIR}/"; then
+  if ! ssh "${SSH_OPTS[@]}" "${remote_user}@${remote_host}" 'tar -C tendermint_cloudlab/logs -cf - .' | tar -C "${LOGS_LOCAL_DIR}" -xf -; then
     echo "Failed to fetch some/all logs from ${remote_host}." >&2
   fi
 fi

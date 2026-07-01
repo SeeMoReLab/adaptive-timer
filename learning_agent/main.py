@@ -26,14 +26,14 @@ from models import (
     FeatureExtractor,
     LinearTorchModel,
     CMABModel,
-    CMABModel,
+    MultiHeadCMABModel,
     ProtocolReportFeatureExtractor,
     ProtocolTimeoutActionDecoder,
     RandomTimeoutModel,
     ScheduledTimeoutModel,
-    ThompsonSamplingModel,
     TensorModel,
     get_action_space_size,
+    get_num_timers,
     get_report_feature_dim,
     get_report_feature_field_names,
     timeout_to_action_index,
@@ -71,8 +71,8 @@ def _parse_bool(value: str) -> bool:
 def reward_engineering(throughput: float) -> float:
     """Quadratic shaping below 1000, linear above (prior-work style)."""
     value = float(max(0, throughput))
-    if value < 1000.0:
-        return (value / 1000.0) ** 2 * 1000.0
+    # if value < 1000.0:
+    #     return (value / 1000.0) ** 2 * 1000.0
     return value
 
 
@@ -1670,12 +1670,26 @@ def serve(
             lr=0.05,
         )
     elif model_type == "cmab":
-
-        model = CMABModel(
-            action_dim=get_action_space_size(protocol),
-            n_features=get_report_feature_dim(protocol),
-            lr=0.05,
-        )
+        n_timers = get_num_timers(protocol)
+        if n_timers >= 2:
+            # Multi-timer protocols (2PC, SBFT, Tendermint): factor the joint
+            # action space into one Thompson-sampling head per timer so each
+            # timer's effect is learned independently instead of being drowned
+            # out in a single regressor over the joint action index.
+            model = MultiHeadCMABModel(
+                action_dim=get_action_space_size(protocol),
+                n_features=get_report_feature_dim(protocol),
+                n_heads=n_timers,
+                n_estimators=100,
+                regressor_type="decision_tree",
+            )
+        else:
+            model = CMABModel(
+                action_dim=get_action_space_size(protocol),
+                n_features=get_report_feature_dim(protocol),
+                n_estimators=100,
+                regressor_type="decision_tree",
+            )
     elif model_type == "scheduled":
         if schedule_file is None:
             raise ValueError("--schedule-file is required when --model-type=scheduled")

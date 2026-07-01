@@ -4,8 +4,11 @@ from enum import IntEnum
 import time
 from pathlib import Path
 from typing import Dict, Generic, List, Optional, Tuple, TypeVar, Any
-from sklearn.tree import  DecisionTreeRegressor
-from collections import deque
+from sklearn.ensemble import RandomForestRegressor
+try:
+    from xgboost import XGBRegressor
+except ImportError:  # xgboost is optional; only required when regressor_type="xgb"
+    XGBRegressor = None
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -266,6 +269,22 @@ def get_action_space_size(protocol: int) -> int:
         return len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS)
     if protocol in (agent_pb2.PROTOCOL_SBFT, agent_pb2.PROTOCOL_TENDERMINT):
         return len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS)
+    raise ValueError(f"Unsupported protocol: {_protocol_name(protocol)}")
+
+
+def get_num_timers(protocol: int) -> int:
+    """Number of independently-tuned timers (timeout dimensions) per protocol.
+
+    This is the per-timer factor count behind the joint action space and the
+    number of heads used by the factored CMAB (MultiHeadCMABModel).
+    """
+    protocol = _validate_protocol(protocol)
+    if protocol == agent_pb2.PROTOCOL_PBFT:
+        return 1
+    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+        return 2
+    if protocol in (agent_pb2.PROTOCOL_SBFT, agent_pb2.PROTOCOL_TENDERMINT):
+        return 3
     raise ValueError(f"Unsupported protocol: {_protocol_name(protocol)}")
 
 
@@ -720,18 +739,37 @@ class ScheduledTimeoutModel(TensorModel):
     def load(self, checkpoint: Dict[str, Any]) -> None:
         pass
 
-class CMABModel(TensorModel):
-    """Contextual multi-armed bandit (CMAB) model.
+def _normalize_regressor_type(regressor_type: str) -> str:
+    """Normalize the base-regressor selector for the CMAB ensemble."""
+    rt = str(regressor_type).strip().lower()
+    if rt in ("xgb", "xgboost"):
+        return "xgb"
+    if rt in ("decision_tree", "decisiontree", "tree", "dt"):
+        return "decision_tree"
+    raise ValueError(
+        f"Unsupported regressor_type: {regressor_type!r}. "
+        "Use 'xgb' or 'decision_tree'."
+    )
 
-    Solved with bootstrapped Thompson sampling over an ensemble of
-    decision-tree reward regressors.
+
+class CMABModel(TensorModel):
+    """Contextual multi-armed bandit via bootstrap Thompson sampling (BFTBrain-style).
+
+    A single bagged forest over [state, action] estimates reward. Each update
+    refits the forest on a fresh bootstrap resample of *all* accumulated data --
+    that bootstrap-refit is the Thompson posterior sample (Eckles & Kaptein 2014;
+    BFTBrain, NSDI'25). Prediction reads out the forest *mean* (low variance) and
+    takes the argmax action, forcing a one-shot explore of any never-tried action.
+    Because the replay buffer is unbounded, successive bootstraps concentrate as
+    data grows, so exploration anneals automatically.
     """
 
     def __init__(
         self,
         action_dim: int,
         n_features: int,
-        n_estimators: int = 5,
+        n_estimators: int = 100,
+        regressor_type: str = "dt",
     ):
         if action_dim <= 0:
             raise ValueError(f"action_dim must be > 0, got {action_dim}")
@@ -741,43 +779,77 @@ class CMABModel(TensorModel):
         self._act_dim = int(action_dim)
         self._obs_dim = int(n_features)
         self._n_estimators = int(n_estimators)
-        self._max_bucket_size = 128
+        self._regressor_type = _normalize_regressor_type(regressor_type)
 
         self.reset_model()
 
-    def _predict_head(self, head: int, features_np: np.ndarray) -> np.ndarray:
-        """Per-action reward predictions for one tree. Shape (batch, act_dim)."""
-        batch_size = features_np.shape[0]
-        if not self.is_fitted[head]:
-            return np.full((batch_size, self._act_dim), 1e9)
+    def _make_model(self):
+        """Build the reward regressor whose *mean* is the readout (sklearn.ensemble)."""
+        if self._regressor_type == "xgb":
+            if XGBRegressor is None:
+                raise ImportError(
+                    "regressor_type='xgb' requires the xgboost package "
+                    "(pip install xgboost), or use regressor_type='decision_tree'."
+                )
+            return XGBRegressor(
+                n_estimators=self._n_estimators,
+                max_depth=4,
+                learning_rate=0.1,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_lambda=1.0,
+                objective="reg:squarederror",
+                random_state=0,
+                n_jobs=1,
+                verbosity=0,
+            )
+        # Bagged trees: RandomForest.predict averages its trees -> posterior-mean readout.
+        return RandomForestRegressor(
+            n_estimators=self._n_estimators,
+            max_depth=5,
+            n_jobs=1,
+            random_state=0,
+        )
 
-        preds = np.empty((batch_size, self._act_dim))
-        for act in range(self._act_dim):
-            action_col = np.full((batch_size, 1), act)
-            state_action_input = np.hstack((features_np, action_col))
-            preds[:, act] = self.models[head].predict(state_action_input)
-        return preds
+    def _mean_predict(self, state_action_input: np.ndarray) -> np.ndarray:
+        """Reward estimate per row = MEAN across the n_estimators (the readout)."""
+        if hasattr(self.model, "estimators_"):
+            # RandomForest: explicitly average the n_estimators trees' predictions.
+            return np.mean(
+                [tree.predict(state_action_input) for tree in self.model.estimators_],
+                axis=0,
+            )
+        # XGBoost / other ensembles: predict() already returns the ensemble mean.
+        return self.model.predict(state_action_input)
 
     def predict_action(self, features: torch.Tensor) -> torch.Tensor:
+        """Average the n_estimators, then select the highest-value action.
+
+        Exploration is *not* here -- it comes from the bootstrap-refit in
+        ``update_model``. Returns a peaked vector so the decoder's argmax (and the
+        per-head argmax in MultiHeadCMABModel) recovers the chosen action.
+        """
         features_np = features.cpu().numpy()
         if features_np.ndim == 1:
             features_np = features_np.reshape(1, -1)
 
         batch_size = features_np.shape[0]
-        q_values_np = np.empty((batch_size, self._act_dim))
+        q_values_np = np.zeros((batch_size, self._act_dim))
+        actions_col = np.arange(self._act_dim).reshape(-1, 1)
 
-        # Thompson sampling: draw a fresh posterior sample (tree) per decision.
         for i in range(batch_size):
-            head = np.random.randint(self._n_estimators)
-            row_preds = self._predict_head(head, features_np[i : i + 1])[0]
-
-            tied_indices = np.flatnonzero(np.isclose(row_preds, np.max(row_preds)))
-            if len(tied_indices) > 1:
-                best_index = np.random.choice(tied_indices, replace=True)
-                # Magnitude-relative nudge so the random tie-break survives the
-                row_preds[best_index] += 1e-5 * max(1.0, abs(np.max(row_preds)))
-
-            q_values_np[i] = row_preds
+            unvisited = np.flatnonzero(self._action_counts == 0)
+            if unvisited.size > 0:
+                choice = int(np.random.choice(unvisited))       # explore any never-tried action
+            elif not self.is_fitted:
+                choice = int(np.random.randint(self._act_dim))
+            else:
+                state_rows = np.repeat(features_np[i : i + 1], self._act_dim, axis=0)
+                state_action_input = np.hstack((state_rows, actions_col))
+                preds = self._mean_predict(state_action_input)  # mean across n_estimators, per action
+                tied = np.flatnonzero(np.isclose(preds, np.max(preds)))
+                choice = int(np.random.choice(tied))            # select highest (argmax) + random tie-break
+            q_values_np[i, choice] = 1.0
 
         return torch.tensor(q_values_np, device=features.device, dtype=torch.float32)
 
@@ -800,46 +872,33 @@ class CMABModel(TensorModel):
 
         for i in range(len(actions_np)):
             self.memory["features"].append(features_np[i])
-            self.memory["actions"].append(actions_np[i])
-            self.memory["rewards"].append(rewards_np[i])
+            self.memory["actions"].append(int(actions_np[i]))
+            self.memory["rewards"].append(float(rewards_np[i]))
+            if 0 <= int(actions_np[i]) < self._act_dim:
+                self._action_counts[int(actions_np[i])] += 1
 
         if backward and len(self.memory["rewards"]) > 0:
             X_features = np.array(self.memory["features"])
             X_actions = np.array(self.memory["actions"]).reshape(-1, 1)
-
-            # X [features, action]
+            # X = [state, action]
             X = np.hstack((X_features, X_actions))
             y = np.array(self.memory["rewards"])
 
-            # Each tree sees an independent bootstrap resample, so the
-            # ensemble approximates the posterior over the reward function.
-            for k in range(self._n_estimators):
-                idx = np.random.choice(len(X), size=len(X), replace=True)
-                self.models[k].fit(X[idx], y[idx])
-                self.is_fitted[k] = True
+            # Bootstrap resample of ALL accumulated data = one Thompson posterior
+            # sample; refit the forest on it. Successive bootstraps concentrate as
+            # N grows, so the (re-sampled) mean prediction stops moving -> annealing.
+            idx = np.random.choice(len(X), size=len(X), replace=True)
+            self.model.fit(X[idx], y[idx])
+            self.is_fitted = True
 
         return 0.0
 
     def reset_model(self) -> None:
-        self.models = [
-            DecisionTreeRegressor(
-                criterion='squared_error',
-                max_depth=6,
-                min_samples_leaf=2,
-                min_impurity_decrease=0.01,
-                random_state=k,
-            )
-            for k in range(self._n_estimators)
-        ]
-        self.is_fitted = [False] * self._n_estimators
-        self._init_buckets()
-
-    def _init_buckets(self):
-        self.memory = {
-            "features": deque(maxlen=self._max_bucket_size),
-            "actions": deque(maxlen=self._max_bucket_size),
-            "rewards": deque(maxlen=self._max_bucket_size)
-        }
+        self.model = self._make_model()
+        self.is_fitted = False
+        # Unbounded replay buffer: the bootstrap can only concentrate (anneal) if N grows.
+        self.memory = {"features": [], "actions": [], "rewards": []}
+        self._action_counts = np.zeros(self._act_dim, dtype=np.int64)
 
 class MultiHeadCMABModel(TensorModel):
     """Per-timer factored CMAB (Thompson sampling) for protocols with multiple timers."""
@@ -849,7 +908,8 @@ class MultiHeadCMABModel(TensorModel):
         action_dim: int,
         n_features: int,
         n_heads: int,
-        n_estimators: int = 10,
+        n_estimators: int = 100,
+        regressor_type: str = "dt",
     ):
         if action_dim <= 0:
             raise ValueError(f"action_dim must be > 0, got {action_dim}")
@@ -871,6 +931,7 @@ class MultiHeadCMABModel(TensorModel):
         self._n_heads = int(n_heads)
         self._n_options = n_options
         self._n_estimators = int(n_estimators)
+        self._regressor_type = _normalize_regressor_type(regressor_type)
 
         self._weights = [
             self._n_options ** (self._n_heads - 1 - k) for k in range(self._n_heads)
@@ -921,10 +982,11 @@ class MultiHeadCMABModel(TensorModel):
 
     def reset_model(self) -> None:
         self.heads = [
-            ThompsonSamplingModel(
+            CMABModel(
                 action_dim=self._n_options,
                 n_features=self._obs_dim,
                 n_estimators=self._n_estimators,
+                regressor_type=self._regressor_type,
             )
             for _ in range(self._n_heads)
         ]

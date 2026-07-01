@@ -922,8 +922,6 @@ echo "Generating local testnet config (n=${num_nodes})..."
 
 echo "Applying master Tendermint config: ${master_config}"
 
-echo "Applying master Tendermint config: ${master_config}"
-
 for ((i = 0; i < num_nodes; i++)); do
   config_file="${testnet_dir}/node${i}/config/config.toml"
   if [[ ! -f "${config_file}" ]]; then
@@ -1151,9 +1149,6 @@ fi
 echo "Done. Client output saved to ${OUTPUT_LOCAL}."
 if (( LOG_ENABLED == 1 )); then
   echo "Logs saved to ${LOGS_LOCAL_DIR} (including client.log)."
-fi
-if (( DATASET_ENABLED == 1 )); then
-  echo "Datasets saved to ${LOCAL_TMP_DIR}/agentN.csv."
 fi
 if (( DATASET_ENABLED == 1 )); then
   echo "Datasets saved to ${LOCAL_TMP_DIR}/agentN.csv."

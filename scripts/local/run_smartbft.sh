@@ -6,8 +6,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 SMARTBFT_DIR="${REPO_ROOT}/SmartBFT"
 LEARNING_AGENT_SRC_DIR="${REPO_ROOT}/learning_agent"
-CONFIG_DEFAULT="${REPO_ROOT}/config/bft-smart/smallbank.xml"
-FAILURE_SPEC_DEFAULT="${REPO_ROOT}/config/bft-smart/failure_spec.xml"
+CONFIG_DEFAULT="${REPO_ROOT}/config/pbft/smallbank.xml"
+FAILURE_SPEC_DEFAULT="${REPO_ROOT}/config/pbft/failure_spec.xml"
 LOCAL_TMP_DIR="${REPO_ROOT}/scripts/local/tmp/smartbft"
 OUTPUT_LOCAL="${LOCAL_TMP_DIR}/output.txt"
 
@@ -98,8 +98,8 @@ Flags:
 
 SmartBFT options:
   --nodes <int>                         Override node count (default: 3f+1).
-  --config <path>                       SmallBank XML config (default: config/bft-smart/smallbank.xml).
-  --failure-spec <path>                 failure_spec.xml for proposal delay (default: config/bft-smart/failure_spec.xml).
+  --config <path>                       SmallBank XML config (default: config/pbft/smallbank.xml).
+  --failure-spec <path>                 failure_spec.xml for proposal delay (default: config/pbft/failure_spec.xml).
   --no-failure-spec                     Do not pass a failure spec to SmartBFT.
   --batch-size <int>                    SmartBFT batch size (default: 500).
   --batch-timeout <duration>            SmartBFT batch timeout (default: 50ms).

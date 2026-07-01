@@ -90,7 +90,7 @@ These scripts run SmallBank PBFT with:
 - one network fault applier process per replica (`scripts/apply_network_failures.py`),
 - synchronized start time for client and failure schedule.
 
-Failure spec source is `config/bft-smart/failure_spec.xml` (packaged to `library/config/failure_spec.xml`).
+Failure spec source is `config/pbft/failure_spec.xml` (packaged to `library/config/failure_spec.xml`).
 
 ### Local (Single Machine)
 
@@ -141,13 +141,7 @@ This writes `scripts/cloudlab/tmp/cloudlab_ip.txt`.
 3. Run PBFT:
 
 ```bash
-bash scripts/cloudlab/run_pbft.sh ~/.ssh/<cloudlab_private_key> -f 1 -t 60
-```
-
-Optional mode (currently informational only):
-
-```bash
-bash scripts/cloudlab/run_pbft.sh ~/.ssh/<cloudlab_private_key> normal -f 1 -t 120
+bash scripts/cloudlab/run_smartbft.sh ~/.ssh/<cloudlab_private_key> learning --model cmab -t 3610
 ```
 
 Outputs:
@@ -157,9 +151,3 @@ Outputs:
 Notes:
 - CloudLab run also requires passwordless `sudo -n` on target nodes (for namespaces/routes/tc).
 - The runner handles namespace setup, per-replica applier launch, server/client launch, and teardown.
-
-TODO:
-
-- Test feeding data to linear model
-- Make systems.config generation script and read from `consensus.config` and `data_exchange.config` instead of `system.config`
-- Try running end to end

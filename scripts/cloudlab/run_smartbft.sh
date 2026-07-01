@@ -8,8 +8,8 @@ TARGETS_FILE_DEFAULT="${REPO_ROOT}/scripts/cloudlab/tmp/cloudlab_ssh_targets.txt
 SMARTBFT_SRC="${REPO_ROOT}/SmartBFT"
 LEARNING_AGENT_SRC_DIR="${REPO_ROOT}/learning_agent"
 APPLIER_LOCAL_PATH="${REPO_ROOT}/scripts/apply_network_failures.py"
-CONFIG_DEFAULT="${REPO_ROOT}/config/bft-smart/smallbank.xml"
-FAILURE_SPEC_DEFAULT="${REPO_ROOT}/config/bft-smart/failure_spec.xml"
+CONFIG_DEFAULT="${REPO_ROOT}/config/pbft/smallbank.xml"
+FAILURE_SPEC_DEFAULT="${REPO_ROOT}/config/pbft/failure_spec.xml"
 LOCAL_TMP_DIR="${REPO_ROOT}/scripts/cloudlab/tmp"
 LOCAL_TAR="${LOCAL_TMP_DIR}/smartbft_payload.tar.gz"
 OUTPUT_LOCAL="${LOCAL_TMP_DIR}/smartbft_output.txt"
@@ -70,7 +70,7 @@ Flags:
 
 SmartBFT options:
   --nodes <int>                     Override node count (default: 3f+1).
-  --config <path>                   SmallBank XML config (default: config/bft-smart/smallbank.xml).
+  --config <path>                   SmallBank XML config (default: config/pbft/smallbank.xml).
   --failure-spec <path>             failure_spec.xml for proposal and network delay.
   --no-failure-spec                 Disable proposal delay and network delay appliers.
   --batch-size <int>                SmartBFT batch size (default: 200).
@@ -627,10 +627,10 @@ tar -xzf "${tar_path}" -C "${run_root}"
 mkdir -p "${run_root}/bin" "${run_root}/logs" "${run_root}/wal"
 cp "${hosts_path}" "${run_root}/hosts.config"
 cp "${failure_hosts_path}" "${run_root}/hosts.failure.config"
-mkdir -p "${run_root}/config/bft-smart"
-cp "${config_path}" "${run_root}/config/bft-smart/smallbank.xml"
+mkdir -p "${run_root}/config/pbft"
+cp "${config_path}" "${run_root}/config/pbft/smallbank.xml"
 if [[ -n "${failure_spec_path}" ]]; then
-  cp "${failure_spec_path}" "${run_root}/config/bft-smart/failure_spec.xml"
+  cp "${failure_spec_path}" "${run_root}/config/pbft/failure_spec.xml"
 fi
 chmod +x "${run_root}/scripts/apply_network_failures.py"
 rm -f "${tar_path}" "${hosts_path}" "${failure_hosts_path}" "${config_path}"
@@ -884,7 +884,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   session_name="smartbft_applier_${replica_id}"
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   tmux new-session -d -s "${session_name}" \
-    "cd \"${run_root}\" && python3 \"${run_root}/scripts/apply_network_failures.py\" --failure-spec \"${run_root}/config/bft-smart/failure_spec.xml\" --hosts-config \"${run_root}/hosts.failure.config\" --replica-id ${replica_id} --netns ${ns_name} --interface ${interface_name} --start-unix-ms ${start_unix_ms} > \"${run_root}/logs/applier_${replica_id}.log\" 2>&1"
+    "cd \"${run_root}\" && python3 \"${run_root}/scripts/apply_network_failures.py\" --failure-spec \"${run_root}/config/pbft/failure_spec.xml\" --hosts-config \"${run_root}/hosts.failure.config\" --replica-id ${replica_id} --netns ${ns_name} --interface ${interface_name} --start-unix-ms ${start_unix_ms} > \"${run_root}/logs/applier_${replica_id}.log\" 2>&1"
 done
 REMOTE
     then
@@ -951,7 +951,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   fi
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   tmux new-session -d -s "${session_name}" \
-    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec python3 learning_agent/main.py --node-id ${replica_id} --protocol pbft --host 127.0.0.1 --port ${agent_port} --signing false ${agent_model_args} ${dataset_args} --failure-spec \"${run_root}/config/bft-smart/failure_spec.xml\" --injection-start-unix-ms ${start_unix_ms}' > \"${agent_log}\" 2>&1"
+    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec python3 learning_agent/main.py --node-id ${replica_id} --protocol pbft --host 127.0.0.1 --port ${agent_port} --signing false ${agent_model_args} ${dataset_args} --failure-spec \"${run_root}/config/pbft/failure_spec.xml\" --injection-start-unix-ms ${start_unix_ms}' > \"${agent_log}\" 2>&1"
 done
 
 sleep 2
@@ -1044,7 +1044,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
     "--keep-data"
   )
 	  if [[ "${failure_enabled}" == "1" ]]; then
-	    args+=("--failure-spec" "${run_root}/config/bft-smart/failure_spec.xml" "--failure-start-unix-ms" "${start_unix_ms}")
+	    args+=("--failure-spec" "${run_root}/config/pbft/failure_spec.xml" "--failure-start-unix-ms" "${start_unix_ms}")
 	  fi
 	  if [[ "${learning_enabled}" == "1" ]]; then
 	    args+=("--learning" "--agent-target" "127.0.0.1:${agent_port}" "--learning-node-id" "${node_id}" "--learning-initial-election-timeout" "${initial_timeout}")
@@ -1119,7 +1119,7 @@ args=(
   "${run_root}/bin/smartbft-smallbank"
   "--role" "client"
   "--hosts-config" "${run_root}/hosts.config"
-  "--config" "${run_root}/config/bft-smart/smallbank.xml"
+  "--config" "${run_root}/config/pbft/smallbank.xml"
   "--request-timeout" "${request_timeout}"
   "--submit-mode" "${submit_mode}"
   "--client-reply-listen" "0.0.0.0:0"

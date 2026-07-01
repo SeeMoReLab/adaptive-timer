@@ -1,5 +1,0 @@
-node0 hp023.utah.cloudlab.us yosefnw
-node1 hp016.utah.cloudlab.us yosefnw
-node2 hp006.utah.cloudlab.us yosefnw
-node3 hp013.utah.cloudlab.us yosefnw
-node4 hp011.utah.cloudlab.us yosefnw

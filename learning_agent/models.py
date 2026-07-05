@@ -772,7 +772,9 @@ class ScheduledTimeoutModel(TensorModel):
     def load(self, checkpoint: Dict[str, Any]) -> None:
         pass
 
-class ThompsonSamplingModel(TensorModel): 
+class ThompsonSamplingModelOld(TensorModel): 
+    """Previous single-tree bootstrapped CMAB implementation."""
+
     def __init__(
         self, 
         action_dim: int, 
@@ -875,7 +877,8 @@ class ThompsonSamplingModel(TensorModel):
             "rewards": deque(maxlen=self._max_bucket_size)
         }
 
-class MultiHeadThompsonSamplingModel(TensorModel): 
+
+class ThompsonSamplingModel(TensorModel): 
     def __init__(
         self, 
         action_dim: int, 
@@ -884,6 +887,8 @@ class MultiHeadThompsonSamplingModel(TensorModel):
     ):
         if action_dim <= 0:
             raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        if n_heads <= 0:
+            raise ValueError(f"n_heads must be > 0, got {n_heads}")
         
         self._act_dim = int(action_dim)
         self._obs_dim = int(n_features)
@@ -893,29 +898,45 @@ class MultiHeadThompsonSamplingModel(TensorModel):
         self.reset_model()
 
     def predict_action(self, features: torch.Tensor) -> torch.Tensor:
-        features_np = features.cpu().numpy().reshape(1, -1)  
+        features_np = features.cpu().numpy()
+        if features_np.ndim == 1:
+            features_np = features_np.reshape(1, -1)
+            
+        batch_size = features_np.shape[0]
+        predictions_stacked = np.zeros((batch_size, self._act_dim), dtype=float)
+        sampled_heads = self._rng.integers(0, self._n_heads, size=batch_size)
 
-        head_predictions = np.zeros((self._n_heads, self._act_dim))
+        for i, head_index in enumerate(sampled_heads):
+            if not self.is_fitted[head_index]:
+                predictions_stacked[i, :] = 0.0
+                continue
 
-        for k in range(self._n_heads):
-            if not self.is_fitted[k]:
-                head_predictions[k] = 1e9
-            else:
-                for act in range(self._act_dim):
-                    action_col = np.array([[act]])
-                    state_action_input = np.hstack((features_np, action_col))
-                    head_predictions[k, act] = self.models[k].predict(state_action_input)[0]
+            state_rows = np.repeat(features_np[i : i + 1], self._act_dim, axis=0)
+            action_col = np.arange(self._act_dim, dtype=float).reshape(-1, 1)
+            state_action_input = np.hstack((state_rows, action_col))
+            predictions_stacked[i, :] = self.models[head_index].predict(
+                state_action_input
+            )
 
-        k = np.random.randint(0, self._n_heads)
-        sampled_pred = head_predictions[k]
-
-        tied = np.flatnonzero(np.isclose(sampled_pred, np.max(sampled_pred)))
-        if len(tied) > 1:
-            sampled_pred[np.random.choice(tied)] += 1e-5
-
-        q_values = torch.tensor(
-            head_predictions[:, np.newaxis, :], device=features.device, dtype=torch.float32
+        # Force basic action coverage before trusting the reward model. This is
+        # explicit exploration; posterior-like exploration comes from the sampled head.
+        action_counts = np.bincount(
+            np.array(self.memory["actions"], dtype=int),
+            minlength=self._act_dim,
         )
+        untried_actions = np.flatnonzero(action_counts == 0)
+        if len(untried_actions) > 0:
+            predictions_stacked[:, untried_actions] = 1e9
+
+        for i in range(batch_size):
+            row_preds = predictions_stacked[i]
+            tied_indices = np.flatnonzero(np.isclose(row_preds, np.max(row_preds)))
+            
+            if len(tied_indices) > 1:
+                best_index = np.random.choice(tied_indices, replace=True)
+                predictions_stacked[i, best_index] += 1e-5
+
+        q_values = torch.tensor(predictions_stacked, device=features.device, dtype=torch.float32)
         return q_values
 
     def update_model(
@@ -923,58 +944,84 @@ class MultiHeadThompsonSamplingModel(TensorModel):
     ) -> float:
         features_np = features.cpu().numpy()
         if features_np.ndim == 1:
-            features_np = features_np.reshape(self._n_heads, -1)
-
+            features_np = features_np.reshape(1, -1)
+            
         if isinstance(actions, torch.Tensor):
             actions_np = actions.cpu().numpy().astype(int).flatten()
         else:
-            actions_np = np.full(self._n_heads, int(actions))
-
+            actions_np = np.array([int(actions)])
+            
         if isinstance(rewards, torch.Tensor):
             rewards_np = rewards.cpu().numpy().flatten()
         else:
-            rewards_np = np.full(self._n_heads, float(rewards))
+            rewards_np = np.full(len(actions_np), float(rewards))
 
-        for k in range(self._n_heads):
-            sample_features = np.concatenate([features_np[k], [actions_np[k]]])  # [features | action]
-            self.memory[k]["features"].append(sample_features)
-            self.memory[k]["rewards"].append(rewards_np[k])
+        if len(actions_np) == 1 and features_np.shape[0] > 1:
+            actions_np = np.repeat(actions_np, features_np.shape[0])
+        if len(rewards_np) == 1 and features_np.shape[0] > 1:
+            rewards_np = np.repeat(rewards_np, features_np.shape[0])
+        if len(actions_np) != features_np.shape[0]:
+            raise ValueError(
+                "actions batch size mismatch: "
+                f"expected {features_np.shape[0]}, got {len(actions_np)}"
+            )
+        if len(rewards_np) != features_np.shape[0]:
+            raise ValueError(
+                "rewards batch size mismatch: "
+                f"expected {features_np.shape[0]}, got {len(rewards_np)}"
+            )
 
-        if backward:
-            for k in range(self._n_heads):
-                bucket = self.memory[k]
-                if len(bucket["rewards"]) == 0:
-                    continue
-
-                X = np.array(bucket["features"]) 
-                y = np.array(bucket["rewards"])
-
-                # Bootstrapping data
-                idx = np.random.choice(len(X), size=len(X), replace=True)
-                self.models[k].fit(X[idx], y[idx])
-                self.is_fitted[k] = True
+        for i in range(len(actions_np)):
+            self.memory["features"].append(features_np[i])
+            self.memory["actions"].append(actions_np[i])
+            self.memory["rewards"].append(rewards_np[i])
+        
+        if backward and len(self.memory["rewards"]) > 0:
+            X_features = np.array(self.memory["features"])
+            X_actions = np.array(self.memory["actions"]).reshape(-1, 1)
+            X = np.hstack((X_features, X_actions))
+            y = np.array(self.memory["rewards"])
+            
+            for head_index, model in enumerate(self.models):
+                idx = self._rng.choice(len(X), size=len(X), replace=True)
+                model.fit(X[idx], y[idx])
+                self.is_fitted[head_index] = True
 
         return 0.0
 
     def reset_model(self) -> None:
+        self._rng = np.random.default_rng()
         self.models = [
             DecisionTreeRegressor(
                 criterion='squared_error',
                 max_depth=6,
-                min_samples_leaf=2,
+                min_samples_leaf=1,
                 min_impurity_decrease=0.01,
-                random_state=k,  
+                random_state=head_index,
             )
-            for k in range(self._n_heads)
+            for head_index in range(self._n_heads)
         ]
         self.is_fitted = [False] * self._n_heads
         self._init_buckets()
 
     def _init_buckets(self):
         self.memory = {
-            k: {
-                "features": deque(maxlen=self._max_bucket_size),  
-                "rewards":  deque(maxlen=self._max_bucket_size),
-            }
-            for k in range(self._n_heads)
+            "features": deque(maxlen=self._max_bucket_size), 
+            "actions": deque(maxlen=self._max_bucket_size),
+            "rewards": deque(maxlen=self._max_bucket_size)
         }
+
+class MultiHeadThompsonSamplingModel(ThompsonSamplingModel): 
+    """Backward-compatible name for the bootstrapped ensemble CMAB model."""
+
+    def __init__(
+        self, 
+        action_dim: int, 
+        n_features: int,
+        n_heads: int = 10,
+    ):
+        super().__init__(
+            action_dim=action_dim,
+            n_features=n_features,
+            n_heads=n_heads,
+        )

@@ -4,7 +4,12 @@ from typing import Dict
 import numpy as np
 
 import agent_pb2
-from models import get_report_feature_field_names
+from models import (
+    PBFT_REPORT_FEATURE_FIELD_NAMES,
+    TWO_PC_OVER_PBFT_GLOBAL_FEATURE_FIELD_NAMES,
+    TWO_PC_OVER_PBFT_NEIGHBOR_FEATURE_FIELD_NAMES,
+    get_report_feature_field_names,
+)
 
 
 def _extract_state(report_local: agent_pb2.ReportLocal, protocol: int) -> object:
@@ -86,6 +91,24 @@ def _array_to_report(protocol: int, values: np.ndarray) -> object:
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
+def _values_from_fields(report: object, fields: tuple[str, ...]) -> np.ndarray:
+    return np.array([float(getattr(report, field_name)) for field_name in fields], dtype=float)
+
+
+def _assign_fields(report: object, fields: tuple[str, ...], values: np.ndarray) -> None:
+    for idx, field_name in enumerate(fields):
+        field = report.DESCRIPTOR.fields_by_name[field_name]
+        value = float(values[idx])
+        if field.cpp_type in (
+            field.CPPTYPE_INT32,
+            field.CPPTYPE_INT64,
+            field.CPPTYPE_UINT32,
+            field.CPPTYPE_UINT64,
+        ):
+            value = max(0, int(round(value)))
+        setattr(report, field_name, value)
+
+
 def _batch_to_reports_by_node(
     protocol: int, report_batch: agent_pb2.ReportBatch
 ) -> Dict[int, object]:
@@ -121,9 +144,67 @@ class BaseAggregator(ABC):
         if not reports_by_node:
             raise ValueError("No reports provided for aggregation")
 
+        if self.protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+            return self._aggregate_two_pc(reports_by_node, node_id=node_id)
+
         data = {node: _report_to_array(self.protocol, report) for node, report in reports_by_node.items()}
         aggregated_values = self._calculate(data, node_id=node_id)
         return _array_to_report(self.protocol, aggregated_values)
+
+    def _aggregate_two_pc(
+        self, reports_by_node: Dict[int, object], node_id: int
+    ) -> agent_pb2.TwoPcOverPbftReport:
+        result = agent_pb2.TwoPcOverPbftReport()
+
+        pbft_data = {
+            node: _values_from_fields(report.pbft, PBFT_REPORT_FEATURE_FIELD_NAMES)
+            for node, report in reports_by_node.items()
+            if report.HasField("pbft")
+        }
+        if pbft_data:
+            _assign_fields(
+                result.pbft,
+                PBFT_REPORT_FEATURE_FIELD_NAMES,
+                self._calculate(pbft_data, node_id=node_id),
+            )
+
+        global_data = {
+            node: _values_from_fields(
+                report, TWO_PC_OVER_PBFT_GLOBAL_FEATURE_FIELD_NAMES
+            )
+            for node, report in reports_by_node.items()
+        }
+        _assign_fields(
+            result,
+            TWO_PC_OVER_PBFT_GLOBAL_FEATURE_FIELD_NAMES,
+            self._calculate(global_data, node_id=node_id),
+        )
+
+        participant_ids = sorted(
+            {
+                int(neighbor.participant_shard_id)
+                for report in reports_by_node.values()
+                for neighbor in report.neighbor_reports
+            }
+        )
+        for participant_id in participant_ids:
+            neighbor_data = {}
+            for node, report in reports_by_node.items():
+                for neighbor in report.neighbor_reports:
+                    if int(neighbor.participant_shard_id) == participant_id:
+                        neighbor_data[node] = _values_from_fields(
+                            neighbor,
+                            TWO_PC_OVER_PBFT_NEIGHBOR_FEATURE_FIELD_NAMES,
+                        )
+                        break
+            if not neighbor_data:
+                continue
+            aggregated_neighbor = result.neighbor_reports.add()
+            _assign_fields(
+                aggregated_neighbor,
+                TWO_PC_OVER_PBFT_NEIGHBOR_FEATURE_FIELD_NAMES,
+                self._calculate(neighbor_data, node_id=node_id),
+            )
 
     @abstractmethod
     def _calculate(self, data: Dict[int, np.ndarray], node_id: int) -> np.ndarray:

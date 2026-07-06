@@ -210,42 +210,52 @@ def _random_two_pc_report(rng: random.Random) -> agent_pb2.TwoPcOverPbftReport:
     )
     reason_other_count = rng.randint(0, max(1, total_transactions // 10))
 
+    neighbor_reports = []
+    for participant_shard_id in (1, 2):
+        neighbor_reports.append(
+            agent_pb2.TwoPcNeighborReport(
+                participant_shard_id=participant_shard_id,
+                cross_shard_transactions=cross_shard_transactions,
+                prepare_ok_count=prepare_ok_count,
+                prepare_fail_count=prepare_fail_count,
+                commit_ok_count=commit_ok_count,
+                abort_count=abort_count,
+                in_doubt_count=in_doubt_count,
+                prepare_timeout_count=prepare_timeout_count,
+                commit_timeout_unknown_outcome_count=commit_timeout_unknown_outcome_count,
+                abort_best_effort_timeout_count=abort_best_effort_timeout_count,
+                lock_contention_count=lock_contention_count,
+                prepare_timeout_rate=prepare_timeout_rate,
+                abort_rate=abort_rate,
+                commit_rate=commit_rate,
+                lock_contention_rate=lock_contention_rate,
+                avg_end_to_end_latency_ms=avg_end_to_end_latency_ms,
+                p95_end_to_end_latency_ms=p95_end_to_end_latency_ms,
+                p99_end_to_end_latency_ms=p99_end_to_end_latency_ms,
+                avg_prepare_latency_ms=avg_prepare_latency_ms,
+                p95_prepare_latency_ms=p95_prepare_latency_ms,
+                avg_commit_latency_ms=avg_commit_latency_ms,
+                p95_commit_latency_ms=p95_commit_latency_ms,
+                avg_lock_wait_ms=avg_lock_wait_ms,
+                p95_lock_wait_ms=p95_lock_wait_ms,
+                avg_lock_hold_ms=avg_lock_hold_ms,
+                p95_lock_hold_ms=p95_lock_hold_ms,
+                reason_prepare_lock_busy_count=reason_prepare_lock_busy_count,
+                reason_prepare_validation_fail_count=reason_prepare_validation_fail_count,
+                reason_prepare_timeout_count=reason_prepare_timeout_count,
+                reason_prepare_other_count=reason_prepare_other_count,
+                reason_commit_timeout_unknown_outcome_count=reason_commit_timeout_unknown_outcome_count,
+                reason_abort_best_effort_timeout_count=reason_abort_best_effort_timeout_count,
+                reason_other_count=reason_other_count,
+            )
+        )
+
     return agent_pb2.TwoPcOverPbftReport(
         pbft=_random_pbft_report(rng),
         total_transactions=total_transactions,
         single_shard_transactions=single_shard_transactions,
         cross_shard_transactions=cross_shard_transactions,
-        prepare_ok_count=prepare_ok_count,
-        prepare_fail_count=prepare_fail_count,
-        commit_ok_count=commit_ok_count,
-        abort_count=abort_count,
-        in_doubt_count=in_doubt_count,
-        prepare_timeout_count=prepare_timeout_count,
-        commit_timeout_unknown_outcome_count=commit_timeout_unknown_outcome_count,
-        abort_best_effort_timeout_count=abort_best_effort_timeout_count,
-        lock_contention_count=lock_contention_count,
-        prepare_timeout_rate=prepare_timeout_rate,
-        abort_rate=abort_rate,
-        commit_rate=commit_rate,
-        lock_contention_rate=lock_contention_rate,
-        avg_end_to_end_latency_ms=avg_end_to_end_latency_ms,
-        p95_end_to_end_latency_ms=p95_end_to_end_latency_ms,
-        p99_end_to_end_latency_ms=p99_end_to_end_latency_ms,
-        avg_prepare_latency_ms=avg_prepare_latency_ms,
-        p95_prepare_latency_ms=p95_prepare_latency_ms,
-        avg_commit_latency_ms=avg_commit_latency_ms,
-        p95_commit_latency_ms=p95_commit_latency_ms,
-        avg_lock_wait_ms=avg_lock_wait_ms,
-        p95_lock_wait_ms=p95_lock_wait_ms,
-        avg_lock_hold_ms=avg_lock_hold_ms,
-        p95_lock_hold_ms=p95_lock_hold_ms,
-        reason_prepare_lock_busy_count=reason_prepare_lock_busy_count,
-        reason_prepare_validation_fail_count=reason_prepare_validation_fail_count,
-        reason_prepare_timeout_count=reason_prepare_timeout_count,
-        reason_prepare_other_count=reason_prepare_other_count,
-        reason_commit_timeout_unknown_outcome_count=reason_commit_timeout_unknown_outcome_count,
-        reason_abort_best_effort_timeout_count=reason_abort_best_effort_timeout_count,
-        reason_other_count=reason_other_count,
+        neighbor_reports=neighbor_reports,
     )
 
 
@@ -308,7 +318,16 @@ def _random_timeout_used(protocol: int, rng: random.Random) -> object:
         prepare_timeout_ms = rng.choice(TIMEOUT_OPTIONS_MS)
         return agent_pb2.TwoPcOverPbftTimeout(
             election_timeout_milliseconds=election_timeout_ms,
-            prepare_timeout_milliseconds=prepare_timeout_ms,
+            prepare_timeouts=[
+                agent_pb2.TwoPcNeighborPrepareTimeout(
+                    participant_shard_id=1,
+                    prepare_timeout_milliseconds=prepare_timeout_ms,
+                ),
+                agent_pb2.TwoPcNeighborPrepareTimeout(
+                    participant_shard_id=2,
+                    prepare_timeout_milliseconds=prepare_timeout_ms,
+                ),
+            ],
         )
     if protocol == agent_pb2.PROTOCOL_SBFT:
         slow_path_timeout_ms = rng.choice(TIMEOUT_OPTIONS_MS)
@@ -346,14 +365,28 @@ def _print_sent_payload(
             f"throughput_tps={float(report.throughput_tps):.2f}",
         )
     elif protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+        neighbor_count = len(report.neighbor_reports)
+        prepare_timeout_rate = (
+            sum(float(neighbor.prepare_timeout_rate) for neighbor in report.neighbor_reports)
+            / neighbor_count
+            if neighbor_count
+            else 0.0
+        )
+        commit_rate = (
+            sum(float(neighbor.commit_rate) for neighbor in report.neighbor_reports)
+            / neighbor_count
+            if neighbor_count
+            else 0.0
+        )
         print(
             "Sent ReportLocal:",
             f"node_id={node_id}",
             f"episode={episode}",
             f"protocol={agent_pb2.Protocol.Name(protocol)}",
             f"total_transactions={int(report.total_transactions)}",
-            f"prepare_timeout_rate={float(report.prepare_timeout_rate):.3f}",
-            f"commit_rate={float(report.commit_rate):.3f}",
+            f"neighbors={neighbor_count}",
+            f"prepare_timeout_rate={prepare_timeout_rate:.3f}",
+            f"commit_rate={commit_rate:.3f}",
         )
     elif protocol == agent_pb2.PROTOCOL_SBFT:
         print(
@@ -388,13 +421,14 @@ def _print_sent_payload(
         election_timeout_ms = (
             reward.two_pc_over_pbft.timeout_used.election_timeout_milliseconds
         )
-        prepare_timeout_ms = (
-            reward.two_pc_over_pbft.timeout_used.prepare_timeout_milliseconds
+        prepare_timeout_desc = ";".join(
+            f"{entry.participant_shard_id}:{entry.prepare_timeout_milliseconds}"
+            for entry in reward.two_pc_over_pbft.timeout_used.prepare_timeouts
         )
         reward_episode = reward.two_pc_over_pbft.episode
         timeout_desc = (
             f"reward.election_timeout_ms={election_timeout_ms} "
-            f"reward.prepare_timeout_ms={prepare_timeout_ms}"
+            f"reward.prepare_timeouts={prepare_timeout_desc}"
         )
     elif reward.HasField("sbft"):
         election_timeout_ms = reward.sbft.timeout_used.election_timeout_milliseconds
@@ -443,12 +477,15 @@ def _print_timeout_status(status: agent_pb2.TimeoutStatus) -> None:
         )
         return
     if status.timeout.HasField("two_pc_over_pbft"):
+        prepare_timeout_desc = ";".join(
+            f"{entry.participant_shard_id}:{entry.prepare_timeout_milliseconds}"
+            for entry in status.timeout.two_pc_over_pbft.prepare_timeouts
+        )
         print(
             "Timeout ready:",
             "election_timeout_ms="
             f"{status.timeout.two_pc_over_pbft.election_timeout_milliseconds}",
-            "prepare_timeout_ms="
-            f"{status.timeout.two_pc_over_pbft.prepare_timeout_milliseconds}",
+            f"prepare_timeouts={prepare_timeout_desc}",
             window_desc,
         )
         return

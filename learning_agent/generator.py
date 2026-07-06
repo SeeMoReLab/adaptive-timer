@@ -21,11 +21,10 @@ LOCAL_PBFT_COLUMNS: Tuple[str, ...] = (
 
 LOCAL_2PC_OVER_PBFT_COLUMNS: Tuple[str, ...] = (
     "report_node_id",
-    'shard_id'
+    "participant_shard_id",
     "election_timeout_milliseconds_used",
-    "prepare_timeout_milliseconds"
-    'matched_episode_features'
-
+    "prepare_timeout_milliseconds_used",
+    "matched_episode_features",
 )
 
 REPORT_ORDINAL_COLUMNS_PBFT: Tuple[str, ...]= [
@@ -48,7 +47,7 @@ REPORT_ORDINAL_COLUMNS_2PC_OVER_PBFT: Tuple[str, ...]= [
 
 STRUCTURAL_COLUMNS_PBFT: List[str] = ['reward_episode', 'report_node_id']
 
-STRUCTURAL_COLUMNS_2PC_OVER_PBFT: List[str] = ['reward_episode', 'shard_id']
+STRUCTURAL_COLUMNS_2PC_OVER_PBFT: List[str] = ['reward_episode', 'participant_shard_id']
 
 
 def _matched_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -190,11 +189,12 @@ class DataGenerator(BaseDataGenerator):
 
         grouped_df = self.df[self.df['phase'] == phase_index]
         
-        conf_stats = grouped_df.groupby('prepare_timeout_milliseconds')['reward'].agg(
+        grouped_df = _matched_rows(grouped_df)
+        conf_stats = grouped_df.groupby('prepare_timeout_milliseconds_used')['reward'].agg(
                 ['mean', 'std', 'median', 'var', 'min', 'max']
         ).to_dict(orient='index')
         
-        unique_nodes = grouped_df['shard_id'].dropna().unique()
+        unique_nodes = grouped_df['participant_shard_id'].dropna().unique()
         
         res = {}
 
@@ -204,7 +204,7 @@ class DataGenerator(BaseDataGenerator):
         synthetic_episodes = np.arange(current_start_episode, current_start_episode + num_episode)
         skeleton_index = pd.MultiIndex.from_product(
             [synthetic_episodes, unique_nodes],
-            names=['reward_episode', 'shard_id']
+            names=['reward_episode', 'participant_shard_id']
         )
         trial = pd.DataFrame(index=skeleton_index).reset_index()
         total_rows = len(trial)
@@ -222,14 +222,14 @@ class DataGenerator(BaseDataGenerator):
             trial[col] = synthetic_features[col].values
 
         if prev_timeout != None:
-            trial['prepare_timeout_milliseconds'] = prev_timeout
+            trial['prepare_timeout_milliseconds_used'] = prev_timeout
         else:
-            trial['prepare_timeout_milliseconds'] = 150
+            trial['prepare_timeout_milliseconds_used'] = 150
 
         trial['reward'] = 0.0 
 
         for idx, row in trial.iterrows():
-            timeout_val = row['prepare_timeout_milliseconds']
+            timeout_val = row['prepare_timeout_milliseconds_used']
             single_reward = self._sample_reward_by_timeout(phase_index,timeout_val, conf_stats, n_samples=1)[0]
             trial.at[idx, 'reward'] = single_reward
 

@@ -53,7 +53,7 @@ ARTIFACT_FETCH_MAX_PARALLEL=8
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--model <random|linear|cmab>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--model <random|linear|cmab|cmab_old>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -64,7 +64,8 @@ Flags:
   --dataset                         Compatibility flag; agent modes collect the agent CSV automatically.
   --log                             Download client, server, applier, and agent logs.
   --verbose                         Enable SmartBFT debug logs on server replicas.
-  --model <random|linear|cmab>      Learning-agent model for learning mode (default: random).
+  --model <random|linear|cmab|cmab_old>
+                                     Learning-agent model for learning mode (default: random).
   -f <int>                          Fault tolerance f; nodes defaults to 3f+1 (default: 1).
   -t <int>                          Seconds to run after benchmark start (default: 300).
 
@@ -103,7 +104,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|linear|cmab) printf '%s\n' "${model_lower}" ;;
+    random|linear|cmab|cmab_old) printf '%s\n' "${model_lower}" ;;
     *) return 1 ;;
   esac
 }
@@ -393,7 +394,7 @@ if [[ -n "${CREATE_WORKERS}" ]] && (! [[ "${CREATE_WORKERS}" =~ ^[0-9]+$ ]] || (
   exit 2
 fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear|cmab." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear|cmab|cmab_old." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" ]]; then

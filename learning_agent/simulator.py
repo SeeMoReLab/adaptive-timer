@@ -26,6 +26,7 @@ from models import (
     PHASE_INDEX_TO_TIMEOUT_INDEX,
     LinearTorchModel,
     ThompsonSamplingModel,
+    ThompsonSamplingModelOld,
     TensorModel,
     QuadraticRewardScaler,
     RewardTransformer,
@@ -54,7 +55,8 @@ PROTOCOL_NAME_TO_ENUM = {
 
 MODEL_NAME_TO_TENSORMODEL = {
     "linear": LinearTorchModel,
-    "cmab": ThompsonSamplingModel
+    "cmab": ThompsonSamplingModel,
+    "cmab_old": ThompsonSamplingModelOld,
 }
 
 def set_seed(seed: int) -> None:
@@ -80,7 +82,7 @@ def _parse_protocol(value: str) -> int:
 def _parse_model(value: str) -> TensorModel:
     model = MODEL_NAME_TO_TENSORMODEL.get(value.strip().lower())
     if model is None:
-        valid = ", ".join(sorted({"linear", 'svm',"ppo","cmab"}))
+        valid = ", ".join(sorted({"linear", 'svm',"ppo","cmab", "cmab_old"}))
         raise argparse.ArgumentTypeError(
             f"Unsupported model '{value}'. Valid options: {valid}"
         )
@@ -520,7 +522,7 @@ def main() -> None:
     )
     scaler = QuadraticRewardScaler.transform if args.reward_scaler == "quadratic" else None
 
-    if args.model == ThompsonSamplingModel:
+    if args.model in (ThompsonSamplingModel, ThompsonSamplingModelOld):
         model = args.model(
             action_dim=get_action_space_size(_parse_protocol(args.protocol)),
             n_features=get_report_feature_dim(_parse_protocol(args.protocol)),

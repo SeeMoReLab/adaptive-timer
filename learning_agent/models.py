@@ -97,10 +97,13 @@ PBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "view_change_count",
     "no_progress_view_change_count",
 )
-TWO_PC_OVER_PBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
+TWO_PC_OVER_PBFT_GLOBAL_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "total_transactions",
     "single_shard_transactions",
     "cross_shard_transactions",
+)
+TWO_PC_OVER_PBFT_NEIGHBOR_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
+    "participant_shard_id",
     "prepare_ok_count",
     "prepare_fail_count",
     "commit_ok_count",
@@ -132,6 +135,10 @@ TWO_PC_OVER_PBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "reason_commit_timeout_unknown_outcome_count",
     "reason_abort_best_effort_timeout_count",
     "reason_other_count",
+)
+TWO_PC_OVER_PBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
+    TWO_PC_OVER_PBFT_GLOBAL_FEATURE_FIELD_NAMES
+    + TWO_PC_OVER_PBFT_NEIGHBOR_FEATURE_FIELD_NAMES
 )
 SBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "total_transactions",
@@ -260,6 +267,35 @@ def _two_pc_index_to_pair(index: int) -> Tuple[int, int]:
     return timeout_index_to_ms(election_idx), timeout_index_to_ms(prepare_idx)
 
 
+def _two_pc_prepare_timeout_for_neighbor(timeout_msg: object, participant_shard_id: int) -> int:
+    for entry in getattr(timeout_msg, "prepare_timeouts", []):
+        if int(entry.participant_shard_id) == int(participant_shard_id):
+            return int(entry.prepare_timeout_milliseconds)
+    scalar = getattr(timeout_msg, "prepare_timeout_milliseconds", 0)
+    if scalar:
+        return int(scalar)
+    entries = list(getattr(timeout_msg, "prepare_timeouts", []))
+    if entries:
+        return int(entries[0].prepare_timeout_milliseconds)
+    return TIMEOUT_VALUES_MS[0]
+
+
+def two_pc_prepare_timeout_summary(timeout_msg: object) -> str:
+    entries = sorted(
+        getattr(timeout_msg, "prepare_timeouts", []),
+        key=lambda entry: int(entry.participant_shard_id),
+    )
+    if entries:
+        return ";".join(
+            f"{int(entry.participant_shard_id)}:{int(entry.prepare_timeout_milliseconds)}"
+            for entry in entries
+        )
+    scalar = getattr(timeout_msg, "prepare_timeout_milliseconds", 0)
+    if scalar:
+        return str(int(scalar))
+    return ""
+
+
 def _sbft_triple_to_index(
     election_timeout_ms: int, slow_path_timeout_ms: int, batch_timeout_ms: int
 ) -> int:
@@ -321,10 +357,57 @@ def get_action_space_size(protocol: int) -> int:
     raise ValueError(f"Unsupported protocol: {_protocol_name(protocol)}")
 
 
+def two_pc_neighbor_ids(state: object) -> List[int]:
+    reports = sorted(
+        getattr(state, "neighbor_reports", []),
+        key=lambda report: int(report.participant_shard_id),
+    )
+    return [int(report.participant_shard_id) for report in reports]
+
+
+def two_pc_report_to_feature_rows(state: object) -> Tuple[List[List[float]], List[int]]:
+    global_values = [
+        float(getattr(state, field_name))
+        for field_name in TWO_PC_OVER_PBFT_GLOBAL_FEATURE_FIELD_NAMES
+    ]
+    reports = sorted(
+        getattr(state, "neighbor_reports", []),
+        key=lambda report: int(report.participant_shard_id),
+    )
+    if not reports:
+        return [
+            global_values
+            + [0.0] * len(TWO_PC_OVER_PBFT_NEIGHBOR_FEATURE_FIELD_NAMES)
+        ], []
+
+    rows: List[List[float]] = []
+    neighbor_ids: List[int] = []
+    for report in reports:
+        neighbor_ids.append(int(report.participant_shard_id))
+        rows.append(
+            global_values
+            + [
+                float(getattr(report, field_name))
+                for field_name in TWO_PC_OVER_PBFT_NEIGHBOR_FEATURE_FIELD_NAMES
+            ]
+        )
+    return rows, neighbor_ids
+
+
 def report_to_feature_values(protocol: int, state: object) -> List[float]:
     protocol = _validate_protocol(protocol)
+    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+        rows, _ = two_pc_report_to_feature_rows(state)
+        return rows[0]
     fields = get_report_feature_field_names(protocol)
     return [float(getattr(state, field_name)) for field_name in fields]
+
+
+def report_to_feature_rows(protocol: int, state: object) -> Tuple[List[List[float]], List[int]]:
+    protocol = _validate_protocol(protocol)
+    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+        return two_pc_report_to_feature_rows(state)
+    return [report_to_feature_values(protocol, state)], []
 
 
 def timeout_to_action_index(protocol: int, timeout_used: object) -> int:
@@ -336,7 +419,7 @@ def timeout_to_action_index(protocol: int, timeout_used: object) -> int:
         timeout_msg = timeout_used
         return _two_pc_pair_to_index(
             int(timeout_msg.election_timeout_milliseconds),
-            int(timeout_msg.prepare_timeout_milliseconds),
+            _two_pc_prepare_timeout_for_neighbor(timeout_msg, 0),
         )
     if protocol == agent_pb2.PROTOCOL_SBFT:
         timeout_msg = timeout_used
@@ -355,6 +438,31 @@ def timeout_to_action_index(protocol: int, timeout_used: object) -> int:
     raise ValueError(f"Unsupported protocol: {_protocol_name(protocol)}")
 
 
+def timeout_to_action_indices(protocol: int, timeout_used: object, state: Optional[object] = None) -> List[int]:
+    protocol = _validate_protocol(protocol)
+    if protocol != agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+        return [timeout_to_action_index(protocol, timeout_used)]
+
+    timeout_msg = timeout_used
+    neighbor_ids = two_pc_neighbor_ids(state) if state is not None else []
+    if not neighbor_ids:
+        entries = sorted(
+            getattr(timeout_msg, "prepare_timeouts", []),
+            key=lambda entry: int(entry.participant_shard_id),
+        )
+        neighbor_ids = [int(entry.participant_shard_id) for entry in entries]
+    if not neighbor_ids:
+        return [timeout_to_action_index(protocol, timeout_used)]
+
+    return [
+        _two_pc_pair_to_index(
+            int(timeout_msg.election_timeout_milliseconds),
+            _two_pc_prepare_timeout_for_neighbor(timeout_msg, participant_shard_id),
+        )
+        for participant_shard_id in neighbor_ids
+    ]
+
+
 def action_index_to_timeout(protocol: int, index: int) -> agent_pb2.Timeout:
     protocol = _validate_protocol(protocol)
     if protocol == agent_pb2.PROTOCOL_PBFT:
@@ -367,7 +475,12 @@ def action_index_to_timeout(protocol: int, index: int) -> agent_pb2.Timeout:
         return agent_pb2.Timeout(
             two_pc_over_pbft=agent_pb2.TwoPcOverPbftTimeout(
                 election_timeout_milliseconds=election_timeout_ms,
-                prepare_timeout_milliseconds=prepare_timeout_ms,
+                prepare_timeouts=[
+                    agent_pb2.TwoPcNeighborPrepareTimeout(
+                        participant_shard_id=0,
+                        prepare_timeout_milliseconds=prepare_timeout_ms,
+                    )
+                ],
             )
         )
     if protocol == agent_pb2.PROTOCOL_SBFT:
@@ -469,6 +582,9 @@ class ProtocolReportFeatureExtractor(FeatureExtractor[object]):
         self._protocol = _validate_protocol(protocol)
 
     def featurize(self, state: object) -> torch.Tensor:
+        if self._protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+            features, _ = report_to_feature_rows(self._protocol, state)
+            return torch.tensor(features, dtype=torch.float32)
         features = report_to_feature_values(self._protocol, state)
         return torch.tensor(features, dtype=torch.float32)
 
@@ -485,6 +601,46 @@ class ProtocolTimeoutActionDecoder(ActionDecoder[agent_pb2.Timeout]):
         else:
             option_index = int(torch.argmax(action).item())
         return action_index_to_timeout(self._protocol, option_index)
+
+    def decode_for_report(self, action: torch.Tensor, report: object) -> agent_pb2.Timeout:
+        if self._protocol != agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+            return self.decode(action)
+
+        neighbor_ids = two_pc_neighbor_ids(report)
+        if action.dim() == 1:
+            action_rows = action.unsqueeze(0)
+        else:
+            action_rows = action
+        if not neighbor_ids:
+            return self.decode(action_rows[0])
+        if action_rows.shape[0] != len(neighbor_ids):
+            raise ValueError(
+                "2PC action row count mismatch: "
+                f"actions={action_rows.shape[0]}, neighbors={len(neighbor_ids)}"
+            )
+
+        election_values: List[int] = []
+        prepare_entries: List[agent_pb2.TwoPcNeighborPrepareTimeout] = []
+        for idx, participant_shard_id in enumerate(neighbor_ids):
+            option_index = int(torch.argmax(action_rows[idx]).item())
+            election_timeout_ms, prepare_timeout_ms = _two_pc_index_to_pair(option_index)
+            election_values.append(election_timeout_ms)
+            prepare_entries.append(
+                agent_pb2.TwoPcNeighborPrepareTimeout(
+                    participant_shard_id=participant_shard_id,
+                    prepare_timeout_milliseconds=prepare_timeout_ms,
+                )
+            )
+
+        election_values.sort()
+        election_timeout_ms = election_values[(len(election_values) - 1) // 2]
+        prepare_entries.sort(key=lambda entry: int(entry.participant_shard_id))
+        return agent_pb2.Timeout(
+            two_pc_over_pbft=agent_pb2.TwoPcOverPbftTimeout(
+                election_timeout_milliseconds=election_timeout_ms,
+                prepare_timeouts=prepare_entries,
+            )
+        )
 
 class QuadraticRewardScaler(RewardTransformer):
     """Quadratic shaping below 1000, linear above. Prior work"""

@@ -26,16 +26,19 @@ from models import (
     FeatureExtractor,
     LinearTorchModel,
     ThompsonSamplingModel,
+    ThompsonSamplingModelOld,
     ProtocolReportFeatureExtractor,
     ProtocolTimeoutActionDecoder,
     RandomTimeoutModel,
     ScheduledTimeoutModel,
-    ThompsonSamplingModel,
     TensorModel,
     get_action_space_size,
     get_report_feature_dim,
     get_report_feature_field_names,
+    report_to_feature_rows,
     timeout_to_action_index,
+    timeout_to_action_indices,
+    two_pc_prepare_timeout_summary,
 )
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -123,12 +126,32 @@ def _dataset_timeout_field_names(protocol: int) -> Tuple[str, ...]:
 
 
 def _dataset_timeout_values(protocol: int, timeout_used: object) -> Tuple[object, ...]:
+    return _dataset_timeout_values_for_participant(protocol, timeout_used, None)
+
+
+def _dataset_timeout_values_for_participant(
+    protocol: int, timeout_used: object, participant_shard_id: Optional[int]
+) -> Tuple[object, ...]:
     if protocol == agent_pb2.PROTOCOL_PBFT:
         return (getattr(timeout_used, "election_timeout_milliseconds", ""),)
     if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+        prepare_timeout = ""
+        entries = sorted(
+            getattr(timeout_used, "prepare_timeouts", []),
+            key=lambda entry: int(entry.participant_shard_id),
+        )
+        if participant_shard_id is not None:
+            for entry in entries:
+                if int(entry.participant_shard_id) == int(participant_shard_id):
+                    prepare_timeout = int(entry.prepare_timeout_milliseconds)
+                    break
+        elif entries:
+            prepare_timeout = two_pc_prepare_timeout_summary(timeout_used)
+        else:
+            prepare_timeout = getattr(timeout_used, "prepare_timeout_milliseconds", "")
         return (
             getattr(timeout_used, "election_timeout_milliseconds", ""),
-            getattr(timeout_used, "prepare_timeout_milliseconds", ""),
+            prepare_timeout,
         )
     if protocol == agent_pb2.PROTOCOL_SBFT:
         return (
@@ -864,109 +887,82 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         dirty.cross_shard_transactions = self._rng.randint(
             0, max(int(state.cross_shard_transactions), 1) * 3
         )
-        dirty.prepare_ok_count = self._rng.randint(0, max(int(state.prepare_ok_count), 1) * 3)
-        dirty.prepare_fail_count = self._rng.randint(0, max(int(state.prepare_fail_count), 1) * 3)
-        dirty.commit_ok_count = self._rng.randint(0, max(int(state.commit_ok_count), 1) * 3)
-        dirty.abort_count = self._rng.randint(0, max(int(state.abort_count), 1) * 3)
-        dirty.in_doubt_count = self._rng.randint(0, max(int(state.in_doubt_count), 1) * 3)
-        dirty.prepare_timeout_count = self._rng.randint(
-            0, max(int(state.prepare_timeout_count), 1) * 3
-        )
-        dirty.commit_timeout_unknown_outcome_count = self._rng.randint(
-            0, max(int(state.commit_timeout_unknown_outcome_count), 1) * 3
-        )
-        dirty.abort_best_effort_timeout_count = self._rng.randint(
-            0, max(int(state.abort_best_effort_timeout_count), 1) * 3
-        )
-        dirty.lock_contention_count = self._rng.randint(
-            0, max(int(state.lock_contention_count), 1) * 3
-        )
-        dirty.prepare_timeout_rate = float(
-            min(1.0, max(0.0, float(state.prepare_timeout_rate) + self._rng.uniform(-0.1, 0.2)))
-        )
-        dirty.abort_rate = float(
-            min(1.0, max(0.0, float(state.abort_rate) + self._rng.uniform(-0.1, 0.2)))
-        )
-        dirty.commit_rate = float(
-            min(1.0, max(0.0, float(state.commit_rate) + self._rng.uniform(-0.1, 0.2)))
-        )
-        dirty.lock_contention_rate = float(
-            min(
-                1.0, max(0.0, float(state.lock_contention_rate) + self._rng.uniform(-0.1, 0.2))
+        for neighbor in dirty.neighbor_reports:
+            neighbor.cross_shard_transactions = self._rng.randint(
+                0, max(int(neighbor.cross_shard_transactions), 1) * 3
             )
-        )
-        dirty.avg_end_to_end_latency_ms = float(
-            max(0.0, float(state.avg_end_to_end_latency_ms) * self._rng.uniform(0.4, 2.0))
-        )
-        dirty.p95_end_to_end_latency_ms = float(
-            max(
-                dirty.avg_end_to_end_latency_ms,
-                float(state.p95_end_to_end_latency_ms) * self._rng.uniform(0.4, 2.2),
+            for field_name in (
+                "prepare_ok_count",
+                "prepare_fail_count",
+                "commit_ok_count",
+                "abort_count",
+                "in_doubt_count",
+                "prepare_timeout_count",
+                "commit_timeout_unknown_outcome_count",
+                "abort_best_effort_timeout_count",
+                "lock_contention_count",
+                "reason_prepare_lock_busy_count",
+                "reason_prepare_validation_fail_count",
+                "reason_prepare_timeout_count",
+                "reason_prepare_other_count",
+                "reason_commit_timeout_unknown_outcome_count",
+                "reason_abort_best_effort_timeout_count",
+                "reason_other_count",
+            ):
+                setattr(
+                    neighbor,
+                    field_name,
+                    self._rng.randint(0, max(int(getattr(neighbor, field_name)), 1) * 3),
+                )
+            for field_name in (
+                "prepare_timeout_rate",
+                "abort_rate",
+                "commit_rate",
+                "lock_contention_rate",
+            ):
+                setattr(
+                    neighbor,
+                    field_name,
+                    float(
+                        min(
+                            1.0,
+                            max(
+                                0.0,
+                                float(getattr(neighbor, field_name))
+                                + self._rng.uniform(-0.1, 0.2),
+                            ),
+                        )
+                    ),
+                )
+            for avg_field, p95_field in (
+                ("avg_end_to_end_latency_ms", "p95_end_to_end_latency_ms"),
+                ("avg_prepare_latency_ms", "p95_prepare_latency_ms"),
+                ("avg_commit_latency_ms", "p95_commit_latency_ms"),
+                ("avg_lock_wait_ms", "p95_lock_wait_ms"),
+                ("avg_lock_hold_ms", "p95_lock_hold_ms"),
+            ):
+                avg_value = float(
+                    max(0.0, float(getattr(neighbor, avg_field)) * self._rng.uniform(0.4, 2.0))
+                )
+                setattr(neighbor, avg_field, avg_value)
+                setattr(
+                    neighbor,
+                    p95_field,
+                    float(
+                        max(
+                            avg_value,
+                            float(getattr(neighbor, p95_field))
+                            * self._rng.uniform(0.4, 2.2),
+                        )
+                    ),
+                )
+            neighbor.p99_end_to_end_latency_ms = float(
+                max(
+                    neighbor.p95_end_to_end_latency_ms,
+                    float(neighbor.p99_end_to_end_latency_ms)
+                    * self._rng.uniform(0.4, 2.4),
+                )
             )
-        )
-        dirty.p99_end_to_end_latency_ms = float(
-            max(
-                dirty.p95_end_to_end_latency_ms,
-                float(state.p99_end_to_end_latency_ms) * self._rng.uniform(0.4, 2.4),
-            )
-        )
-        dirty.avg_prepare_latency_ms = float(
-            max(0.0, float(state.avg_prepare_latency_ms) * self._rng.uniform(0.4, 2.0))
-        )
-        dirty.p95_prepare_latency_ms = float(
-            max(
-                dirty.avg_prepare_latency_ms,
-                float(state.p95_prepare_latency_ms) * self._rng.uniform(0.4, 2.2),
-            )
-        )
-        dirty.avg_commit_latency_ms = float(
-            max(0.0, float(state.avg_commit_latency_ms) * self._rng.uniform(0.4, 2.0))
-        )
-        dirty.p95_commit_latency_ms = float(
-            max(
-                dirty.avg_commit_latency_ms,
-                float(state.p95_commit_latency_ms) * self._rng.uniform(0.4, 2.2),
-            )
-        )
-        dirty.avg_lock_wait_ms = float(
-            max(0.0, float(state.avg_lock_wait_ms) * self._rng.uniform(0.4, 2.0))
-        )
-        dirty.p95_lock_wait_ms = float(
-            max(
-                dirty.avg_lock_wait_ms,
-                float(state.p95_lock_wait_ms) * self._rng.uniform(0.4, 2.2),
-            )
-        )
-        dirty.avg_lock_hold_ms = float(
-            max(0.0, float(state.avg_lock_hold_ms) * self._rng.uniform(0.4, 2.0))
-        )
-        dirty.p95_lock_hold_ms = float(
-            max(
-                dirty.avg_lock_hold_ms,
-                float(state.p95_lock_hold_ms) * self._rng.uniform(0.4, 2.2),
-            )
-        )
-        dirty.reason_prepare_lock_busy_count = self._rng.randint(
-            0, max(int(state.reason_prepare_lock_busy_count), 1) * 3
-        )
-        dirty.reason_prepare_validation_fail_count = self._rng.randint(
-            0, max(int(state.reason_prepare_validation_fail_count), 1) * 3
-        )
-        dirty.reason_prepare_timeout_count = self._rng.randint(
-            0, max(int(state.reason_prepare_timeout_count), 1) * 3
-        )
-        dirty.reason_prepare_other_count = self._rng.randint(
-            0, max(int(state.reason_prepare_other_count), 1) * 3
-        )
-        dirty.reason_commit_timeout_unknown_outcome_count = self._rng.randint(
-            0, max(int(state.reason_commit_timeout_unknown_outcome_count), 1) * 3
-        )
-        dirty.reason_abort_best_effort_timeout_count = self._rng.randint(
-            0, max(int(state.reason_abort_best_effort_timeout_count), 1) * 3
-        )
-        dirty.reason_other_count = self._rng.randint(
-            0, max(int(state.reason_other_count), 1) * 3
-        )
         return dirty
 
     def _dirty_state(self, state: object) -> object:
@@ -994,23 +990,31 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
 
         matched = matched_state is not None
         report = matched_state
-        report_values = (
-            [getattr(report, field_name) for field_name in self._report_feature_field_names]
-            if report is not None
-            else [""] * len(self._report_feature_field_names)
-        )
-        timeout_values = _dataset_timeout_values(self._protocol, timeout_used)
-        self._dataset_writer.writerow(
-            [
-                reward_episode,
-                phase,
-                report_node_id,
-                *report_values,
-                *timeout_values,
-                _report_throughput_tps(reward_report),
-                int(matched),
-            ]
-        )
+        if report is not None:
+            report_rows, participant_ids = report_to_feature_rows(self._protocol, report)
+        else:
+            report_rows, participant_ids = (
+                [[""] * len(self._report_feature_field_names)],
+                [],
+            )
+        if not participant_ids:
+            participant_ids = [None] * len(report_rows)
+
+        for report_values, participant_id in zip(report_rows, participant_ids):
+            timeout_values = _dataset_timeout_values_for_participant(
+                self._protocol, timeout_used, participant_id
+            )
+            self._dataset_writer.writerow(
+                [
+                    reward_episode,
+                    phase,
+                    report_node_id,
+                    *report_values,
+                    *timeout_values,
+                    _report_throughput_tps(reward_report),
+                    int(matched),
+                ]
+            )
         # Flush every row to keep memory usage minimal and avoid data loss.
         self._dataset_handle.flush()
 
@@ -1146,12 +1150,30 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                     f"view_changes={local.view_change_count}"
                 )
             elif self._protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+                prepare_timeout_rate = 0.0
+                commit_rate = 0.0
+                avg_e2e_latency_ms = 0.0
+                neighbor_count = len(local.neighbor_reports)
+                if neighbor_count:
+                    prepare_timeout_rate = sum(
+                        float(neighbor.prepare_timeout_rate)
+                        for neighbor in local.neighbor_reports
+                    ) / neighbor_count
+                    commit_rate = sum(
+                        float(neighbor.commit_rate)
+                        for neighbor in local.neighbor_reports
+                    ) / neighbor_count
+                    avg_e2e_latency_ms = sum(
+                        float(neighbor.avg_end_to_end_latency_ms)
+                        for neighbor in local.neighbor_reports
+                    ) / neighbor_count
                 print(
                     f"node={report.node_id} "
                     f"total_tx={local.total_transactions} "
-                    f"prepare_timeout_rate={local.prepare_timeout_rate:.6f} "
-                    f"commit_rate={local.commit_rate:.6f} "
-                    f"avg_e2e_latency_ms={local.avg_end_to_end_latency_ms:.6f}"
+                    f"neighbors={neighbor_count} "
+                    f"prepare_timeout_rate={prepare_timeout_rate:.6f} "
+                    f"commit_rate={commit_rate:.6f} "
+                    f"avg_e2e_latency_ms={avg_e2e_latency_ms:.6f}"
                 )
             elif self._protocol == agent_pb2.PROTOCOL_SBFT:
                 print(
@@ -1453,7 +1475,12 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         )
 
         try:
-            action_index = timeout_to_action_index(self._protocol, timeout_used)
+            if self._protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+                action_indices = timeout_to_action_indices(
+                    self._protocol, timeout_used, matched_state
+                )
+            else:
+                action_indices = [timeout_to_action_index(self._protocol, timeout_used)]
         except ValueError as exc:
             print(f"[learning] skipped reward for episode {reward_episode}: {exc}")
             self._pending_rewards_by_episode.pop(reward_episode, None)
@@ -1467,7 +1494,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         elif self._protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
             reward_timeout = (
                 f"{timeout_used.election_timeout_milliseconds}/"
-                f"{timeout_used.prepare_timeout_milliseconds}"
+                f"{two_pc_prepare_timeout_summary(timeout_used)}"
             )
         elif self._protocol == agent_pb2.PROTOCOL_SBFT:
             reward_timeout = (
@@ -1492,7 +1519,10 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             )
         else:
             features = self._feature_extractor.featurize(matched_state)
-            action = torch.tensor(float(action_index), dtype=torch.float32)
+            if self._protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+                action = torch.tensor(action_indices, dtype=torch.float32)
+            else:
+                action = torch.tensor(float(action_indices[0]), dtype=torch.float32)
             self._model.update_model(features, action, engineered_reward)
             print(
                 "[learning] applied reward update "
@@ -1529,22 +1559,24 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             timeout_inner = _timeout_from_status(self._protocol, timeout)
         except ValueError:
             return
-        report_values = [
-            getattr(report_state, field_name)
-            for field_name in self._report_feature_field_names
-        ]
-        timeout_values = _dataset_timeout_values(self._protocol, timeout_inner)
-        self._dataset_writer.writerow(
-            [
-                episode,
-                phase,
-                report_node_id,
-                *report_values,
-                *timeout_values,
-                "",
-                0,
-            ]
-        )
+        report_rows, participant_ids = report_to_feature_rows(self._protocol, report_state)
+        if not participant_ids:
+            participant_ids = [None] * len(report_rows)
+        for report_values, participant_id in zip(report_rows, participant_ids):
+            timeout_values = _dataset_timeout_values_for_participant(
+                self._protocol, timeout_inner, participant_id
+            )
+            self._dataset_writer.writerow(
+                [
+                    episode,
+                    phase,
+                    report_node_id,
+                    *report_values,
+                    *timeout_values,
+                    "",
+                    0,
+                ]
+            )
         self._dataset_handle.flush()
 
     def _predict_timeout_locked(
@@ -1560,7 +1592,10 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
 
         features = self._feature_extractor.featurize(report)
         action = self._model.predict_action(features)
-        timeout = self._action_decoder.decode(action)
+        if self._protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
+            timeout = self._action_decoder.decode_for_report(action, report)
+        else:
+            timeout = self._action_decoder.decode(action)
 
         self._log_report_row_locked(
             phase=self._phase_by_episode[episode],
@@ -1653,6 +1688,11 @@ def serve(
         )
     elif model_type in ("cmab", "thompson"):
         model = ThompsonSamplingModel(
+            action_dim=get_action_space_size(protocol),
+            n_features=get_report_feature_dim(protocol),
+        )
+    elif model_type == "cmab_old":
+        model = ThompsonSamplingModelOld(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
         )
@@ -1804,11 +1844,12 @@ def main():
     parser.add_argument(
         "--model-type",
         type=str,
-        choices=("random", "linear", "cmab", "scheduled", "thompson"),
+        choices=("random", "linear", "cmab", "cmab_old", "scheduled", "thompson"),
         default="random",
         help=(
             "random: random timeout selection; linear: learned linear model; "
-            "cmab: contextual multi-armed bandit (Thompson sampling); "
+            "cmab: bootstrapped ensemble contextual multi-armed bandit; "
+            "cmab_old: previous single-tree bootstrapped CMAB; "
             "thompson: deprecated alias for cmab; "
             "scheduled: timeout from a time-based schedule CSV."
         ),

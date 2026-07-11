@@ -1205,7 +1205,7 @@ class ThompsonSamplingModel(TensorModel):
 
         self.reset_model()
 
-    def predict_action(self, features: torch.Tensor, e = 0.35) -> torch.Tensor:
+    def predict_action(self, features: torch.Tensor, e = 0.5) -> torch.Tensor:
         """e-TS: with probability e take the Thompson draw (one bootstrap head
         per arm); with probability 1-e exploit the arm with the highest
         empirical mean over its reward sliding window."""

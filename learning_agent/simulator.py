@@ -646,7 +646,7 @@ def main() -> None:
 
     plot_accuracy(result=result, save_path=os.path.join(exp_path, 'summary_accuracies.png'))
     plot_stage_accuracies(data_dict=raw_result, save_path=os.path.join(exp_path, 'episode_accuracies.png'))
-    plot_prediction_phases(data_dict=predictions, save_path=os.path.join(exp_path, 'predictions.png'), y_ticks=[100, 700, 1900])
+    plot_prediction_phases(data_dict=predictions, save_path=os.path.join(exp_path, 'predictions.png'), y_ticks=[300, 800, 1800])
 
     print(f"\n[SUMMARY]")
     print(f"[Experiment Configs:]\tprotocol={args.protocol}, num_episodes={args.num_episodes}, phases={args.phases}")

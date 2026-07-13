@@ -162,7 +162,7 @@ class DataGenerator(BaseDataGenerator):
         if prev_timeout != None:
             trial['election_timeout_milliseconds_used'] = prev_timeout
         else:
-            trial['election_timeout_milliseconds_used'] = 100
+            trial['election_timeout_milliseconds_used'] = 300
 
         trial['reward'] = 0.0 
 

@@ -125,7 +125,7 @@ def _random_pbft_report(rng: random.Random) -> agent_pb2.PbftReport:
     p95_batch_size = rng.uniform(avg_batch_size, max(avg_batch_size, avg_batch_size * 1.5))
     leader_change_count = rng.randint(0, 8)
     regency_change_count = rng.randint(0, 8)
-    timeout_ms = rng.choice([100, 700, 1900])
+    timeout_ms = rng.choice([300, 800, 1800])
     avg_inter_commit_gap_ms = rng.uniform(1.0, 250.0)
     p50_inter_commit_gap_ms = rng.uniform(1.0, avg_inter_commit_gap_ms)
     p95_inter_commit_gap_ms = rng.uniform(

@@ -17,15 +17,15 @@ A = TypeVar("A")  # generic action type
 
 
 class PbftTimeoutOption(IntEnum):
-    TIMEOUT_100_MS = 100
-    TIMEOUT_700_MS = 700
-    TIMEOUT_1900_MS = 1900
+    TIMEOUT_300_MS = 300
+    TIMEOUT_800_MS = 800
+    TIMEOUT_1800_MS = 1800
 
 
 PBFT_TIMEOUT_OPTIONS: Tuple[PbftTimeoutOption, ...] = (
-    PbftTimeoutOption.TIMEOUT_100_MS,
-    PbftTimeoutOption.TIMEOUT_700_MS,
-    PbftTimeoutOption.TIMEOUT_1900_MS,
+    PbftTimeoutOption.TIMEOUT_300_MS,
+    PbftTimeoutOption.TIMEOUT_800_MS,
+    PbftTimeoutOption.TIMEOUT_1800_MS,
 )
 PBFT_TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(
     int(option) for option in PBFT_TIMEOUT_OPTIONS
@@ -57,12 +57,12 @@ TIMEOUT_INDEX_TO_MS: Dict[int, int] = {
 }
 
 class PhaseMapping(IntEnum):
-    PHASE_0 = PbftTimeoutOption.TIMEOUT_100_MS
-    PHASE_1 = PbftTimeoutOption.TIMEOUT_100_MS
-    PHASE_2 = PbftTimeoutOption.TIMEOUT_100_MS
-    PHASE_3 = PbftTimeoutOption.TIMEOUT_700_MS
-    PHASE_4 = PbftTimeoutOption.TIMEOUT_700_MS
-    PHASE_5 = PbftTimeoutOption.TIMEOUT_1900_MS
+    PHASE_0 = PbftTimeoutOption.TIMEOUT_300_MS
+    PHASE_1 = PbftTimeoutOption.TIMEOUT_300_MS
+    PHASE_2 = PbftTimeoutOption.TIMEOUT_300_MS
+    PHASE_3 = PbftTimeoutOption.TIMEOUT_800_MS
+    PHASE_4 = PbftTimeoutOption.TIMEOUT_800_MS
+    PHASE_5 = PbftTimeoutOption.TIMEOUT_1800_MS
 
 PHASE_OPTIONS: Tuple[PhaseMapping, ...] = (
     PhaseMapping.PHASE_0,

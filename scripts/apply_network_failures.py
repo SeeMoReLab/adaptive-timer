@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply phase-scheduled network delay/loss faults using tc netem.
+"""Apply phase-scheduled burst-delay faults using tc netem.
 
 This applier intentionally handles only the <network> section of
 config/pbft/failure_spec.xml and ignores PBFT/agent fault sections.
@@ -8,6 +8,8 @@ config/pbft/failure_spec.xml and ignores PBFT/agent fault sections.
 from __future__ import annotations
 
 import argparse
+import heapq
+import hashlib
 import os
 import re
 import subprocess
@@ -20,24 +22,40 @@ from typing import Dict, List, Tuple
 
 
 @dataclass(frozen=True)
-class DelayLoss:
+class BurstDelay:
     delay_ms: float
-    loss_pct: float
+    burst_duration_ms: float
+    burst_interval_ms: float
 
 
 @dataclass
 class PhaseNetworkSpec:
     at_time_s: float
     directed_edges: bool
-    global_fault: DelayLoss
-    source_faults: Dict[int, DelayLoss]
-    edge_faults: Dict[Tuple[int, int], DelayLoss]
+    global_fault: BurstDelay
+    source_faults: Dict[int, BurstDelay]
+    edge_faults: Dict[Tuple[int, int], BurstDelay]
 
 
 @dataclass(frozen=True)
 class HostEntry:
     replica_id: int
     ip: str
+
+
+@dataclass(frozen=True)
+class IpRule:
+    dst_ip: str
+    dst_replicas: Tuple[int, ...]
+    fault: BurstDelay
+    class_id: int
+
+
+@dataclass(frozen=True)
+class BurstEvent:
+    at_s: float
+    rule: IpRule
+    active: bool
 
 
 def _log(msg: str) -> None:
@@ -96,14 +114,64 @@ def _parse_optional_int(parent: ET.Element, tag: str) -> int | None:
         raise ValueError(f"Invalid integer in <{tag}>: {node.text!r}") from exc
 
 
-def _parse_delay_loss(node: ET.Element) -> DelayLoss:
+def _parse_burst_delay(node: ET.Element) -> BurstDelay:
     delay_ms = _parse_required_float(node, "delayMs")
-    loss_pct = _parse_required_float(node, "lossPct")
     if delay_ms < 0:
         raise ValueError("delayMs must be >= 0")
-    if loss_pct < 0:
-        raise ValueError("lossPct must be >= 0")
-    return DelayLoss(delay_ms=delay_ms, loss_pct=loss_pct)
+
+    burst_duration_ms = _parse_optional_float(node, "burstDurationMs")
+    burst_interval_ms = _parse_optional_float(node, "burstIntervalMs")
+    if burst_duration_ms is None and burst_interval_ms is None:
+        probability_pct = _parse_optional_float(node, "probability")
+        if probability_pct is not None:
+            if probability_pct < 0 or probability_pct > 100:
+                raise ValueError("probability must be between 0 and 100")
+            burst_interval_ms = 10_000.0
+            burst_duration_ms = burst_interval_ms * probability_pct / 100.0
+        elif delay_ms > 0:
+            # Legacy deterministic delay specs had no burst/probability fields.
+            burst_duration_ms = 10_000.0
+            burst_interval_ms = 10_000.0
+        else:
+            burst_duration_ms = 0.0
+            burst_interval_ms = 0.0
+    elif burst_duration_ms is None or burst_interval_ms is None:
+        raise ValueError("burstDurationMs and burstIntervalMs must be specified together")
+
+    legacy_loss_pct = _parse_optional_float(node, "lossPct")
+    if legacy_loss_pct is not None and legacy_loss_pct != 0:
+        raise ValueError(
+            "Legacy <lossPct> is no longer supported for network phases; "
+            "use burstDurationMs/burstIntervalMs to express delay bursts."
+        )
+
+    if burst_duration_ms < 0:
+        raise ValueError("burstDurationMs must be >= 0")
+    if burst_interval_ms < 0:
+        raise ValueError("burstIntervalMs must be >= 0")
+    if burst_duration_ms > 0 and burst_interval_ms <= 0:
+        raise ValueError("burstIntervalMs must be > 0 when burstDurationMs is > 0")
+
+    return BurstDelay(
+        delay_ms=delay_ms,
+        burst_duration_ms=burst_duration_ms,
+        burst_interval_ms=burst_interval_ms,
+    )
+
+
+def _parse_global_network_delay_ms(root: ET.Element) -> float:
+    delay_node = root.find("./globalNetworkDelay/delayMs")
+    if delay_node is None or delay_node.text is None:
+        return 0.0
+    try:
+        delay_ms = float(delay_node.text.strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid float in <globalNetworkDelay>/<delayMs>: {delay_node.text!r}"
+        ) from exc
+    if delay_ms < 0:
+        raise ValueError("globalNetworkDelay delayMs must be >= 0")
+    return delay_ms
 
 
 def _parse_warmup_seconds(root: ET.Element) -> float:
@@ -117,9 +185,10 @@ def _parse_warmup_seconds(root: ET.Element) -> float:
     return max(0.0, warmup_s)
 
 
-def _parse_phases(spec_path: Path) -> Tuple[float, List[PhaseNetworkSpec]]:
+def _parse_phases(spec_path: Path) -> Tuple[float, float, List[PhaseNetworkSpec]]:
     root = ET.parse(spec_path).getroot()
     warmup_s = _parse_warmup_seconds(root)
+    base_delay_ms = _parse_global_network_delay_ms(root)
     phase_nodes = root.findall("./phases/phase")
     if not phase_nodes:
         raise ValueError("No <phase> entries found under <phases>")
@@ -152,7 +221,11 @@ def _parse_phases(spec_path: Path) -> Tuple[float, List[PhaseNetworkSpec]]:
                 PhaseNetworkSpec(
                     at_time_s=at_time_s,
                     directed_edges=True,
-                    global_fault=DelayLoss(delay_ms=0.0, loss_pct=0.0),
+                    global_fault=BurstDelay(
+                        delay_ms=0.0,
+                        burst_duration_ms=0.0,
+                        burst_interval_ms=0.0,
+                    ),
                     source_faults={},
                     edge_faults={},
                 )
@@ -163,21 +236,21 @@ def _parse_phases(spec_path: Path) -> Tuple[float, List[PhaseNetworkSpec]]:
 
         global_node = network.find("global")
         global_fault = (
-            _parse_delay_loss(global_node)
+            _parse_burst_delay(global_node)
             if global_node is not None
-            else DelayLoss(delay_ms=0.0, loss_pct=0.0)
+            else BurstDelay(delay_ms=0.0, burst_duration_ms=0.0, burst_interval_ms=0.0)
         )
 
-        source_faults: Dict[int, DelayLoss] = {}
+        source_faults: Dict[int, BurstDelay] = {}
         for source_node in network.findall("./sources/source"):
             src = _parse_required_int(source_node, "src")
-            source_faults[src] = _parse_delay_loss(source_node)
+            source_faults[src] = _parse_burst_delay(source_node)
 
-        edge_faults: Dict[Tuple[int, int], DelayLoss] = {}
+        edge_faults: Dict[Tuple[int, int], BurstDelay] = {}
         for edge_node in network.findall("./edges/edge"):
             src = _parse_required_int(edge_node, "src")
             dst = _parse_required_int(edge_node, "dst")
-            edge_faults[(src, dst)] = _parse_delay_loss(edge_node)
+            edge_faults[(src, dst)] = _parse_burst_delay(edge_node)
 
         phases.append(
             PhaseNetworkSpec(
@@ -195,7 +268,7 @@ def _parse_phases(spec_path: Path) -> Tuple[float, List[PhaseNetworkSpec]]:
     if not has_at_time:
         _log("No <atTime> found; treating <time> as phase duration (legacy behavior).")
 
-    return warmup_s, phases
+    return warmup_s, base_delay_ms, phases
 
 
 def _load_hosts(hosts_config: Path) -> Dict[int, HostEntry]:
@@ -309,7 +382,7 @@ def _clear_tc(
     )
 
 
-def _choose_fault(phase: PhaseNetworkSpec, src: int, dst: int) -> DelayLoss:
+def _choose_fault(phase: PhaseNetworkSpec, src: int, dst: int) -> BurstDelay:
     fault = phase.global_fault
     if src in phase.source_faults:
         fault = phase.source_faults[src]
@@ -320,45 +393,56 @@ def _choose_fault(phase: PhaseNetworkSpec, src: int, dst: int) -> DelayLoss:
     return fault
 
 
-def _build_ip_faults(
+def _build_ip_rules(
     phase: PhaseNetworkSpec, src_replica_id: int, hosts: Dict[int, HostEntry]
-) -> Dict[str, DelayLoss]:
-    ip_faults: Dict[str, DelayLoss] = {}
+) -> List[IpRule]:
+    by_ip: Dict[str, Tuple[BurstDelay, List[int]]] = {}
     for dst_replica_id, entry in sorted(hosts.items()):
         if dst_replica_id == src_replica_id:
             continue
         fault = _choose_fault(phase, src_replica_id, dst_replica_id)
-        existing = ip_faults.get(entry.ip)
+        existing = by_ip.get(entry.ip)
         if existing is None:
-            ip_faults[entry.ip] = fault
+            by_ip[entry.ip] = (fault, [dst_replica_id])
             continue
-        if existing != fault:
+        existing_fault, dst_replicas = existing
+        if existing_fault != fault:
             raise ValueError(
                 "Cannot express different per-replica faults for replicas sharing "
                 f"the same destination IP ({entry.ip}) without namespaces/port rules."
             )
-    return ip_faults
+        dst_replicas.append(dst_replica_id)
+
+    rules: List[IpRule] = []
+    for rule_idx, (dst_ip, (fault, dst_replicas)) in enumerate(sorted(by_ip.items()), start=1):
+        rules.append(
+            IpRule(
+                dst_ip=dst_ip,
+                dst_replicas=tuple(sorted(dst_replicas)),
+                fault=fault,
+                class_id=100 + rule_idx,
+            )
+        )
+    return rules
 
 
 def _log_phase_rule_plan(
     *,
     phase_index: int,
     src_replica_id: int,
-    hosts: Dict[int, HostEntry],
-    ip_faults: Dict[str, DelayLoss],
+    rules: List[IpRule],
+    base_delay_ms: float,
 ) -> None:
-    replicas_by_ip: Dict[str, List[int]] = {}
-    for dst_replica_id, entry in sorted(hosts.items()):
-        if dst_replica_id == src_replica_id:
-            continue
-        replicas_by_ip.setdefault(entry.ip, []).append(dst_replica_id)
-
-    for dst_ip, fault in sorted(ip_faults.items()):
-        dst_replicas = replicas_by_ip.get(dst_ip, [])
+    for rule in rules:
+        fault = rule.fault
         _log(
             f"Phase #{phase_index} rule: src={src_replica_id} "
-            f"dst_replicas={dst_replicas} dst_ip={dst_ip} "
-            f"delay_ms={fault.delay_ms:g} loss_pct={fault.loss_pct:g}"
+            f"dst_replicas={list(rule.dst_replicas)} dst_ip={rule.dst_ip} "
+            f"base_delay_ms={base_delay_ms:g} "
+            f"burst_delay_ms={fault.delay_ms:g} "
+            f"burst_duration_ms={fault.burst_duration_ms:g} "
+            f"burst_interval_ms={fault.burst_interval_ms:g} "
+            f"burst_total_delay_ms={base_delay_ms + fault.delay_ms:g}"
         )
 
 
@@ -399,57 +483,127 @@ def _log_tc_state(
             _log(f"tc {label} on {interface}: <empty>")
 
 
-def _apply_phase(
+def _burst_enabled(fault: BurstDelay) -> bool:
+    return (
+        fault.delay_ms > 0
+        and fault.burst_duration_ms > 0
+        and fault.burst_interval_ms > 0
+    )
+
+
+def _burst_continuous(fault: BurstDelay) -> bool:
+    return _burst_enabled(fault) and fault.burst_duration_ms >= fault.burst_interval_ms
+
+
+def _stable_fraction(*parts: object) -> float:
+    raw = "|".join(str(part) for part in parts).encode("utf-8")
+    digest = hashlib.sha256(raw).digest()
+    value = int.from_bytes(digest[:8], byteorder="big", signed=False)
+    return value / float(2**64 - 1)
+
+
+def _initial_delay_ms(base_delay_ms: float, fault: BurstDelay) -> float:
+    if _burst_continuous(fault):
+        return base_delay_ms + fault.delay_ms
+    return base_delay_ms
+
+
+def _netem_qdisc_cmd(
+    tc_bin: str,
+    interface: str,
+    class_id: int,
+    delay_ms: float,
     *,
-    phase_index: int,
-    phase: PhaseNetworkSpec,
-    src_replica_id: int,
-    hosts: Dict[int, HostEntry],
+    verb: str,
+    netem_limit: int,
+) -> List[str]:
+    return [
+        tc_bin,
+        "qdisc",
+        verb,
+        "dev",
+        interface,
+        "parent",
+        f"1:{class_id}",
+        "handle",
+        f"{class_id}:",
+        "netem",
+        "limit",
+        str(netem_limit),
+        "delay",
+        f"{delay_ms:g}ms",
+    ]
+
+
+def _set_rule_delay(
+    *,
+    rule: IpRule,
+    delay_ms: float,
     interface: str,
     tc_bin: str,
-    link_rate: str,
+    netem_limit: int,
     use_sudo: bool,
     dry_run: bool,
     netns: str | None,
 ) -> None:
-    ip_faults = _build_ip_faults(phase, src_replica_id, hosts)
-    _log(
-        f"Applying phase #{phase_index} at t={phase.at_time_s:.3f}s "
-        f"on {interface}; rules={len(ip_faults)}"
-    )
-    _log_phase_rule_plan(
-        phase_index=phase_index,
-        src_replica_id=src_replica_id,
-        hosts=hosts,
-        ip_faults=ip_faults,
-    )
-
-    _clear_tc(
-        interface,
-        tc_bin=tc_bin,
-        use_sudo=use_sudo,
-        dry_run=dry_run,
-        netns=netns,
-    )
-
     _run_command(
-        [
+        _netem_qdisc_cmd(
             tc_bin,
-            "qdisc",
-            "replace",
-            "dev",
             interface,
-            "root",
-            "handle",
-            "1:",
-            "htb",
-            "default",
-            "999",
-        ],
+            rule.class_id,
+            delay_ms,
+            verb="change",
+            netem_limit=netem_limit,
+        ),
         use_sudo=use_sudo,
         dry_run=dry_run,
         netns=netns,
     )
+
+
+def _configure_phase_tc(
+    *,
+    rules: List[IpRule],
+    base_delay_ms: float,
+    initialized: bool,
+    interface: str,
+    tc_bin: str,
+    link_rate: str,
+    netem_limit: int,
+    use_sudo: bool,
+    dry_run: bool,
+    netns: str | None,
+) -> bool:
+    if not initialized:
+        _clear_tc(
+            interface,
+            tc_bin=tc_bin,
+            use_sudo=use_sudo,
+            dry_run=dry_run,
+            netns=netns,
+        )
+
+        _run_command(
+            [
+                tc_bin,
+                "qdisc",
+                "replace",
+                "dev",
+                interface,
+                "root",
+                "handle",
+                "1:",
+                "htb",
+                "default",
+                "999",
+            ],
+            use_sudo=use_sudo,
+            dry_run=dry_run,
+            netns=netns,
+        )
+    else:
+        _log(f"Updating tc rules on {interface} without deleting the root qdisc.")
+
     _run_command(
         [
             tc_bin,
@@ -472,8 +626,7 @@ def _apply_phase(
         netns=netns,
     )
 
-    for rule_idx, (dst_ip, fault) in enumerate(sorted(ip_faults.items()), start=1):
-        class_id = 100 + rule_idx
+    for rule in rules:
         _run_command(
             [
                 tc_bin,
@@ -484,7 +637,7 @@ def _apply_phase(
                 "parent",
                 "1:",
                 "classid",
-                f"1:{class_id}",
+                f"1:{rule.class_id}",
                 "htb",
                 "rate",
                 link_rate,
@@ -495,27 +648,54 @@ def _apply_phase(
             dry_run=dry_run,
             netns=netns,
         )
-        _run_command(
-            [
-                tc_bin,
-                "qdisc",
-                "replace",
-                "dev",
-                interface,
-                "parent",
-                f"1:{class_id}",
-                "handle",
-                f"{class_id}:",
-                "netem",
-                "delay",
-                f"{fault.delay_ms:g}ms",
-                "loss",
-                f"{fault.loss_pct:g}%",
-            ],
-            use_sudo=use_sudo,
-            dry_run=dry_run,
-            netns=netns,
-        )
+        if not initialized:
+            _run_command(
+                _netem_qdisc_cmd(
+                    tc_bin,
+                    interface,
+                    rule.class_id,
+                    _initial_delay_ms(base_delay_ms, rule.fault),
+                    verb="replace",
+                    netem_limit=netem_limit,
+                ),
+                use_sudo=use_sudo,
+                dry_run=dry_run,
+                netns=netns,
+            )
+        else:
+            result = _run_command(
+                _netem_qdisc_cmd(
+                    tc_bin,
+                    interface,
+                    rule.class_id,
+                    _initial_delay_ms(base_delay_ms, rule.fault),
+                    verb="change",
+                    netem_limit=netem_limit,
+                ),
+                use_sudo=use_sudo,
+                dry_run=dry_run,
+                check=False,
+                netns=netns,
+            )
+            if result.returncode != 0:
+                _log(
+                    f"netem change failed for class 1:{rule.class_id} "
+                    f"({result.stderr.strip()}); replacing child qdisc."
+                )
+                _run_command(
+                    _netem_qdisc_cmd(
+                        tc_bin,
+                        interface,
+                        rule.class_id,
+                        _initial_delay_ms(base_delay_ms, rule.fault),
+                        verb="replace",
+                        netem_limit=netem_limit,
+                    ),
+                    use_sudo=use_sudo,
+                    dry_run=dry_run,
+                    netns=netns,
+                )
+
         _run_command(
             [
                 tc_bin,
@@ -528,19 +708,275 @@ def _apply_phase(
                 "parent",
                 "1:",
                 "prio",
-                "1",
+                "10",
                 "u32",
                 "match",
                 "ip",
                 "dst",
-                f"{dst_ip}/32",
+                f"{rule.dst_ip}/32",
                 "flowid",
-                f"1:{class_id}",
+                f"1:{rule.class_id}",
             ],
             use_sudo=use_sudo,
             dry_run=dry_run,
             netns=netns,
         )
+
+    return True
+
+
+def _build_burst_events(
+    *,
+    phase_index: int,
+    src_replica_id: int,
+    rules: List[IpRule],
+    phase_duration_s: float,
+    burst_seed: int,
+) -> List[BurstEvent]:
+    events: List[BurstEvent] = []
+    if phase_duration_s <= 0:
+        return events
+
+    for rule in rules:
+        fault = rule.fault
+        if not _burst_enabled(fault) or _burst_continuous(fault):
+            continue
+
+        interval_index = 0
+        interval_s = fault.burst_interval_ms / 1000.0
+        while (interval_index + 1) * interval_s <= phase_duration_s + 1e-9:
+            start_event, end_event = _burst_event_pair(
+                phase_index=phase_index,
+                src_replica_id=src_replica_id,
+                rule=rule,
+                burst_seed=burst_seed,
+                interval_index=interval_index,
+            )
+            events.append(start_event)
+            events.append(end_event)
+            interval_index += 1
+
+    return sorted(
+        events,
+        key=lambda event: (event.at_s, 0 if event.active else 1, event.rule.dst_ip),
+    )
+
+
+def _burst_event_pair(
+    *,
+    phase_index: int,
+    src_replica_id: int,
+    rule: IpRule,
+    burst_seed: int,
+    interval_index: int,
+) -> Tuple[BurstEvent, BurstEvent]:
+    fault = rule.fault
+    interval_s = fault.burst_interval_ms / 1000.0
+    duration_s = fault.burst_duration_ms / 1000.0
+    latest_start_offset_s = interval_s - duration_s
+    fraction = _stable_fraction(
+        burst_seed,
+        phase_index,
+        src_replica_id,
+        ",".join(str(replica) for replica in rule.dst_replicas),
+        rule.dst_ip,
+        interval_index,
+    )
+    start_s = interval_index * interval_s + fraction * latest_start_offset_s
+    end_s = start_s + duration_s
+    return (
+        BurstEvent(at_s=start_s, rule=rule, active=True),
+        BurstEvent(at_s=end_s, rule=rule, active=False),
+    )
+
+
+def _apply_burst_event(
+    *,
+    phase_index: int,
+    src_replica_id: int,
+    event: BurstEvent,
+    base_delay_ms: float,
+    interface: str,
+    tc_bin: str,
+    netem_limit: int,
+    use_sudo: bool,
+    dry_run: bool,
+    netns: str | None,
+) -> None:
+    delay_ms = base_delay_ms + event.rule.fault.delay_ms if event.active else base_delay_ms
+    _log(
+        f"Phase #{phase_index} burst {'start' if event.active else 'end'}: "
+        f"src={src_replica_id} dst_replicas={list(event.rule.dst_replicas)} "
+        f"dst_ip={event.rule.dst_ip} delay_ms={delay_ms:g}"
+    )
+    _set_rule_delay(
+        rule=event.rule,
+        delay_ms=delay_ms,
+        interface=interface,
+        tc_bin=tc_bin,
+        netem_limit=netem_limit,
+        use_sudo=use_sudo,
+        dry_run=dry_run,
+        netns=netns,
+    )
+
+
+def _push_open_ended_burst_pair(
+    heap: List[Tuple[float, int, str, int, BurstEvent]],
+    *,
+    phase_index: int,
+    src_replica_id: int,
+    rule: IpRule,
+    burst_seed: int,
+    interval_index: int,
+) -> None:
+    start_event, end_event = _burst_event_pair(
+        phase_index=phase_index,
+        src_replica_id=src_replica_id,
+        rule=rule,
+        burst_seed=burst_seed,
+        interval_index=interval_index,
+    )
+    heapq.heappush(
+        heap,
+        (start_event.at_s, 0, start_event.rule.dst_ip, interval_index, start_event),
+    )
+    heapq.heappush(
+        heap,
+        (end_event.at_s, 1, end_event.rule.dst_ip, interval_index, end_event),
+    )
+
+
+def _run_open_ended_bursts(
+    *,
+    phase_index: int,
+    phase_start_mono: float,
+    base_delay_ms: float,
+    src_replica_id: int,
+    rules: List[IpRule],
+    interface: str,
+    tc_bin: str,
+    netem_limit: int,
+    burst_seed: int,
+    use_sudo: bool,
+    dry_run: bool,
+    netns: str | None,
+) -> None:
+    heap: List[Tuple[float, int, str, int, BurstEvent]] = []
+    elapsed_s = max(0.0, time.monotonic() - phase_start_mono)
+    for rule in rules:
+        if not _burst_enabled(rule.fault) or _burst_continuous(rule.fault):
+            continue
+        interval_s = rule.fault.burst_interval_ms / 1000.0
+        interval_index = int(elapsed_s // interval_s)
+        while True:
+            start_event, end_event = _burst_event_pair(
+                phase_index=phase_index,
+                src_replica_id=src_replica_id,
+                rule=rule,
+                burst_seed=burst_seed,
+                interval_index=interval_index,
+            )
+            if end_event.at_s > elapsed_s:
+                break
+            interval_index += 1
+
+        if start_event.at_s <= elapsed_s:
+            start_event = BurstEvent(at_s=elapsed_s, rule=rule, active=True)
+
+        heapq.heappush(
+            heap,
+            (start_event.at_s, 0, start_event.rule.dst_ip, interval_index, start_event),
+        )
+        heapq.heappush(
+            heap,
+            (end_event.at_s, 1, end_event.rule.dst_ip, interval_index, end_event),
+        )
+
+    if not heap:
+        return
+
+    _log(f"Phase #{phase_index} has no next phase; scheduling bursts until stopped.")
+    while True:
+        _, _, _, interval_index, event = heapq.heappop(heap)
+        _sleep_until(phase_start_mono + event.at_s)
+        _apply_burst_event(
+            phase_index=phase_index,
+            src_replica_id=src_replica_id,
+            event=event,
+            base_delay_ms=base_delay_ms,
+            interface=interface,
+            tc_bin=tc_bin,
+            netem_limit=netem_limit,
+            use_sudo=use_sudo,
+            dry_run=dry_run,
+            netns=netns,
+        )
+        if not event.active:
+            _push_open_ended_burst_pair(
+                heap,
+                phase_index=phase_index,
+                src_replica_id=src_replica_id,
+                rule=event.rule,
+                burst_seed=burst_seed,
+                interval_index=interval_index + 1,
+            )
+
+
+def _sleep_until(target_mono: float) -> None:
+    sleep_s = target_mono - time.monotonic()
+    if sleep_s > 0:
+        time.sleep(sleep_s)
+
+
+def _run_phase(
+    *,
+    phase_index: int,
+    phase: PhaseNetworkSpec,
+    phase_start_mono: float,
+    phase_end_mono: float | None,
+    base_delay_ms: float,
+    tc_initialized: bool,
+    src_replica_id: int,
+    hosts: Dict[int, HostEntry],
+    interface: str,
+    tc_bin: str,
+    link_rate: str,
+    netem_limit: int,
+    burst_seed: int,
+    use_sudo: bool,
+    dry_run: bool,
+    netns: str | None,
+) -> bool:
+    rules = _build_ip_rules(phase, src_replica_id, hosts)
+    phase_duration_s = (
+        None if phase_end_mono is None else max(0.0, phase_end_mono - phase_start_mono)
+    )
+    duration_text = "open-ended" if phase_duration_s is None else f"{phase_duration_s:.3f}s"
+    _log(
+        f"Applying phase #{phase_index} at t={phase.at_time_s:.3f}s "
+        f"on {interface}; base_delay_ms={base_delay_ms:g}; "
+        f"rules={len(rules)}; duration={duration_text}"
+    )
+    _log_phase_rule_plan(
+        phase_index=phase_index,
+        src_replica_id=src_replica_id,
+        rules=rules,
+        base_delay_ms=base_delay_ms,
+    )
+
+    tc_initialized = _configure_phase_tc(
+        rules=rules,
+        base_delay_ms=base_delay_ms,
+        initialized=tc_initialized,
+        interface=interface,
+        tc_bin=tc_bin,
+        link_rate=link_rate,
+        netem_limit=netem_limit,
+        use_sudo=use_sudo,
+        dry_run=dry_run,
+        netns=netns,
+    )
 
     _log_tc_state(
         interface=interface,
@@ -549,6 +985,50 @@ def _apply_phase(
         dry_run=dry_run,
         netns=netns,
     )
+
+    if phase_duration_s is None:
+        _run_open_ended_bursts(
+            phase_index=phase_index,
+            phase_start_mono=phase_start_mono,
+            base_delay_ms=base_delay_ms,
+            src_replica_id=src_replica_id,
+            rules=rules,
+            interface=interface,
+            tc_bin=tc_bin,
+            netem_limit=netem_limit,
+            burst_seed=burst_seed,
+            use_sudo=use_sudo,
+            dry_run=dry_run,
+            netns=netns,
+        )
+        return tc_initialized
+
+    events = _build_burst_events(
+        phase_index=phase_index,
+        src_replica_id=src_replica_id,
+        rules=rules,
+        phase_duration_s=phase_duration_s,
+        burst_seed=burst_seed,
+    )
+    for event in events:
+        target_mono = phase_start_mono + event.at_s
+        if phase_end_mono is not None and target_mono >= phase_end_mono:
+            break
+        _sleep_until(target_mono)
+        _apply_burst_event(
+            phase_index=phase_index,
+            src_replica_id=src_replica_id,
+            event=event,
+            base_delay_ms=base_delay_ms,
+            interface=interface,
+            tc_bin=tc_bin,
+            netem_limit=netem_limit,
+            use_sudo=use_sudo,
+            dry_run=dry_run,
+            netns=netns,
+        )
+
+    return tc_initialized
 
 
 def _compute_start_mono(start_unix_ms: int | None) -> float:
@@ -569,7 +1049,7 @@ def _compute_start_mono(start_unix_ms: int | None) -> float:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Apply network delay/loss phases from failure_spec.xml using tc."
+        description="Apply burst-delay phases from failure_spec.xml using tc/netem."
     )
     parser.add_argument(
         "--failure-spec",
@@ -625,6 +1105,18 @@ def main() -> int:
         help="HTB class rate used for created classes (default: 10000mbit).",
     )
     parser.add_argument(
+        "--netem-limit",
+        type=int,
+        default=100000,
+        help="Packet limit for each netem qdisc (default: 100000).",
+    )
+    parser.add_argument(
+        "--burst-seed",
+        type=int,
+        default=1,
+        help="Seed for deterministic per-edge burst placement.",
+    )
+    parser.add_argument(
         "--no-sudo",
         action="store_true",
         help="Do not prefix tc commands with sudo when not root.",
@@ -635,8 +1127,10 @@ def main() -> int:
         help="Print tc commands without executing them.",
     )
     args = parser.parse_args()
+    if args.netem_limit <= 0:
+        raise ValueError("--netem-limit must be greater than zero")
 
-    warmup_s, phases = _parse_phases(args.failure_spec)
+    warmup_s, base_delay_ms, phases = _parse_phases(args.failure_spec)
     hosts = _load_hosts(args.hosts_config)
     if args.replica_id not in hosts:
         raise ValueError(
@@ -659,22 +1153,31 @@ def main() -> int:
     _log(
         "Starting network applier "
         f"(replica_id={args.replica_id}, netns={args.netns or 'host'}, "
-        f"interface={interface}, warmup_s={warmup_s:.3f}, phases={len(phases)})"
+        f"interface={interface}, warmup_s={warmup_s:.3f}, "
+        f"base_delay_ms={base_delay_ms:g}, phases={len(phases)})"
     )
 
+    tc_initialized = False
     for idx, phase in enumerate(phases):
         target_mono = start_mono + warmup_s + phase.at_time_s
-        sleep_s = target_mono - time.monotonic()
-        if sleep_s > 0:
-            time.sleep(sleep_s)
-        _apply_phase(
+        _sleep_until(target_mono)
+        next_phase_mono = None
+        if idx + 1 < len(phases):
+            next_phase_mono = start_mono + warmup_s + phases[idx + 1].at_time_s
+        tc_initialized = _run_phase(
             phase_index=idx,
             phase=phase,
+            phase_start_mono=target_mono,
+            phase_end_mono=next_phase_mono,
+            base_delay_ms=base_delay_ms,
+            tc_initialized=tc_initialized,
             src_replica_id=args.replica_id,
             hosts=hosts,
             interface=interface,
             tc_bin=args.tc_bin,
             link_rate=args.link_rate,
+            netem_limit=args.netem_limit,
+            burst_seed=args.burst_seed,
             use_sudo=use_sudo,
             dry_run=args.dry_run,
             netns=args.netns,

@@ -23,14 +23,14 @@ NODES=4
 TARGETS_FILE="${TARGETS_FILE_DEFAULT}"
 EXPERIMENT_TIME_S=300
 CLIENT_START_DELAY_S=10
-START_OFFSET_AFTER_CLIENT_LAUNCH_S=20
+START_OFFSET_AFTER_CLIENT_LAUNCH_S=10
 DATASET_ENABLED=0
 LOG_ENABLED=0
 VERBOSE_ENABLED=0
 AGENT_MODEL_TYPE="random"
 AGENT_MODEL_SET=0
 
-BATCH_SIZE=200
+BATCH_SIZE=256
 BATCH_TIMEOUT="50ms"
 REQUEST_TIMEOUT="30s"
 SUBMIT_MODE="broadcast"
@@ -131,7 +131,7 @@ write_filtered_output() {
   local source_log="$1"
   local output_path="$2"
   awk '
-    /^Monitor duration=/ {
+    /Monitor duration=/ {
       seen_monitor = 1
       print
       next
@@ -1039,8 +1039,6 @@ for ((n = 0; n < replicas_per_machine; n++)); do
     "--batch-size" "${batch_size}"
     "--batch-timeout" "${batch_timeout}"
     "--request-timeout" "${request_timeout}"
-    "--request-timeout-backoff"
-    "--request-timeout-backoff-max" "${backoff_max}"
     "--data-dir" "${data_dir}"
     "--keep-data"
   )

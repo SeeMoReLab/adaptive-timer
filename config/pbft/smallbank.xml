@@ -17,7 +17,7 @@
             <time>10000</time>
 
             <!-- Number of terminals active in this phase -->
-            <terminals>256</terminals>
+            <terminals>512</terminals>
 
             <!-- Target transactions per second PER TERMINAL -->
             <!-- Total TPS = rate * terminals -->

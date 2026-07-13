@@ -180,7 +180,7 @@ write_filtered_output() {
   local output_path="$2"
 
   awk '
-    /^Monitor duration=/ {
+    /Monitor duration=/ {
       seen_monitor = 1
       print
       next

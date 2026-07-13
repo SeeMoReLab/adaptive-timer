@@ -6,17 +6,37 @@
       Replica IDs are global IDs (0..N-1).
 
       Network precedence per phase: edge > source > global.
+      Network delay semantics:
+        - <globalNetworkDelay>/<delayMs> is a constant base one-way packet delay.
+        - Per-phase network <delayMs> is an extra delay during slow bursts.
+        - <burstDurationMs> and <burstIntervalMs> define burst scheduling:
+          one slow burst is placed at a deterministic-random start time within
+          each interval fully contained in the phase.
+        - During a burst: delay = globalNetworkDelay + phase delayMs.
+          Outside bursts: delay = globalNetworkDelay.
+        - Set both burst fields to 0 to disable phase network bursts.
+          If burstDurationMs >= burstIntervalMs, the edge is continuously slow.
       Protocol precedence per phase: replica override > global default.
+      Proposal delay:
+        - <interval> repeats the proposal-delay phase every N seconds until the
+          next phase starts. <intervalMs> can be used for millisecond precision.
+        - For <id>leader</id>, the leader is resolved independently at each
+          interval tick.
 
       Phase timing:
         - Preferred: <atTime> means "activate this phase at t seconds from start".
         - Legacy: <time> is interpreted as phase duration by the network applier.
     -->
 
-    <schemaVersion>2</schemaVersion>
+    <schemaVersion>4</schemaVersion>
     <replicaIdType>global</replicaIdType>
     <!-- Warm-up period in seconds: no failure behavior is active during this time. -->
     <warmUpTime>10</warmUpTime>
+
+    <!-- Constant one-way packet delay applied for the whole experiment. -->
+    <globalNetworkDelay>
+        <delayMs>5</delayMs>
+    </globalNetworkDelay>
 
     <phases>
         <!-- Base case -->
@@ -28,31 +48,34 @@
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
 
-                <!-- Applied to all directed edges unless overridden -->
+                <!-- Extra burst delay applied to all directed edges unless overridden -->
                 <global>
                     <delayMs>0</delayMs>
-                    <lossPct>0</lossPct>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
                 </global>
 
-                <!-- Applied to all outgoing edges from src unless overridden by edge -->
+                <!-- Extra burst delay applied to all outgoing edges from src unless overridden by edge -->
                 <sources>
                     <!--
                     <source>
                         <src>0</src>
                         <delayMs>0</delayMs>
-                        <lossPct>0</lossPct>
+                        <burstDurationMs>0</burstDurationMs>
+                        <burstIntervalMs>0</burstIntervalMs>
                     </source>
                     -->
                 </sources>
 
-                <!-- Applied to one directed edge (src -> dst) -->
+                <!-- Extra burst delay applied to one directed edge (src -> dst) -->
                 <edges>
                     <!--
                     <edge>
                         <src>0</src>
                         <dst>1</dst>
                         <delayMs>0</delayMs>
-                        <lossPct>0</lossPct>
+                        <burstDurationMs>0</burstDurationMs>
+                        <burstIntervalMs>0</burstIntervalMs>
                     </edge>
                     -->
                 </edges>
@@ -63,8 +86,8 @@
                   Proposal-delay behavior:
                     enabled for listed replica IDs.
                     Special ID "leader" means:
-                    snapshot phase-start leader and target leader + next (f-1) replicas
-                    in current view order for the whole phase.
+                    snapshot the active phase or interval-tick leader and target
+                    leader + next (f-1) replicas in current view order.
                 -->
                 <proposalDelay>
                     <replicas>
@@ -107,7 +130,6 @@
             </agent>
         </phase>
 
-        <!-- Small proposal delay -->
         <phase>
             <atTime>300</atTime>
             <network>
@@ -116,12 +138,14 @@
 
                 <global>
                     <delayMs>0</delayMs>
-                    <lossPct>0</lossPct>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
                 </global>
             </network>
 
             <pbft>
                 <proposalDelay>
+                    <interval>60</interval>
                     <replicas>
                         <replica>
                             <id>leader</id>
@@ -133,216 +157,25 @@
         </phase>
 
         <phase>
-            <atTime>420</atTime>
+            <atTime>600</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
 
                 <global>
                     <delayMs>0</delayMs>
-                    <lossPct>0</lossPct>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
                 </global>
             </network>
 
             <pbft>
                 <proposalDelay>
+                    <interval>60</interval>
                     <replicas>
                         <replica>
                             <id>leader</id>
-                            <delayMs>300</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </pbft>
-        </phase>
-
-        <phase>
-            <atTime>540</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>0</delayMs>
-                    <lossPct>0</lossPct>
-                </global>
-            </network>
-
-            <pbft>
-                <proposalDelay>
-                    <replicas>
-                        <replica>
-                            <id>leader</id>
-                            <delayMs>300</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </pbft>
-        </phase>
-
-        <phase>
-            <atTime>660</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>0</delayMs>
-                    <lossPct>0</lossPct>
-                </global>
-            </network>
-
-            <pbft>
-                <proposalDelay>
-                    <replicas>
-                        <replica>
-                            <id>leader</id>
-                            <delayMs>300</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </pbft>
-        </phase>
-
-        <phase>
-            <atTime>780</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>0</delayMs>
-                    <lossPct>0</lossPct>
-                </global>
-            </network>
-
-            <pbft>
-                <proposalDelay>
-                    <replicas>
-                        <replica>
-                            <id>leader</id>
-                            <delayMs>300</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </pbft>
-        </phase>
-
-        <!-- Large proposal delay -->
-        <phase>
-            <atTime>900</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>0</delayMs>
-                    <lossPct>0</lossPct>
-                </global>
-            </network>
-
-            <pbft>
-                <proposalDelay>
-                    <replicas>
-                        <replica>
-                            <id>leader</id>
-                            <delayMs>900</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </pbft>
-        </phase>
-
-        <phase>
-            <atTime>1020</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>0</delayMs>
-                    <lossPct>0</lossPct>
-                </global>
-            </network>
-
-            <pbft>
-                <proposalDelay>
-                    <replicas>
-                        <replica>
-                            <id>leader</id>
-                            <delayMs>900</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </pbft>
-        </phase>
-
-        <phase>
-            <atTime>1140</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>0</delayMs>
-                    <lossPct>0</lossPct>
-                </global>
-            </network>
-
-            <pbft>
-                <proposalDelay>
-                    <replicas>
-                        <replica>
-                            <id>leader</id>
-                            <delayMs>900</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </pbft>
-        </phase>
-
-        <phase>
-            <atTime>1260</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>0</delayMs>
-                    <lossPct>0</lossPct>
-                </global>
-            </network>
-
-            <pbft>
-                <proposalDelay>
-                    <replicas>
-                        <replica>
-                            <id>leader</id>
-                            <delayMs>900</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </pbft>
-        </phase>
-
-        <phase>
-            <atTime>1380</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>0</delayMs>
-                    <lossPct>0</lossPct>
-                </global>
-            </network>
-
-            <pbft>
-                <proposalDelay>
-                    <replicas>
-                        <replica>
-                            <id>leader</id>
-                            <delayMs>900</delayMs>
+                            <delayMs>600</delayMs>
                         </replica>
                     </replicas>
                 </proposalDelay>
@@ -351,6 +184,34 @@
 
         <!-- Small network delay -->
         <phase>
+            <atTime>900</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>50</delayMs>
+                    <burstDurationMs>1000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+            </network>
+        </phase>
+
+        <phase>
+            <atTime>1200</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>150</delayMs>
+                    <burstDurationMs>250</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+            </network>
+        </phase>
+
+        <phase>
             <atTime>1500</atTime>
             <network>
                 <directedEdges>true</directedEdges>
@@ -358,12 +219,24 @@
 
                 <global>
                     <delayMs>50</delayMs>
-                    <lossPct>0</lossPct>
+                    <burstDurationMs>1000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
                 </global>
             </network>
+
+            <pbft>
+                <proposalDelay>
+                    <interval>60</interval>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>300</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
         </phase>
 
-        <!-- Small network delay + small proposal delay -->
         <phase>
             <atTime>1800</atTime>
             <network>
@@ -371,109 +244,15 @@
                 <precedence>global,source,edge</precedence>
 
                 <global>
-                    <delayMs>50</delayMs>
-                    <lossPct>0</lossPct>
+                    <delayMs>150</delayMs>
+                    <burstDurationMs>250</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
                 </global>
             </network>
 
             <pbft>
                 <proposalDelay>
-                    <replicas>
-                        <replica>
-                            <id>leader</id>
-                            <delayMs>300</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </pbft>
-        </phase>
-
-        <phase>
-            <atTime>1920</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>50</delayMs>
-                    <lossPct>0</lossPct>
-                </global>
-            </network>
-
-            <pbft>
-                <proposalDelay>
-                    <replicas>
-                        <replica>
-                            <id>leader</id>
-                            <delayMs>300</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </pbft>
-        </phase>
-
-        <phase>
-            <atTime>2040</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>50</delayMs>
-                    <lossPct>0</lossPct>
-                </global>
-            </network>
-
-            <pbft>
-                <proposalDelay>
-                    <replicas>
-                        <replica>
-                            <id>leader</id>
-                            <delayMs>300</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </pbft>
-        </phase>
-
-        <phase>
-            <atTime>2160</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>50</delayMs>
-                    <lossPct>0</lossPct>
-                </global>
-            </network>
-
-            <pbft>
-                <proposalDelay>
-                    <replicas>
-                        <replica>
-                            <id>leader</id>
-                            <delayMs>300</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </pbft>
-        </phase>
-
-        <phase>
-            <atTime>2280</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>50</delayMs>
-                    <lossPct>0</lossPct>
-                </global>
-            </network>
-
-            <pbft>
-                <proposalDelay>
+                    <interval>60</interval>
                     <replicas>
                         <replica>
                             <id>leader</id>
@@ -486,27 +265,29 @@
 
         <!-- Large network delay -->
         <phase>
-            <atTime>2400</atTime>
+            <atTime>2100</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
 
                 <global>
                     <delayMs>150</delayMs>
-                    <lossPct>0</lossPct>
+                    <burstDurationMs>1000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
                 </global>
             </network>
         </phase>
 
         <phase>
-            <atTime>3300</atTime>
+            <atTime>2400</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
 
                 <global>
                     <delayMs>0</delayMs>
-                    <lossPct>0</lossPct>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
                 </global>
             </network>
         </phase>

@@ -6,6 +6,16 @@
       Replica IDs are global IDs (0..N-1).
 
       Network precedence per phase: edge > source > global.
+      Network delay semantics:
+        - <globalNetworkDelay>/<delayMs> is a constant base one-way packet delay.
+        - Per-phase network <delayMs> is an extra delay during slow bursts.
+        - <burstDurationMs> and <burstIntervalMs> define burst scheduling:
+          one slow burst is placed at a deterministic-random start time within
+          each interval fully contained in the phase.
+        - During a burst: delay = globalNetworkDelay + phase delayMs.
+          Outside bursts: delay = globalNetworkDelay.
+        - Set both burst fields to 0 to disable phase network bursts.
+          If burstDurationMs >= burstIntervalMs, the edge is continuously slow.
       Protocol precedence per phase: replica override > global default.
 
       Phase timing:
@@ -13,10 +23,15 @@
         - Legacy: <time> is interpreted as phase duration by the network applier.
     -->
 
-    <schemaVersion>2</schemaVersion>
+    <schemaVersion>4</schemaVersion>
     <replicaIdType>global</replicaIdType>
     <!-- Warm-up period in seconds: no failure behavior is active during this time. -->
     <warmUpTime>10</warmUpTime>
+
+    <!-- Constant one-way packet delay applied for the whole experiment. -->
+    <globalNetworkDelay>
+        <delayMs>0</delayMs>
+    </globalNetworkDelay>
 
     <phases>
         <!-- Base case -->
@@ -28,31 +43,34 @@
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
 
-                <!-- Applied to all directed edges unless overridden -->
+                <!-- Extra burst delay applied to all directed edges unless overridden -->
                 <global>
                     <delayMs>0</delayMs>
-                    <lossPct>0</lossPct>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
                 </global>
 
-                <!-- Applied to all outgoing edges from src unless overridden by edge -->
+                <!-- Extra burst delay applied to all outgoing edges from src unless overridden by edge -->
                 <sources>
                     <!--
                     <source>
                         <src>0</src>
                         <delayMs>0</delayMs>
-                        <lossPct>0</lossPct>
+                        <burstDurationMs>0</burstDurationMs>
+                        <burstIntervalMs>0</burstIntervalMs>
                     </source>
                     -->
                 </sources>
 
-                <!-- Applied to one directed edge (src -> dst) -->
+                <!-- Extra burst delay applied to one directed edge (src -> dst) -->
                 <edges>
                     <!--
                     <edge>
                         <src>0</src>
                         <dst>1</dst>
                         <delayMs>0</delayMs>
-                        <lossPct>0</lossPct>
+                        <burstDurationMs>0</burstDurationMs>
+                        <burstIntervalMs>0</burstIntervalMs>
                     </edge>
                     -->
                 </edges>
@@ -111,7 +129,8 @@
 
                 <global>
                     <delayMs>0</delayMs>
-                    <lossPct>0</lossPct>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
                 </global>
             </network>
 
@@ -131,7 +150,8 @@
 
                 <global>
                     <delayMs>0</delayMs>
-                    <lossPct>0</lossPct>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
                 </global>
             </network>
 
@@ -151,7 +171,8 @@
 
                 <global>
                     <delayMs>150</delayMs>
-                    <lossPct>0</lossPct>
+                    <burstDurationMs>200</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
                 </global>
             </network>
         </phase>
@@ -165,7 +186,8 @@
 
                 <global>
                     <delayMs>50</delayMs>
-                    <lossPct>0</lossPct>
+                    <burstDurationMs>200</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
                 </global>
             </network>
 
@@ -185,7 +207,8 @@
 
                 <global>
                     <delayMs>150</delayMs>
-                    <lossPct>0</lossPct>
+                    <burstDurationMs>500</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
                 </global>
             </network>
         </phase>

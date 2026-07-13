@@ -510,9 +510,8 @@ def plot_prediction_phases(data_dict: Dict[Tuple[int, str], List[float]], save_p
     plt.close(fig)
 
 def main() -> None:
-    set_seed(11)
-
     args = _build_parser().parse_args()
+    set_seed(args.seed)
     print(f'Initiating Experiment [Model:] {args.model} [Protocol:] {args.protocol} [Phases:] {args.phases} ')
 
     # 1. Initialization
@@ -522,7 +521,13 @@ def main() -> None:
     )
     scaler = QuadraticRewardScaler.transform if args.reward_scaler == "quadratic" else None
 
-    if args.model in (ThompsonSamplingModel, ThompsonSamplingModelOld):
+    if args.model is ThompsonSamplingModel:
+        model = args.model(
+            action_dim=get_action_space_size(_parse_protocol(args.protocol)),
+            n_features=get_report_feature_dim(_parse_protocol(args.protocol)),
+            seed=args.seed,
+        )
+    elif args.model is ThompsonSamplingModelOld:
         model = args.model(
             action_dim=get_action_space_size(_parse_protocol(args.protocol)),
             n_features=get_report_feature_dim(_parse_protocol(args.protocol)),

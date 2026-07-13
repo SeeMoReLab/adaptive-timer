@@ -1034,22 +1034,24 @@ class ThompsonSamplingModelOld(TensorModel):
         }
 
 
-class ThompsonSamplingModel(TensorModel): 
+class ThompsonSamplingModelv01(TensorModel):
     def __init__(
-        self, 
-        action_dim: int, 
+        self,
+        action_dim: int,
         n_features: int,
-        n_heads: int = 10,
+        n_heads: int = 100,
+        seed: Optional[int] = None,
     ):
         if action_dim <= 0:
             raise ValueError(f"action_dim must be > 0, got {action_dim}")
         if n_heads <= 0:
             raise ValueError(f"n_heads must be > 0, got {n_heads}")
-        
+
         self._act_dim = int(action_dim)
         self._obs_dim = int(n_features)
         self._n_heads = int(n_heads)
-        self._max_bucket_size = 256
+        self._max_bucket_size = 32
+        self._seed = seed
 
         self.reset_model()
 
@@ -1087,9 +1089,9 @@ class ThompsonSamplingModel(TensorModel):
         for i in range(batch_size):
             row_preds = predictions_stacked[i]
             tied_indices = np.flatnonzero(np.isclose(row_preds, np.max(row_preds)))
-            
+
             if len(tied_indices) > 1:
-                best_index = np.random.choice(tied_indices, replace=True)
+                best_index = self._rng.choice(tied_indices)
                 predictions_stacked[i, best_index] += 1e-5
 
         q_values = torch.tensor(predictions_stacked, device=features.device, dtype=torch.float32)
@@ -1137,7 +1139,14 @@ class ThompsonSamplingModel(TensorModel):
             X_actions = np.array(self.memory["actions"]).reshape(-1, 1)
             X = np.hstack((X_features, X_actions))
             y = np.array(self.memory["rewards"])
-            
+
+            # GIRO: https://arxiv.org/pdf/1811.05154
+            # Optimistic pseudo-reward is the max reward in the sliding window
+            # X = np.tile(X, (3, 1))
+            # y = np.concatenate(
+            #     [np.zeros_like(y), y, np.full_like(y, np.max(y))]
+            # )
+
             for head_index, model in enumerate(self.models):
                 idx = self._rng.choice(len(X), size=len(X), replace=True)
                 model.fit(X[idx], y[idx])
@@ -1146,12 +1155,12 @@ class ThompsonSamplingModel(TensorModel):
         return 0.0
 
     def reset_model(self) -> None:
-        self._rng = np.random.default_rng()
+        self._rng = np.random.default_rng(self._seed)
         self.models = [
             DecisionTreeRegressor(
                 criterion='squared_error',
                 max_depth=6,
-                min_samples_leaf=1,
+                min_samples_leaf=6,
                 min_impurity_decrease=0.01,
                 random_state=head_index,
             )
@@ -1167,7 +1176,162 @@ class ThompsonSamplingModel(TensorModel):
             "rewards": deque(maxlen=self._max_bucket_size)
         }
 
-class MultiHeadThompsonSamplingModel(ThompsonSamplingModel): 
+class ThompsonSamplingModel(TensorModel):
+    """Per-arm bootstrapped-tree CMAB (contextual GIRO structure).
+
+    Each arm keeps its own sliding window of (features, reward) pairs and its
+    own ensemble of trees, each head fit on a bootstrap resample of that arm's
+    window. Prediction draws one head per arm independently and the caller
+    pulls the argmax across arms.
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        n_features: int,
+        n_heads: int = 100,
+        seed: Optional[int] = None,
+    ):
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        if n_heads <= 0:
+            raise ValueError(f"n_heads must be > 0, got {n_heads}")
+
+        self._act_dim = int(action_dim)
+        self._obs_dim = int(n_features)
+        self._n_heads = int(n_heads)
+        self._max_bucket_size = 32
+        self._seed = seed
+
+        self.reset_model()
+
+    def predict_action(self, features: torch.Tensor, e = 0.5) -> torch.Tensor:
+        """e-TS: with probability e take the Thompson draw (one bootstrap head
+        per arm); with probability 1-e exploit the arm with the highest
+        empirical mean over its reward sliding window."""
+        features_np = features.cpu().numpy()
+        if features_np.ndim == 1:
+            features_np = features_np.reshape(1, -1)
+
+        batch_size = features_np.shape[0]
+        predictions_stacked = np.zeros((batch_size, self._act_dim), dtype=float)
+        # One independent head (bootstrap draw) per arm, per row.
+        sampled_heads = self._rng.integers(
+            0, self._n_heads, size=(batch_size, self._act_dim)
+        )
+        explore = self._rng.random(batch_size) < e
+
+        for i in range(batch_size):
+            row = features_np[i : i + 1]
+            for arm in range(self._act_dim):
+                if not self.is_fitted[arm]:
+                    # Arm without a fitted window yet: force a pull.
+                    predictions_stacked[i, arm] = 1e9
+                    continue
+                if explore[i]:
+                    head = self.models[arm][sampled_heads[i, arm]]
+                    predictions_stacked[i, arm] = head.predict(row)[0]
+                else:
+                    predictions_stacked[i, arm] = float(
+                        np.mean(self.memory[arm]["rewards"])
+                    )
+
+        for i in range(batch_size):
+            row_preds = predictions_stacked[i]
+            tied_indices = np.flatnonzero(np.isclose(row_preds, np.max(row_preds)))
+
+            if len(tied_indices) > 1:
+                best_index = self._rng.choice(tied_indices)
+                predictions_stacked[i, best_index] += 1e-5
+
+        q_values = torch.tensor(predictions_stacked, device=features.device, dtype=torch.float32)
+        return q_values
+
+    def update_model(
+        self, features: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor | float, backward: bool = True
+    ) -> float:
+        features_np = features.cpu().numpy()
+        if features_np.ndim == 1:
+            features_np = features_np.reshape(1, -1)
+            
+        if isinstance(actions, torch.Tensor):
+            actions_np = actions.cpu().numpy().astype(int).flatten()
+        else:
+            actions_np = np.array([int(actions)])
+            
+        if isinstance(rewards, torch.Tensor):
+            rewards_np = rewards.cpu().numpy().flatten()
+        else:
+            rewards_np = np.full(len(actions_np), float(rewards))
+
+        if len(actions_np) == 1 and features_np.shape[0] > 1:
+            actions_np = np.repeat(actions_np, features_np.shape[0])
+        if len(rewards_np) == 1 and features_np.shape[0] > 1:
+            rewards_np = np.repeat(rewards_np, features_np.shape[0])
+        if len(actions_np) != features_np.shape[0]:
+            raise ValueError(
+                "actions batch size mismatch: "
+                f"expected {features_np.shape[0]}, got {len(actions_np)}"
+            )
+        if len(rewards_np) != features_np.shape[0]:
+            raise ValueError(
+                "rewards batch size mismatch: "
+                f"expected {features_np.shape[0]}, got {len(rewards_np)}"
+            )
+
+        for i in range(len(actions_np)):
+            arm = int(actions_np[i])
+            if not 0 <= arm < self._act_dim:
+                raise ValueError(f"action out of range: {arm}")
+            self.memory[arm]["features"].append(features_np[i])
+            self.memory[arm]["rewards"].append(rewards_np[i])
+
+        if backward:
+            window_max = max(
+                (max(m["rewards"]) for m in self.memory if m["rewards"]),
+                default=0.0,
+            )
+                                    
+            for arm in sorted({int(a) for a in actions_np}):
+                X = np.array(self.memory[arm]["features"])
+                y = np.array(self.memory[arm]["rewards"])
+
+                            
+                for model in self.models[arm]:
+                    idx = self._rng.choice(len(X), size=len(X), replace=True)
+                    model.fit(X[idx], y[idx])
+                self.is_fitted[arm] = True
+
+        return 0.0
+
+    def reset_model(self) -> None:
+        self._rng = np.random.default_rng(self._seed)
+        self.models = [
+            [
+                DecisionTreeRegressor(
+                    criterion='squared_error',
+                    max_depth=6,
+                    min_samples_leaf=6,
+                    min_impurity_decrease=0.01,
+                    random_state=arm_index * self._n_heads + head_index,
+                )
+                for head_index in range(self._n_heads)
+            ]
+            for arm_index in range(self._act_dim)
+        ]
+        self.is_fitted = [False] * self._act_dim
+        self._init_buckets()
+
+    def _init_buckets(self):
+        self.memory = [
+            {
+                "features": deque(maxlen=self._max_bucket_size),
+                "rewards": deque(maxlen=self._max_bucket_size),
+            }
+            for _ in range(self._act_dim)
+        ]
+
+class MultiHeadThompsonSamplingModel(ThompsonSamplingModel):
     """Backward-compatible name for the bootstrapped ensemble CMAB model."""
 
     def __init__(

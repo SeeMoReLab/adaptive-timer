@@ -1690,6 +1690,7 @@ def serve(
         model = ThompsonSamplingModel(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
+            seed=42,
         )
     elif model_type == "cmab_old":
         model = ThompsonSamplingModelOld(

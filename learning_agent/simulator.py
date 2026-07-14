@@ -549,6 +549,7 @@ def main() -> None:
     curr_timeout = None
     
     accuracy = []
+    delay_accuracy = []
     result = {}
     raw_result = {}
     predictions = {}
@@ -648,6 +649,8 @@ def main() -> None:
         phase_avg_acc = sum(phase_accuracy) / len(phase_accuracy)
         result[(idx, phase)] = phase_avg_acc
         accuracy.append(phase_avg_acc)
+        if PHASE_INDEX_TO_TIMEOUT_INDEX[int(phase)] != 0:
+            delay_accuracy.append(phase_avg_acc)
 
     plot_accuracy(result=result, save_path=os.path.join(exp_path, 'summary_accuracies.png'))
     plot_stage_accuracies(data_dict=raw_result, save_path=os.path.join(exp_path, 'episode_accuracies.png'))
@@ -683,7 +686,11 @@ def main() -> None:
     print(
         f"[Overall Metrics:]\t"
         f"accuracy={(sum(accuracy) / len(accuracy)):.4f} (std={np.std(accuracy):.4f}), "
-        f"conv_eps={avg_eps:.1f} (std={std_eps:.1f}, med={med_eps:.1f}, max={max_eps:.1f}), "
+        + (
+            f"delay_accuracy={(sum(delay_accuracy) / len(delay_accuracy)):.4f} (std={np.std(delay_accuracy):.4f}), "
+            if delay_accuracy else ""
+        )
+        + f"conv_eps={avg_eps:.1f} (std={std_eps:.1f}, med={med_eps:.1f}, max={max_eps:.1f}), "
         f"conv_time={avg_ms:.2f} (std={std_ms:.2f}, med={med_ms:.2f}, max={max_ms:.2f}), "
         f"[Computation Overheads:]\t"
         f"inference={avg_inf:.2f}ms (std={std_inf:.2f}, med={med_inf:.2f}, max={max_inf:.2f}), "

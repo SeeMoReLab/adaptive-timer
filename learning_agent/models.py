@@ -62,7 +62,10 @@ class PhaseMapping(IntEnum):
     PHASE_2 = PbftTimeoutOption.TIMEOUT_300_MS
     PHASE_3 = PbftTimeoutOption.TIMEOUT_800_MS
     PHASE_4 = PbftTimeoutOption.TIMEOUT_800_MS
-    PHASE_5 = PbftTimeoutOption.TIMEOUT_1800_MS
+    PHASE_5 = PbftTimeoutOption.TIMEOUT_800_MS
+    PHASE_6 = PbftTimeoutOption.TIMEOUT_800_MS
+    PHASE_7 = PbftTimeoutOption.TIMEOUT_1800_MS
+    PHASE_8 = PbftTimeoutOption.TIMEOUT_300_MS
 
 PHASE_OPTIONS: Tuple[PhaseMapping, ...] = (
     PhaseMapping.PHASE_0,
@@ -71,6 +74,9 @@ PHASE_OPTIONS: Tuple[PhaseMapping, ...] = (
     PhaseMapping.PHASE_3,
     PhaseMapping.PHASE_4,
     PhaseMapping.PHASE_5,
+    PhaseMapping.PHASE_6,
+    PhaseMapping.PHASE_7,
+    PhaseMapping.PHASE_8,
 )
 
 PHASE_VALUES_MS: Tuple[int, ...] = tuple(int(option) for option in PHASE_OPTIONS)
@@ -1205,7 +1211,7 @@ class ThompsonSamplingModel(TensorModel):
 
         self.reset_model()
 
-    def predict_action(self, features: torch.Tensor, e = 0.5) -> torch.Tensor:
+    def predict_action(self, features: torch.Tensor, e = 0.25) -> torch.Tensor:
         """e-TS: with probability e take the Thompson draw (one bootstrap head
         per arm); with probability 1-e exploit the arm with the highest
         empirical mean over its reward sliding window."""
@@ -1295,7 +1301,7 @@ class ThompsonSamplingModel(TensorModel):
             for arm in sorted({int(a) for a in actions_np}):
                 X = np.array(self.memory[arm]["features"])
                 y = np.array(self.memory[arm]["rewards"])
-
+        
                             
                 for model in self.models[arm]:
                     idx = self._rng.choice(len(X), size=len(X), replace=True)

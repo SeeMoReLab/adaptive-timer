@@ -286,31 +286,6 @@ def _extract_action_index(
         )
         return _timeout_ms_to_index(election_timeout_ms, timeout_values_ms, row_number)
 
-    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
-        election_timeout_ms = _parse_timeout_ms(
-            row=row,
-            candidates=(
-                "election_timeout_milliseconds_used",
-                "election_timeout_milliseconds",
-            ),
-            row_number=row_number,
-        )
-        prepare_timeout_ms = _parse_timeout_ms(
-            row=row,
-            candidates=(
-                "prepare_timeout_milliseconds_used",
-                "prepare_timeout_milliseconds",
-            ),
-            row_number=row_number,
-        )
-        election_idx = _timeout_ms_to_index(
-            election_timeout_ms, timeout_values_ms, row_number
-        )
-        prepare_idx = _timeout_ms_to_index(
-            prepare_timeout_ms, timeout_values_ms, row_number
-        )
-        return election_idx * len(timeout_values_ms) + prepare_idx
-
     if protocol == agent_pb2.PROTOCOL_SBFT:
         election_timeout_ms = _parse_timeout_ms(
             row=row,

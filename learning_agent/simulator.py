@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import torch
@@ -55,7 +56,7 @@ PROTOCOL_NAME_TO_ENUM = {
 
 MODEL_NAME_TO_TENSORMODEL = {
     "linear": LinearTorchModel,
-    "cmab": ThompsonSamplingModel,
+    "cmab": ThompsonSamplingModel,       # FC-TS (faithful, recurring regimes)
     "cmab_old": ThompsonSamplingModelOld,
 }
 
@@ -82,7 +83,7 @@ def _parse_protocol(value: str) -> int:
 def _parse_model(value: str) -> TensorModel:
     model = MODEL_NAME_TO_TENSORMODEL.get(value.strip().lower())
     if model is None:
-        valid = ", ".join(sorted({"linear", 'svm',"ppo","cmab", "cmab_old"}))
+        valid = ", ".join(sorted({"linear", "cmab", "cmab_v03", "cmab_old"}))
         raise argparse.ArgumentTypeError(
             f"Unsupported model '{value}'. Valid options: {valid}"
         )
@@ -207,6 +208,26 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("raw", "quadratic"),
         default="raw",
         help="How to scale reward column before training.",
+    )
+    parser.add_argument(
+        "--reward-noise",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply deployment-calibrated noise to synthetic rewards "
+             "(per-phase failure-episode probability + steady jitter, "
+             "measured on local/epsilon25). Use --no-reward-noise to disable.",
+    )
+    parser.add_argument(
+        "--metrics-out",
+        type=str,
+        default=None,
+        help="If set, write the run's config + summary metrics as JSON to this path "
+             "(machine-readable output for hyperparameter sweeps).",
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Skip writing the summary/episode/prediction PNGs (faster for sweeps).",
     )
 
     return parser
@@ -453,58 +474,74 @@ def plot_prediction_phases(data_dict: Dict[Tuple[int, str], List[float]], save_p
         'axes.spines.right': False
     })
 
-    fig, ax = plt.subplots()
-    
-    current_x = 0
+    single_color = '#1f77b4'
+
+    sorted_keys = sorted(data_dict.items(), key=lambda item: item[0][0])
+
+    # Each stored prediction is a per-episode vector with one entry per agent
+    # (the row order of the eval batch). Plot each agent on its own subplot.
+    n_agents = 1
+    for _, preds in sorted_keys:
+        for ep in preds:
+            if isinstance(ep, (list, tuple, np.ndarray)):
+                n_agents = max(n_agents, len(ep))
+
+    def _val(ep, a):
+        if isinstance(ep, (list, tuple, np.ndarray)):
+            return ep[a] if a < len(ep) else np.nan
+        return ep if a == 0 else np.nan
+
+    fig, axes = plt.subplots(
+        n_agents, 1, sharex=True, sharey=True,
+        figsize=(12.0, max(2.2 * n_agents, 3.0)),
+    )
+    if n_agents == 1:
+        axes = [axes]
+
     x_ticks = []
     x_labels = []
     all_predictions = []
-    
-    single_color = '#1f77b4' 
-    
-    sorted_keys = sorted(data_dict.items(), key=lambda item: item[0][0])
-    
-    for i, (key, predictions) in enumerate(sorted_keys):
-        stage_idx, phase_id = key
-        n_points = len(predictions)
-        all_predictions.extend(predictions)
-        
-        x_coords = range(current_x, current_x + n_points)
-        
-        label = 'Predicted Timeout' if i == 0 else None
-        
-        ax.plot(x_coords, predictions, marker='o', linestyle='', 
-                color=single_color, 
-                label=label,
-                alpha=0.5) 
-        
-        middle_x = current_x + (n_points / 2) - 0.5
-        x_ticks.append(middle_x)
-        x_labels.append(f'{phase_id}')
-        
-        current_x += n_points
-        
-        if i < len(sorted_keys) - 1:
-            ax.axvline(x=current_x - 0.5, color='gray', linestyle='--', alpha=1.0)
+
+    for a, ax in enumerate(axes):
+        current_x = 0
+        for i, (key, preds) in enumerate(sorted_keys):
+            stage_idx, phase_id = key
+            series = [_val(ep, a) for ep in preds]
+            n_points = len(series)
+            x_coords = range(current_x, current_x + n_points)
+
+            ax.plot(x_coords, series, marker='o', linestyle='',
+                    color=single_color, alpha=0.5)
+
+            if a == 0:
+                all_predictions.extend(v for v in series if v == v)
+            if a == len(axes) - 1:
+                x_ticks.append(current_x + (n_points / 2) - 0.5)
+                x_labels.append(f'{phase_id}')
+
+            current_x += n_points
+            if i < len(sorted_keys) - 1:
+                ax.axvline(x=current_x - 0.5, color='gray', linestyle='--', alpha=1.0)
+
+        ax.set_ylabel(f'Agent {a}')
+        ax.grid(True, linestyle=':', alpha=0.6, axis='y')
 
     if y_ticks is not None:
-        ax.set_yticks(y_ticks)
-    else:
+        for ax in axes:
+            ax.set_yticks(y_ticks)
+    elif all_predictions:
         unique_preds = np.unique(all_predictions)
-        ax.set_yticks(unique_preds)
         y_min, y_max = min(unique_preds), max(unique_preds)
         padding = (y_max - y_min) * 0.1 if y_max != y_min else 10
-        ax.set_ylim(y_min - padding, y_max + padding)
+        for ax in axes:
+            ax.set_yticks(unique_preds)
+            ax.set_ylim(y_min - padding, y_max + padding)
 
-    ax.set_xlabel('Phase')
-    ax.set_ylabel('Predicted Value')
-    
-    ax.set_xticks(x_ticks)
-    ax.set_xticklabels(x_labels)
-    
-    ax.grid(True, linestyle=':', alpha=0.6, axis='y')
-    ax.legend(frameon=False, loc='lower right')
-    
+    axes[-1].set_xlabel('Phase')
+    axes[-1].set_xticks(x_ticks)
+    axes[-1].set_xticklabels(x_labels)
+    fig.supylabel('Predicted Value')
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
@@ -516,16 +553,17 @@ def main() -> None:
 
     # 1. Initialization
     generator = DataGenerator(
-        protocol=args.protocol, 
-        directory_path=args.data_dir, 
+        protocol=args.protocol,
+        directory_path=args.data_dir,
+        reward_noise=args.reward_noise,
     )
     scaler = QuadraticRewardScaler.transform if args.reward_scaler == "quadratic" else None
 
-    if args.model is ThompsonSamplingModel:
+    if args.model in (ThompsonSamplingModel, ThompsonSamplingModelv03):
         model = args.model(
             action_dim=get_action_space_size(_parse_protocol(args.protocol)),
             n_features=get_report_feature_dim(_parse_protocol(args.protocol)),
-            seed=args.seed,
+            seed=args.seed
         )
     elif args.model is ThompsonSamplingModelOld:
         model = args.model(
@@ -652,9 +690,10 @@ def main() -> None:
         if PHASE_INDEX_TO_TIMEOUT_INDEX[int(phase)] != 0:
             delay_accuracy.append(phase_avg_acc)
 
-    plot_accuracy(result=result, save_path=os.path.join(exp_path, 'summary_accuracies.png'))
-    plot_stage_accuracies(data_dict=raw_result, save_path=os.path.join(exp_path, 'episode_accuracies.png'))
-    plot_prediction_phases(data_dict=predictions, save_path=os.path.join(exp_path, 'predictions.png'), y_ticks=[300, 800, 1800])
+    if not args.no_plots:
+        plot_accuracy(result=result, save_path=os.path.join(exp_path, 'summary_accuracies.png'))
+        plot_stage_accuracies(data_dict=raw_result, save_path=os.path.join(exp_path, 'episode_accuracies.png'))
+        plot_prediction_phases(data_dict=predictions, save_path=os.path.join(exp_path, 'predictions.png'), y_ticks=[300, 800, 1800])
 
     print(f"\n[SUMMARY]")
     print(f"[Experiment Configs:]\tprotocol={args.protocol}, num_episodes={args.num_episodes}, phases={args.phases}")
@@ -708,8 +747,58 @@ def main() -> None:
         f"epochs={args.epochs}, "
         f"batch_size={args.batch_size}, "
         f"seed={args.seed}, "
-        f"Data Generation temperature= 0.5"
+        f"Data Generation temperature= 0.5, "
+        f"reward_noise={args.reward_noise}"
     )
+
+    if args.metrics_out:
+        # Mean within-phase episode-accuracy std, averaged over phases: an extra
+        # stability signal (how much per-episode accuracy jitters inside a phase).
+        per_phase_ep_std = [float(np.std(v)) for v in raw_result.values() if len(v) > 1]
+        episode_acc_std = float(np.mean(per_phase_ep_std)) if per_phase_ep_std else 0.0
+        acc_mean = float(sum(accuracy) / len(accuracy)) if accuracy else 0.0
+        delay_mean = (
+            float(sum(delay_accuracy) / len(delay_accuracy)) if delay_accuracy else None
+        )
+        metrics = {
+            "config": {
+                "model": model.__class__.__name__,
+                "protocol": args.protocol,
+                "num_episodes": args.num_episodes,
+                "phases": args.phases,
+                "seed": args.seed,
+                "reward_scaler": args.reward_scaler,
+                "reward_noise": bool(args.reward_noise),
+            },
+            "metrics": {
+                "accuracy_mean": acc_mean,
+                "accuracy_std": float(np.std(accuracy)) if accuracy else 0.0,
+                "delay_accuracy_mean": delay_mean,
+                "delay_accuracy_std": (
+                    float(np.std(delay_accuracy)) if delay_accuracy else None
+                ),
+                "episode_acc_std": episode_acc_std,
+                "conv_eps_mean": float(avg_eps),
+                "conv_eps_std": float(std_eps),
+                "conv_eps_med": float(med_eps),
+                "conv_eps_max": float(max_eps),
+                "conv_time_mean_ms": float(avg_ms),
+                "conv_time_max_ms": float(max_ms),
+                "inference_ms_mean": float(avg_inf),
+                "training_ms_mean": float(avg_train),
+                "n_changes": int(getattr(model, "n_changes", 0)),
+                "per_phase_accuracy": {f"{i}:{p}": float(v) for (i, p), v in result.items()},
+                "per_phase_convergence": {
+                    f"{i}:{p}": {"ep": int(s["ep"]), "time_ms": float(s["time_ms"]), "converged": bool(s["converged"])}
+                    for (i, p), s in convergence_stats.items()
+                },
+            },
+        }
+        metrics_path = Path(args.metrics_out)
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(metrics_path, "w") as handle:
+            json.dump(metrics, handle, indent=2)
+        print(f"[Metrics written to:]\t{metrics_path}")
 
 if __name__ == "__main__":
     main()

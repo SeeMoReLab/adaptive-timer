@@ -49,6 +49,30 @@ STRUCTURAL_COLUMNS_PBFT: List[str] = ['reward_episode', 'report_node_id']
 
 STRUCTURAL_COLUMNS_2PC_OVER_PBFT: List[str] = ['reward_episode', 'participant_shard_id']
 
+# Per-node params: faults (proposal/network delay) hit nodes unequally, so each
+# report_node_id gets its own {phase: (p_fail, jitter)}. Applied by node when the
+# node id is known; PHASE_NOISE_PARAMS (pooled over nodes) is the fallback for
+# unknown nodes / other protocols.
+PHASE_NOISE_PARAMS_BY_NODE = {
+    1: {0: (0.03, 0.025), 1: (0.08, 0.055), 2: (0.11, 0.060), 3: (0.28, 0.296), 4: (0.25, 0.201), 5: (0.21, 0.350), 6: (0.29, 0.350), 7: (0.28, 0.350), 8: (0.00, 0.004)},
+    2: {0: (0.01, 0.028), 1: (0.12, 0.018), 2: (0.07, 0.089), 3: (0.31, 0.346), 4: (0.31, 0.198), 5: (0.36, 0.254), 6: (0.23, 0.350), 7: (0.38, 0.350), 8: (0.00, 0.004)},
+    3: {0: (0.01, 0.026), 1: (0.12, 0.026), 2: (0.18, 0.075), 3: (0.20, 0.350), 4: (0.40, 0.148), 5: (0.25, 0.350), 6: (0.10, 0.350), 7: (0.31, 0.350), 8: (0.00, 0.005)},
+    4: {0: (0.01, 0.027), 1: (0.17, 0.014), 2: (0.10, 0.018), 3: (0.35, 0.329), 4: (0.30, 0.309), 5: (0.38, 0.350), 6: (0.35, 0.346), 7: (0.29, 0.350), 8: (0.00, 0.005)},
+}
+# PHASE_NOISE_PARAMS = {
+#     0: (0.02, 0.032),
+#     1: (0.13, 0.022),
+#     2: (0.11, 0.074),
+#     3: (0.29, 0.329),
+#     4: (0.31, 0.261),
+#     5: (0.32, 0.350),
+#     6: (0.30, 0.350),
+#     7: (0.30, 0.350),
+#     8: (0.00, 0.005),
+# }
+# DEFAULT_NOISE_PARAMS = (0.25, 0.30)
+FAIL_RATIO_MAX = 0.45
+
 
 def _matched_rows(df: pd.DataFrame) -> pd.DataFrame:
     if 'matched_episode_features' not in df.columns:
@@ -78,12 +102,13 @@ class BaseDataGenerator(ABC):
 
 
 class DataGenerator(BaseDataGenerator):
-    def __init__(self, protocol: str, directory_path: str) -> None:
+    def __init__(self, protocol: str, directory_path: str, reward_noise: bool = True) -> None:
         self.directory_path = directory_path
         self.df: Optional[pd.DataFrame] = None
         self.protocol = protocol
         self.reward_models = {}
         self.reward_residuals = {}
+        self.reward_noise = reward_noise
 
         self.local_col_name = LOCAL_PBFT_COLUMNS + PBFT_REPORT_FEATURE_FIELD_NAMES
         self.local_col_ordinal = REPORT_ORDINAL_COLUMNS_PBFT
@@ -164,11 +189,14 @@ class DataGenerator(BaseDataGenerator):
         else:
             trial['election_timeout_milliseconds_used'] = 300
 
-        trial['reward'] = 0.0 
+        trial['reward'] = 0.0
 
         for idx, row in trial.iterrows():
             timeout_val = row['election_timeout_milliseconds_used']
-            single_reward = self._sample_reward_by_timeout(phase_index,timeout_val, conf_stats, n_samples=1)[0]
+            single_reward = self._sample_reward_by_timeout(
+                phase_index, timeout_val, conf_stats, n_samples=1,
+                node_id=row['report_node_id'],
+            )[0]
             trial.at[idx, 'reward'] = single_reward
 
         res = trial.assign(phase=phase_index)
@@ -226,7 +254,7 @@ class DataGenerator(BaseDataGenerator):
         else:
             trial['prepare_timeout_milliseconds_used'] = 150
 
-        trial['reward'] = 0.0 
+        trial['reward'] = 0.0
 
         for idx, row in trial.iterrows():
             timeout_val = row['prepare_timeout_milliseconds_used']
@@ -287,11 +315,37 @@ class DataGenerator(BaseDataGenerator):
 
         return pd.DataFrame(res)
     
+    def _apply_deployment_noise(self, rewards: np.ndarray, phase_index: int, node_id=None) -> np.ndarray:
+        """
+        Deployment noise: with probability p_fail the episode degrades (reward
+        drops to Uniform(0, 0.45) x its value), otherwise relative Gaussian
+        jitter is applied. Uses the calling node's per-node params when known,
+        falling back to the pooled per-phase params.
+        """
+        if not self.reward_noise or rewards.size == 0:
+            return rewards
+
+        params = None
+        if node_id is not None:
+            node_map = PHASE_NOISE_PARAMS_BY_NODE.get(int(node_id))
+            if node_map is not None:
+                params = node_map.get(int(phase_index))
+        if params is None:
+            params = PHASE_NOISE_PARAMS.get(int(phase_index), DEFAULT_NOISE_PARAMS)
+        p_fail, jitter = params
+
+        n = rewards.shape[0]
+        noisy = rewards * (1.0 + np.random.normal(0.0, jitter, size=n))
+        failed = np.random.random(n) < p_fail
+        noisy[failed] = rewards[failed] * np.random.uniform(0.0, FAIL_RATIO_MAX, size=int(failed.sum()))
+        return np.maximum(noisy, 0.0)
+
     def _sample_reward_by_timeout(
-            self, idx, timeout_val: float, conf_stats: dict, n_samples: int, temperature:float = 0.5
+            self, idx, timeout_val: float, conf_stats: dict, n_samples: int, temperature:float = 0.5, node_id=None
             ) -> np.ndarray:
         """
-        Generates rewards using a Normal distribution based on historical mean and std, 
+        Generates rewards using a Normal distribution based on historical mean and std,
+        then applies deployment-calibrated noise so the oracle arm is not always best.
         """
         if n_samples == 0:
             return np.array([])
@@ -303,17 +357,18 @@ class DataGenerator(BaseDataGenerator):
         max_val = stats.get('max', 0.0)
 
         if pd.isna(std) or std == 0:
-            jitter = abs(mean * temperature) 
-            return np.random.uniform(mean - jitter, mean + jitter, size=n_samples)
+            jitter = abs(mean * temperature)
+            sampled_rewards = np.random.uniform(mean - jitter, mean + jitter, size=n_samples)
         else:
             sampled_rewards = np.random.normal(
-                loc=mean, 
-                scale=(std * temperature), 
+                loc=mean,
+                scale=(std * temperature),
                 size=n_samples
             )
             min_val = stats.get('min', 0.0)
-            max_val = stats.get('max', 1.0) 
+            max_val = stats.get('max', 1.0)
             sampled_rewards = np.clip(sampled_rewards, min_val, max_val)
-            return sampled_rewards
+
+        return self._apply_deployment_noise(sampled_rewards, idx, node_id=node_id)
 
      

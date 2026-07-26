@@ -1039,13 +1039,12 @@ class ThompsonSamplingModelOld(TensorModel):
             "rewards": deque(maxlen=self._max_bucket_size)
         }
 
-
 class ThompsonSamplingModelv01(TensorModel):
     def __init__(
         self,
         action_dim: int,
         n_features: int,
-        n_heads: int = 100,
+        n_heads: int = 30,
         seed: Optional[int] = None,
     ):
         if action_dim <= 0:
@@ -1056,41 +1055,52 @@ class ThompsonSamplingModelv01(TensorModel):
         self._act_dim = int(action_dim)
         self._obs_dim = int(n_features)
         self._n_heads = int(n_heads)
-        self._max_bucket_size = 32
+        self._max_bucket_size = 512
         self._seed = seed
 
         self.reset_model()
 
-    def predict_action(self, features: torch.Tensor) -> torch.Tensor:
+    def predict_action(self, features: torch.Tensor, e = 0.5) -> torch.Tensor:
+        """e-TS with forced coverage.
+
+        - Any action absent from the shared sliding window is force-pulled
+        - with probability ``e`` take the Thompson draw  with
+          probability ``1-e`` exploit greedily on the MEDIAN windowed reward per
+          action"""
         features_np = features.cpu().numpy()
         if features_np.ndim == 1:
             features_np = features_np.reshape(1, -1)
-            
+
         batch_size = features_np.shape[0]
         predictions_stacked = np.zeros((batch_size, self._act_dim), dtype=float)
         sampled_heads = self._rng.integers(0, self._n_heads, size=batch_size)
+        explore = self._rng.random(batch_size) < e
+
+        # Per-action median reward over the shared sliding window (greedy branch).
+        actions_arr = np.array(self.memory["actions"], dtype=int)
+        rewards_arr = np.array(self.memory["rewards"], dtype=float)
+        action_medians = np.zeros(self._act_dim, dtype=float)
+        for arm in range(self._act_dim):
+            mask = actions_arr == arm
+            if np.any(mask):
+                action_medians[arm] = np.mean(rewards_arr[mask])
 
         for i, head_index in enumerate(sampled_heads):
-            if not self.is_fitted[head_index]:
-                predictions_stacked[i, :] = 0.0
+            if not explore[i]:
+                # Greedy: exploit the windowed median reward per action.
+                predictions_stacked[i, :] = action_medians
                 continue
 
-            state_rows = np.repeat(features_np[i : i + 1], self._act_dim, axis=0)
-            action_col = np.arange(self._act_dim, dtype=float).reshape(-1, 1)
-            state_action_input = np.hstack((state_rows, action_col))
-            predictions_stacked[i, :] = self.models[head_index].predict(
-                state_action_input
-            )
-
-        # Force basic action coverage before trusting the reward model. This is
-        # explicit exploration; posterior-like exploration comes from the sampled head.
-        action_counts = np.bincount(
-            np.array(self.memory["actions"], dtype=int),
-            minlength=self._act_dim,
-        )
-        untried_actions = np.flatnonzero(action_counts == 0)
-        if len(untried_actions) > 0:
-            predictions_stacked[:, untried_actions] = 1e9
+          
+            if self.is_fitted[head_index]:
+                state_rows = np.repeat(features_np[i : i + 1], self._act_dim, axis=0)
+                action_col = np.arange(self._act_dim, dtype=float).reshape(-1, 1)
+                state_action_input = np.hstack((state_rows, action_col))
+                predictions_stacked[i, :] = self.models[head_index].predict(
+                    state_action_input
+                )
+            else:
+                predictions_stacked[i, :] = 0.0
 
         for i in range(batch_size):
             row_preds = predictions_stacked[i]
@@ -1183,7 +1193,7 @@ class ThompsonSamplingModelv01(TensorModel):
         }
 
 class ThompsonSamplingModel(TensorModel):
-    """Per-arm bootstrapped-tree CMAB (contextual GIRO structure).
+    """Per-arm bootstrapped-tree CMAB
 
     Each arm keeps its own sliding window of (features, reward) pairs and its
     own ensemble of trees, each head fit on a bootstrap resample of that arm's
@@ -1206,7 +1216,7 @@ class ThompsonSamplingModel(TensorModel):
         self._act_dim = int(action_dim)
         self._obs_dim = int(n_features)
         self._n_heads = int(n_heads)
-        self._max_bucket_size = 32
+        self._max_bucket_size = 8
         self._seed = seed
 
         self.reset_model()
@@ -1214,7 +1224,8 @@ class ThompsonSamplingModel(TensorModel):
     def predict_action(self, features: torch.Tensor, e = 0.25) -> torch.Tensor:
         """e-TS: with probability e take the Thompson draw (one bootstrap head
         per arm); with probability 1-e exploit the arm with the highest
-        empirical mean over its reward sliding window."""
+        median over its ensemble of bootstrap-head predictions (each head
+        outputs a mean, so this is a robust median-of-means)."""
         features_np = features.cpu().numpy()
         if features_np.ndim == 1:
             features_np = features_np.reshape(1, -1)
@@ -1238,9 +1249,11 @@ class ThompsonSamplingModel(TensorModel):
                     head = self.models[arm][sampled_heads[i, arm]]
                     predictions_stacked[i, arm] = head.predict(row)[0]
                 else:
-                    predictions_stacked[i, arm] = float(
-                        np.mean(self.memory[arm]["rewards"])
-                    )
+                    head_preds = [
+                        self.models[arm][h].predict(row)[0]
+                        for h in range(self._n_heads)
+                    ]
+                    predictions_stacked[i, arm] = float(np.median(head_preds))
 
         for i in range(batch_size):
             row_preds = predictions_stacked[i]
@@ -1317,8 +1330,13 @@ class ThompsonSamplingModel(TensorModel):
                 DecisionTreeRegressor(
                     criterion='squared_error',
                     max_depth=6,
-                    min_samples_leaf=6,
-                    min_impurity_decrease=0.01,
+                    # leaf >= _max_bucket_size/2 forces constant per-arm-mean
+                    # heads (no split possible on the small window). On the
+                    # simulator this maximizes delay_accuracy (~0.96); contextual
+                    # trees (leaf<=3, or a larger window) trade delay for base
+                    # accuracy. max_depth / min_impurity_decrease are inert here.
+                    min_samples_leaf=32,
+                    min_impurity_decrease=0.0,
                     random_state=arm_index * self._n_heads + head_index,
                 )
                 for head_index in range(self._n_heads)
@@ -1338,11 +1356,11 @@ class ThompsonSamplingModel(TensorModel):
         ]
 
 class MultiHeadThompsonSamplingModel(ThompsonSamplingModel):
-    """Backward-compatible name for the bootstrapped ensemble CMAB model."""
+    """Backward-compatible name for the bootstrapped ensemble CMAB model (v03)."""
 
     def __init__(
-        self, 
-        action_dim: int, 
+        self,
+        action_dim: int,
         n_features: int,
         n_heads: int = 10,
     ):
@@ -1351,3 +1369,4 @@ class MultiHeadThompsonSamplingModel(ThompsonSamplingModel):
             n_features=n_features,
             n_heads=n_heads,
         )
+

@@ -25,7 +25,7 @@ from models import (
     ActionDecoder,
     FeatureExtractor,
     LinearTorchModel,
-    ThompsonSamplingModel,
+    ThompsonSamplingModelv01,
     ThompsonSamplingModelOld,
     ProtocolReportFeatureExtractor,
     ProtocolTimeoutActionDecoder,
@@ -1687,7 +1687,7 @@ def serve(
             lr=0.05,
         )
     elif model_type in ("cmab", "thompson"):
-        model = ThompsonSamplingModel(
+        model = ThompsonSamplingModelv01(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
             seed=42,

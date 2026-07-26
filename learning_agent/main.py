@@ -35,10 +35,8 @@ from models import (
     get_action_space_size,
     get_report_feature_dim,
     get_report_feature_field_names,
-    report_to_feature_rows,
+    report_to_feature_values,
     timeout_to_action_index,
-    timeout_to_action_indices,
-    two_pc_prepare_timeout_summary,
 )
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -80,7 +78,6 @@ def reward_engineering(throughput: float) -> float:
 
 PROTOCOL_NAME_TO_ENUM = {
     "pbft": agent_pb2.PROTOCOL_PBFT,
-    "two_pc_over_pbft": agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT,
     "sbft": agent_pb2.PROTOCOL_SBFT,
     "tendermint": agent_pb2.PROTOCOL_TENDERMINT,
 }
@@ -88,8 +85,6 @@ PROTOCOL_NAME_TO_ENUM = {
 
 def _parse_protocol(value: str) -> int:
     normalized = value.strip().lower().replace("-", "_")
-    if normalized == "2pc":
-        normalized = "two_pc_over_pbft"
     protocol = PROTOCOL_NAME_TO_ENUM.get(normalized)
     if protocol is None:
         raise argparse.ArgumentTypeError(
@@ -105,11 +100,6 @@ def _protocols_compatible(incoming_protocol: int, expected_protocol: int) -> boo
 def _dataset_timeout_field_names(protocol: int) -> Tuple[str, ...]:
     if protocol == agent_pb2.PROTOCOL_PBFT:
         return ("election_timeout_milliseconds_used",)
-    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
-        return (
-            "election_timeout_milliseconds_used",
-            "prepare_timeout_milliseconds_used",
-        )
     if protocol == agent_pb2.PROTOCOL_SBFT:
         return (
             "election_timeout_milliseconds_used",
@@ -126,33 +116,8 @@ def _dataset_timeout_field_names(protocol: int) -> Tuple[str, ...]:
 
 
 def _dataset_timeout_values(protocol: int, timeout_used: object) -> Tuple[object, ...]:
-    return _dataset_timeout_values_for_participant(protocol, timeout_used, None)
-
-
-def _dataset_timeout_values_for_participant(
-    protocol: int, timeout_used: object, participant_shard_id: Optional[int]
-) -> Tuple[object, ...]:
     if protocol == agent_pb2.PROTOCOL_PBFT:
         return (getattr(timeout_used, "election_timeout_milliseconds", ""),)
-    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
-        prepare_timeout = ""
-        entries = sorted(
-            getattr(timeout_used, "prepare_timeouts", []),
-            key=lambda entry: int(entry.participant_shard_id),
-        )
-        if participant_shard_id is not None:
-            for entry in entries:
-                if int(entry.participant_shard_id) == int(participant_shard_id):
-                    prepare_timeout = int(entry.prepare_timeout_milliseconds)
-                    break
-        elif entries:
-            prepare_timeout = two_pc_prepare_timeout_summary(timeout_used)
-        else:
-            prepare_timeout = getattr(timeout_used, "prepare_timeout_milliseconds", "")
-        return (
-            getattr(timeout_used, "election_timeout_milliseconds", ""),
-            prepare_timeout,
-        )
     if protocol == agent_pb2.PROTOCOL_SBFT:
         return (
             getattr(timeout_used, "election_timeout_milliseconds", ""),
@@ -173,10 +138,6 @@ def _extract_state(report: agent_pb2.ReportLocal, protocol: int) -> object:
         if not report.HasField("pbft_state"):
             raise ValueError("ReportLocal missing pbft_state")
         return report.pbft_state
-    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
-        if not report.HasField("two_pc_over_pbft_state"):
-            raise ValueError("ReportLocal missing two_pc_over_pbft_state")
-        return report.two_pc_over_pbft_state
     if protocol == agent_pb2.PROTOCOL_SBFT:
         if not report.HasField("sbft_state"):
             raise ValueError("ReportLocal missing sbft_state")
@@ -191,9 +152,6 @@ def _extract_state(report: agent_pb2.ReportLocal, protocol: int) -> object:
 def _set_state(report: agent_pb2.ReportLocal, protocol: int, state: object) -> None:
     if protocol == agent_pb2.PROTOCOL_PBFT:
         report.pbft_state.CopyFrom(state)
-        return
-    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
-        report.two_pc_over_pbft_state.CopyFrom(state)
         return
     if protocol == agent_pb2.PROTOCOL_SBFT:
         report.sbft_state.CopyFrom(state)
@@ -215,10 +173,6 @@ def _timeout_from_status(protocol: int, timeout: agent_pb2.Timeout) -> object:
         if not timeout.HasField("pbft"):
             raise ValueError("Timeout payload missing pbft")
         return timeout.pbft
-    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
-        if not timeout.HasField("two_pc_over_pbft"):
-            raise ValueError("Timeout payload missing two_pc_over_pbft")
-        return timeout.two_pc_over_pbft
     if protocol == agent_pb2.PROTOCOL_SBFT:
         if not timeout.HasField("sbft"):
             raise ValueError("Timeout payload missing sbft")
@@ -235,11 +189,6 @@ def _extract_reward_payload(protocol: int, reward: agent_pb2.Reward) -> Optional
         if not reward.HasField("pbft"):
             return None
         payload = reward.pbft
-        return payload.episode, payload.report, payload.timeout_used
-    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
-        if not reward.HasField("two_pc_over_pbft"):
-            return None
-        payload = reward.two_pc_over_pbft
         return payload.episode, payload.report, payload.timeout_used
     if protocol == agent_pb2.PROTOCOL_SBFT:
         if not reward.HasField("sbft"):
@@ -281,6 +230,13 @@ class TimeoutDecision:
     timeout: agent_pb2.Timeout
     start_tick: int
     report_seq: int
+    window_consensus_count: int
+
+
+def _report_window_key(report: agent_pb2.ReportLocal) -> int:
+    if int(report.protocol) == agent_pb2.PROTOCOL_PBFT:
+        return int(report.window_consensus_count)
+    return int(report.report_seq)
 
 
 def _parse_required_int(parent: ET.Element, tag: str) -> int:
@@ -592,7 +548,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._active_injection_phase_index = -1
         self._current_episode = 0
         self._sealed_through_episode = 0
-        self._winner_report_seq_by_episode: Dict[int, int] = {}
+        self._winner_report_window_by_episode: Dict[int, int] = {}
         self._reports_by_episode: Dict[
             int, Dict[int, Dict[int, agent_pb2.ReportLocal]]
         ] = {}
@@ -640,11 +596,11 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             return True
         if episode in self._finalized_episodes:
             return True
-        return episode in self._winner_report_seq_by_episode
+        return episode in self._winner_report_window_by_episode
 
     def _derive_window_from_reports(
         self, reports: List[agent_pb2.ReportLocal]
-    ) -> Tuple[int, int]:
+    ) -> Tuple[int, int, int]:
         # Derive a robust consensus window from participant reports.
         report_seq = int(
             statistics.median_low([int(report.report_seq) for report in reports])
@@ -656,7 +612,14 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             raise ValueError(
                 f"Invalid consensus report window: start={start_tick}, seq={report_seq}"
             )
-        return start_tick, report_seq
+        window_consensus_count = int(
+            statistics.median_low(
+                [int(report.window_consensus_count) for report in reports]
+            )
+        )
+        if self._protocol == agent_pb2.PROTOCOL_PBFT and window_consensus_count <= 0:
+            raise ValueError("Invalid PBFT report window: consensus count must be positive")
+        return start_tick, report_seq, window_consensus_count
 
     def _active_agent_injection_flags_locked(self) -> Tuple[bool, bool]:
         if not self._agent_injection_schedule:
@@ -874,102 +837,9 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         )
         return dirty_report
 
-    def _dirty_two_pc_over_pbft_state(
-        self, state: agent_pb2.TwoPcOverPbftReport
-    ) -> agent_pb2.TwoPcOverPbftReport:
-        dirty = agent_pb2.TwoPcOverPbftReport()
-        dirty.CopyFrom(state)
-        dirty.pbft.CopyFrom(self._dirty_pbft_state(state.pbft))
-        dirty.total_transactions = self._rng.randint(0, max(int(state.total_transactions), 1) * 3)
-        dirty.single_shard_transactions = self._rng.randint(
-            0, max(int(state.single_shard_transactions), 1) * 3
-        )
-        dirty.cross_shard_transactions = self._rng.randint(
-            0, max(int(state.cross_shard_transactions), 1) * 3
-        )
-        for neighbor in dirty.neighbor_reports:
-            neighbor.cross_shard_transactions = self._rng.randint(
-                0, max(int(neighbor.cross_shard_transactions), 1) * 3
-            )
-            for field_name in (
-                "prepare_ok_count",
-                "prepare_fail_count",
-                "commit_ok_count",
-                "abort_count",
-                "in_doubt_count",
-                "prepare_timeout_count",
-                "commit_timeout_unknown_outcome_count",
-                "abort_best_effort_timeout_count",
-                "lock_contention_count",
-                "reason_prepare_lock_busy_count",
-                "reason_prepare_validation_fail_count",
-                "reason_prepare_timeout_count",
-                "reason_prepare_other_count",
-                "reason_commit_timeout_unknown_outcome_count",
-                "reason_abort_best_effort_timeout_count",
-                "reason_other_count",
-            ):
-                setattr(
-                    neighbor,
-                    field_name,
-                    self._rng.randint(0, max(int(getattr(neighbor, field_name)), 1) * 3),
-                )
-            for field_name in (
-                "prepare_timeout_rate",
-                "abort_rate",
-                "commit_rate",
-                "lock_contention_rate",
-            ):
-                setattr(
-                    neighbor,
-                    field_name,
-                    float(
-                        min(
-                            1.0,
-                            max(
-                                0.0,
-                                float(getattr(neighbor, field_name))
-                                + self._rng.uniform(-0.1, 0.2),
-                            ),
-                        )
-                    ),
-                )
-            for avg_field, p95_field in (
-                ("avg_end_to_end_latency_ms", "p95_end_to_end_latency_ms"),
-                ("avg_prepare_latency_ms", "p95_prepare_latency_ms"),
-                ("avg_commit_latency_ms", "p95_commit_latency_ms"),
-                ("avg_lock_wait_ms", "p95_lock_wait_ms"),
-                ("avg_lock_hold_ms", "p95_lock_hold_ms"),
-            ):
-                avg_value = float(
-                    max(0.0, float(getattr(neighbor, avg_field)) * self._rng.uniform(0.4, 2.0))
-                )
-                setattr(neighbor, avg_field, avg_value)
-                setattr(
-                    neighbor,
-                    p95_field,
-                    float(
-                        max(
-                            avg_value,
-                            float(getattr(neighbor, p95_field))
-                            * self._rng.uniform(0.4, 2.2),
-                        )
-                    ),
-                )
-            neighbor.p99_end_to_end_latency_ms = float(
-                max(
-                    neighbor.p95_end_to_end_latency_ms,
-                    float(neighbor.p99_end_to_end_latency_ms)
-                    * self._rng.uniform(0.4, 2.4),
-                )
-            )
-        return dirty
-
     def _dirty_state(self, state: object) -> object:
         if self._protocol == agent_pb2.PROTOCOL_PBFT:
             return self._dirty_pbft_state(state)
-        if self._protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
-            return self._dirty_two_pc_over_pbft_state(state)
         if self._protocol == agent_pb2.PROTOCOL_SBFT:
             return self._dirty_sbft_state(state)
         if self._protocol == agent_pb2.PROTOCOL_TENDERMINT:
@@ -989,32 +859,22 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             return
 
         matched = matched_state is not None
-        report = matched_state
-        if report is not None:
-            report_rows, participant_ids = report_to_feature_rows(self._protocol, report)
+        if matched_state is not None:
+            report_values = report_to_feature_values(self._protocol, matched_state)
         else:
-            report_rows, participant_ids = (
-                [[""] * len(self._report_feature_field_names)],
-                [],
-            )
-        if not participant_ids:
-            participant_ids = [None] * len(report_rows)
-
-        for report_values, participant_id in zip(report_rows, participant_ids):
-            timeout_values = _dataset_timeout_values_for_participant(
-                self._protocol, timeout_used, participant_id
-            )
-            self._dataset_writer.writerow(
-                [
-                    reward_episode,
-                    phase,
-                    report_node_id,
-                    *report_values,
-                    *timeout_values,
-                    _report_throughput_tps(reward_report),
-                    int(matched),
-                ]
-            )
+            report_values = [""] * len(self._report_feature_field_names)
+        timeout_values = _dataset_timeout_values(self._protocol, timeout_used)
+        self._dataset_writer.writerow(
+            [
+                reward_episode,
+                phase,
+                report_node_id,
+                *report_values,
+                *timeout_values,
+                _report_throughput_tps(reward_report),
+                int(matched),
+            ]
+        )
         # Flush every row to keep memory usage minimal and avoid data loss.
         self._dataset_handle.flush()
 
@@ -1030,6 +890,14 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 grpc.StatusCode.INVALID_ARGUMENT,
                 "Invalid report window: report_seq must be greater than start_tick.",
             )
+        if (
+            self._protocol == agent_pb2.PROTOCOL_PBFT
+            and int(request.window_consensus_count) <= 0
+        ):
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "Invalid PBFT report window: window_consensus_count must be positive.",
+            )
         try:
             incoming_state = _extract_state(request, self._protocol)
         except ValueError as exc:
@@ -1041,6 +909,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             protocol=self._protocol,
             start_tick=request.start_tick,
             report_seq=request.report_seq,
+            window_consensus_count=request.window_consensus_count,
         )
         _set_state(local_report, self._protocol, incoming_state)
 
@@ -1093,6 +962,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                     timeout=timeout,
                     start_tick=int(local_report.start_tick),
                     report_seq=int(local_report.report_seq),
+                    window_consensus_count=int(local_report.window_consensus_count),
                 )
             else:
                 self._pending_episodes.add(local_report.episode)
@@ -1111,6 +981,11 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         if not _protocols_compatible(request.protocol, self._protocol):
             return empty_pb2.Empty()
         if int(request.report_seq) <= int(request.start_tick):
+            return empty_pb2.Empty()
+        if (
+            self._protocol == agent_pb2.PROTOCOL_PBFT
+            and int(request.window_consensus_count) <= 0
+        ):
             return empty_pb2.Empty()
         if not self._verify_report(request):
             return empty_pb2.Empty()
@@ -1149,32 +1024,6 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                     f"timeout_ms={local.timeout_ms} "
                     f"view_changes={local.view_change_count}"
                 )
-            elif self._protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
-                prepare_timeout_rate = 0.0
-                commit_rate = 0.0
-                avg_e2e_latency_ms = 0.0
-                neighbor_count = len(local.neighbor_reports)
-                if neighbor_count:
-                    prepare_timeout_rate = sum(
-                        float(neighbor.prepare_timeout_rate)
-                        for neighbor in local.neighbor_reports
-                    ) / neighbor_count
-                    commit_rate = sum(
-                        float(neighbor.commit_rate)
-                        for neighbor in local.neighbor_reports
-                    ) / neighbor_count
-                    avg_e2e_latency_ms = sum(
-                        float(neighbor.avg_end_to_end_latency_ms)
-                        for neighbor in local.neighbor_reports
-                    ) / neighbor_count
-                print(
-                    f"node={report.node_id} "
-                    f"total_tx={local.total_transactions} "
-                    f"neighbors={neighbor_count} "
-                    f"prepare_timeout_rate={prepare_timeout_rate:.6f} "
-                    f"commit_rate={commit_rate:.6f} "
-                    f"avg_e2e_latency_ms={avg_e2e_latency_ms:.6f}"
-                )
             elif self._protocol == agent_pb2.PROTOCOL_SBFT:
                 print(
                     f"node={report.node_id} "
@@ -1199,8 +1048,8 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             node_id=self.node_id, report_batch=request
         )
         try:
-            start_tick, report_seq = self._derive_window_from_reports(
-                list(request.reports)
+            start_tick, report_seq, window_consensus_count = (
+                self._derive_window_from_reports(list(request.reports))
             )
         except ValueError:
             return empty_pb2.Empty()
@@ -1214,7 +1063,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             if timer is not None:
                 timer.cancel()
             self._reports_by_episode.pop(request.episode, None)
-            self._winner_report_seq_by_episode.pop(request.episode, None)
+            self._winner_report_window_by_episode.pop(request.episode, None)
             self._submitted_episodes.add(request.episode)
             self._finalized_episodes.add(request.episode)
             self._sealed_through_episode = max(
@@ -1234,6 +1083,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 timeout=timeout,
                 start_tick=start_tick,
                 report_seq=report_seq,
+                window_consensus_count=window_consensus_count,
             )
 
         return empty_pb2.Empty()
@@ -1255,6 +1105,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                     timeout=decision.timeout,
                     start_tick=decision.start_tick,
                     report_seq=decision.report_seq,
+                    window_consensus_count=decision.window_consensus_count,
                 )
             if request.episode in self._pending_episodes or request.episode in self._received_episodes:
                 return agent_pb2.TimeoutStatus(
@@ -1272,7 +1123,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 timer.cancel()
             self._timers_by_episode.clear()
             self._reports_by_episode.clear()
-            self._winner_report_seq_by_episode.clear()
+            self._winner_report_window_by_episode.clear()
             self._submitted_episodes.clear()
             self._finalized_episodes.clear()
             self._received_episodes.clear()
@@ -1289,70 +1140,71 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         if self._is_episode_sealed_locked(report.episode):
             return False
 
-        winner_seq = self._winner_report_seq_by_episode.get(report.episode)
-        report_seq = int(report.report_seq)
-        if winner_seq is not None and report_seq != winner_seq:
+        winner_window = self._winner_report_window_by_episode.get(report.episode)
+        window_key = _report_window_key(report)
+        if winner_window is not None and window_key != winner_window:
             return False
 
-        by_seq = self._reports_by_episode.setdefault(report.episode, {})
-        reports_for_seq = by_seq.setdefault(report_seq, {})
-        existing = reports_for_seq.get(report.node_id)
+        by_window = self._reports_by_episode.setdefault(report.episode, {})
+        reports_for_window = by_window.setdefault(window_key, {})
+        existing = reports_for_window.get(report.node_id)
         if existing is not None:
             if int(report.start_tick) > int(existing.start_tick):
-                reports_for_seq[report.node_id] = report
+                reports_for_window[report.node_id] = report
             return False
 
-        reports_for_seq[report.node_id] = report
-        reports_collected = len(reports_for_seq)
+        reports_for_window[report.node_id] = report
+        reports_collected = len(reports_for_window)
 
         print(
-            f"[episode {report.episode} seq={report_seq}] accepted valid report "
+            f"[episode {report.episode} window={window_key} "
+            f"seq={report.report_seq}] accepted valid report "
             f"from node={report.node_id} ({reports_collected}/{self._threshold})"
         )
 
         if (
-            winner_seq is None
+            winner_window is None
             and reports_collected >= self._threshold
             and report.episode not in self._timers_by_episode
             and report.episode not in self._submitted_episodes
         ):
-            self._winner_report_seq_by_episode[report.episode] = report_seq
+            self._winner_report_window_by_episode[report.episode] = window_key
             self._sealed_through_episode = max(
                 self._sealed_through_episode, int(report.episode)
             )
             timer = threading.Timer(
                 self._collect_wait_s,
                 self._finalize_episode,
-                args=(int(report.episode), report_seq),
+                args=(int(report.episode), window_key),
             )
             self._timers_by_episode[report.episode] = timer
             timer.daemon = True
             timer.start()
         return True
 
-    def _finalize_episode(self, episode: int, report_seq: int) -> None:
+    def _finalize_episode(self, episode: int, window_key: int) -> None:
         with self._lock:
             if episode in self._finalized_episodes or episode in self._submitted_episodes:
                 return
-            winner_seq = self._winner_report_seq_by_episode.get(episode)
-            if winner_seq is None or int(winner_seq) != int(report_seq):
+            winner_window = self._winner_report_window_by_episode.get(episode)
+            if winner_window is None or int(winner_window) != int(window_key):
                 return
-            reports_by_seq = self._reports_by_episode.get(episode, {})
-            reports_for_seq = reports_by_seq.get(report_seq, {})
-            if not reports_for_seq:
+            reports_by_window = self._reports_by_episode.get(episode, {})
+            reports_for_window = reports_by_window.get(window_key, {})
+            if not reports_for_window:
                 return
-            snapshot = list(reports_for_seq.values())
+            snapshot = list(reports_for_window.values())
             _, ignore_active = self._active_agent_injection_flags_locked()
             if ignore_active and len(snapshot) > self._threshold:
                 snapshot = sorted(snapshot, key=lambda item: item.node_id)[: self._threshold]
                 print(
                     "[injection] ignoreReport applied "
-                    f"(node={self.node_id}, episode={episode}, seq={report_seq}, "
+                    f"(node={self.node_id}, episode={episode}, window={window_key}, "
                     f"kept={len(snapshot)})"
                 )
             self._submitted_episodes.add(episode)
             self._reports_by_episode.pop(episode, None)
-            self._winner_report_seq_by_episode.pop(episode, None)
+            self._winner_report_window_by_episode.pop(episode, None)
             self._timers_by_episode.pop(episode, None)
 
         if self._consensus_stub is None:
@@ -1475,12 +1327,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         )
 
         try:
-            if self._protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
-                action_indices = timeout_to_action_indices(
-                    self._protocol, timeout_used, matched_state
-                )
-            else:
-                action_indices = [timeout_to_action_index(self._protocol, timeout_used)]
+            action_indices = [timeout_to_action_index(self._protocol, timeout_used)]
         except ValueError as exc:
             print(f"[learning] skipped reward for episode {reward_episode}: {exc}")
             self._pending_rewards_by_episode.pop(reward_episode, None)
@@ -1491,11 +1338,6 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         engineered_reward = reward_engineering(throughput_tps)
         if self._protocol == agent_pb2.PROTOCOL_PBFT:
             reward_timeout = f"{timeout_used.election_timeout_milliseconds}"
-        elif self._protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
-            reward_timeout = (
-                f"{timeout_used.election_timeout_milliseconds}/"
-                f"{two_pc_prepare_timeout_summary(timeout_used)}"
-            )
         elif self._protocol == agent_pb2.PROTOCOL_SBFT:
             reward_timeout = (
                 f"{timeout_used.election_timeout_milliseconds}/"
@@ -1519,10 +1361,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             )
         else:
             features = self._feature_extractor.featurize(matched_state)
-            if self._protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
-                action = torch.tensor(action_indices, dtype=torch.float32)
-            else:
-                action = torch.tensor(float(action_indices[0]), dtype=torch.float32)
+            action = torch.tensor(float(action_indices[0]), dtype=torch.float32)
             self._model.update_model(features, action, engineered_reward)
             print(
                 "[learning] applied reward update "
@@ -1559,24 +1398,19 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             timeout_inner = _timeout_from_status(self._protocol, timeout)
         except ValueError:
             return
-        report_rows, participant_ids = report_to_feature_rows(self._protocol, report_state)
-        if not participant_ids:
-            participant_ids = [None] * len(report_rows)
-        for report_values, participant_id in zip(report_rows, participant_ids):
-            timeout_values = _dataset_timeout_values_for_participant(
-                self._protocol, timeout_inner, participant_id
-            )
-            self._dataset_writer.writerow(
-                [
-                    episode,
-                    phase,
-                    report_node_id,
-                    *report_values,
-                    *timeout_values,
-                    "",
-                    0,
-                ]
-            )
+        report_values = report_to_feature_values(self._protocol, report_state)
+        timeout_values = _dataset_timeout_values(self._protocol, timeout_inner)
+        self._dataset_writer.writerow(
+            [
+                episode,
+                phase,
+                report_node_id,
+                *report_values,
+                *timeout_values,
+                "",
+                0,
+            ]
+        )
         self._dataset_handle.flush()
 
     def _predict_timeout_locked(
@@ -1592,10 +1426,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
 
         features = self._feature_extractor.featurize(report)
         action = self._model.predict_action(features)
-        if self._protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
-            timeout = self._action_decoder.decode_for_report(action, report)
-        else:
-            timeout = self._action_decoder.decode(action)
+        timeout = self._action_decoder.decode(action)
 
         self._log_report_row_locked(
             phase=self._phase_by_episode[episode],
@@ -1838,8 +1669,7 @@ def main():
         type=_parse_protocol,
         default=agent_pb2.PROTOCOL_PBFT,
         help=(
-            "Protocol for this agent: pbft, two_pc_over_pbft (alias: 2pc), "
-            "sbft, or tendermint."
+            "Protocol for this agent: pbft, sbft, or tendermint."
         ),
     )
     parser.add_argument(
@@ -1877,7 +1707,6 @@ def main():
         default=None,
         help=(
             "Path to schedule CSV. PBFT format: time_s,election_timeout_ms. "
-            "2PC-over-PBFT format: time_s,election_timeout_ms,prepare_timeout_ms. "
             "SBFT format: time_s,election_timeout_ms,slow_path_timeout_ms,batch_timeout_ms. "
             "Tendermint format: time_s,propose_timeout_ms,prevote_timeout_ms,precommit_timeout_ms. "
             "Negative time_s values are allowed for pre-start offsets; schedule "

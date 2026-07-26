@@ -48,8 +48,6 @@ except ImportError:
 
 PROTOCOL_NAME_TO_ENUM = {
     "pbft": agent_pb2.PROTOCOL_PBFT,
-    "two_pc_over_pbft": agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT,
-    "2pc": agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT,
     "sbft": agent_pb2.PROTOCOL_SBFT,
     "tendermint": agent_pb2.PROTOCOL_TENDERMINT,
 }
@@ -74,7 +72,7 @@ def set_seed(seed: int) -> None:
 def _parse_protocol(value: str) -> int:
     protocol = PROTOCOL_NAME_TO_ENUM.get(value.strip().lower().replace("-", "_"))
     if protocol is None:
-        valid = ", ".join(sorted({"pbft", "two_pc_over_pbft", "sbft", "tendermint"}))
+        valid = ", ".join(sorted({"pbft", "sbft", "tendermint"}))
         raise argparse.ArgumentTypeError(
             f"Unsupported protocol '{value}'. Valid options: {valid}"
         )
@@ -156,7 +154,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--protocol",
         type=str,
         default='pbft',
-        help="Protocol: pbft | two_pc_over_pbft | sbft | tendermint",
+        help="Protocol: pbft | sbft | tendermint",
     )
     parser.add_argument(
         "--model",
@@ -559,7 +557,7 @@ def main() -> None:
     )
     scaler = QuadraticRewardScaler.transform if args.reward_scaler == "quadratic" else None
 
-    if args.model in (ThompsonSamplingModel, ThompsonSamplingModelv03):
+    if args.model is ThompsonSamplingModel:
         model = args.model(
             action_dim=get_action_space_size(_parse_protocol(args.protocol)),
             n_features=get_report_feature_dim(_parse_protocol(args.protocol)),

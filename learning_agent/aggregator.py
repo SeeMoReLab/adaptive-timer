@@ -4,12 +4,7 @@ from typing import Dict
 import numpy as np
 
 import agent_pb2
-from models import (
-    PBFT_REPORT_FEATURE_FIELD_NAMES,
-    TWO_PC_OVER_PBFT_GLOBAL_FEATURE_FIELD_NAMES,
-    TWO_PC_OVER_PBFT_NEIGHBOR_FEATURE_FIELD_NAMES,
-    get_report_feature_field_names,
-)
+from models import get_report_feature_field_names
 
 
 def _extract_state(report_local: agent_pb2.ReportLocal, protocol: int) -> object:
@@ -19,13 +14,6 @@ def _extract_state(report_local: agent_pb2.ReportLocal, protocol: int) -> object
                 f"ReportLocal for node {report_local.node_id} missing pbft_state"
             )
         return report_local.pbft_state
-    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
-        if not report_local.HasField("two_pc_over_pbft_state"):
-            raise ValueError(
-                "ReportLocal for node "
-                f"{report_local.node_id} missing two_pc_over_pbft_state"
-            )
-        return report_local.two_pc_over_pbft_state
     if protocol == agent_pb2.PROTOCOL_SBFT:
         if not report_local.HasField("sbft_state"):
             raise ValueError(
@@ -58,55 +46,17 @@ def _array_to_report(protocol: int, values: np.ndarray) -> object:
         "total_consensus_instances",
         "leader_change_count",
         "regency_change_count",
-        "single_shard_transactions",
-        "cross_shard_transactions",
-        "prepare_ok_count",
-        "prepare_fail_count",
-        "commit_ok_count",
-        "abort_count",
-        "in_doubt_count",
-        "prepare_timeout_count",
-        "commit_timeout_unknown_outcome_count",
-        "abort_best_effort_timeout_count",
-        "lock_contention_count",
-        "reason_prepare_lock_busy_count",
-        "reason_prepare_validation_fail_count",
-        "reason_prepare_timeout_count",
-        "reason_prepare_other_count",
-        "reason_commit_timeout_unknown_outcome_count",
-        "reason_abort_best_effort_timeout_count",
-        "reason_other_count",
     ):
         if int_field in kwargs:
             kwargs[int_field] = max(0, int(round(float(kwargs[int_field]))))
 
     if protocol == agent_pb2.PROTOCOL_PBFT:
         return agent_pb2.PbftReport(**kwargs)
-    if protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
-        return agent_pb2.TwoPcOverPbftReport(**kwargs)
     if protocol == agent_pb2.PROTOCOL_SBFT:
         return agent_pb2.SbftReport(**kwargs)
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
         return agent_pb2.TendermintReport(**kwargs)
     raise ValueError(f"Unsupported protocol: {protocol}")
-
-
-def _values_from_fields(report: object, fields: tuple[str, ...]) -> np.ndarray:
-    return np.array([float(getattr(report, field_name)) for field_name in fields], dtype=float)
-
-
-def _assign_fields(report: object, fields: tuple[str, ...], values: np.ndarray) -> None:
-    for idx, field_name in enumerate(fields):
-        field = report.DESCRIPTOR.fields_by_name[field_name]
-        value = float(values[idx])
-        if field.cpp_type in (
-            field.CPPTYPE_INT32,
-            field.CPPTYPE_INT64,
-            field.CPPTYPE_UINT32,
-            field.CPPTYPE_UINT64,
-        ):
-            value = max(0, int(round(value)))
-        setattr(report, field_name, value)
 
 
 def _batch_to_reports_by_node(
@@ -122,7 +72,6 @@ class BaseAggregator(ABC):
     def __init__(self, protocol: int):
         if protocol not in (
             agent_pb2.PROTOCOL_PBFT,
-            agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT,
             agent_pb2.PROTOCOL_SBFT,
             agent_pb2.PROTOCOL_TENDERMINT,
         ):
@@ -144,67 +93,9 @@ class BaseAggregator(ABC):
         if not reports_by_node:
             raise ValueError("No reports provided for aggregation")
 
-        if self.protocol == agent_pb2.PROTOCOL_TWO_PC_OVER_PBFT:
-            return self._aggregate_two_pc(reports_by_node, node_id=node_id)
-
         data = {node: _report_to_array(self.protocol, report) for node, report in reports_by_node.items()}
         aggregated_values = self._calculate(data, node_id=node_id)
         return _array_to_report(self.protocol, aggregated_values)
-
-    def _aggregate_two_pc(
-        self, reports_by_node: Dict[int, object], node_id: int
-    ) -> agent_pb2.TwoPcOverPbftReport:
-        result = agent_pb2.TwoPcOverPbftReport()
-
-        pbft_data = {
-            node: _values_from_fields(report.pbft, PBFT_REPORT_FEATURE_FIELD_NAMES)
-            for node, report in reports_by_node.items()
-            if report.HasField("pbft")
-        }
-        if pbft_data:
-            _assign_fields(
-                result.pbft,
-                PBFT_REPORT_FEATURE_FIELD_NAMES,
-                self._calculate(pbft_data, node_id=node_id),
-            )
-
-        global_data = {
-            node: _values_from_fields(
-                report, TWO_PC_OVER_PBFT_GLOBAL_FEATURE_FIELD_NAMES
-            )
-            for node, report in reports_by_node.items()
-        }
-        _assign_fields(
-            result,
-            TWO_PC_OVER_PBFT_GLOBAL_FEATURE_FIELD_NAMES,
-            self._calculate(global_data, node_id=node_id),
-        )
-
-        participant_ids = sorted(
-            {
-                int(neighbor.participant_shard_id)
-                for report in reports_by_node.values()
-                for neighbor in report.neighbor_reports
-            }
-        )
-        for participant_id in participant_ids:
-            neighbor_data = {}
-            for node, report in reports_by_node.items():
-                for neighbor in report.neighbor_reports:
-                    if int(neighbor.participant_shard_id) == participant_id:
-                        neighbor_data[node] = _values_from_fields(
-                            neighbor,
-                            TWO_PC_OVER_PBFT_NEIGHBOR_FEATURE_FIELD_NAMES,
-                        )
-                        break
-            if not neighbor_data:
-                continue
-            aggregated_neighbor = result.neighbor_reports.add()
-            _assign_fields(
-                aggregated_neighbor,
-                TWO_PC_OVER_PBFT_NEIGHBOR_FEATURE_FIELD_NAMES,
-                self._calculate(neighbor_data, node_id=node_id),
-            )
 
     @abstractmethod
     def _calculate(self, data: Dict[int, np.ndarray], node_id: int) -> np.ndarray:

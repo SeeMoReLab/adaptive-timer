@@ -11,20 +11,12 @@ from scipy.stats import gaussian_kde
 import csv
 import io
 
-from models import PBFT_REPORT_FEATURE_FIELD_NAMES, TWO_PC_OVER_PBFT_REPORT_FEATURE_FIELD_NAMES
+from models import PBFT_REPORT_FEATURE_FIELD_NAMES
 
 LOCAL_PBFT_COLUMNS: Tuple[str, ...] = (
     "report_node_id",
     "election_timeout_milliseconds_used",
     'matched_episode_features'
-)
-
-LOCAL_2PC_OVER_PBFT_COLUMNS: Tuple[str, ...] = (
-    "report_node_id",
-    "participant_shard_id",
-    "election_timeout_milliseconds_used",
-    "prepare_timeout_milliseconds_used",
-    "matched_episode_features",
 )
 
 REPORT_ORDINAL_COLUMNS_PBFT: Tuple[str, ...]= [
@@ -35,19 +27,7 @@ REPORT_ORDINAL_COLUMNS_PBFT: Tuple[str, ...]= [
     'regency_change_count'
 ]
 
-REPORT_ORDINAL_COLUMNS_2PC_OVER_PBFT: Tuple[str, ...]= [
-    "reason_prepare_lock_busy_count",
-    "reason_prepare_validation_fail_count",
-    "reason_prepare_timeout_count",
-    "reason_prepare_other_count",
-    "reason_commit_timeout_unknown_outcome_count",
-    "reason_abort_best_effort_timeout_count",
-    "reason_other_count",
-]
-
 STRUCTURAL_COLUMNS_PBFT: List[str] = ['reward_episode', 'report_node_id']
-
-STRUCTURAL_COLUMNS_2PC_OVER_PBFT: List[str] = ['reward_episode', 'participant_shard_id']
 
 # Per-node params: faults (proposal/network delay) hit nodes unequally, so each
 # report_node_id gets its own {phase: (p_fail, jitter)}. Applied by node when the
@@ -96,11 +76,6 @@ class BaseDataGenerator(ABC):
     def generate_local_report(self) -> Optional[pd.DataFrame]:
         pass
 
-    @abstractmethod
-    def generate_tpc_report(self) -> Optional[pd.DataFrame]:
-        pass
-
-
 class DataGenerator(BaseDataGenerator):
     def __init__(self, protocol: str, directory_path: str, reward_noise: bool = True) -> None:
         self.directory_path = directory_path
@@ -115,12 +90,6 @@ class DataGenerator(BaseDataGenerator):
         self.local_structure = STRUCTURAL_COLUMNS_PBFT
         self.protocol =protocol.lower()
 
-        if self.protocol == 'two_pc_over_pbft':
-            self.tpc_col_name = LOCAL_2PC_OVER_PBFT_COLUMNS + TWO_PC_OVER_PBFT_REPORT_FEATURE_FIELD_NAMES
-            self.tpc_col_ordinal = REPORT_ORDINAL_COLUMNS_2PC_OVER_PBFT
-            self.tpc_structure = STRUCTURAL_COLUMNS_2PC_OVER_PBFT
-
-        
         self.read_data()
 
     def read_data(self):
@@ -210,68 +179,6 @@ class DataGenerator(BaseDataGenerator):
         current_start_episode += num_episode
         return reader, current_start_episode
 
-    def generate_tpc_report(self, phase_index: int = 0, current_start_episode: int = 0, verbose: bool = False, num_episode:int = 1, prev_timeout: Optional[List[int]] = None )-> csv.DictReader:
-        if self.df is None or self.df.empty:
-            print("No data available. Please run read_data() first.")
-            return None
-
-        grouped_df = self.df[self.df['phase'] == phase_index]
-        
-        grouped_df = _matched_rows(grouped_df)
-        conf_stats = grouped_df.groupby('prepare_timeout_milliseconds_used')['reward'].agg(
-                ['mean', 'std', 'median', 'var', 'min', 'max']
-        ).to_dict(orient='index')
-        
-        unique_nodes = grouped_df['participant_shard_id'].dropna().unique()
-        
-        res = {}
-
-        feature_cols = [c for c in self.tpc_col_name if c not in self.tpc_structure]
-        original_phase_data = grouped_df[feature_cols]
-
-        synthetic_episodes = np.arange(current_start_episode, current_start_episode + num_episode)
-        skeleton_index = pd.MultiIndex.from_product(
-            [synthetic_episodes, unique_nodes],
-            names=['reward_episode', 'participant_shard_id']
-        )
-        trial = pd.DataFrame(index=skeleton_index).reset_index()
-        total_rows = len(trial)
-
-        if verbose:
-            print(f"Phase {phase_index}: Generating {total_rows} rows...")
-
-        synthetic_features = self._generate_kde(
-            original_df=original_phase_data,
-            num_samples=total_rows,
-            ordinal_cols=self.local_col_ordinal
-        )
-        
-        for col in feature_cols:
-            trial[col] = synthetic_features[col].values
-
-        if prev_timeout != None:
-            trial['prepare_timeout_milliseconds_used'] = prev_timeout
-        else:
-            trial['prepare_timeout_milliseconds_used'] = 150
-
-        trial['reward'] = 0.0
-
-        for idx, row in trial.iterrows():
-            timeout_val = row['prepare_timeout_milliseconds_used']
-            single_reward = self._sample_reward_by_timeout(phase_index,timeout_val, conf_stats, n_samples=1)[0]
-            trial.at[idx, 'reward'] = single_reward
-
-        res = trial.assign(phase=phase_index)
-
-        csv_buffer = io.StringIO()
-
-        res.to_csv(csv_buffer, index=False)
-        csv_buffer.seek(0)
-        reader = csv.DictReader(csv_buffer)
-
-        current_start_episode += num_episode
-        return reader, current_start_episode
-    
     def _generate_kde(
         self, 
         original_df: pd.DataFrame, 

@@ -21,14 +21,18 @@ import torch
 import agent_pb2
 import agent_pb2_grpc
 from aggregator import BaseAggregator, MedianAggregator, WeightedMedianAggregator
+from continuous_bandit import (
+    ContinuousThompsonSamplingModel,
+    ContinuousTimeoutActionCodec,
+)
 from models import (
-    ActionDecoder,
+    ActionCodec,
     FeatureExtractor,
     LinearTorchModel,
     ThompsonSamplingModel,
     ThompsonSamplingModelOld,
     ProtocolReportFeatureExtractor,
-    ProtocolTimeoutActionDecoder,
+    ProtocolTimeoutActionCodec,
     RandomTimeoutModel,
     ScheduledTimeoutModel,
     TensorModel,
@@ -36,7 +40,6 @@ from models import (
     get_report_feature_dim,
     get_report_feature_field_names,
     report_to_feature_values,
-    timeout_to_action_index,
 )
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -478,7 +481,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         sharing: bool,
         model: TensorModel,
         feature_extractor: FeatureExtractor[object],
-        action_decoder: ActionDecoder[agent_pb2.Timeout],
+        action_codec: ActionCodec[agent_pb2.Timeout],
         aggregator: BaseAggregator,
         consensus_stub: Optional[agent_pb2_grpc.ConsensusStub],
         share_timeout_s: Optional[float],
@@ -496,7 +499,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._sharing = sharing
         self._model = model
         self._feature_extractor = feature_extractor
-        self._action_decoder = action_decoder
+        self._action_codec = action_codec
         self._aggregator = aggregator
         self._consensus_stub = consensus_stub
         self._share_timeout_s = share_timeout_s
@@ -1327,7 +1330,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         )
 
         try:
-            action_indices = [timeout_to_action_index(self._protocol, timeout_used)]
+            action = self._action_codec.encode(timeout_used)
         except ValueError as exc:
             print(f"[learning] skipped reward for episode {reward_episode}: {exc}")
             self._pending_rewards_by_episode.pop(reward_episode, None)
@@ -1361,7 +1364,6 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             )
         else:
             features = self._feature_extractor.featurize(matched_state)
-            action = torch.tensor(float(action_indices[0]), dtype=torch.float32)
             self._model.update_model(features, action, engineered_reward)
             print(
                 "[learning] applied reward update "
@@ -1426,7 +1428,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
 
         features = self._feature_extractor.featurize(report)
         action = self._model.predict_action(features)
-        timeout = self._action_decoder.decode(action)
+        timeout = self._action_codec.decode(action)
 
         self._log_report_row_locked(
             phase=self._phase_by_episode[episode],
@@ -1507,7 +1509,18 @@ def serve(
         )
         consensus_stub = agent_pb2_grpc.ConsensusStub(consensus_channel)
 
-    if model_type == "random":
+    if model_type == "continuous":
+        action_codec = ContinuousTimeoutActionCodec(protocol)
+        discrete_action_count = get_action_space_size(protocol)
+        model = ContinuousThompsonSamplingModel(
+            action_dim=action_codec.action_dim,
+            n_features=get_report_feature_dim(protocol),
+            anchor_actions=action_codec.anchor_actions(),
+            initial_design_size=discrete_action_count,
+            memory_size=discrete_action_count * 32,
+            seed=42,
+        )
+    elif model_type == "random":
         model = RandomTimeoutModel(
             action_dim=get_action_space_size(protocol),
         )
@@ -1540,7 +1553,8 @@ def serve(
         raise ValueError(f"Unsupported model type: {model_type}")
 
     feature_extractor = ProtocolReportFeatureExtractor(protocol)
-    action_decoder = ProtocolTimeoutActionDecoder(protocol)
+    if model_type != "continuous":
+        action_codec = ProtocolTimeoutActionCodec(protocol)
     if aggregate_function == "median":
         aggregator: BaseAggregator = MedianAggregator(protocol=protocol)
     elif aggregate_function == "weighted_median":
@@ -1569,7 +1583,7 @@ def serve(
         sharing=sharing,
         model=model,
         feature_extractor=feature_extractor,
-        action_decoder=action_decoder,
+        action_codec=action_codec,
         aggregator=aggregator,
         consensus_stub=consensus_stub,
         share_timeout_s=share_timeout_s,
@@ -1675,12 +1689,21 @@ def main():
     parser.add_argument(
         "--model-type",
         type=str,
-        choices=("random", "linear", "cmab", "cmab_old", "scheduled", "thompson"),
+        choices=(
+            "random",
+            "linear",
+            "cmab",
+            "cmab_old",
+            "continuous",
+            "scheduled",
+            "thompson",
+        ),
         default="random",
         help=(
             "random: random timeout selection; linear: learned linear model; "
             "cmab: bootstrapped ensemble contextual multi-armed bandit; "
             "cmab_old: previous single-tree bootstrapped CMAB; "
+            "continuous: bootstrapped continuous contextual bandit; "
             "thompson: deprecated alias for cmab; "
             "scheduled: timeout from a time-based schedule CSV."
         ),

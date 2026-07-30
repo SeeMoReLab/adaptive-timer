@@ -356,11 +356,15 @@ class FeatureExtractor(Generic[S], ABC):
         pass
 
 
-class ActionDecoder(Generic[A], ABC):
-    """Converts a model output tensor into a domain-specific action."""
+class ActionCodec(Generic[A], ABC):
+    """Converts between model actions and domain-specific actions."""
 
     @abstractmethod
     def decode(self, action: torch.Tensor) -> A:
+        pass
+
+    @abstractmethod
+    def encode(self, action: object) -> torch.Tensor:
         pass
 
 
@@ -398,8 +402,8 @@ class ProtocolReportFeatureExtractor(FeatureExtractor[object]):
         return torch.tensor(features, dtype=torch.float32)
 
 
-class ProtocolTimeoutActionDecoder(ActionDecoder[agent_pb2.Timeout]):
-    """Decodes model output into a protocol-specific timeout action."""
+class ProtocolTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
+    """Converts discrete arm indices to and from protocol timeout actions."""
 
     def __init__(self, protocol: int):
         self._protocol = _validate_protocol(protocol)
@@ -411,8 +415,9 @@ class ProtocolTimeoutActionDecoder(ActionDecoder[agent_pb2.Timeout]):
             option_index = int(torch.argmax(action).item())
         return action_index_to_timeout(self._protocol, option_index)
 
-    def decode_for_report(self, action: torch.Tensor, report: object) -> agent_pb2.Timeout:
-        return self.decode(action)
+    def encode(self, action: object) -> torch.Tensor:
+        option_index = timeout_to_action_index(self._protocol, action)
+        return torch.tensor(float(option_index), dtype=torch.float32)
 
 class QuadraticRewardScaler(RewardTransformer):
     """Quadratic shaping below 1000, linear above. Prior work"""

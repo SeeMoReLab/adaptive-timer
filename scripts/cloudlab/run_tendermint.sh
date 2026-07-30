@@ -27,7 +27,7 @@ APPLIER_LOCAL_PATH="${REPO_ROOT}/scripts/apply_network_failures.py"
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--model <random|linear|cmab>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--model <random|linear|cmab|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -37,7 +37,7 @@ Arguments:
 Flags:
   --dataset         Collect per-replica learning-agent dataset CSVs as agentN.csv.
   --log             Fetch remote Tendermint, ABCI, and client logs into scripts/cloudlab/tmp/tendermint_logs/.
-  --model           Learning-agent model for learning/sharing modes: random|linear|cmab (default: random).
+  --model           Learning-agent model for learning/sharing modes: random|linear|cmab|continuous (default: random).
   -f <int>          Fault tolerance f. Number of nodes is derived as 3f+1 (default: 1).
   -t <int>          Load-generation duration in seconds (default: 60).
 EOF
@@ -58,13 +58,47 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|linear|cmab)
+    random|linear|cmab|continuous)
       printf '%s\n' "${model_lower}"
       ;;
     *)
       return 1
       ;;
   esac
+}
+
+fetch_tendermint_logs_parallel() {
+  local remote="$1"
+  local remote_logs_dir="$2"
+  local local_logs_dir="$3"
+  local num_nodes="$4"
+  local learning_agent_enabled="$5"
+  local i idx log_file failed=0
+  local log_files=("client.log")
+  local pids=()
+
+  for ((i = 0; i < num_nodes; i++)); do
+    log_files+=("node_${i}.log" "abci_${i}.log" "applier_${i}.log")
+    if (( learning_agent_enabled == 1 )); then
+      log_files+=("agent_${i}.log")
+    fi
+  done
+
+  for log_file in "${log_files[@]}"; do
+    scp -q "${SSH_OPTS[@]}" \
+      "${remote}:${remote_logs_dir}/${log_file}" \
+      "${local_logs_dir}/${log_file}" &
+    pids+=("$!")
+  done
+
+  for idx in "${!pids[@]}"; do
+    if ! wait "${pids[$idx]}"; then
+      echo "Missing or failed to fetch ${log_files[$idx]} from ${remote}." >&2
+      failed=1
+    fi
+  done
+
+  return "${failed}"
 }
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -148,7 +182,6 @@ if ! [[ "${EXPERIMENT_TIME_S}" =~ ^[0-9]+$ ]] || (( EXPERIMENT_TIME_S < 1 )); th
   echo "Invalid -t value: ${EXPERIMENT_TIME_S}. It must be an integer >= 1." >&2
   exit 2
 fi
-
 if [[ "${MODE}" != "normal" && "${MODE}" != "learning" && "${MODE}" != "sharing" && "${MODE}" != "scheduled" ]]; then
   echo "Mode '${MODE}' is not implemented. Supported modes: normal, learning, sharing, scheduled." >&2
   exit 2
@@ -159,7 +192,7 @@ else
   LEARNING_AGENT_ENABLED=1
 fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear|cmab." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear|cmab|continuous." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -251,21 +284,23 @@ fi
 
 echo "Creating CometBFT payload tarball..."
 if (( LEARNING_AGENT_ENABLED == 1 )); then
-  COPYFILE_DISABLE=1 tar -C "${REPO_ROOT}" -czf "${LOCAL_PAYLOAD}" \
+  COPYFILE_DISABLE=1 COPY_EXTENDED_ATTRIBUTES_DISABLE=1 tar -C "${REPO_ROOT}" -czf "${LOCAL_PAYLOAD}" \
     --exclude='cometbft/mytestnet' \
     --exclude='cometbft/logs' \
     --exclude='cometbft/build' \
     --exclude='learning_agent/__pycache__' \
     cometbft \
     config/tendermint \
-    learning_agent
+    learning_agent \
+    scripts/tendermint_phase_report.py
 else
-  COPYFILE_DISABLE=1 tar -C "${REPO_ROOT}" -czf "${LOCAL_PAYLOAD}" \
+  COPYFILE_DISABLE=1 COPY_EXTENDED_ATTRIBUTES_DISABLE=1 tar -C "${REPO_ROOT}" -czf "${LOCAL_PAYLOAD}" \
     --exclude='cometbft/mytestnet' \
     --exclude='cometbft/logs' \
     --exclude='cometbft/build' \
     cometbft \
-    config/tendermint
+    config/tendermint \
+    scripts/tendermint_phase_report.py
 fi
 
 REMOTE_PAYLOAD="/tmp/tendermint_cloudlab_payload_$$.tar.gz"
@@ -320,8 +355,8 @@ if ! [[ "${load_send_period_ms}" =~ ^[0-9]+$ ]] || (( load_send_period_ms < 1 ))
   echo "Invalid load_send_period_ms: ${load_send_period_ms}" >&2
   exit 2
 fi
-if [[ "${agent_model_type}" != "random" && "${agent_model_type}" != "linear" && "${agent_model_type}" != "cmab" ]]; then
-  echo "Invalid agent_model_type: ${agent_model_type}. Use random|linear|cmab." >&2
+if [[ "${agent_model_type}" != "random" && "${agent_model_type}" != "linear" && "${agent_model_type}" != "cmab" && "${agent_model_type}" != "continuous" ]]; then
+  echo "Invalid agent_model_type: ${agent_model_type}. Use random|linear|cmab|continuous." >&2
   exit 2
 fi
 if [[ "${mode}" != "learning" && "${mode}" != "sharing" && "${agent_model_type}" != "random" ]]; then
@@ -647,193 +682,48 @@ run_report_with_retry() {
   done
 }
 
-append_node_phase_commit_summary() {
+append_tendermint_phase_report() {
   local out_file="$1"
   local node_logs_dir="$2"
-  local nodes="$3"
-  python3 - "$node_logs_dir" "$nodes" >> "${out_file}" <<'PY'
-import datetime
-import os
-import re
-import sys
+  local failure_spec_path="$3"
+  local experiment_start_unix_ms="$4"
+  local report_script="$5"
+  python3 "$report_script" \
+    --logs-dir "$node_logs_dir" \
+    --failure-spec "$failure_spec_path" \
+    --start-unix-ms "$experiment_start_unix_ms" >> "$out_file"
+}
 
-logs_dir = sys.argv[1]
-num_nodes = int(sys.argv[2])
+stop_progress_reporter() {
+  if [[ -z "${progress_reporter_pid:-}" ]]; then
+    return
+  fi
+  kill "${progress_reporter_pid}" >/dev/null 2>&1 || true
+  wait "${progress_reporter_pid}" >/dev/null 2>&1 || true
+  progress_reporter_pid=""
+}
 
-ts_re = re.compile(r'^[A-Z]\[(?:(\d{4}-\d{2}-\d{2})\|)?(\d{2}:\d{2}:\d{2}\.\d{3})\]')
-new_height_re = re.compile(r'phase enter\s+module=consensus\s+height=(\d+)\s+round=\d+\s+phase=RoundStepNewHeight\b')
-new_round_re = re.compile(r'phase enter\s+module=consensus\s+height=(\d+)\s+round=\d+\s+phase=RoundStepNewRound\b')
-finalize_re = re.compile(r'finalizing commit of block\s+module=consensus\s+height=(\d+)\b.*\bnum_txs=(\d+)\b')
-committed_re = re.compile(r'committed state\s+module=state\s+height=(\d+)\b')
+report_time_remaining() {
+  local end_epoch_s="$1"
+  local now_epoch_s remaining_s remaining_minutes sleep_s
 
-def parse_ts(line):
-    m = ts_re.search(line)
-    if not m:
-        return None
-    date_part = m.group(1)
-    time_part = m.group(2)
-    if date_part:
-        return datetime.datetime.strptime(f"{date_part} {time_part}", "%Y-%m-%d %H:%M:%S.%f")
-    return datetime.datetime.strptime(time_part, "%H:%M:%S.%f")
-
-print("==> Per-height per-node commit summary (RoundStepNewRound -> committed state):")
-per_node = []
-all_heights = set()
-
-for node_idx in range(num_nodes):
-    path = os.path.join(logs_dir, f"node_{node_idx}.log")
-    if not os.path.isfile(path):
-        per_node.append({
-            "rows": {},
-            "committed": {},
-            "new_height_start": {},
-        })
-        continue
-
-    new_height_start = {}
-    new_round_start = {}
-    finalized_txs = {}
-    committed = {}
-
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            ts = parse_ts(line)
-            if ts is None:
-                continue
-
-            m_nh = new_height_re.search(line)
-            if m_nh:
-                h = int(m_nh.group(1))
-                if h not in new_height_start:
-                    new_height_start[h] = ts
-                continue
-
-            m_nr = new_round_re.search(line)
-            if m_nr:
-                h = int(m_nr.group(1))
-                if h not in new_round_start:
-                    new_round_start[h] = ts
-                continue
-
-            m_fc = finalize_re.search(line)
-            if m_fc:
-                h = int(m_fc.group(1))
-                txs = int(m_fc.group(2))
-                if h not in finalized_txs:
-                    finalized_txs[h] = txs
-                continue
-
-            m_cs = committed_re.search(line)
-            if m_cs:
-                h = int(m_cs.group(1))
-                if h not in committed:
-                    committed[h] = ts
-
-    node_rows = {}
-    for h, commit_ts in committed.items():
-        start_ts = new_round_start.get(h)
-        txs = finalized_txs.get(h, "-")
-        if start_ts is None:
-            lat = "NA"
-        else:
-            latency_ms = int(round((commit_ts - start_ts).total_seconds() * 1000.0))
-            if latency_ms < 0:
-                # Handle midnight rollover for time-only logs.
-                if latency_ms < -12 * 60 * 60 * 1000:
-                    latency_ms += 24 * 60 * 60 * 1000
-                else:
-                    latency_ms = 0
-            lat = str(latency_ms)
-        node_rows[h] = (lat, str(txs))
-        all_heights.add(h)
-    per_node.append({
-        "rows": node_rows,
-        "committed": committed,
-        "new_height_start": new_height_start,
-    })
-
-if not all_heights:
-    print("  no committed heights found")
-else:
-    heights = sorted(all_heights)
-    headers = ["height", "prev_h_commit_to_new_h_ms"]
-    for i in range(num_nodes):
-        headers.append(f"n{i}_lat_ms")
-    headers.extend(["lat_min_ms", "lat_max_ms", "lat_avg_ms"])
-    for i in range(num_nodes):
-        headers.append(f"n{i}_txs")
-
-    rows = []
-    for h in heights:
-        row = [str(h)]
-
-        gap_values = []
-        if h > 1:
-            for i in range(num_nodes):
-                prev_commit = per_node[i]["committed"].get(h - 1)
-                curr_new_height = per_node[i]["new_height_start"].get(h)
-                if prev_commit is None or curr_new_height is None:
-                    continue
-                gap_ms = int(round((curr_new_height - prev_commit).total_seconds() * 1000.0))
-                if gap_ms < 0:
-                    if gap_ms < -12 * 60 * 60 * 1000:
-                        gap_ms += 24 * 60 * 60 * 1000
-                    else:
-                        gap_ms = 0
-                gap_values.append(gap_ms)
-        if gap_values:
-            row.append(f"{(sum(gap_values) / len(gap_values)):.1f}")
-        else:
-            row.append("-")
-
-        lat_cells = []
-        tx_cells = []
-        lat_values = []
-        for i in range(num_nodes):
-            item = per_node[i]["rows"].get(h)
-            if item is None:
-                lat_cells.append("-")
-                tx_cells.append("-")
-            else:
-                lat, txs = item
-                lat_cells.append(lat)
-                tx_cells.append(txs)
-                try:
-                    lat_values.append(int(lat))
-                except ValueError:
-                    pass
-
-        if lat_values:
-            lat_min = str(min(lat_values))
-            lat_max = str(max(lat_values))
-            lat_avg = f"{(sum(lat_values) / len(lat_values)):.1f}"
-        else:
-            lat_min = "-"
-            lat_max = "-"
-            lat_avg = "-"
-
-        row.extend(lat_cells)
-        row.extend([lat_min, lat_max, lat_avg])
-        row.extend(tx_cells)
-        rows.append(row)
-
-    widths = [len(h) for h in headers]
-    for row in rows:
-        for idx, cell in enumerate(row):
-            if len(cell) > widths[idx]:
-                widths[idx] = len(cell)
-
-    def fmt_row(cells):
-        return " | ".join(cells[i].ljust(widths[i]) for i in range(len(cells)))
-
-    print(fmt_row(headers))
-    print("-+-".join("-" * w for w in widths))
-    for row in rows:
-        print(fmt_row(row))
-PY
+  while true; do
+    now_epoch_s="$(date +%s)"
+    remaining_s="$((end_epoch_s - now_epoch_s))"
+    if (( remaining_s <= 0 )); then
+      echo "Experiment deadline reached."
+      return
+    fi
+    remaining_minutes="$(((remaining_s + 59) / 60))"
+    echo "Time left until experiment deadline: ${remaining_s}s (~${remaining_minutes}m)"
+    sleep_s=300
+    (( remaining_s < sleep_s )) && sleep_s="${remaining_s}"
+    sleep "${sleep_s}"
+  done
 }
 
 cleanup() {
+  stop_progress_reporter
   kill_run_sessions
   force_stop_run_processes
   teardown_network_namespaces
@@ -853,7 +743,7 @@ start_unix_ms="$(( $(python3 -c 'import time; print(int(time.time() * 1000))') +
 
 rm -rf "${run_root}"
 mkdir -p "${run_root}" "${logs_dir}"
-tar -xzf "${payload_path}" -C "${run_root}"
+tar --warning=no-unknown-keyword -xzf "${payload_path}" -C "${run_root}"
 cp -a "${applier_path}" "${applier_script}"
 chmod +x "${applier_script}"
 
@@ -1020,6 +910,7 @@ expected_peers=$((num_nodes - 1))
 rpc0="$(rpc_port 0)"
 rpc0_ip="$(node_ip 0)"
 load_endpoints="$(load_endpoints_csv)"
+experiment_end_epoch_s="$(((start_unix_ms + experiment_time_s * 1000) / 1000))"
 for attempt in $(seq 1 30); do
   peers="$(curl -sf "http://${rpc0_ip}:${rpc0}/net_info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["n_peers"])' 2>/dev/null || echo "0")"
   if [[ "${peers}" =~ ^[0-9]+$ ]] && (( peers >= expected_peers )); then
@@ -1041,6 +932,10 @@ fi
   echo "==> client log: ${client_log}"
 } > "${output_file}"
 
+echo "Experiment deadline unix_ms=$((start_unix_ms + experiment_time_s * 1000)) (start_unix_ms + ${experiment_time_s}s)"
+report_time_remaining "${experiment_end_epoch_s}" &
+progress_reporter_pid=$!
+
 load \
   --endpoints "${load_endpoints}" \
   --start-unix-ms "${start_unix_ms}" \
@@ -1049,6 +944,7 @@ load \
   --send-period "${load_send_period_ms}ms" \
   --time "${experiment_time_s}" \
   --size "${load_size}" 2>&1 | tee "${client_log}" | awk '/^-- Monitor / { print }' >> "${output_file}"
+stop_progress_reporter
 
 echo "" >> "${output_file}"
 echo "==> Stopping nodes..." >> "${output_file}"
@@ -1083,7 +979,12 @@ sleep 2
     }
   ' "${results_csv}"
   echo ""
-  append_node_phase_commit_summary "${output_file}" "${logs_dir}" "${num_nodes}"
+  append_tendermint_phase_report \
+    "${output_file}" \
+    "${logs_dir}" \
+    "${failure_spec}" \
+    "${start_unix_ms}" \
+    "${run_root}/scripts/tendermint_phase_report.py"
 } >> "${output_file}" 2>&1
 
 if (( log_enabled == 0 )); then
@@ -1121,8 +1022,13 @@ if (( fetched_output == 0 )); then
 fi
 
 if (( LOG_ENABLED == 1 )); then
-  echo "Fetching logs to ${LOGS_LOCAL_DIR}..."
-  if ! scp -r "${SSH_OPTS[@]}" "${remote_user}@${remote_host}:tendermint_cloudlab/logs/." "${LOGS_LOCAL_DIR}/"; then
+  echo "Fetching logs in parallel to ${LOGS_LOCAL_DIR}..."
+  if ! fetch_tendermint_logs_parallel \
+    "${remote_user}@${remote_host}" \
+    "tendermint_cloudlab/logs" \
+    "${LOGS_LOCAL_DIR}" \
+    "${LOCAL_NUM_NODES}" \
+    "${LEARNING_AGENT_ENABLED}"; then
     echo "Failed to fetch some/all logs from ${remote_host}." >&2
   fi
 fi

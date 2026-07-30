@@ -46,6 +46,7 @@ REQUEST_TIMEOUT="30s"
 SUBMIT_MODE="broadcast"
 CREATE_WORKERS=""
 INITIAL_TIMEOUT="5s"
+BACKOFF_ENABLED=0
 REQUEST_TIMEOUT_BACKOFF_MAX="10s"
 
 cleanup_done=0
@@ -84,7 +85,7 @@ trap cleanup EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--model <random|linear|cmab|cmab_old>] [-f <fault_tolerance>] [-t <experiment_seconds>]
+Usage: $0 [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--backoff] [--model <random|linear|cmab|cmab_old|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>]
 
 Arguments:
   mode              Optional; one of normal|heuristic|learning|sharing|scheduled (default: normal).
@@ -92,7 +93,8 @@ Arguments:
 Flags:
   --dataset         Compatibility flag; agent modes collect one agent CSV per node.
   --log             Keep/copy SmartBFT benchmark and learning-agent logs.
-  --model           Learning-agent model for learning mode: random|linear|cmab|cmab_old (default: random).
+  --backoff         Enable request timeout backoff with a 10s maximum.
+  --model           Learning-agent model for learning mode: random|linear|cmab|cmab_old|continuous (default: random).
   -f <int>          Fault tolerance f; nodes defaults to 3f+1 (default: 1).
   -t <int>          Seconds to run after benchmark start before stopping tmux sessions (default: 300).
 
@@ -117,7 +119,7 @@ Learning-agent options:
 
 Notes:
   SmartBFT SmallBank runs one server process per replica plus one client process.
-  Request timeout backoff is enabled by this script with max effective timeout 10s.
+  Request timeout backoff is disabled unless --backoff is supplied.
   Logs are written as server_N.log, client.log, and agent_REPLICA.log.
 EOF
 }
@@ -137,7 +139,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|linear|cmab|cmab_old)
+    random|linear|cmab|cmab_old|continuous)
       printf '%s\n' "${model_lower}"
       ;;
     *)
@@ -221,6 +223,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --log)
       LOG_ENABLED=1
+      shift
+      ;;
+    --backoff)
+      BACKOFF_ENABLED=1
       shift
       ;;
     --model)
@@ -460,7 +466,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear|cmab|cmab_old." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear|cmab|cmab_old|continuous." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" ]]; then
@@ -534,7 +540,11 @@ echo "Submit mode: ${SUBMIT_MODE}"
 echo "SmartBFT batch size: ${BATCH_SIZE}"
 echo "SmartBFT batch timeout: ${BATCH_TIMEOUT}"
 echo "SmartBFT request timeout: ${REQUEST_TIMEOUT}"
-echo "SmartBFT request timeout backoff: enabled (max=${REQUEST_TIMEOUT_BACKOFF_MAX})"
+if (( BACKOFF_ENABLED == 1 )); then
+  echo "SmartBFT request timeout backoff: enabled (max=${REQUEST_TIMEOUT_BACKOFF_MAX})"
+else
+  echo "SmartBFT request timeout backoff: disabled"
+fi
 if (( FAILURE_SPEC_ENABLED == 1 )); then
   echo "Failure spec: ${FAILURE_SPEC_PATH}"
 else
@@ -588,9 +598,13 @@ server_common_args=(
   "--batch-size" "${BATCH_SIZE}"
   "--batch-timeout" "${BATCH_TIMEOUT}"
   "--request-timeout" "${REQUEST_TIMEOUT}"
-  "--request-timeout-backoff"
-  "--request-timeout-backoff-max" "${REQUEST_TIMEOUT_BACKOFF_MAX}"
 )
+if (( BACKOFF_ENABLED == 1 )); then
+  server_common_args+=(
+    "--request-timeout-backoff"
+    "--request-timeout-backoff-max" "${REQUEST_TIMEOUT_BACKOFF_MAX}"
+  )
+fi
 if (( FAILURE_SPEC_ENABLED == 1 )); then
   server_common_args+=(
     "--failure-spec" "${FAILURE_SPEC_PATH}"

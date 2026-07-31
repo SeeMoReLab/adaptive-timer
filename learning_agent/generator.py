@@ -16,25 +16,21 @@ from models import PBFT_REPORT_FEATURE_FIELD_NAMES
 LOCAL_PBFT_COLUMNS: Tuple[str, ...] = (
     "report_node_id",
     "election_timeout_milliseconds_used",
-    'matched_episode_features'
 )
 
+PBFT_FEATURE_COLUMNS: Tuple[str, ...] = tuple(
+    f"feature_{field_name}" for field_name in PBFT_REPORT_FEATURE_FIELD_NAMES
+)
+REWARD_THROUGHPUT_COLUMN = "reward_throughput_tps"
+
 REPORT_ORDINAL_COLUMNS_PBFT: Tuple[str, ...]= [
-    'total_transactions',
-    'total_consensus_instances',
-    'matched_episode_features',
-    'leader_change_count', 
-    'regency_change_count'
+    "feature_total_transactions",
+    "feature_total_consensus_instances",
+    "feature_leader_change_count",
+    "feature_regency_change_count",
 ]
 
-STRUCTURAL_COLUMNS_PBFT: List[str] = ['reward_episode', 'report_node_id']
-
-
-def _matched_rows(df: pd.DataFrame) -> pd.DataFrame:
-    if 'matched_episode_features' not in df.columns:
-        return df
-    matched = df['matched_episode_features'].astype(str).str.strip().str.lower()
-    return df[matched.isin({'1', 'true', 'yes', 'y'})]
+STRUCTURAL_COLUMNS_PBFT: List[str] = ["episode", "report_node_id"]
 
 
 def seed_everything(seed: int = 42):
@@ -60,7 +56,7 @@ class DataGenerator(BaseDataGenerator):
         self.reward_models = {}
         self.reward_residuals = {}
 
-        self.local_col_name = LOCAL_PBFT_COLUMNS + PBFT_REPORT_FEATURE_FIELD_NAMES
+        self.local_col_name = LOCAL_PBFT_COLUMNS + PBFT_FEATURE_COLUMNS
         self.local_col_ordinal = REPORT_ORDINAL_COLUMNS_PBFT
         self.local_structure = STRUCTURAL_COLUMNS_PBFT
         self.protocol =protocol.lower()
@@ -90,14 +86,12 @@ class DataGenerator(BaseDataGenerator):
             return None
 
         grouped_df = self.df[self.df['phase'] == phase_index]
-        grouped_df = _matched_rows(grouped_df)
         if grouped_df.empty:
             raise ValueError(
-                f"No matched PBFT rows found for phase {phase_index}. "
-                "The simulator requires rows with matched_episode_features=1."
+                f"No completed PBFT episode rows found for phase {phase_index}."
             )
         
-        conf_stats = grouped_df.groupby('election_timeout_milliseconds_used')['reward'].agg(
+        conf_stats = grouped_df.groupby('election_timeout_milliseconds_used')[REWARD_THROUGHPUT_COLUMN].agg(
                 ['mean', 'std', 'median', 'var', 'min', 'max']
         ).to_dict(orient='index')
         
@@ -105,13 +99,13 @@ class DataGenerator(BaseDataGenerator):
         
         res = {}
 
-        feature_cols = [c for c in self.local_col_name if c not in self.local_structure]
+        feature_cols = list(PBFT_FEATURE_COLUMNS)
         original_phase_data = grouped_df[feature_cols]
 
         synthetic_episodes = np.arange(current_start_episode, current_start_episode + num_episode)
         skeleton_index = pd.MultiIndex.from_product(
             [synthetic_episodes, unique_nodes],
-            names=['reward_episode', 'report_node_id']
+            names=["episode", "report_node_id"],
         )
         trial = pd.DataFrame(index=skeleton_index).reset_index()
         total_rows = len(trial)
@@ -133,12 +127,12 @@ class DataGenerator(BaseDataGenerator):
         else:
             trial['election_timeout_milliseconds_used'] = 300
 
-        trial['reward'] = 0.0 
+        trial[REWARD_THROUGHPUT_COLUMN] = 0.0
 
         for idx, row in trial.iterrows():
             timeout_val = row['election_timeout_milliseconds_used']
             single_reward = self._sample_reward_by_timeout(phase_index,timeout_val, conf_stats, n_samples=1)[0]
-            trial.at[idx, 'reward'] = single_reward
+            trial.at[idx, REWARD_THROUGHPUT_COLUMN] = single_reward
 
         res = trial.assign(phase=phase_index)
 

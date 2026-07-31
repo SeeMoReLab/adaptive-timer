@@ -9,7 +9,9 @@ from google.protobuf import empty_pb2
 import agent_pb2
 import agent_pb2_grpc
 
-TIMEOUT_OPTIONS_MS = (150, 400, 900)
+PBFT_TIMEOUT_OPTIONS_MS = (300, 800, 1800)
+SBFT_TIMEOUT_OPTIONS_MS = (150, 400, 900)
+TENDERMINT_PROPOSE_TIMEOUT_OPTIONS_MS = (150, 300, 600)
 PROTOCOL_NAME_TO_ENUM = {
     "pbft": agent_pb2.PROTOCOL_PBFT,
     "sbft": agent_pb2.PROTOCOL_SBFT,
@@ -201,26 +203,26 @@ def _random_report(protocol: int, rng: random.Random) -> object:
 
 
 def _random_timeout_used(protocol: int, rng: random.Random) -> object:
-    election_timeout_ms = rng.choice(TIMEOUT_OPTIONS_MS)
     if protocol == agent_pb2.PROTOCOL_PBFT:
         return agent_pb2.PbftTimeout(
-            election_timeout_milliseconds=election_timeout_ms
+            election_timeout_milliseconds=rng.choice(PBFT_TIMEOUT_OPTIONS_MS)
         )
     if protocol == agent_pb2.PROTOCOL_SBFT:
-        slow_path_timeout_ms = rng.choice(TIMEOUT_OPTIONS_MS)
-        batch_timeout_ms = rng.choice(TIMEOUT_OPTIONS_MS)
+        election_timeout_ms = rng.choice(SBFT_TIMEOUT_OPTIONS_MS)
+        slow_path_timeout_ms = rng.choice(SBFT_TIMEOUT_OPTIONS_MS)
+        batch_timeout_ms = rng.choice(SBFT_TIMEOUT_OPTIONS_MS)
         return agent_pb2.SbftTimeout(
             election_timeout_milliseconds=election_timeout_ms,
             slow_path_timeout_milliseconds=slow_path_timeout_ms,
             batch_timeout_milliseconds=batch_timeout_ms,
         )
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
-        prevote_timeout_ms = rng.choice(TIMEOUT_OPTIONS_MS)
-        precommit_timeout_ms = rng.choice(TIMEOUT_OPTIONS_MS)
+        propose_timeout_ms = rng.choice(TENDERMINT_PROPOSE_TIMEOUT_OPTIONS_MS)
+        phase_timeout_ms = propose_timeout_ms // 3
         return agent_pb2.TendermintTimeout(
-            propose_timeout_milliseconds=election_timeout_ms,
-            prevote_timeout_milliseconds=prevote_timeout_ms,
-            precommit_timeout_milliseconds=precommit_timeout_ms,
+            propose_timeout_milliseconds=propose_timeout_ms,
+            prevote_timeout_milliseconds=phase_timeout_ms,
+            precommit_timeout_milliseconds=phase_timeout_ms,
         )
     raise ValueError(f"Unsupported protocol: {protocol}")
 
@@ -351,18 +353,21 @@ def _random_tendermint_report(rng: random.Random) -> agent_pb2.TendermintReport:
         1, int(round(total_transactions / max(avg_batch_size, 1.0)))
     )
     avg_consensus_latency_ms = rng.uniform(1.0, 250.0)
-    p95_consensus_latency_ms = rng.uniform(
+    p50_consensus_latency_ms = rng.uniform(
         avg_consensus_latency_ms,
-        max(avg_consensus_latency_ms, avg_consensus_latency_ms * 2.0),
+        max(avg_consensus_latency_ms, avg_consensus_latency_ms * 1.5),
     )
-    p99_consensus_latency_ms = rng.uniform(
-        p95_consensus_latency_ms,
-        max(p95_consensus_latency_ms, p95_consensus_latency_ms * 1.5),
+    p90_consensus_latency_ms = rng.uniform(
+        p50_consensus_latency_ms,
+        max(p50_consensus_latency_ms, p50_consensus_latency_ms * 1.5),
     )
     throughput_tps = total_transactions / rng.uniform(0.5, 5.0)
     timeout_violation_rate = rng.uniform(0.0, 0.2)
-    p95_batch_size = rng.uniform(
+    p50_batch_size = rng.uniform(
         avg_batch_size, max(avg_batch_size, avg_batch_size * 1.5)
+    )
+    p90_batch_size = rng.uniform(
+        p50_batch_size, max(p50_batch_size, p50_batch_size * 1.5)
     )
     leader_change_count = rng.randint(0, 8)
     regency_change_count = rng.randint(0, 8)
@@ -373,12 +378,13 @@ def _random_tendermint_report(rng: random.Random) -> agent_pb2.TendermintReport:
         total_transactions=total_transactions,
         total_consensus_instances=total_consensus_instances,
         avg_consensus_latency_ms=avg_consensus_latency_ms,
-        p95_consensus_latency_ms=p95_consensus_latency_ms,
-        p99_consensus_latency_ms=p99_consensus_latency_ms,
+        p50_consensus_latency_ms=p50_consensus_latency_ms,
+        p90_consensus_latency_ms=p90_consensus_latency_ms,
         throughput_tps=throughput_tps,
         timeout_violation_rate=timeout_violation_rate,
         avg_batch_size=avg_batch_size,
-        p95_batch_size=p95_batch_size,
+        p50_batch_size=p50_batch_size,
+        p90_batch_size=p90_batch_size,
         leader_change_count=leader_change_count,
         regency_change_count=regency_change_count,
         propose_latency_ms=propose_latency_ms,
@@ -420,8 +426,8 @@ def main() -> None:
         "--reward",
         action="store_true",
         help=(
-            "Attach a randomized reward payload using random timeout values from "
-            f"{TIMEOUT_OPTIONS_MS}."
+            "Attach a randomized reward payload using protocol-specific timeout "
+            "options."
         ),
     )
     args = parser.parse_args()

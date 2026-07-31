@@ -1,5 +1,4 @@
 from collections import deque
-from itertools import product
 import math
 import time
 from typing import Any, Dict, Optional, Tuple
@@ -9,7 +8,12 @@ from sklearn.tree import DecisionTreeRegressor
 import torch
 
 import agent_pb2
-from models import ActionCodec, TensorModel, get_timeout_values_ms
+from models import (
+    ActionCodec,
+    TensorModel,
+    get_timeout_values_ms,
+    tendermint_timeouts_from_propose,
+)
 
 
 class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
@@ -25,10 +29,11 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
                 f"Invalid continuous timeout bounds: {lower_ms}..{upper_ms}ms"
             )
 
-        if self._protocol == agent_pb2.PROTOCOL_PBFT:
+        if self._protocol in (
+            agent_pb2.PROTOCOL_PBFT,
+            agent_pb2.PROTOCOL_TENDERMINT,
+        ):
             self._action_dim = 1
-        elif self._protocol == agent_pb2.PROTOCOL_TENDERMINT:
-            self._action_dim = 3
         else:
             raise ValueError(
                 "Continuous timeout actions currently support only PBFT and Tendermint"
@@ -83,11 +88,14 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
                     election_timeout_milliseconds=timeout_values[0]
                 )
             )
+        propose_timeout_ms, prevote_timeout_ms, precommit_timeout_ms = (
+            tendermint_timeouts_from_propose(timeout_values[0])
+        )
         return agent_pb2.Timeout(
             tendermint=agent_pb2.TendermintTimeout(
-                propose_timeout_milliseconds=timeout_values[0],
-                prevote_timeout_milliseconds=timeout_values[1],
-                precommit_timeout_milliseconds=timeout_values[2],
+                propose_timeout_milliseconds=propose_timeout_ms,
+                prevote_timeout_milliseconds=prevote_timeout_ms,
+                precommit_timeout_milliseconds=precommit_timeout_ms,
             )
         )
 
@@ -103,11 +111,21 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
                 int(getattr(action, "election_timeout_milliseconds"))
             ]
         else:
-            timeout_values = [
-                int(getattr(action, "propose_timeout_milliseconds")),
+            propose_timeout_ms = int(
+                getattr(action, "propose_timeout_milliseconds")
+            )
+            expected = tendermint_timeouts_from_propose(propose_timeout_ms)
+            actual = (
+                propose_timeout_ms,
                 int(getattr(action, "prevote_timeout_milliseconds")),
                 int(getattr(action, "precommit_timeout_milliseconds")),
-            ]
+            )
+            if actual != expected:
+                raise ValueError(
+                    "Tendermint prevote and precommit timeouts must be "
+                    f"one-third of propose timeout: expected {expected}, got {actual}"
+                )
+            timeout_values = [propose_timeout_ms]
 
         normalized = [
             self._normalize_value(timeout_ms, index)
@@ -117,11 +135,7 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
 
     def anchor_actions(self) -> torch.Tensor:
         timeout_values = get_timeout_values_ms(self._protocol)
-        timeout_tuples = (
-            [(value,) for value in timeout_values]
-            if self._action_dim == 1
-            else list(product(timeout_values, repeat=self._action_dim))
-        )
+        timeout_tuples = [(value,) for value in timeout_values]
         normalized = [
             [
                 self._normalize_value(int(timeout_ms), index)

@@ -39,6 +39,11 @@ SERVER_PORT_BASE=19100
 AGENT_PORT=15501
 LEARNING_NODE_ID=1
 INITIAL_TIMEOUT="5s"
+LEARNING_WINDOW_MODE="consensus"
+LEARNING_FEATURE_DURATION="10s"
+LEARNING_REPLY_WAIT="2s"
+LEARNING_WARMUP_DURATION="3s"
+LEARNING_REWARD_DURATION="5s"
 BACKOFF_ENABLED=0
 REQUEST_TIMEOUT_BACKOFF_MAX="10s"
 CONFIG_PATH="${CONFIG_DEFAULT}"
@@ -50,7 +55,9 @@ OVERLAY_OCTET_B=252
 OVERLAY_MASK_BITS=24
 OVERLAY_BRIDGE_NAME="br-smartbft"
 OVERLAY_HOST_OFFSET=10
-ARTIFACT_FETCH_MAX_PARALLEL=8
+ARTIFACT_FETCH_MAX_PARALLEL=4
+ARTIFACT_FETCH_MAX_ATTEMPTS=3
+ARTIFACT_FETCH_RETRY_DELAY_S=1
 
 usage() {
   cat <<EOF
@@ -89,6 +96,14 @@ Learning-agent options:
   --agent-port <port>               Learning-agent port inside each replica namespace (default: 15501).
   --learning-node-id <id>           Deprecated; SmartBFT CloudLab now starts one agent per node.
   --initial-timeout <duration>      Initial PBFT timeout value reported by SmartBFT (default: 5s).
+  --learning-window-mode <mode>     Episode boundaries: consensus|wall-clock (default: consensus).
+  --learning-feature-duration <duration>
+                                     Feature window in wall-clock mode (default: 10s).
+  --learning-reply-wait <duration>  Recommendation wait in wall-clock mode (default: 2s).
+  --learning-warmup-duration <duration>
+                                     Post-apply warm-up in wall-clock mode (default: 3s).
+  --learning-reward-duration <duration>
+                                     Reward window in wall-clock mode (default: 5s).
 
 Notes:
   Request timeout backoff is disabled unless --backoff is supplied.
@@ -166,18 +181,21 @@ queue_artifact_download() {
   done
 
   (
-    if ssh "${SSH_OPTS[@]}" "${user}@${host}" "test -f ${remote_check_path}"; then
+    local attempt
+    for ((attempt = 1; attempt <= ARTIFACT_FETCH_MAX_ATTEMPTS; attempt++)); do
+      rm -f "${local_path}"
       if scp "${SSH_OPTS[@]}" "${user}@${host}:${remote_copy_path}" "${local_path}"; then
         echo "  - copied ${artifact_label} from ${node}"
-      else
-        echo "  - failed to copy ${artifact_label} from ${node}" >&2
-        exit 1
+        exit 0
       fi
-    else
-      echo "  - missing ${artifact_label} on ${node}" >&2
-      (( missing_ok == 1 )) && exit 0
-      exit 1
-    fi
+      if (( attempt < ARTIFACT_FETCH_MAX_ATTEMPTS )); then
+        sleep $((ARTIFACT_FETCH_RETRY_DELAY_S * attempt))
+      fi
+    done
+
+    echo "  - missing or failed to copy ${artifact_label} from ${node}" >&2
+    (( missing_ok == 1 )) && exit 0
+    exit 1
   ) &
 
   artifact_fetch_pids+=("$!")
@@ -341,6 +359,26 @@ while [[ $# -gt 0 ]]; do
       INITIAL_TIMEOUT="${2:-}"
       shift 2
       ;;
+    --learning-window-mode)
+      LEARNING_WINDOW_MODE="${2:-}"
+      shift 2
+      ;;
+    --learning-feature-duration)
+      LEARNING_FEATURE_DURATION="${2:-}"
+      shift 2
+      ;;
+    --learning-reply-wait)
+      LEARNING_REPLY_WAIT="${2:-}"
+      shift 2
+      ;;
+    --learning-warmup-duration)
+      LEARNING_WARMUP_DURATION="${2:-}"
+      shift 2
+      ;;
+    --learning-reward-duration)
+      LEARNING_REWARD_DURATION="${2:-}"
+      shift 2
+      ;;
     normal|heuristic|learning|sharing|scheduled)
       MODE="$1"
       shift
@@ -394,6 +432,10 @@ fi
 case "${SUBMIT_MODE}" in
   broadcast|leader) ;;
   *) echo "Invalid --submit-mode value: ${SUBMIT_MODE}. Expected broadcast or leader." >&2; exit 2 ;;
+esac
+case "${LEARNING_WINDOW_MODE}" in
+  consensus|wall-clock) ;;
+  *) echo "Invalid --learning-window-mode value: ${LEARNING_WINDOW_MODE}. Expected consensus or wall-clock." >&2; exit 2 ;;
 esac
 if [[ -n "${CREATE_WORKERS}" ]] && (! [[ "${CREATE_WORKERS}" =~ ^[0-9]+$ ]] || (( CREATE_WORKERS < 1 ))); then
   echo "Invalid --create-workers value: ${CREATE_WORKERS}." >&2
@@ -1016,6 +1058,11 @@ for i in "${!server_nodes[@]}"; do
 	      "${BATCH_TIMEOUT}" \
 	      "${REQUEST_TIMEOUT}" \
 	      "${INITIAL_TIMEOUT}" \
+	      "${LEARNING_WINDOW_MODE}" \
+	      "${LEARNING_FEATURE_DURATION}" \
+	      "${LEARNING_REPLY_WAIT}" \
+	      "${LEARNING_WARMUP_DURATION}" \
+	      "${LEARNING_REWARD_DURATION}" \
 	      "${BACKOFF_ENABLED}" \
 	      "${REQUEST_TIMEOUT_BACKOFF_MAX}" \
 	      "${VERBOSE_ENABLED}" <<'REMOTE'
@@ -1031,9 +1078,14 @@ batch_size="$7"
 batch_timeout="$8"
 request_timeout="$9"
 initial_timeout="${10}"
-backoff_enabled="${11}"
-backoff_max="${12}"
-verbose_enabled="${13}"
+learning_window_mode="${11}"
+learning_feature_duration="${12}"
+learning_reply_wait="${13}"
+learning_warmup_duration="${14}"
+learning_reward_duration="${15}"
+backoff_enabled="${16}"
+backoff_max="${17}"
+verbose_enabled="${18}"
 run_root="$HOME/smartbft_cloudlab"
 
 for ((n = 0; n < replicas_per_machine; n++)); do
@@ -1061,7 +1113,17 @@ for ((n = 0; n < replicas_per_machine; n++)); do
 	    args+=("--failure-spec" "${run_root}/config/pbft/failure_spec.xml" "--failure-start-unix-ms" "${start_unix_ms}")
 	  fi
 	  if [[ "${learning_enabled}" == "1" ]]; then
-	    args+=("--learning" "--agent-target" "127.0.0.1:${agent_port}" "--learning-node-id" "${node_id}" "--learning-initial-election-timeout" "${initial_timeout}")
+	    args+=(
+	      "--learning"
+	      "--agent-target" "127.0.0.1:${agent_port}"
+	      "--learning-node-id" "${node_id}"
+	      "--learning-initial-election-timeout" "${initial_timeout}"
+	      "--learning-window-mode" "${learning_window_mode}"
+	      "--learning-feature-duration" "${learning_feature_duration}"
+	      "--learning-reply-wait" "${learning_reply_wait}"
+	      "--learning-warmup-duration" "${learning_warmup_duration}"
+	      "--learning-reward-duration" "${learning_reward_duration}"
+	    )
 	  fi
 	  if [[ "${verbose_enabled}" == "1" ]]; then
 	    args+=("--verbose")

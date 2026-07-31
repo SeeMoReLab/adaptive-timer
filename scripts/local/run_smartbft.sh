@@ -46,6 +46,11 @@ REQUEST_TIMEOUT="30s"
 SUBMIT_MODE="broadcast"
 CREATE_WORKERS=""
 INITIAL_TIMEOUT="5s"
+LEARNING_WINDOW_MODE="consensus"
+LEARNING_FEATURE_DURATION="10s"
+LEARNING_REPLY_WAIT="2s"
+LEARNING_WARMUP_DURATION="3s"
+LEARNING_REWARD_DURATION="5s"
 BACKOFF_ENABLED=0
 REQUEST_TIMEOUT_BACKOFF_MAX="10s"
 
@@ -116,6 +121,12 @@ Learning-agent options:
   --agent-port <port>                   Base learning-agent port; node i uses base+i-1 (default: 15501).
   --learning-node-id <id>               Deprecated; SmartBFT local now starts one agent per node.
   --initial-timeout <duration>          Initial PBFT timeout value reported by SmartBFT (default: 5s).
+  --learning-window-mode <mode>         Episode boundaries: consensus|wall-clock (default: consensus).
+  --learning-feature-duration <duration>
+                                         Feature window in wall-clock mode (default: 10s).
+  --learning-reply-wait <duration>      Recommendation wait in wall-clock mode (default: 2s).
+  --learning-warmup-duration <duration> Post-apply warm-up in wall-clock mode (default: 3s).
+  --learning-reward-duration <duration> Reward window in wall-clock mode (default: 5s).
 
 Notes:
   SmartBFT SmallBank runs one server process per replica plus one client process.
@@ -371,6 +382,51 @@ while [[ $# -gt 0 ]]; do
       INITIAL_TIMEOUT="${2}"
       shift 2
       ;;
+    --learning-window-mode)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --learning-window-mode." >&2
+        usage >&2
+        exit 2
+      fi
+      LEARNING_WINDOW_MODE="${2}"
+      shift 2
+      ;;
+    --learning-feature-duration)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --learning-feature-duration." >&2
+        usage >&2
+        exit 2
+      fi
+      LEARNING_FEATURE_DURATION="${2}"
+      shift 2
+      ;;
+    --learning-reply-wait)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --learning-reply-wait." >&2
+        usage >&2
+        exit 2
+      fi
+      LEARNING_REPLY_WAIT="${2}"
+      shift 2
+      ;;
+    --learning-warmup-duration)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --learning-warmup-duration." >&2
+        usage >&2
+        exit 2
+      fi
+      LEARNING_WARMUP_DURATION="${2}"
+      shift 2
+      ;;
+    --learning-reward-duration)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --learning-reward-duration." >&2
+        usage >&2
+        exit 2
+      fi
+      LEARNING_REWARD_DURATION="${2}"
+      shift 2
+      ;;
     normal|heuristic|learning|sharing|scheduled)
       MODE="$1"
       shift
@@ -398,6 +454,10 @@ fi
 if (( NODES_SET == 0 )); then
   NODES="$((3 * F + 1))"
 fi
+case "${LEARNING_WINDOW_MODE}" in
+  consensus|wall-clock) ;;
+  *) echo "Invalid --learning-window-mode value: ${LEARNING_WINDOW_MODE}. Expected consensus or wall-clock." >&2; exit 2 ;;
+esac
 if ! [[ "${NODES}" =~ ^[0-9]+$ ]] || (( NODES < 4 )); then
   echo "Invalid node count: ${NODES}. SmartBFT SmallBank requires at least 4 nodes." >&2
   exit 2
@@ -624,6 +684,11 @@ for ((n = 1; n <= NODES; n++)); do
       "--agent-target" "${AGENT_HOST}:${agent_port}"
       "--learning-node-id" "${n}"
       "--learning-initial-election-timeout" "${INITIAL_TIMEOUT}"
+      "--learning-window-mode" "${LEARNING_WINDOW_MODE}"
+      "--learning-feature-duration" "${LEARNING_FEATURE_DURATION}"
+      "--learning-reply-wait" "${LEARNING_REPLY_WAIT}"
+      "--learning-warmup-duration" "${LEARNING_WARMUP_DURATION}"
+      "--learning-reward-duration" "${LEARNING_REWARD_DURATION}"
     )
   fi
   printf -v server_cmd '%q ' "${server_args[@]}"

@@ -2,13 +2,13 @@
 
 One panel per phase; bars = election timeout (light->dark = short->long); the
 "best" bar per phase is outlined (highest for reward-like metrics, lowest for
-cost-like metrics such as leader_change_count). Rows are pooled over agents and
-restricted to matched_episode_features rows (the same rows the generator uses).
+cost-like metrics such as feature_leader_change_count). Rows are pooled over
+agents; each row is one completed episode.
 
 Usage:
     python plot_data_stats.py --metric reward
-    python plot_data_stats.py --metric leader_change_count --lower-is-better
-    python plot_data_stats.py --metric throughput_tps --data-dir data/pbft --out-dir plot
+    python plot_data_stats.py --metric feature_leader_change_count --lower-is-better
+    python plot_data_stats.py --metric reward_throughput_tps --data-dir data/pbft --out-dir plot
 """
 import argparse
 import glob
@@ -21,32 +21,50 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+from reward_utils import reward_from_throughput
+
 # PhaseMapping-intended timeout per phase (annotation only; edit if your labels differ).
-INTENDED = {0: 100, 1: 100, 2: 100, 3: 700, 4: 700, 5: 1900}
-MATCHED_TRUE = {'1', 'true', 'yes', 'y'}
+INTENDED = {0: 300, 1: 300, 2: 300, 3: 800, 4: 800, 5: 1800}
 
 
-def load_matched(data_dir, timeout_col, phase_col, metric):
+def add_derived_reward(df):
+    if 'reward_throughput_tps' not in df.columns:
+        raise SystemExit(
+            "Column 'reward_throughput_tps' is required to derive reward."
+        )
+    df = df.copy()
+    df['reward'] = df['reward_throughput_tps'].astype(float).map(
+        reward_from_throughput
+    )
+    return df
+
+
+def load_completed(data_dir, timeout_col, phase_col, metric):
     files = sorted(glob.glob(os.path.join(data_dir, '*.csv')))
     if not files:
         raise SystemExit(f'No CSV files found in {data_dir}')
     df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+    if metric == 'reward':
+        df = add_derived_reward(df)
+    if metric not in df.columns and f'feature_{metric}' in df.columns:
+        metric = f'feature_{metric}'
     for col in (timeout_col, phase_col, metric):
         if col not in df.columns:
             raise SystemExit(f"Column '{col}' not in data. Available: {list(df.columns)}")
-    if 'matched_episode_features' in df.columns:
-        m = df['matched_episode_features'].astype(str).str.strip().str.lower().isin(MATCHED_TRUE)
-        df = df[m]
     df = df.copy()
     df[timeout_col] = df[timeout_col].astype(int)
     df[phase_col] = df[phase_col].astype(int)
     df[metric] = df[metric].astype(float)
-    return df
+    return df, metric
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--metric', default='reward', help='column to average (e.g. reward, leader_change_count)')
+    p.add_argument(
+        '--metric',
+        default='reward',
+        help='column to average; reward is derived from reward_throughput_tps',
+    )
     p.add_argument('--data-dir', default=os.path.join(os.path.dirname(__file__), 'data', 'pbft'))
     p.add_argument('--out-dir', default=os.path.join(os.path.dirname(__file__), 'plot'))
     p.add_argument('--timeout-col', default='election_timeout_milliseconds_used')
@@ -58,13 +76,15 @@ def main():
     p.add_argument('--ncols', type=int, default=3)
     args = p.parse_args()
 
-    df = load_matched(args.data_dir, args.timeout_col, args.phase_col, args.metric)
+    df, metric = load_completed(
+        args.data_dir, args.timeout_col, args.phase_col, args.metric
+    )
 
     timeouts = sorted(df[args.timeout_col].unique())
     phases = args.phases if args.phases is not None else sorted(p for p in df[args.phase_col].unique() if p >= 0)
 
     tbl = (df[df[args.phase_col].isin(phases)]
-           .groupby([args.phase_col, args.timeout_col])[args.metric].mean()
+           .groupby([args.phase_col, args.timeout_col])[metric].mean()
            .unstack().reindex(index=phases, columns=timeouts))
 
     # light -> dark blue ramp for the (ordinal) timeout
@@ -109,7 +129,7 @@ def main():
         if not ax.has_data():
             ax.set_visible(False)
     for r in range(nrows):
-        axes[r, 0].set_ylabel(f'mean {args.metric}')
+        axes[r, 0].set_ylabel(f'mean {metric}')
 
     handles = [plt.Rectangle((0, 0), 1, 1, color=color[t]) for t in timeouts]
     handles.append(plt.Rectangle((0, 0), 1, 1, fc='white', ec=hilite, lw=2.5))

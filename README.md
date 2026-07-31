@@ -47,6 +47,10 @@ python learning_agent/main.py \
   --dataset-csv scripts/tmp/reward_dataset_node0.csv
 ```
 
+The dataset contains one completed row per episode: decision-time metrics use
+the `feature_` prefix, reward-window metrics use `reward_`, and `reward` is the
+scalar supplied to the model.
+
 ### Send a Report
 
 The client sends a randomized report for the chosen node and episode. It reads the target address from `config/hosts.config`. Use `GetTimeout` to poll for status.

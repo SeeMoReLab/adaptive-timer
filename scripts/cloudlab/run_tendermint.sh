@@ -18,6 +18,9 @@ AGENT_MODEL_SET=0
 LOAD_CONNECTIONS=5
 LOAD_RATE=20
 LOAD_SEND_PERIOD_MS=100
+LOG_FETCH_MAX_PARALLEL=4
+LOG_FETCH_MAX_ATTEMPTS=3
+LOG_FETCH_RETRY_DELAY_S=1
 
 LOCAL_TMP_DIR="${REPO_ROOT}/scripts/cloudlab/tmp"
 OUTPUT_LOCAL="${LOCAL_TMP_DIR}/tendermint_output.txt"
@@ -85,9 +88,25 @@ fetch_tendermint_logs_parallel() {
   done
 
   for log_file in "${log_files[@]}"; do
-    scp -q "${SSH_OPTS[@]}" \
-      "${remote}:${remote_logs_dir}/${log_file}" \
-      "${local_logs_dir}/${log_file}" &
+    while (( $(jobs -pr | wc -l | tr -d '[:space:]') >= LOG_FETCH_MAX_PARALLEL )); do
+      sleep 0.05
+    done
+
+    (
+      local attempt
+      for ((attempt = 1; attempt <= LOG_FETCH_MAX_ATTEMPTS; attempt++)); do
+        rm -f "${local_logs_dir}/${log_file}"
+        if scp -q "${SSH_OPTS[@]}" \
+          "${remote}:${remote_logs_dir}/${log_file}" \
+          "${local_logs_dir}/${log_file}"; then
+          exit 0
+        fi
+        if (( attempt < LOG_FETCH_MAX_ATTEMPTS )); then
+          sleep $((LOG_FETCH_RETRY_DELAY_S * attempt))
+        fi
+      done
+      exit 1
+    ) &
     pids+=("$!")
   done
 

@@ -18,8 +18,7 @@ from data_loader import (
     _extract_features, 
     _extract_label, 
     _extract_reward, 
-    _is_empty_row, 
-    _is_matched_row
+    _is_empty_row,
     )
 
 from models import (
@@ -107,8 +106,6 @@ def _parse_data(
     for row_number, row in enumerate(reader, start=2):
         if _is_empty_row(row):
             continue
-        if not _is_matched_row(row):
-            continue
 
         feature_values = _extract_features(
             protocol=protocol,
@@ -138,10 +135,7 @@ def _parse_data(
 
 
     if not features:
-        raise ValueError(
-            f"No usable rows found "
-            "Rows with matched_episode_features=0 are skipped."
-        )
+        raise ValueError("No completed episode rows found.")
 
     return CsvTrainingData(features=features, actions=actions, rewards=rewards, labels=labels)
 
@@ -204,7 +198,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--reward-scaler",
         choices=("raw", "quadratic"),
         default="raw",
-        help="How to scale reward column before training.",
+        help="Optional additional scaling for the reward derived from the reward report.",
     )
 
     return parser

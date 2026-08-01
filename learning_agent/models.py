@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import numpy as np
 
 import agent_pb2
+from reward_utils import reward_from_throughput
 
 S = TypeVar("S")  # generic state type
 A = TypeVar("A")  # generic action type
@@ -55,6 +56,27 @@ TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
 TIMEOUT_INDEX_TO_MS: Dict[int, int] = {
     idx : value_ms for idx, value_ms in enumerate(TIMEOUT_VALUES_MS)
 }
+
+
+class TendermintProposeTimeoutOption(IntEnum):
+    TIMEOUT_150_MS = 150
+    TIMEOUT_300_MS = 300
+    TIMEOUT_600_MS = 600
+
+
+TENDERMINT_PROPOSE_TIMEOUT_OPTIONS: Tuple[TendermintProposeTimeoutOption, ...] = (
+    TendermintProposeTimeoutOption.TIMEOUT_150_MS,
+    TendermintProposeTimeoutOption.TIMEOUT_300_MS,
+    TendermintProposeTimeoutOption.TIMEOUT_600_MS,
+)
+TENDERMINT_PROPOSE_TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(
+    int(option) for option in TENDERMINT_PROPOSE_TIMEOUT_OPTIONS
+)
+TENDERMINT_PROPOSE_TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
+    value_ms: idx
+    for idx, value_ms in enumerate(TENDERMINT_PROPOSE_TIMEOUT_VALUES_MS)
+}
+
 
 class PhaseMapping(IntEnum):
     PHASE_0 = PbftTimeoutOption.TIMEOUT_300_MS
@@ -120,12 +142,13 @@ TENDERMINT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "total_transactions",
     "total_consensus_instances",
     "avg_consensus_latency_ms",
-    "p95_consensus_latency_ms",
-    "p99_consensus_latency_ms",
+    "p50_consensus_latency_ms",
+    "p90_consensus_latency_ms",
     "throughput_tps",
     "timeout_violation_rate",
     "avg_batch_size",
-    "p95_batch_size",
+    "p50_batch_size",
+    "p90_batch_size",
     "leader_change_count",
     "regency_change_count",
     "propose_latency_ms",
@@ -168,6 +191,8 @@ def get_timeout_values_ms(protocol: int) -> Tuple[int, ...]:
     protocol = _validate_protocol(protocol)
     if protocol == agent_pb2.PROTOCOL_PBFT:
         return PBFT_TIMEOUT_VALUES_MS
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        return TENDERMINT_PROPOSE_TIMEOUT_VALUES_MS
     return TIMEOUT_VALUES_MS
 
 
@@ -210,6 +235,8 @@ def timeout_index_to_ms_for_protocol(protocol: int, index: int) -> int:
     protocol = _validate_protocol(protocol)
     if protocol == agent_pb2.PROTOCOL_PBFT:
         return pbft_timeout_index_to_ms(index)
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        return tendermint_propose_timeout_index_to_ms(index)
     return timeout_index_to_ms(index)
 
 
@@ -238,28 +265,56 @@ def _sbft_index_to_triple(index: int) -> Tuple[int, int, int]:
     )
 
 
-def _tendermint_triple_to_index(
+def tendermint_timeouts_from_propose(
+    propose_timeout_ms: int,
+) -> Tuple[int, int, int]:
+    propose_timeout_ms = int(propose_timeout_ms)
+    if propose_timeout_ms <= 0:
+        raise ValueError(
+            f"Tendermint propose timeout must be positive, got {propose_timeout_ms}"
+        )
+    phase_timeout_ms = max(1, (propose_timeout_ms + 1) // 3)
+    return propose_timeout_ms, phase_timeout_ms, phase_timeout_ms
+
+
+def tendermint_propose_timeout_ms_to_index(propose_timeout_ms: int) -> int:
+    try:
+        return TENDERMINT_PROPOSE_TIMEOUT_MS_TO_INDEX[int(propose_timeout_ms)]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported Tendermint propose timeout {propose_timeout_ms}ms. "
+            f"Valid options: {TENDERMINT_PROPOSE_TIMEOUT_VALUES_MS}"
+        ) from exc
+
+
+def tendermint_propose_timeout_index_to_ms(index: int) -> int:
+    if index < 0:
+        return TENDERMINT_PROPOSE_TIMEOUT_VALUES_MS[0]
+    if index >= len(TENDERMINT_PROPOSE_TIMEOUT_VALUES_MS):
+        return TENDERMINT_PROPOSE_TIMEOUT_VALUES_MS[-1]
+    return TENDERMINT_PROPOSE_TIMEOUT_VALUES_MS[index]
+
+
+def _tendermint_timeouts_to_index(
     propose_timeout_ms: int, prevote_timeout_ms: int, precommit_timeout_ms: int
 ) -> int:
-    propose_idx = timeout_ms_to_index(propose_timeout_ms)
-    prevote_idx = timeout_ms_to_index(prevote_timeout_ms)
-    precommit_idx = timeout_ms_to_index(precommit_timeout_ms)
-    base = len(TIMEOUT_VALUES_MS)
-    return (propose_idx * base * base) + (prevote_idx * base) + precommit_idx
+    expected = tendermint_timeouts_from_propose(propose_timeout_ms)
+    actual = (
+        int(propose_timeout_ms),
+        int(prevote_timeout_ms),
+        int(precommit_timeout_ms),
+    )
+    if actual != expected:
+        raise ValueError(
+            "Tendermint prevote and precommit timeouts must be one-third "
+            f"of propose timeout: expected {expected}, got {actual}"
+        )
+    return tendermint_propose_timeout_ms_to_index(propose_timeout_ms)
 
 
 def _tendermint_index_to_triple(index: int) -> Tuple[int, int, int]:
-    base = len(TIMEOUT_VALUES_MS)
-    total = base * base * base
-    bounded = max(0, min(index, total - 1))
-    propose_idx = bounded // (base * base)
-    rem = bounded % (base * base)
-    prevote_idx = rem // base
-    precommit_idx = rem % base
-    return (
-        timeout_index_to_ms(propose_idx),
-        timeout_index_to_ms(prevote_idx),
-        timeout_index_to_ms(precommit_idx),
+    return tendermint_timeouts_from_propose(
+        tendermint_propose_timeout_index_to_ms(index)
     )
 
 
@@ -267,8 +322,10 @@ def get_action_space_size(protocol: int) -> int:
     protocol = _validate_protocol(protocol)
     if protocol == agent_pb2.PROTOCOL_PBFT:
         return len(PBFT_TIMEOUT_VALUES_MS)
-    if protocol in (agent_pb2.PROTOCOL_SBFT, agent_pb2.PROTOCOL_TENDERMINT):
+    if protocol == agent_pb2.PROTOCOL_SBFT:
         return len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS)
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        return len(TENDERMINT_PROPOSE_TIMEOUT_VALUES_MS)
     raise ValueError(f"Unsupported protocol: {_protocol_name(protocol)}")
 
 
@@ -292,7 +349,7 @@ def timeout_to_action_index(protocol: int, timeout_used: object) -> int:
         )
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
         timeout_msg = timeout_used
-        return _tendermint_triple_to_index(
+        return _tendermint_timeouts_to_index(
             int(timeout_msg.propose_timeout_milliseconds),
             int(timeout_msg.prevote_timeout_milliseconds),
             int(timeout_msg.precommit_timeout_milliseconds),
@@ -362,11 +419,15 @@ class FeatureExtractor(Generic[S], ABC):
         pass
 
 
-class ActionDecoder(Generic[A], ABC):
-    """Converts a model output tensor into a domain-specific action."""
+class ActionCodec(Generic[A], ABC):
+    """Converts between model actions and domain-specific actions."""
 
     @abstractmethod
     def decode(self, action: torch.Tensor) -> A:
+        pass
+
+    @abstractmethod
+    def encode(self, action: object) -> torch.Tensor:
         pass
 
 
@@ -404,8 +465,8 @@ class ProtocolReportFeatureExtractor(FeatureExtractor[object]):
         return torch.tensor(features, dtype=torch.float32)
 
 
-class ProtocolTimeoutActionDecoder(ActionDecoder[agent_pb2.Timeout]):
-    """Decodes model output into a protocol-specific timeout action."""
+class ProtocolTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
+    """Converts discrete arm indices to and from protocol timeout actions."""
 
     def __init__(self, protocol: int):
         self._protocol = _validate_protocol(protocol)
@@ -417,18 +478,16 @@ class ProtocolTimeoutActionDecoder(ActionDecoder[agent_pb2.Timeout]):
             option_index = int(torch.argmax(action).item())
         return action_index_to_timeout(self._protocol, option_index)
 
-    def decode_for_report(self, action: torch.Tensor, report: object) -> agent_pb2.Timeout:
-        return self.decode(action)
+    def encode(self, action: object) -> torch.Tensor:
+        option_index = timeout_to_action_index(self._protocol, action)
+        return torch.tensor(float(option_index), dtype=torch.float32)
 
 class QuadraticRewardScaler(RewardTransformer):
     """Quadratic shaping below 1000, linear above. Prior work"""
 
     @staticmethod
     def transform(throughput: float) -> float:
-        value = float(max(0, throughput))
-        if value < 1000.0:
-            return (value / 1000.0) ** 2 * 1000.0
-        return value          
+        return reward_from_throughput(throughput)
 
 class LinearTorchModel(TensorModel):
     """Linear classifier over protocol-specific discrete timeout options."""
@@ -610,19 +669,15 @@ class ScheduledTimeoutModel(TensorModel):
                         batch_timeout_ms,
                     )
                 else:
-                    if len(row) < 4:
+                    if len(row) < 2:
                         raise ValueError(
                             "Invalid Tendermint schedule at line "
-                            f"{lineno}: expected 4 columns "
-                            "time_s,propose_timeout_ms,prevote_timeout_ms,precommit_timeout_ms."
+                            f"{lineno}: expected 2 columns "
+                            "time_s,propose_timeout_ms."
                         )
                     propose_timeout_ms = int(row[1].strip())
-                    prevote_timeout_ms = int(row[2].strip())
-                    precommit_timeout_ms = int(row[3].strip())
-                    option_index = _tendermint_triple_to_index(
-                        propose_timeout_ms,
-                        prevote_timeout_ms,
-                        precommit_timeout_ms,
+                    option_index = tendermint_propose_timeout_ms_to_index(
+                        propose_timeout_ms
                     )
                 schedule.append((time_s, option_index))
         if not schedule:

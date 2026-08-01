@@ -73,10 +73,10 @@ message TendermintReport {
     uint32 total_transactions = 1;
     uint32 total_consensus_instances = 2;
 
-    // End-to-end SBFT consensus latency summaries (milliseconds).
+    // End-to-end Tendermint consensus latency summaries (milliseconds).
     float avg_consensus_latency_ms = 3;
-    float p95_consensus_latency_ms = 4;
-    float p99_consensus_latency_ms = 5;
+    float p50_consensus_latency_ms = 4;
+    float p90_consensus_latency_ms = 5;
 
     // Throughput and core rates.
     float throughput_tps = 6;
@@ -84,7 +84,8 @@ message TendermintReport {
 
     // Batch characteristics.
     float avg_batch_size = 8;
-    float p95_batch_size = 9;
+    float p50_batch_size = 9;
+    float p90_batch_size = 15;
 
     // Leadership dynamics.
     uint32 leader_change_count = 10;
@@ -107,6 +108,8 @@ message ReportLocal {
     // Window end consensus tick (exclusive) used to build this report.
     uint32 report_seq = 7;
     // Number of locally delivered consensus instances in this window.
+    // PBFT uses zero to identify a wall-clock-bounded window; the actual
+    // delivered count remains in PbftReport.total_consensus_instances.
     uint32 window_consensus_count = 8;
     oneof state {
         PbftReport pbft_state = 10;

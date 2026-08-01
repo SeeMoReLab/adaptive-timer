@@ -21,14 +21,18 @@ import torch
 import agent_pb2
 import agent_pb2_grpc
 from aggregator import BaseAggregator, MedianAggregator, WeightedMedianAggregator
+from continuous_bandit import (
+    ContinuousThompsonSamplingModel,
+    ContinuousTimeoutActionCodec,
+)
 from models import (
-    ActionDecoder,
+    ActionCodec,
     FeatureExtractor,
     LinearTorchModel,
     ThompsonSamplingModelv01,
     ThompsonSamplingModelOld,
     ProtocolReportFeatureExtractor,
-    ProtocolTimeoutActionDecoder,
+    ProtocolTimeoutActionCodec,
     RandomTimeoutModel,
     ScheduledTimeoutModel,
     TensorModel,
@@ -36,8 +40,8 @@ from models import (
     get_report_feature_dim,
     get_report_feature_field_names,
     report_to_feature_values,
-    timeout_to_action_index,
 )
+from reward_utils import reward_from_throughput
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -70,10 +74,7 @@ def _parse_bool(value: str) -> bool:
 
 def reward_engineering(throughput: float) -> float:
     """Quadratic shaping below 1000, linear above (prior-work style)."""
-    value = float(max(0, throughput))
-    if value < 1000.0:
-        return (value / 1000.0) ** 2 * 1000.0
-    return value
+    return reward_from_throughput(throughput)
 
 
 PROTOCOL_NAME_TO_ENUM = {
@@ -166,22 +167,6 @@ def _copy_state(state: object) -> object:
     cloned = state.__class__()
     cloned.CopyFrom(state)
     return cloned
-
-
-def _timeout_from_status(protocol: int, timeout: agent_pb2.Timeout) -> object:
-    if protocol == agent_pb2.PROTOCOL_PBFT:
-        if not timeout.HasField("pbft"):
-            raise ValueError("Timeout payload missing pbft")
-        return timeout.pbft
-    if protocol == agent_pb2.PROTOCOL_SBFT:
-        if not timeout.HasField("sbft"):
-            raise ValueError("Timeout payload missing sbft")
-        return timeout.sbft
-    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
-        if not timeout.HasField("tendermint"):
-            raise ValueError("Timeout payload missing tendermint")
-        return timeout.tendermint
-    raise ValueError(f"Unsupported protocol: {protocol}")
 
 
 def _extract_reward_payload(protocol: int, reward: agent_pb2.Reward) -> Optional[Tuple[int, object, object]]:
@@ -478,7 +463,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         sharing: bool,
         model: TensorModel,
         feature_extractor: FeatureExtractor[object],
-        action_decoder: ActionDecoder[agent_pb2.Timeout],
+        action_codec: ActionCodec[agent_pb2.Timeout],
         aggregator: BaseAggregator,
         consensus_stub: Optional[agent_pb2_grpc.ConsensusStub],
         share_timeout_s: Optional[float],
@@ -496,7 +481,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._sharing = sharing
         self._model = model
         self._feature_extractor = feature_extractor
-        self._action_decoder = action_decoder
+        self._action_codec = action_codec
         self._aggregator = aggregator
         self._consensus_stub = consensus_stub
         self._share_timeout_s = share_timeout_s
@@ -572,21 +557,34 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             return
 
         dataset_csv.parent.mkdir(parents=True, exist_ok=True)
+        header = [
+            "episode",
+            "phase",
+            "report_node_id",
+            *(
+                f"feature_{field_name}"
+                for field_name in self._report_feature_field_names
+            ),
+            *(
+                f"reward_{field_name}"
+                for field_name in self._report_feature_field_names
+            ),
+            *self._dataset_timeout_field_names,
+        ]
         write_header = not dataset_csv.exists() or dataset_csv.stat().st_size == 0
+        if not write_header:
+            with dataset_csv.open("r", newline="") as existing_handle:
+                existing_header = next(csv.reader(existing_handle), [])
+            if existing_header != header:
+                raise ValueError(
+                    f"Dataset CSV schema mismatch in {dataset_csv}. "
+                    "Remove the existing file before using the new episode-row schema."
+                )
+
         self._dataset_handle = dataset_csv.open("a", newline="")
         self._dataset_writer = csv.writer(self._dataset_handle)
         if write_header:
-            self._dataset_writer.writerow(
-                [
-                    "reward_episode",
-                    "phase",
-                    "report_node_id",
-                    *self._report_feature_field_names,
-                    *self._dataset_timeout_field_names,
-                    "reward",
-                    "matched_episode_features",
-                ]
-            )
+            self._dataset_writer.writerow(header)
             self._dataset_handle.flush()
 
     def _is_episode_sealed_locked(self, episode: int) -> bool:
@@ -608,17 +606,21 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         start_tick = int(
             statistics.median_low([int(report.start_tick) for report in reports])
         )
-        if report_seq - start_tick <= 0:
-            raise ValueError(
-                f"Invalid consensus report window: start={start_tick}, seq={report_seq}"
-            )
         window_consensus_count = int(
             statistics.median_low(
                 [int(report.window_consensus_count) for report in reports]
             )
         )
-        if self._protocol == agent_pb2.PROTOCOL_PBFT and window_consensus_count <= 0:
-            raise ValueError("Invalid PBFT report window: consensus count must be positive")
+        is_wall_clock_pbft = (
+            self._protocol == agent_pb2.PROTOCOL_PBFT
+            and window_consensus_count == 0
+        )
+        if report_seq < start_tick or (
+            report_seq == start_tick and not is_wall_clock_pbft
+        ):
+            raise ValueError(
+                f"Invalid consensus report window: start={start_tick}, seq={report_seq}"
+            )
         return start_tick, report_seq, window_consensus_count
 
     def _active_agent_injection_flags_locked(self) -> Tuple[bool, bool]:
@@ -793,16 +795,16 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         dirty_report.avg_consensus_latency_ms = float(
             max(0.0, float(state.avg_consensus_latency_ms) * self._rng.uniform(0.4, 2.0))
         )
-        dirty_report.p95_consensus_latency_ms = float(
+        dirty_report.p50_consensus_latency_ms = float(
             max(
                 dirty_report.avg_consensus_latency_ms,
-                float(state.p95_consensus_latency_ms) * self._rng.uniform(0.4, 2.2),
+                float(state.p50_consensus_latency_ms) * self._rng.uniform(0.4, 2.2),
             )
         )
-        dirty_report.p99_consensus_latency_ms = float(
+        dirty_report.p90_consensus_latency_ms = float(
             max(
-                dirty_report.p95_consensus_latency_ms,
-                float(state.p99_consensus_latency_ms) * self._rng.uniform(0.4, 2.4),
+                dirty_report.p50_consensus_latency_ms,
+                float(state.p90_consensus_latency_ms) * self._rng.uniform(0.4, 2.4),
             )
         )
         dirty_report.throughput_tps = float(
@@ -814,10 +816,16 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         dirty_report.avg_batch_size = float(
             max(0.0, float(state.avg_batch_size) * self._rng.uniform(0.4, 1.6))
         )
-        dirty_report.p95_batch_size = float(
+        dirty_report.p50_batch_size = float(
             max(
                 float(dirty_report.avg_batch_size),
-                float(state.p95_batch_size) * self._rng.uniform(0.4, 1.8),
+                float(state.p50_batch_size) * self._rng.uniform(0.4, 1.8),
+            )
+        )
+        dirty_report.p90_batch_size = float(
+            max(
+                float(dirty_report.p50_batch_size),
+                float(state.p90_batch_size) * self._rng.uniform(0.4, 2.0),
             )
         )
         dirty_report.leader_change_count = self._rng.randint(
@@ -846,36 +854,31 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             return self._dirty_tendermint_state(state)
         raise ValueError(f"Unsupported protocol: {self._protocol}")
 
-    def _log_reward_row_locked(
+    def _log_completed_episode_row_locked(
         self,
         phase: int,
         report_node_id: int,
-        reward_episode: int,
+        episode: int,
         timeout_used: object,
         reward_report: object,
-        matched_state: Optional[object],
+        feature_report: object,
     ) -> None:
         if self._dataset_writer is None or self._dataset_handle is None:
             return
 
-        matched = matched_state is not None
-        if matched_state is not None:
-            report_values = report_to_feature_values(self._protocol, matched_state)
-        else:
-            report_values = [""] * len(self._report_feature_field_names)
+        feature_values = report_to_feature_values(self._protocol, feature_report)
+        reward_values = report_to_feature_values(self._protocol, reward_report)
         timeout_values = _dataset_timeout_values(self._protocol, timeout_used)
         self._dataset_writer.writerow(
             [
-                reward_episode,
+                episode,
                 phase,
                 report_node_id,
-                *report_values,
+                *feature_values,
+                *reward_values,
                 *timeout_values,
-                _report_throughput_tps(reward_report),
-                int(matched),
             ]
         )
-        # Flush every row to keep memory usage minimal and avoid data loss.
         self._dataset_handle.flush()
 
     def SendReport(self, request: agent_pb2.ReportLocal, context) -> empty_pb2.Empty:
@@ -885,18 +888,18 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 "Protocol mismatch in report: "
                 f"expected={self._protocol}, got={request.protocol}",
             )
-        if int(request.report_seq) <= int(request.start_tick):
-            context.abort(
-                grpc.StatusCode.INVALID_ARGUMENT,
-                "Invalid report window: report_seq must be greater than start_tick.",
-            )
-        if (
+        is_wall_clock_pbft = (
             self._protocol == agent_pb2.PROTOCOL_PBFT
-            and int(request.window_consensus_count) <= 0
+            and int(request.window_consensus_count) == 0
+        )
+        if int(request.report_seq) < int(request.start_tick) or (
+            int(request.report_seq) == int(request.start_tick)
+            and not is_wall_clock_pbft
         ):
             context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
-                "Invalid PBFT report window: window_consensus_count must be positive.",
+                "Invalid report window: report_seq must be greater than start_tick "
+                "unless this is a wall-clock PBFT window.",
             )
         try:
             incoming_state = _extract_state(request, self._protocol)
@@ -956,7 +959,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                     state,
                     int(local_report.start_tick),
                     int(local_report.report_seq),
-                    int(local_report.node_id),
+                    int(local_report.window_consensus_count),
                 )
                 self._timeouts_by_episode[local_report.episode] = TimeoutDecision(
                     timeout=timeout,
@@ -980,11 +983,13 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             return empty_pb2.Empty()
         if not _protocols_compatible(request.protocol, self._protocol):
             return empty_pb2.Empty()
-        if int(request.report_seq) <= int(request.start_tick):
-            return empty_pb2.Empty()
-        if (
+        is_wall_clock_pbft = (
             self._protocol == agent_pb2.PROTOCOL_PBFT
-            and int(request.window_consensus_count) <= 0
+            and int(request.window_consensus_count) == 0
+        )
+        if int(request.report_seq) < int(request.start_tick) or (
+            int(request.report_seq) == int(request.start_tick)
+            and not is_wall_clock_pbft
         ):
             return empty_pb2.Empty()
         if not self._verify_report(request):
@@ -1039,6 +1044,11 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                     f"total_tx={local.total_transactions} "
                     f"throughput={local.throughput_tps:.6f} "
                     f"avg_latency_ms={local.avg_consensus_latency_ms:.6f} "
+                    f"p50_latency_ms={local.p50_consensus_latency_ms:.6f} "
+                    f"p90_latency_ms={local.p90_consensus_latency_ms:.6f} "
+                    f"avg_batch_size={local.avg_batch_size:.6f} "
+                    f"p50_batch_size={local.p50_batch_size:.6f} "
+                    f"p90_batch_size={local.p90_batch_size:.6f} "
                     f"propose_latency_ms={local.propose_latency_ms:.6f} "
                     f"prevote_latency_ms={local.prevote_latency_ms:.6f} "
                     f"precommit_latency_ms={local.precommit_latency_ms:.6f}"
@@ -1077,7 +1087,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 aggregated_report,
                 start_tick,
                 report_seq,
-                self.node_id,
+                window_consensus_count,
             )
             self._timeouts_by_episode[request.episode] = TimeoutDecision(
                 timeout=timeout,
@@ -1303,8 +1313,8 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         reward_report: object,
         timeout_used: object,
     ) -> None:
-        matched_state = self._state_by_episode.get(reward_episode)
-        if matched_state is None:
+        feature_report = self._state_by_episode.get(reward_episode)
+        if feature_report is None:
             self._pending_rewards_by_episode[reward_episode] = (
                 report_node_id,
                 reward_report,
@@ -1316,18 +1326,8 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             )
             return
 
-        phase = self._phase_by_episode.get(reward_episode, -1)
-        self._log_reward_row_locked(
-            phase=phase,
-            report_node_id=report_node_id,
-            reward_episode=reward_episode,
-            timeout_used=timeout_used,
-            reward_report=reward_report,
-            matched_state=matched_state,
-        )
-
         try:
-            action_indices = [timeout_to_action_index(self._protocol, timeout_used)]
+            action = self._action_codec.encode(timeout_used)
         except ValueError as exc:
             print(f"[learning] skipped reward for episode {reward_episode}: {exc}")
             self._pending_rewards_by_episode.pop(reward_episode, None)
@@ -1336,6 +1336,15 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         total_transactions = _report_total_transactions(reward_report)
         throughput_tps = _report_throughput_tps(reward_report)
         engineered_reward = reward_engineering(throughput_tps)
+        phase = self._phase_by_episode.get(reward_episode, -1)
+        self._log_completed_episode_row_locked(
+            phase=phase,
+            report_node_id=report_node_id,
+            episode=reward_episode,
+            timeout_used=timeout_used,
+            reward_report=reward_report,
+            feature_report=feature_report,
+        )
         if self._protocol == agent_pb2.PROTOCOL_PBFT:
             reward_timeout = f"{timeout_used.election_timeout_milliseconds}"
         elif self._protocol == agent_pb2.PROTOCOL_SBFT:
@@ -1360,8 +1369,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 f"reward={engineered_reward:.2f})"
             )
         else:
-            features = self._feature_extractor.featurize(matched_state)
-            action = torch.tensor(float(action_indices[0]), dtype=torch.float32)
+            features = self._feature_extractor.featurize(feature_report)
             self._model.update_model(features, action, engineered_reward)
             print(
                 "[learning] applied reward update "
@@ -1384,39 +1392,21 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             return -1
         return self._current_injection_phase_index_locked()
 
-    def _log_report_row_locked(
-        self,
-        phase: int,
-        report_node_id: int,
-        episode: int,
-        timeout: agent_pb2.Timeout,
-        report_state: object,
-    ) -> None:
-        if self._dataset_writer is None or self._dataset_handle is None:
-            return
-        try:
-            timeout_inner = _timeout_from_status(self._protocol, timeout)
-        except ValueError:
-            return
-        report_values = report_to_feature_values(self._protocol, report_state)
-        timeout_values = _dataset_timeout_values(self._protocol, timeout_inner)
-        self._dataset_writer.writerow(
-            [
-                episode,
-                phase,
-                report_node_id,
-                *report_values,
-                *timeout_values,
-                "",
-                0,
-            ]
-        )
-        self._dataset_handle.flush()
-
     def _predict_timeout_locked(
-        self, episode: int, report: object, start_tick: int, report_seq: int, report_node_id: int
+        self,
+        episode: int,
+        report: object,
+        start_tick: int,
+        report_seq: int,
+        window_consensus_count: int,
     ) -> agent_pb2.Timeout:
-        if report_seq <= start_tick:
+        is_wall_clock_pbft = (
+            self._protocol == agent_pb2.PROTOCOL_PBFT
+            and window_consensus_count == 0
+        )
+        if report_seq < start_tick or (
+            report_seq == start_tick and not is_wall_clock_pbft
+        ):
             raise ValueError(
                 f"Invalid report window for timeout prediction: start={start_tick}, seq={report_seq}"
             )
@@ -1426,15 +1416,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
 
         features = self._feature_extractor.featurize(report)
         action = self._model.predict_action(features)
-        timeout = self._action_decoder.decode(action)
-
-        self._log_report_row_locked(
-            phase=self._phase_by_episode[episode],
-            report_node_id=report_node_id,
-            episode=episode,
-            timeout=timeout,
-            report_state=cached_report,
-        )
+        timeout = self._action_codec.decode(action)
 
         pending_reward = self._pending_rewards_by_episode.get(episode)
         if pending_reward is not None:
@@ -1507,7 +1489,18 @@ def serve(
         )
         consensus_stub = agent_pb2_grpc.ConsensusStub(consensus_channel)
 
-    if model_type == "random":
+    if model_type == "continuous":
+        action_codec = ContinuousTimeoutActionCodec(protocol)
+        discrete_action_count = get_action_space_size(protocol)
+        model = ContinuousThompsonSamplingModel(
+            action_dim=action_codec.action_dim,
+            n_features=get_report_feature_dim(protocol),
+            anchor_actions=action_codec.anchor_actions(),
+            initial_design_size=discrete_action_count,
+            memory_size=discrete_action_count * 32,
+            seed=42,
+        )
+    elif model_type == "random":
         model = RandomTimeoutModel(
             action_dim=get_action_space_size(protocol),
         )
@@ -1540,7 +1533,8 @@ def serve(
         raise ValueError(f"Unsupported model type: {model_type}")
 
     feature_extractor = ProtocolReportFeatureExtractor(protocol)
-    action_decoder = ProtocolTimeoutActionDecoder(protocol)
+    if model_type != "continuous":
+        action_codec = ProtocolTimeoutActionCodec(protocol)
     if aggregate_function == "median":
         aggregator: BaseAggregator = MedianAggregator(protocol=protocol)
     elif aggregate_function == "weighted_median":
@@ -1569,7 +1563,7 @@ def serve(
         sharing=sharing,
         model=model,
         feature_extractor=feature_extractor,
-        action_decoder=action_decoder,
+        action_codec=action_codec,
         aggregator=aggregator,
         consensus_stub=consensus_stub,
         share_timeout_s=share_timeout_s,
@@ -1675,12 +1669,21 @@ def main():
     parser.add_argument(
         "--model-type",
         type=str,
-        choices=("random", "linear", "cmab", "cmab_old", "scheduled", "thompson"),
+        choices=(
+            "random",
+            "linear",
+            "cmab",
+            "cmab_old",
+            "continuous",
+            "scheduled",
+            "thompson",
+        ),
         default="random",
         help=(
             "random: random timeout selection; linear: learned linear model; "
             "cmab: bootstrapped ensemble contextual multi-armed bandit; "
             "cmab_old: previous single-tree bootstrapped CMAB; "
+            "continuous: bootstrapped continuous contextual bandit; "
             "thompson: deprecated alias for cmab; "
             "scheduled: timeout from a time-based schedule CSV."
         ),
@@ -1708,7 +1711,8 @@ def main():
         help=(
             "Path to schedule CSV. PBFT format: time_s,election_timeout_ms. "
             "SBFT format: time_s,election_timeout_ms,slow_path_timeout_ms,batch_timeout_ms. "
-            "Tendermint format: time_s,propose_timeout_ms,prevote_timeout_ms,precommit_timeout_ms. "
+            "Tendermint format: time_s,propose_timeout_ms; prevote and "
+            "precommit are derived as one-third of propose. "
             "Negative time_s values are allowed for pre-start offsets; schedule "
             "activations are shifted so the earliest entry begins at time 0. "
             "Required when --model-type=scheduled."
@@ -1719,8 +1723,10 @@ def main():
         type=Path,
         default=None,
         help=(
-            "Optional CSV output path for reward-labeled samples. "
-            "Appends one row per received reward and flushes every row."
+            "Optional CSV output path for completed episodes. Each row contains "
+            "decision-time feature_* metrics, reward-window reward_* metrics, "
+            "and the applied timeout. Scalar rewards are derived from "
+            "reward_throughput_tps when needed."
         ),
     )
     parser.add_argument(

@@ -39,6 +39,12 @@ SERVER_PORT_BASE=19100
 AGENT_PORT=15501
 LEARNING_NODE_ID=1
 INITIAL_TIMEOUT="5s"
+LEARNING_WINDOW_MODE="consensus"
+LEARNING_FEATURE_DURATION="10s"
+LEARNING_REPLY_WAIT="2s"
+LEARNING_WARMUP_DURATION="3s"
+LEARNING_REWARD_DURATION="5s"
+BACKOFF_ENABLED=0
 REQUEST_TIMEOUT_BACKOFF_MAX="10s"
 CONFIG_PATH="${CONFIG_DEFAULT}"
 FAILURE_SPEC_PATH="${FAILURE_SPEC_DEFAULT}"
@@ -49,11 +55,13 @@ OVERLAY_OCTET_B=252
 OVERLAY_MASK_BITS=24
 OVERLAY_BRIDGE_NAME="br-smartbft"
 OVERLAY_HOST_OFFSET=10
-ARTIFACT_FETCH_MAX_PARALLEL=8
+ARTIFACT_FETCH_MAX_PARALLEL=4
+ARTIFACT_FETCH_MAX_ATTEMPTS=3
+ARTIFACT_FETCH_RETRY_DELAY_S=1
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--model <random|linear|cmab|cmab_old>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--backoff] [--model <random|linear|cmab|cmab_old|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -63,8 +71,9 @@ Arguments:
 Flags:
   --dataset                         Compatibility flag; agent modes collect the agent CSV automatically.
   --log                             Download client, server, applier, and agent logs.
+  --backoff                         Enable request timeout backoff with a 10s maximum.
   --verbose                         Enable SmartBFT debug logs on server replicas.
-  --model <random|linear|cmab|cmab_old>
+  --model <random|linear|cmab|cmab_old|continuous>
                                      Learning-agent model for learning mode (default: random).
   -f <int>                          Fault tolerance f; nodes defaults to 3f+1 (default: 1).
   -t <int>                          Seconds to run after benchmark start (default: 300).
@@ -87,9 +96,17 @@ Learning-agent options:
   --agent-port <port>               Learning-agent port inside each replica namespace (default: 15501).
   --learning-node-id <id>           Deprecated; SmartBFT CloudLab now starts one agent per node.
   --initial-timeout <duration>      Initial PBFT timeout value reported by SmartBFT (default: 5s).
+  --learning-window-mode <mode>     Episode boundaries: consensus|wall-clock (default: consensus).
+  --learning-feature-duration <duration>
+                                     Feature window in wall-clock mode (default: 10s).
+  --learning-reply-wait <duration>  Recommendation wait in wall-clock mode (default: 2s).
+  --learning-warmup-duration <duration>
+                                     Post-apply warm-up in wall-clock mode (default: 3s).
+  --learning-reward-duration <duration>
+                                     Reward window in wall-clock mode (default: 5s).
 
 Notes:
-  Request timeout backoff is enabled by this script with max effective timeout 10s.
+  Request timeout backoff is disabled unless --backoff is supplied.
 EOF
 }
 
@@ -104,7 +121,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|linear|cmab|cmab_old) printf '%s\n' "${model_lower}" ;;
+    random|linear|cmab|cmab_old|continuous) printf '%s\n' "${model_lower}" ;;
     *) return 1 ;;
   esac
 }
@@ -164,18 +181,21 @@ queue_artifact_download() {
   done
 
   (
-    if ssh "${SSH_OPTS[@]}" "${user}@${host}" "test -f ${remote_check_path}"; then
+    local attempt
+    for ((attempt = 1; attempt <= ARTIFACT_FETCH_MAX_ATTEMPTS; attempt++)); do
+      rm -f "${local_path}"
       if scp "${SSH_OPTS[@]}" "${user}@${host}:${remote_copy_path}" "${local_path}"; then
         echo "  - copied ${artifact_label} from ${node}"
-      else
-        echo "  - failed to copy ${artifact_label} from ${node}" >&2
-        exit 1
+        exit 0
       fi
-    else
-      echo "  - missing ${artifact_label} on ${node}" >&2
-      (( missing_ok == 1 )) && exit 0
-      exit 1
-    fi
+      if (( attempt < ARTIFACT_FETCH_MAX_ATTEMPTS )); then
+        sleep $((ARTIFACT_FETCH_RETRY_DELAY_S * attempt))
+      fi
+    done
+
+    echo "  - missing or failed to copy ${artifact_label} from ${node}" >&2
+    (( missing_ok == 1 )) && exit 0
+    exit 1
   ) &
 
   artifact_fetch_pids+=("$!")
@@ -264,6 +284,10 @@ while [[ $# -gt 0 ]]; do
       LOG_ENABLED=1
       shift
       ;;
+    --backoff)
+      BACKOFF_ENABLED=1
+      shift
+      ;;
     --verbose)
       VERBOSE_ENABLED=1
       shift
@@ -335,6 +359,26 @@ while [[ $# -gt 0 ]]; do
       INITIAL_TIMEOUT="${2:-}"
       shift 2
       ;;
+    --learning-window-mode)
+      LEARNING_WINDOW_MODE="${2:-}"
+      shift 2
+      ;;
+    --learning-feature-duration)
+      LEARNING_FEATURE_DURATION="${2:-}"
+      shift 2
+      ;;
+    --learning-reply-wait)
+      LEARNING_REPLY_WAIT="${2:-}"
+      shift 2
+      ;;
+    --learning-warmup-duration)
+      LEARNING_WARMUP_DURATION="${2:-}"
+      shift 2
+      ;;
+    --learning-reward-duration)
+      LEARNING_REWARD_DURATION="${2:-}"
+      shift 2
+      ;;
     normal|heuristic|learning|sharing|scheduled)
       MODE="$1"
       shift
@@ -389,12 +433,16 @@ case "${SUBMIT_MODE}" in
   broadcast|leader) ;;
   *) echo "Invalid --submit-mode value: ${SUBMIT_MODE}. Expected broadcast or leader." >&2; exit 2 ;;
 esac
+case "${LEARNING_WINDOW_MODE}" in
+  consensus|wall-clock) ;;
+  *) echo "Invalid --learning-window-mode value: ${LEARNING_WINDOW_MODE}. Expected consensus or wall-clock." >&2; exit 2 ;;
+esac
 if [[ -n "${CREATE_WORKERS}" ]] && (! [[ "${CREATE_WORKERS}" =~ ^[0-9]+$ ]] || (( CREATE_WORKERS < 1 ))); then
   echo "Invalid --create-workers value: ${CREATE_WORKERS}." >&2
   exit 2
 fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear|cmab|cmab_old." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear|cmab|cmab_old|continuous." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" ]]; then
@@ -563,7 +611,11 @@ echo "Selected mode: ${MODE}"
 echo "SmartBFT nodes: ${NODES} (f=${F}, replicas_per_server_machine=${replicas_per_server_machine})"
 echo "Submit mode: ${SUBMIT_MODE}"
 echo "Batch size: ${BATCH_SIZE}; batch timeout: ${BATCH_TIMEOUT}; request timeout: ${REQUEST_TIMEOUT}"
-echo "Request timeout backoff: enabled (max=${REQUEST_TIMEOUT_BACKOFF_MAX})"
+if (( BACKOFF_ENABLED == 1 )); then
+  echo "Request timeout backoff: enabled (max=${REQUEST_TIMEOUT_BACKOFF_MAX})"
+else
+  echo "Request timeout backoff: disabled"
+fi
 echo "SmartBFT verbose server logs: ${VERBOSE_ENABLED}"
 echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (dataset=${DATASET_ENABLED}, log=${LOG_ENABLED})"
 if [[ "${MODE}" == "learning" ]]; then
@@ -572,7 +624,7 @@ fi
 
 echo "Creating SmartBFT CloudLab payload tarball..."
 rm -f "${LOCAL_TAR}"
-tar -czf "${LOCAL_TAR}" \
+COPYFILE_DISABLE=1 COPY_EXTENDED_ATTRIBUTES_DISABLE=1 tar -czf "${LOCAL_TAR}" \
   --exclude='SmartBFT/.git' \
   --exclude='SmartBFT/build' \
   -C "${REPO_ROOT}" SmartBFT config learning_agent scripts/apply_network_failures.py
@@ -624,7 +676,7 @@ remove_path_with_sudo_fallback() {
 
 remove_path_with_sudo_fallback "${run_root}"
 mkdir -p "${run_root}"
-tar -xzf "${tar_path}" -C "${run_root}"
+tar --warning=no-unknown-keyword -xzf "${tar_path}" -C "${run_root}"
 mkdir -p "${run_root}/bin" "${run_root}/logs" "${run_root}/wal"
 cp "${hosts_path}" "${run_root}/hosts.config"
 cp "${failure_hosts_path}" "${run_root}/hosts.failure.config"
@@ -1006,6 +1058,12 @@ for i in "${!server_nodes[@]}"; do
 	      "${BATCH_TIMEOUT}" \
 	      "${REQUEST_TIMEOUT}" \
 	      "${INITIAL_TIMEOUT}" \
+	      "${LEARNING_WINDOW_MODE}" \
+	      "${LEARNING_FEATURE_DURATION}" \
+	      "${LEARNING_REPLY_WAIT}" \
+	      "${LEARNING_WARMUP_DURATION}" \
+	      "${LEARNING_REWARD_DURATION}" \
+	      "${BACKOFF_ENABLED}" \
 	      "${REQUEST_TIMEOUT_BACKOFF_MAX}" \
 	      "${VERBOSE_ENABLED}" <<'REMOTE'
 set -euo pipefail
@@ -1020,8 +1078,14 @@ batch_size="$7"
 batch_timeout="$8"
 request_timeout="$9"
 initial_timeout="${10}"
-backoff_max="${11}"
-verbose_enabled="${12}"
+learning_window_mode="${11}"
+learning_feature_duration="${12}"
+learning_reply_wait="${13}"
+learning_warmup_duration="${14}"
+learning_reward_duration="${15}"
+backoff_enabled="${16}"
+backoff_max="${17}"
+verbose_enabled="${18}"
 run_root="$HOME/smartbft_cloudlab"
 
 for ((n = 0; n < replicas_per_machine; n++)); do
@@ -1042,11 +1106,24 @@ for ((n = 0; n < replicas_per_machine; n++)); do
     "--data-dir" "${data_dir}"
     "--keep-data"
   )
+	  if [[ "${backoff_enabled}" == "1" ]]; then
+	    args+=("--request-timeout-backoff" "--request-timeout-backoff-max" "${backoff_max}")
+	  fi
 	  if [[ "${failure_enabled}" == "1" ]]; then
 	    args+=("--failure-spec" "${run_root}/config/pbft/failure_spec.xml" "--failure-start-unix-ms" "${start_unix_ms}")
 	  fi
 	  if [[ "${learning_enabled}" == "1" ]]; then
-	    args+=("--learning" "--agent-target" "127.0.0.1:${agent_port}" "--learning-node-id" "${node_id}" "--learning-initial-election-timeout" "${initial_timeout}")
+	    args+=(
+	      "--learning"
+	      "--agent-target" "127.0.0.1:${agent_port}"
+	      "--learning-node-id" "${node_id}"
+	      "--learning-initial-election-timeout" "${initial_timeout}"
+	      "--learning-window-mode" "${learning_window_mode}"
+	      "--learning-feature-duration" "${learning_feature_duration}"
+	      "--learning-reply-wait" "${learning_reply_wait}"
+	      "--learning-warmup-duration" "${learning_warmup_duration}"
+	      "--learning-reward-duration" "${learning_reward_duration}"
+	    )
 	  fi
 	  if [[ "${verbose_enabled}" == "1" ]]; then
 	    args+=("--verbose")

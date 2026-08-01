@@ -8,6 +8,8 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import torch
 
 import agent_pb2
+from models import tendermint_timeouts_from_propose
+from reward_utils import reward_from_report_row
 
 PBFT_LEGACY_FEATURE_ALIASES: Dict[str, Tuple[str, ...]] = {
     "total_transactions": ("processed_transactions",),
@@ -170,8 +172,6 @@ def load_training_data_from_csv(
         for row_number, row in enumerate(reader, start=2):
             if _is_empty_row(row):
                 continue
-            if not _is_matched_row(row):
-                continue
 
             feature_values = _extract_features(
                 protocol=protocol,
@@ -200,24 +200,13 @@ def load_training_data_from_csv(
 
 
     if not features:
-        raise ValueError(
-            f"No usable rows found in {path}. "
-            "Rows with matched_episode_features=0 are skipped."
-        )
+        raise ValueError(f"No completed episode rows found in {path}.")
 
     return CsvTrainingData(features=features, actions=actions, rewards=rewards, labels=labels)
 
 
 def _is_empty_row(row: Dict[str, str]) -> bool:
     return all((value is None or not str(value).strip()) for value in row.values())
-
-
-def _is_matched_row(row: Dict[str, str]) -> bool:
-    matched_raw = row.get("matched_episode_features")
-    if matched_raw is None:
-        return True
-    normalized = matched_raw.strip().lower()
-    return normalized in {"1", "true", "yes", "y"}
 
 
 def _extract_features(
@@ -245,19 +234,21 @@ def _extract_features(
 def _lookup_feature_raw_value(
     protocol: int, row: Dict[str, str], field_name: str
 ) -> Optional[str]:
-    direct = row.get(field_name)
+    direct = row.get(f"feature_{field_name}")
     if direct is not None and direct.strip() != "":
         return direct
 
     if protocol == agent_pb2.PROTOCOL_PBFT:
         aliases = PBFT_LEGACY_FEATURE_ALIASES.get(field_name, ())
         for alias in aliases:
-            aliased = row.get(alias)
+            aliased = row.get(f"feature_{alias}")
             if aliased is not None and aliased.strip() != "":
                 return aliased
         if field_name == "total_consensus_instances":
-            total_raw = row.get("processed_transactions") or row.get("total_transactions")
-            batch_raw = row.get("avg_batch_size")
+            total_raw = row.get("feature_processed_transactions") or row.get(
+                "feature_total_transactions"
+            )
+            batch_raw = row.get("feature_avg_batch_size")
             if total_raw and batch_raw:
                 try:
                     total_transactions = float(total_raw)
@@ -344,17 +335,21 @@ def _extract_action_index(
             ),
             row_number=row_number,
         )
-        propose_idx = _timeout_ms_to_index(
+        expected_timeouts = tendermint_timeouts_from_propose(propose_timeout_ms)
+        actual_timeouts = (
+            propose_timeout_ms,
+            prevote_timeout_ms,
+            precommit_timeout_ms,
+        )
+        if actual_timeouts != expected_timeouts:
+            raise ValueError(
+                "Tendermint prevote and precommit timeouts must be one-third "
+                f"of propose timeout at CSV line {row_number}: "
+                f"expected {expected_timeouts}, got {actual_timeouts}"
+            )
+        return _timeout_ms_to_index(
             propose_timeout_ms, timeout_values_ms, row_number
         )
-        prevote_idx = _timeout_ms_to_index(
-            prevote_timeout_ms, timeout_values_ms, row_number
-        )
-        precommit_idx = _timeout_ms_to_index(
-            precommit_timeout_ms, timeout_values_ms, row_number
-        )
-        base = len(timeout_values_ms)
-        return (propose_idx * base * base) + (prevote_idx * base) + precommit_idx
 
     raise ValueError(f"Unsupported protocol: {protocol}")
 
@@ -391,17 +386,7 @@ def _timeout_ms_to_index(
 
 
 def _extract_reward(row: Dict[str, str], row_number: int) -> float:
-    raw_value = row.get("reward")
-    if raw_value is None or raw_value.strip() == "":
-        raise ValueError(
-            f"Missing reward value at CSV line {row_number}. Tried: reward"
-        )
-    try:
-        return float(raw_value)
-    except ValueError as exc:
-        raise ValueError(
-            f"Invalid reward value for 'reward' at CSV line {row_number}: {raw_value!r}"
-        ) from exc
+    return reward_from_report_row(row, row_number)
 
 def _extract_label(row: Dict[str, str], phase_options: Dict[int, int], row_number: int) -> float:
     for field_name in ("phase",):

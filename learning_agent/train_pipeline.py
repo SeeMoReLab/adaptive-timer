@@ -104,7 +104,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--reward-scaler",
         choices=("raw", "quadratic"),
         default="raw",
-        help="How to scale reward column before training.",
+        help="Optional additional scaling for the reward derived from the reward report.",
     )
     parser.add_argument("--verbose", action="store_true")
     return parser

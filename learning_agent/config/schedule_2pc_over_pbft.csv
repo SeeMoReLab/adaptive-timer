@@ -1,6 +1,0 @@
-# time_s,election_timeout_ms,prepare_timeout_ms
-# Valid timeout values: 150, 400, 900
-0,150,150
-10,150,400
-100,400,900
-1000,900,900

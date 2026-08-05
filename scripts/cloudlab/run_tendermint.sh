@@ -76,6 +76,7 @@ fetch_tendermint_logs_parallel() {
   local local_logs_dir="$3"
   local num_nodes="$4"
   local learning_agent_enabled="$5"
+  local sharing_enabled="${6:-0}"
   local i idx log_file failed=0
   local log_files=("client.log")
   local pids=()
@@ -84,6 +85,9 @@ fetch_tendermint_logs_parallel() {
     log_files+=("node_${i}.log" "abci_${i}.log" "applier_${i}.log")
     if (( learning_agent_enabled == 1 )); then
       log_files+=("agent_${i}.log")
+    fi
+    if (( sharing_enabled == 1 )); then
+      log_files+=("sharing_${i}.log")
     fi
   done
 
@@ -301,6 +305,12 @@ if (( LOG_ENABLED == 1 )); then
   mkdir -p "${LOGS_LOCAL_DIR}"
 fi
 
+SHARING_PAYLOAD_PATHS=""
+if [[ "${MODE}" == "sharing" ]]; then
+  # The report chain is a SmartBFT binary built on the remote node.
+  SHARING_PAYLOAD_PATHS="SmartBFT"
+fi
+
 echo "Creating CometBFT payload tarball..."
 if (( LEARNING_AGENT_ENABLED == 1 )); then
   COPYFILE_DISABLE=1 COPY_EXTENDED_ATTRIBUTES_DISABLE=1 tar -C "${REPO_ROOT}" -czf "${LOCAL_PAYLOAD}" \
@@ -308,9 +318,12 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
     --exclude='cometbft/logs' \
     --exclude='cometbft/build' \
     --exclude='learning_agent/__pycache__' \
+    --exclude='SmartBFT/.git' \
+    --exclude='SmartBFT/build' \
     cometbft \
     config/tendermint \
     learning_agent \
+    ${SHARING_PAYLOAD_PATHS} \
     scripts/tendermint_phase_report.py
 else
   COPYFILE_DISABLE=1 COPY_EXTENDED_ATTRIBUTES_DISABLE=1 tar -C "${REPO_ROOT}" -czf "${LOCAL_PAYLOAD}" \
@@ -403,6 +416,9 @@ output_file="$HOME/tendermint_output.txt"
 results_csv="$HOME/results.csv"
 client_log="${logs_dir}/client.log"
 agent_hosts_config="${run_root}/agent_hosts.config"
+sharing_hosts_config="${run_root}/sharing_hosts.config"
+sharing_src_dir="${run_root}/SmartBFT"
+sharing_bin="${run_root}/bin/smartbft-sharing"
 schedule_file="${learning_agent_dir}/config/schedule_tendermint.csv"
 applier_hosts_config="${run_root}/applier_hosts.config"
 applier_script="${run_root}/apply_network_failures.py"
@@ -437,6 +453,8 @@ p2p_port() { echo $((26656 + $1 * 3)); }
 rpc_port() { echo $((26657 + $1 * 3)); }
 abci_port() { echo $((26658 + $1 * 3)); }
 agent_port() { echo $((50000 + $1)); }
+sharing_report_port() { echo $((50200 + $1)); }
+sharing_consensus_port() { echo $((50400 + $1)); }
 node_ip() { echo "${overlay_a}.${overlay_b}.${overlay_subnet}.$((overlay_host_offset + $1))"; }
 ns_name() { echo "tm-r$1"; }
 ns_host_if() { echo "tm-vh$1"; }
@@ -535,7 +553,7 @@ kill_run_sessions() {
   fi
   while read -r session_name; do
     [[ -z "${session_name}" ]] && continue
-    if [[ "${session_name}" == tm_tendermint_node_* || "${session_name}" == tm_abci_* || "${session_name}" == tm_tendermint_agent_* || "${session_name}" == tm_applier_* ]]; then
+    if [[ "${session_name}" == tm_tendermint_node_* || "${session_name}" == tm_abci_* || "${session_name}" == tm_tendermint_agent_* || "${session_name}" == tm_applier_* || "${session_name}" == tm_sharing_* ]]; then
       tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
     fi
   done <<< "${sessions}"
@@ -801,6 +819,16 @@ go install "${buildvcs_flag}" ./test/loadtime/cmd/report
 echo "Building cometbft binary..."
 GOFLAGS="${GOFLAGS:-} ${buildvcs_flag}" make build
 
+if [[ "${mode}" == "sharing" ]]; then
+  echo "Building report-chain (sharing) binary..."
+  if [[ ! -d "${sharing_src_dir}" ]]; then
+    echo "Sharing mode requires the SmartBFT sources in the payload: ${sharing_src_dir}" >&2
+    exit 1
+  fi
+  mkdir -p "${run_root}/bin"
+  (cd "${sharing_src_dir}" && GOCACHE="${run_root}/gocache" go build "${buildvcs_flag}" -o "${sharing_bin}" ./examples/sharing)
+fi
+
 cometbft_bin="${src_dir}/build/cometbft"
 if [[ ! -x "${cometbft_bin}" ]]; then
   echo "Missing built cometbft binary: ${cometbft_bin}" >&2
@@ -849,9 +877,17 @@ for ((i = 0; i < num_nodes; i++)); do
 done
 
 if (( learning_agent_enabled == 1 )); then
+  if [[ "${mode}" == "sharing" ]]; then
+    : > "${sharing_hosts_config}"
+    for ((i = 0; i < num_nodes; i++)); do
+      # report-chain ids are 1-based: node_id host report_port agent_port consensus_port
+      echo "$((i + 1)) $(node_ip "${i}") $(sharing_report_port "${i}") $(agent_port "${i}") $(sharing_consensus_port "${i}")" \
+        >> "${sharing_hosts_config}"
+    done
+  fi
   : > "${agent_hosts_config}"
   for ((i = 0; i < num_nodes; i++)); do
-    echo "${i} $(node_ip "${i}") 0 0 $(agent_port "${i}") $(rpc_port "${i}")" >> "${agent_hosts_config}"
+    echo "${i} $(node_ip "${i}") 0 0 $(agent_port "${i}") $(sharing_consensus_port "${i}")" >> "${agent_hosts_config}"
   done
 fi
 echo "Starting ${num_nodes} kvstore and CometBFT nodes in tmux..."
@@ -859,7 +895,7 @@ kill_run_sessions
 if (( learning_agent_enabled == 1 )); then
   agent_mode_args=""
   if [[ "${mode}" == "sharing" ]]; then
-    agent_mode_args="--sharing true --model-type ${agent_model_type}"
+    agent_mode_args="--sharing true --model-type ${agent_model_type} --collect-wait-ms 100"
   elif [[ "${mode}" == "learning" ]]; then
     agent_mode_args="--model-type ${agent_model_type}"
   elif [[ "${mode}" == "scheduled" ]]; then
@@ -886,6 +922,28 @@ if (( learning_agent_enabled == 1 )); then
       exit 1
     fi
   done
+
+  if [[ "${mode}" == "sharing" ]]; then
+    echo "Starting report-chain (sharing) nodes..."
+    for ((i = 0; i < num_nodes; i++)); do
+      sharing_session="tm_sharing_${i}"
+      ns="$(ns_name "${i}")"
+      sharing_log="${logs_dir}/sharing_${i}.log"
+      rm -rf "${run_root}/sharing_wal_${i}"
+      # The report chain orders report batches with SmartBFT regardless of the
+      # protocol being learned, so the same binary serves Tendermint runs.
+      tmux new-session -d -s "${sharing_session}" \
+        "sudo -n ip netns exec ${ns} sudo -n -u ${run_as_user} env HOME=${run_as_home} PATH=${run_as_home}/go/bin:${PATH} bash -lc 'cd \"${run_root}\" && exec \"${sharing_bin}\" --role server --node-id $((i + 1)) --protocol tendermint --hosts-config \"${sharing_hosts_config}\" --data-dir \"${run_root}/sharing_wal_${i}\" --keep-data' > \"${sharing_log}\" 2>&1"
+    done
+    sleep 2
+    for ((i = 0; i < num_nodes; i++)); do
+      if ! tmux has-session -t "tm_sharing_${i}" 2>/dev/null; then
+        echo "Sharing session exited early: tm_sharing_${i}" >&2
+        tail -n 80 "${logs_dir}/sharing_${i}.log" >&2 || true
+        exit 1
+      fi
+    done
+  fi
 fi
 for ((i = 0; i < num_nodes; i++)); do
   abci_session="tm_abci_${i}"
@@ -1047,7 +1105,8 @@ if (( LOG_ENABLED == 1 )); then
     "tendermint_cloudlab/logs" \
     "${LOGS_LOCAL_DIR}" \
     "${LOCAL_NUM_NODES}" \
-    "${LEARNING_AGENT_ENABLED}"; then
+    "${LEARNING_AGENT_ENABLED}" \
+    "$([[ "${MODE}" == "sharing" ]] && echo 1 || echo 0)"; then
     echo "Failed to fetch some/all logs from ${remote_host}." >&2
   fi
 fi

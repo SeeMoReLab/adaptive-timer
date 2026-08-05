@@ -8,6 +8,7 @@ import statistics
 import threading
 import time
 import xml.etree.ElementTree as ET
+from collections import Counter
 from concurrent import futures
 from dataclasses import dataclass
 from datetime import datetime
@@ -41,7 +42,11 @@ from models import (
     get_report_feature_field_names,
     report_to_feature_values,
 )
-from reward_utils import reward_from_throughput
+from reward_utils import (
+    calculate_pbft_reward,
+    calculate_sbft_reward,
+    calculate_tendermint_reward,
+)
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -72,9 +77,62 @@ def _parse_bool(value: str) -> bool:
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
-def reward_engineering(throughput: float) -> float:
-    """Quadratic shaping below 1000, linear above (prior-work style)."""
-    return reward_from_throughput(throughput)
+def reward_engineering(protocol: int, report: object) -> float:
+    """Calculate a protocol-specific reward from a complete reward report."""
+    if protocol == agent_pb2.PROTOCOL_PBFT:
+        return calculate_pbft_reward(
+            total_transactions=int(report.total_transactions),
+            total_consensus_instances=int(report.total_consensus_instances),
+            avg_consensus_latency_ms=float(report.avg_consensus_latency_ms),
+            p50_consensus_latency_ms=float(report.p50_consensus_latency_ms),
+            p95_consensus_latency_ms=float(report.p95_consensus_latency_ms),
+            throughput_tps=float(report.throughput_tps),
+            avg_batch_size=float(report.avg_batch_size),
+            p95_batch_size=float(report.p95_batch_size),
+            leader_change_count=int(report.leader_change_count),
+            regency_change_count=int(report.regency_change_count),
+            timeout_ms=int(report.timeout_ms),
+            avg_inter_commit_gap_ms=float(report.avg_inter_commit_gap_ms),
+            p50_inter_commit_gap_ms=float(report.p50_inter_commit_gap_ms),
+            p95_inter_commit_gap_ms=float(report.p95_inter_commit_gap_ms),
+            view_change_count=int(report.view_change_count),
+            no_progress_view_change_count=int(
+                report.no_progress_view_change_count
+            ),
+        )
+    if protocol == agent_pb2.PROTOCOL_SBFT:
+        return calculate_sbft_reward(
+            total_transactions=int(report.total_transactions),
+            total_consensus_instances=int(report.total_consensus_instances),
+            avg_consensus_latency_ms=float(report.avg_consensus_latency_ms),
+            p95_consensus_latency_ms=float(report.p95_consensus_latency_ms),
+            p99_consensus_latency_ms=float(report.p99_consensus_latency_ms),
+            throughput_tps=float(report.throughput_tps),
+            timeout_violation_rate=float(report.timeout_violation_rate),
+            avg_batch_size=float(report.avg_batch_size),
+            p95_batch_size=float(report.p95_batch_size),
+            leader_change_count=int(report.leader_change_count),
+            regency_change_count=int(report.regency_change_count),
+        )
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        return calculate_tendermint_reward(
+            total_transactions=int(report.total_transactions),
+            total_consensus_instances=int(report.total_consensus_instances),
+            avg_consensus_latency_ms=float(report.avg_consensus_latency_ms),
+            p50_consensus_latency_ms=float(report.p50_consensus_latency_ms),
+            p90_consensus_latency_ms=float(report.p90_consensus_latency_ms),
+            throughput_tps=float(report.throughput_tps),
+            timeout_violation_rate=float(report.timeout_violation_rate),
+            avg_batch_size=float(report.avg_batch_size),
+            p50_batch_size=float(report.p50_batch_size),
+            p90_batch_size=float(report.p90_batch_size),
+            leader_change_count=int(report.leader_change_count),
+            regency_change_count=int(report.regency_change_count),
+            propose_latency_ms=float(report.propose_latency_ms),
+            prevote_latency_ms=float(report.prevote_latency_ms),
+            precommit_latency_ms=float(report.precommit_latency_ms),
+        )
+    raise ValueError(f"Unsupported protocol: {protocol}")
 
 
 PROTOCOL_NAME_TO_ENUM = {
@@ -218,10 +276,13 @@ class TimeoutDecision:
     window_consensus_count: int
 
 
-def _report_window_key(report: agent_pb2.ReportLocal) -> int:
-    if int(report.protocol) == agent_pb2.PROTOCOL_PBFT:
-        return int(report.window_consensus_count)
-    return int(report.report_seq)
+def _reward_timeouts_agree(timeouts: List[object]) -> bool:
+    if not timeouts:
+        return False
+    first = timeouts[0].SerializeToString(deterministic=True)
+    return all(
+        timeout.SerializeToString(deterministic=True) == first for timeout in timeouts[1:]
+    )
 
 
 def _parse_required_int(parent: ET.Element, tag: str) -> int:
@@ -533,10 +594,12 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._active_injection_phase_index = -1
         self._current_episode = 0
         self._sealed_through_episode = 0
-        self._winner_report_window_by_episode: Dict[int, int] = {}
-        self._reports_by_episode: Dict[
-            int, Dict[int, Dict[int, agent_pb2.ReportLocal]]
-        ] = {}
+        # Reports are bucketed by episode alone. Bucketing by report window
+        # would partition a quorum across nodes whose report lengths differ,
+        # so no bucket would ever reach 2f+1; the window is instead reconciled
+        # by taking the median across the collected reports.
+        self._quorum_episodes: Set[int] = set()
+        self._reports_by_episode: Dict[int, Dict[int, agent_pb2.ReportLocal]] = {}
         self._timers_by_episode: Dict[int, threading.Timer] = {}
         self._submitted_episodes: Set[int] = set()
         self._finalized_episodes: Set[int] = set()
@@ -594,7 +657,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             return True
         if episode in self._finalized_episodes:
             return True
-        return episode in self._winner_report_window_by_episode
+        return episode in self._quorum_episodes
 
     def _derive_window_from_reports(
         self, reports: List[agent_pb2.ReportLocal]
@@ -915,10 +978,15 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             window_consensus_count=request.window_consensus_count,
         )
         _set_state(local_report, self._protocol, incoming_state)
+        if self._sharing and request.HasField("reward"):
+            # In sharing mode the reward travels with the report so that it is
+            # aggregated by the same consensus batch that carries the features.
+            local_report.reward.CopyFrom(request.reward)
 
         signed_report: Optional[agent_pb2.ReportLocal] = None
         with self._lock:
-            self._apply_reward_update_locked(request)
+            if not self._sharing:
+                self._apply_reward_update_locked(request)
             dirty_active, _ = self._active_agent_injection_flags_locked()
             if dirty_active:
                 state = _extract_state(local_report, self._protocol)
@@ -941,12 +1009,6 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             if local_report.episode > self._current_episode:
                 self._current_episode = local_report.episode
             self._received_episodes.add(local_report.episode)
-            if self._sharing and local_report.episode not in self._phase_by_episode:
-                # In sharing mode, mirror non-sharing semantics by capturing
-                # the active injection phase as soon as the local report is accepted.
-                self._phase_by_episode[local_report.episode] = (
-                    self._current_injection_phase_index_locked()
-                )
 
             if not self._sharing:
                 print(
@@ -970,9 +1032,11 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             else:
                 self._pending_episodes.add(local_report.episode)
                 signed_report = self._sign_report(local_report)
-                if not self._store_report_locked(signed_report):
-                    signed_report = None
+                self._store_report_locked(signed_report)
 
+        # Broadcast regardless of whether the report was stored locally. A
+        # follow-up report is a no-op here but is exactly what heals a peer that
+        # missed this node's first report for the episode.
         if signed_report is not None:
             self._broadcast_signed_report_async(signed_report)
 
@@ -1073,7 +1137,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             if timer is not None:
                 timer.cancel()
             self._reports_by_episode.pop(request.episode, None)
-            self._winner_report_window_by_episode.pop(request.episode, None)
+            self._quorum_episodes.discard(int(request.episode))
             self._submitted_episodes.add(request.episode)
             self._finalized_episodes.add(request.episode)
             self._sealed_through_episode = max(
@@ -1081,6 +1145,12 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             )
             self._pending_episodes.discard(request.episode)
             self._received_episodes.add(request.episode)
+            self._prune_stale_episodes_locked()
+
+            # Apply the agreed reward before predicting: both the features and
+            # the reward for this batch come from consensus, so every node feeds
+            # its model exactly the same experience.
+            self._apply_aggregated_reward_locked(request)
 
             timeout = self._predict_timeout_locked(
                 request.episode,
@@ -1107,10 +1177,28 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 status=agent_pb2.TimeoutStatus.Status.NOT_RECEIVED,
             )
         with self._lock:
-            decision = self._timeouts_by_episode.get(request.episode)
+            # Answer with the newest decision at or after the requested episode.
+            # When consensus has moved past a lagging node, that is what lets the
+            # node fast-forward instead of polling an episode it will never get.
+            episode = request.episode
+            decision = self._timeouts_by_episode.get(episode)
+            if decision is None:
+                later = [
+                    candidate
+                    for candidate in self._timeouts_by_episode
+                    if candidate > request.episode
+                ]
+                if later:
+                    episode = max(later)
+                    decision = self._timeouts_by_episode[episode]
             if decision is not None:
+                if episode != request.episode:
+                    print(
+                        f"[episode {request.episode}] answering with newer decision "
+                        f"for episode {episode}"
+                    )
                 return agent_pb2.TimeoutStatus(
-                    episode=request.episode,
+                    episode=episode,
                     status=agent_pb2.TimeoutStatus.Status.READY,
                     timeout=decision.timeout,
                     start_tick=decision.start_tick,
@@ -1133,7 +1221,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 timer.cancel()
             self._timers_by_episode.clear()
             self._reports_by_episode.clear()
-            self._winner_report_window_by_episode.clear()
+            self._quorum_episodes.clear()
             self._submitted_episodes.clear()
             self._finalized_episodes.clear()
             self._received_episodes.clear()
@@ -1150,71 +1238,64 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         if self._is_episode_sealed_locked(report.episode):
             return False
 
-        winner_window = self._winner_report_window_by_episode.get(report.episode)
-        window_key = _report_window_key(report)
-        if winner_window is not None and window_key != winner_window:
-            return False
-
-        by_window = self._reports_by_episode.setdefault(report.episode, {})
-        reports_for_window = by_window.setdefault(window_key, {})
-        existing = reports_for_window.get(report.node_id)
+        reports_for_episode = self._reports_by_episode.setdefault(report.episode, {})
+        existing = reports_for_episode.get(report.node_id)
         if existing is not None:
-            if int(report.start_tick) > int(existing.start_tick):
-                reports_for_window[report.node_id] = report
+            # Keep the first report a node sent for an episode. Follow-up reports
+            # only exist because that node is still waiting for a recommendation,
+            # and the first reports across nodes are the most time-aligned.
             return False
 
-        reports_for_window[report.node_id] = report
-        reports_collected = len(reports_for_window)
+        reports_for_episode[report.node_id] = report
+        reports_collected = len(reports_for_episode)
 
         print(
-            f"[episode {report.episode} window={window_key} "
-            f"seq={report.report_seq}] accepted valid report "
-            f"from node={report.node_id} ({reports_collected}/{self._threshold})"
+            f"[episode {report.episode} seq={report.report_seq} "
+            f"window_consensus_count={report.window_consensus_count}] "
+            f"accepted valid report from node={report.node_id} "
+            f"({reports_collected}/{self._threshold})"
         )
 
         if (
-            winner_window is None
-            and reports_collected >= self._threshold
+            reports_collected >= self._threshold
             and report.episode not in self._timers_by_episode
             and report.episode not in self._submitted_episodes
         ):
-            self._winner_report_window_by_episode[report.episode] = window_key
+            self._quorum_episodes.add(int(report.episode))
             self._sealed_through_episode = max(
                 self._sealed_through_episode, int(report.episode)
             )
             timer = threading.Timer(
                 self._collect_wait_s,
                 self._finalize_episode,
-                args=(int(report.episode), window_key),
+                args=(int(report.episode),),
             )
             self._timers_by_episode[report.episode] = timer
             timer.daemon = True
             timer.start()
         return True
 
-    def _finalize_episode(self, episode: int, window_key: int) -> None:
+    def _finalize_episode(self, episode: int) -> None:
         with self._lock:
             if episode in self._finalized_episodes or episode in self._submitted_episodes:
                 return
-            winner_window = self._winner_report_window_by_episode.get(episode)
-            if winner_window is None or int(winner_window) != int(window_key):
+            if episode not in self._quorum_episodes:
                 return
-            reports_by_window = self._reports_by_episode.get(episode, {})
-            reports_for_window = reports_by_window.get(window_key, {})
-            if not reports_for_window:
+            reports_for_episode = self._reports_by_episode.get(episode, {})
+            if not reports_for_episode:
                 return
-            snapshot = list(reports_for_window.values())
+            snapshot = list(reports_for_episode.values())
             _, ignore_active = self._active_agent_injection_flags_locked()
             if ignore_active and len(snapshot) > self._threshold:
                 snapshot = sorted(snapshot, key=lambda item: item.node_id)[: self._threshold]
                 print(
                     "[injection] ignoreReport applied "
-                    f"(node={self.node_id}, episode={episode}, window={window_key}, "
+                    f"(node={self.node_id}, episode={episode}, "
                     f"kept={len(snapshot)})"
                 )
             self._submitted_episodes.add(episode)
             self._reports_by_episode.pop(episode, None)
-            self._winner_report_window_by_episode.pop(episode, None)
+            self._quorum_episodes.discard(episode)
             self._timers_by_episode.pop(episode, None)
 
         if self._consensus_stub is None:
@@ -1306,6 +1387,88 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             timeout_used=timeout_used_copy,
         )
 
+    def _prune_stale_episodes_locked(self) -> None:
+        """Drop bookkeeping for episodes that can no longer be finalized.
+
+        An episode that never reaches quorum leaves a partial report bucket
+        behind, and an episode that is never ordered leaves a reward that can
+        never be matched to features.
+        """
+        threshold = int(self._sealed_through_episode)
+        for episode in [ep for ep in self._reports_by_episode if ep < threshold]:
+            self._reports_by_episode.pop(episode, None)
+            self._pending_episodes.discard(episode)
+        for episode in [ep for ep in self._pending_rewards_by_episode if ep < threshold]:
+            self._pending_rewards_by_episode.pop(episode, None)
+            print(
+                f"[learning] dropped unmatched reward for episode {episode}: "
+                "consensus never produced features for it"
+            )
+
+    def _apply_aggregated_reward_locked(self, report_batch: agent_pb2.ReportBatch) -> None:
+        """Apply one reward, agreed by consensus, to this node's model.
+
+        The reward for episode e-1 is piggybacked on the reports for episode e,
+        so the delivered batch carries one reward per contributing node. Taking
+        the median over them makes the reward Byzantine-robust and identical on
+        every node, instead of each node training on its own local measurement.
+        """
+        payloads: List[Tuple[int, int, object, object]] = []
+        for report in report_batch.reports:
+            if not report.HasField("reward"):
+                continue
+            payload = _extract_reward_payload(self._protocol, report.reward)
+            if payload is None:
+                continue
+            reward_episode, reward_report, timeout_used = payload
+            payloads.append(
+                (int(report.node_id), int(reward_episode), reward_report, timeout_used)
+            )
+        if not payloads:
+            return
+
+        episode_counts = Counter(episode for _, episode, _, _ in payloads)
+        reward_episode, present = episode_counts.most_common(1)[0]
+        required = (self._threshold + 1) // 2  # f+1
+        if present < required:
+            print(
+                f"[learning] skipped reward update for episode {reward_episode}: "
+                f"only {present} of {len(report_batch.reports)} reports carry it, need {required}"
+            )
+            return
+
+        group = [payload for payload in payloads if payload[1] == reward_episode]
+        timeouts = [payload[3] for payload in group]
+        if not _reward_timeouts_agree(timeouts):
+            # Aggregating rewards measured under different timeouts would label
+            # the training row with an action no node actually ran.
+            print(
+                f"[learning] skipped reward update for episode {reward_episode}: "
+                f"contributing nodes report different timeouts "
+                f"({[node_id for node_id, _, _, _ in group]})"
+            )
+            return
+
+        synthetic = agent_pb2.ReportBatch(
+            episode=reward_episode, protocol=self._protocol
+        )
+        for node_id, _, reward_report, _ in group:
+            entry = synthetic.reports.add()
+            entry.node_id = node_id
+            entry.episode = reward_episode
+            entry.protocol = self._protocol
+            _set_state(entry, self._protocol, reward_report)
+
+        aggregated_reward = self._aggregator.aggregate(
+            node_id=self.node_id, report_batch=synthetic
+        )
+        self._apply_reward_payload_locked(
+            report_node_id=self.node_id,
+            reward_episode=reward_episode,
+            reward_report=aggregated_reward,
+            timeout_used=timeouts[0],
+        )
+
     def _apply_reward_payload_locked(
         self,
         report_node_id: int,
@@ -1335,7 +1498,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
 
         total_transactions = _report_total_transactions(reward_report)
         throughput_tps = _report_throughput_tps(reward_report)
-        engineered_reward = reward_engineering(throughput_tps)
+        engineered_reward = reward_engineering(self._protocol, reward_report)
         phase = self._phase_by_episode.get(reward_episode, -1)
         self._log_completed_episode_row_locked(
             phase=phase,
@@ -1501,8 +1664,12 @@ def serve(
             seed=42,
         )
     elif model_type == "random":
+        # Seeded like the other models so that, in sharing mode, every node
+        # draws the same action from the same agreed features. Reward
+        # aggregation is only meaningful when the fleet explores in lockstep.
         model = RandomTimeoutModel(
             action_dim=get_action_space_size(protocol),
+            seed=42,
         )
     elif model_type == "linear":
         model = LinearTorchModel(
@@ -1616,7 +1783,7 @@ def main():
     parser.add_argument(
         "--collect-wait-ms",
         type=int,
-        default=1000,
+        default=100,
         help="Wait time (ms) after reaching 2f+1 reports before consensus submit.",
     )
     parser.add_argument(

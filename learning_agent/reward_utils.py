@@ -1,4 +1,7 @@
-from typing import Mapping, Optional
+import math
+from typing import Callable, Mapping, Optional, Tuple, Type
+
+import agent_pb2
 
 
 REWARD_THROUGHPUT_FIELD = "reward_throughput_tps"
@@ -10,6 +13,69 @@ def reward_from_throughput(throughput_tps: float) -> float:
     if value < 1000.0:
         return (value / 1000.0) ** 2 * 1000.0
     return value
+
+
+def calculate_pbft_reward(
+    *,
+    total_transactions: int,
+    total_consensus_instances: int,
+    avg_consensus_latency_ms: float,
+    p50_consensus_latency_ms: float,
+    p95_consensus_latency_ms: float,
+    throughput_tps: float,
+    avg_batch_size: float,
+    p95_batch_size: float,
+    leader_change_count: int,
+    regency_change_count: int,
+    timeout_ms: int,
+    avg_inter_commit_gap_ms: float,
+    p50_inter_commit_gap_ms: float,
+    p95_inter_commit_gap_ms: float,
+    view_change_count: int,
+    no_progress_view_change_count: int,
+) -> float:
+    """Calculate an online PBFT reward from a complete reward report."""
+    return reward_from_throughput(throughput_tps)
+
+
+def calculate_sbft_reward(
+    *,
+    total_transactions: int,
+    total_consensus_instances: int,
+    avg_consensus_latency_ms: float,
+    p95_consensus_latency_ms: float,
+    p99_consensus_latency_ms: float,
+    throughput_tps: float,
+    timeout_violation_rate: float,
+    avg_batch_size: float,
+    p95_batch_size: float,
+    leader_change_count: int,
+    regency_change_count: int,
+) -> float:
+    """Calculate an online SBFT reward from a complete reward report."""
+    return reward_from_throughput(throughput_tps)
+
+
+def calculate_tendermint_reward(
+    *,
+    total_transactions: int,
+    total_consensus_instances: int,
+    avg_consensus_latency_ms: float,
+    p50_consensus_latency_ms: float,
+    p90_consensus_latency_ms: float,
+    throughput_tps: float,
+    timeout_violation_rate: float,
+    avg_batch_size: float,
+    p50_batch_size: float,
+    p90_batch_size: float,
+    leader_change_count: int,
+    regency_change_count: int,
+    propose_latency_ms: float,
+    prevote_latency_ms: float,
+    precommit_latency_ms: float,
+) -> float:
+    """Calculate an online Tendermint reward from a complete reward report."""
+    return (throughput_tps - 0.3 * p90_consensus_latency_ms) / 1000.0
 
 
 def reward_from_report_row(
@@ -29,3 +95,75 @@ def reward_from_report_row(
             f"at CSV line {row_number}: {raw_value!r}"
         ) from exc
     return reward_from_throughput(throughput_tps)
+
+
+_REPORT_TYPES: Mapping[int, Type[object]] = {
+    agent_pb2.PROTOCOL_PBFT: agent_pb2.PbftReport,
+    agent_pb2.PROTOCOL_SBFT: agent_pb2.SbftReport,
+    agent_pb2.PROTOCOL_TENDERMINT: agent_pb2.TendermintReport,
+}
+
+_REPORT_REWARD_CALCULATORS: Mapping[int, Callable[..., float]] = {
+    agent_pb2.PROTOCOL_PBFT: calculate_pbft_reward,
+    agent_pb2.PROTOCOL_SBFT: calculate_sbft_reward,
+    agent_pb2.PROTOCOL_TENDERMINT: calculate_tendermint_reward,
+}
+
+
+def get_reward_report_field_names(protocol: int) -> Tuple[str, ...]:
+    """Return every field expected by a protocol's reward calculator."""
+    report_type = _REPORT_TYPES.get(int(protocol))
+    if report_type is None:
+        raise ValueError(f"Unsupported protocol: {protocol}")
+    return tuple(field.name for field in report_type.DESCRIPTOR.fields)
+
+
+def calculate_reward_from_report_row(
+    protocol: int,
+    row: Mapping[str, object],
+    row_number: int,
+    prefix: str = "reward_",
+) -> float:
+    """Calculate a reward from all report fields stored in a CSV row."""
+    report_type = _REPORT_TYPES.get(int(protocol))
+    calculator = _REPORT_REWARD_CALCULATORS.get(int(protocol))
+    if report_type is None or calculator is None:
+        raise ValueError(f"Unsupported protocol: {protocol}")
+
+    values = {}
+    for field in report_type.DESCRIPTOR.fields:
+        column = f"{prefix}{field.name}"
+        raw_value = row.get(column)
+        if raw_value is None or str(raw_value).strip() == "":
+            raise ValueError(
+                f"Missing reward report value '{column}' at CSV line {row_number}."
+            )
+        try:
+            numeric_value = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid reward report value for '{column}' at CSV line "
+                f"{row_number}: {raw_value!r}"
+            ) from exc
+        if not math.isfinite(numeric_value):
+            raise ValueError(
+                f"Non-finite reward report value for '{column}' at CSV line "
+                f"{row_number}: {raw_value!r}"
+            )
+        if field.type in (
+            field.TYPE_INT32,
+            field.TYPE_INT64,
+            field.TYPE_UINT32,
+            field.TYPE_UINT64,
+            field.TYPE_SINT32,
+            field.TYPE_SINT64,
+            field.TYPE_FIXED32,
+            field.TYPE_FIXED64,
+            field.TYPE_SFIXED32,
+            field.TYPE_SFIXED64,
+        ):
+            values[field.name] = int(numeric_value)
+        else:
+            values[field.name] = numeric_value
+
+    return float(calculator(**values))

@@ -17,12 +17,11 @@ from data_loader import (
     _extract_action_index, 
     _extract_features, 
     _extract_label, 
-    _extract_reward, 
     _is_empty_row,
     )
+from reward_utils import calculate_reward_from_report_row
 
 from models import (
-    PHASE_INDEX_TO_TIMEOUT_INDEX,
     LinearTorchModel,
     ThompsonSamplingModel,
     ThompsonSamplingModelOld,
@@ -55,6 +54,8 @@ MODEL_NAME_TO_TENSORMODEL = {
     "cmab": ThompsonSamplingModel,
     "cmab_old": ThompsonSamplingModelOld,
 }
+
+DEFAULT_PBFT_PHASES = "0;1;2;3;4;5;0;2;1;5;4;2;1"
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -120,7 +121,13 @@ def _parse_data(
             timeout_values_ms=timeout_values_ms,
             row_number=row_number,
         )
-        reward_value = _extract_reward(row=row, row_number=row_number)
+        simulated_reward = row.get("simulated_reward")
+        if simulated_reward is not None and simulated_reward.strip() != "":
+            reward_value = float(simulated_reward)
+        else:
+            reward_value = calculate_reward_from_report_row(
+                protocol, row, row_number=row_number
+            )
 
         label_index = _extract_label(
             row=row, 
@@ -158,8 +165,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=Path(__file__).resolve().parent / "data",
-        help="Observation Sample Directory path.",
+        default=None,
+        help=(
+            "Observation sample directory. Defaults to "
+            "learning_agent/data/<protocol>."
+        ),
     )
     parser.add_argument(
         "--plot-dir",
@@ -185,8 +195,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--phases",
         type=str,
-        default="0;1;2;3;4;5;0;2;1;5;4;2;1",
-        help="Phase sequence.",
+        default=None,
+        help=(
+            "Phase sequence. PBFT retains its established default; other "
+            "protocols default to every non-warmup phase in the dataset."
+        ),
     )
 
     parser.add_argument("--verbose", action="store_true")
@@ -204,17 +217,32 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 def generate_data(
-        generator: DataGenerator, protocol: str, phase: int, current_start_episode: int, scaler: RewardTransformer, batch_size: int, num_episode:int = 1, prev_timeout: List[int] = None
-        )-> DatasetLoader:
-    phase_data, new_start_episode = generator.generate_local_report(phase_index=int(phase), current_start_episode=current_start_episode, num_episode=num_episode, prev_timeout = prev_timeout)
+    generator: DataGenerator,
+    protocol: str,
+    phase: int,
+    current_start_episode: int,
+    scaler: RewardTransformer,
+    batch_size: int,
+    phase_options: Dict[int, int],
+    num_episode: int = 1,
+    prev_timeout: List[int] = None,
+) -> Tuple[DatasetLoader, int]:
+    phase_data, new_start_episode = generator.generate_local_report(
+        phase_index=int(phase),
+        current_start_episode=current_start_episode,
+        num_episode=num_episode,
+        prev_timeout=prev_timeout,
+    )
     parsed_data = _parse_data(
-            reader=phase_data,
-            protocol=PROTOCOL_NAME_TO_ENUM[protocol],
-            feature_field_names=get_report_feature_field_names(PROTOCOL_NAME_TO_ENUM[protocol]),
-            timeout_values_ms=get_timeout_values_ms(PROTOCOL_NAME_TO_ENUM[protocol]),
-            phase_options=PHASE_INDEX_TO_TIMEOUT_INDEX, 
-            reward_transform= scaler,
-    )  
+        reader=phase_data,
+        protocol=PROTOCOL_NAME_TO_ENUM[protocol],
+        feature_field_names=get_report_feature_field_names(
+            PROTOCOL_NAME_TO_ENUM[protocol]
+        ),
+        timeout_values_ms=get_timeout_values_ms(PROTOCOL_NAME_TO_ENUM[protocol]),
+        phase_options=phase_options,
+        reward_transform=scaler,
+    )
 
     loader = DatasetLoader(
         features=parsed_data.features,
@@ -504,30 +532,44 @@ def plot_prediction_phases(data_dict: Dict[Tuple[int, str], List[float]], save_p
 def main() -> None:
     args = _build_parser().parse_args()
     set_seed(args.seed)
-    print(f'Initiating Experiment [Model:] {args.model} [Protocol:] {args.protocol} [Phases:] {args.phases} ')
+    protocol_name = args.protocol.strip().lower().replace("-", "_")
+    protocol_id = _parse_protocol(protocol_name)
+    data_dir = args.data_dir or Path(__file__).resolve().parent / "data" / protocol_name
 
     # 1. Initialization
     generator = DataGenerator(
-        protocol=args.protocol, 
-        directory_path=args.data_dir, 
+        protocol=protocol_name,
+        directory_path=data_dir,
+    )
+    if args.phases is not None:
+        phase_spec = args.phases
+    elif protocol_id == agent_pb2.PROTOCOL_PBFT:
+        phase_spec = DEFAULT_PBFT_PHASES
+    else:
+        phase_spec = ";".join(
+            str(phase) for phase in sorted(generator.phase_options) if phase >= 0
+        )
+    print(
+        f"Initiating Experiment [Model:] {args.model} "
+        f"[Protocol:] {protocol_name} [Phases:] {phase_spec}"
     )
     scaler = QuadraticRewardScaler.transform if args.reward_scaler == "quadratic" else None
 
     if args.model is ThompsonSamplingModel:
         model = args.model(
-            action_dim=get_action_space_size(_parse_protocol(args.protocol)),
-            n_features=get_report_feature_dim(_parse_protocol(args.protocol)),
+            action_dim=get_action_space_size(protocol_id),
+            n_features=get_report_feature_dim(protocol_id),
             seed=args.seed,
         )
     elif args.model is ThompsonSamplingModelOld:
         model = args.model(
-            action_dim=get_action_space_size(_parse_protocol(args.protocol)),
-            n_features=get_report_feature_dim(_parse_protocol(args.protocol)),
+            action_dim=get_action_space_size(protocol_id),
+            n_features=get_report_feature_dim(protocol_id),
         )
     else:
         model = args.model(
-        action_dim=get_action_space_size(_parse_protocol(args.protocol)),
-        n_features=get_report_feature_dim(_parse_protocol(args.protocol)),
+        action_dim=get_action_space_size(protocol_id),
+        n_features=get_report_feature_dim(protocol_id),
     )
 
     os.makedirs(args.plot_dir, exist_ok=True)
@@ -536,7 +578,7 @@ def main() -> None:
 
     current_start_episode = 0
     idx = 0
-    phases = args.phases.split(';')
+    phases = phase_spec.split(';')
     use_tqdm = HAS_TQDM and args.verbose
     curr_timeout = None
     
@@ -578,18 +620,19 @@ def main() -> None:
         for phase_eps in episode_iterator:
             phase_loader, current_start_episode = generate_data(
                 generator=generator, 
-                protocol=args.protocol, 
+                protocol=protocol_name,
                 phase=phase, 
                 current_start_episode=current_start_episode, 
                 scaler=scaler,       
                 batch_size=args.batch_size,
+                phase_options=generator.phase_options,
                 num_episode=1,
                 prev_timeout=curr_timeout
             )
             
             inf_start_t = time.perf_counter()
             metrics, curr_timeout = evaluate_model(
-                protocol=PROTOCOL_NAME_TO_ENUM[args.protocol],
+                protocol=protocol_id,
                 model=model,         
                 eval_loader=phase_loader,
             )
@@ -613,7 +656,7 @@ def main() -> None:
 
             train_start_t = time.perf_counter()
             model, _ = train_model(
-                protocol=PROTOCOL_NAME_TO_ENUM[args.protocol],
+                protocol=protocol_id,
                 model=model,
                 train_loader=phase_loader,
                 eval_loader=phase_loader,
@@ -643,10 +686,17 @@ def main() -> None:
 
     plot_accuracy(result=result, save_path=os.path.join(exp_path, 'summary_accuracies.png'))
     plot_stage_accuracies(data_dict=raw_result, save_path=os.path.join(exp_path, 'episode_accuracies.png'))
-    plot_prediction_phases(data_dict=predictions, save_path=os.path.join(exp_path, 'predictions.png'), y_ticks=[300, 800, 1800])
+    plot_prediction_phases(
+        data_dict=predictions,
+        save_path=os.path.join(exp_path, 'predictions.png'),
+        y_ticks=list(get_timeout_values_ms(protocol_id)),
+    )
 
     print(f"\n[SUMMARY]")
-    print(f"[Experiment Configs:]\tprotocol={args.protocol}, num_episodes={args.num_episodes}, phases={args.phases}")
+    print(
+        f"[Experiment Configs:]\tprotocol={protocol_name}, "
+        f"num_episodes={args.num_episodes}, phases={phase_spec}"
+    )
     
     eps_values = [stat['ep'] for stat in convergence_stats.values()]
     time_values = [stat['time_ms'] for stat in convergence_stats.values()]

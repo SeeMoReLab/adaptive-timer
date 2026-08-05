@@ -1,6 +1,13 @@
 import unittest
 
-from reward_utils import reward_from_report_row
+import agent_pb2
+from reward_utils import (
+    calculate_pbft_reward,
+    calculate_reward_from_report_row,
+    calculate_sbft_reward,
+    calculate_tendermint_reward,
+    reward_from_report_row,
+)
 
 
 class RewardExtractionTest(unittest.TestCase):
@@ -23,6 +30,76 @@ class RewardExtractionTest(unittest.TestCase):
     def test_requires_reward_report_throughput(self) -> None:
         with self.assertRaisesRegex(ValueError, "reward_throughput_tps"):
             reward_from_report_row({"reward": "500"}, row_number=2)
+
+    def test_complete_protocol_reports_keep_current_reward_formula(self) -> None:
+        common = {
+            "total_transactions": 100,
+            "total_consensus_instances": 10,
+            "avg_consensus_latency_ms": 20.0,
+            "throughput_tps": 500.0,
+            "avg_batch_size": 10.0,
+            "leader_change_count": 1,
+            "regency_change_count": 1,
+        }
+        pbft_reward = calculate_pbft_reward(
+            **common,
+            p50_consensus_latency_ms=18.0,
+            p95_consensus_latency_ms=30.0,
+            p95_batch_size=15.0,
+            timeout_ms=300,
+            avg_inter_commit_gap_ms=25.0,
+            p50_inter_commit_gap_ms=22.0,
+            p95_inter_commit_gap_ms=40.0,
+            view_change_count=1,
+            no_progress_view_change_count=1,
+        )
+        sbft_reward = calculate_sbft_reward(
+            **common,
+            p95_consensus_latency_ms=30.0,
+            p99_consensus_latency_ms=35.0,
+            timeout_violation_rate=0.1,
+            p95_batch_size=15.0,
+        )
+        tendermint_reward = calculate_tendermint_reward(
+            **common,
+            p50_consensus_latency_ms=18.0,
+            p90_consensus_latency_ms=28.0,
+            timeout_violation_rate=0.1,
+            p50_batch_size=9.0,
+            p90_batch_size=14.0,
+            propose_latency_ms=10.0,
+            prevote_latency_ms=5.0,
+            precommit_latency_ms=5.0,
+        )
+
+        self.assertEqual(pbft_reward, 250.0)
+        self.assertEqual(sbft_reward, 250.0)
+        self.assertAlmostEqual(tendermint_reward, 0.4944)
+
+    def test_tendermint_csv_reward_uses_complete_reward_report(self) -> None:
+        row = {
+            "reward_total_transactions": "100",
+            "reward_total_consensus_instances": "10",
+            "reward_avg_consensus_latency_ms": "20",
+            "reward_p50_consensus_latency_ms": "18",
+            "reward_p90_consensus_latency_ms": "500",
+            "reward_throughput_tps": "4000",
+            "reward_timeout_violation_rate": "0.1",
+            "reward_avg_batch_size": "10",
+            "reward_p50_batch_size": "9",
+            "reward_p90_batch_size": "14",
+            "reward_leader_change_count": "1",
+            "reward_regency_change_count": "1",
+            "reward_propose_latency_ms": "10",
+            "reward_prevote_latency_ms": "5",
+            "reward_precommit_latency_ms": "5",
+        }
+
+        reward = calculate_reward_from_report_row(
+            agent_pb2.PROTOCOL_TENDERMINT, row, row_number=2
+        )
+
+        self.assertEqual(reward, 3.9)
 
 
 if __name__ == "__main__":

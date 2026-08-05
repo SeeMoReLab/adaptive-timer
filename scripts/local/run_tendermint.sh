@@ -194,6 +194,8 @@ output_file="${run_root}/tendermint_output.txt"
 results_csv="${run_root}/results.csv"
 client_log="${logs_dir}/client.log"
 agent_hosts_config="${run_root}/agent_hosts.config"
+sharing_hosts_config="${run_root}/sharing_hosts.config"
+SMARTBFT_DIR="${REPO_ROOT}/SmartBFT"
 schedule_file="${SCHEDULE_TENDERMINT}"
 buildvcs_flag="-buildvcs=false"
 
@@ -201,6 +203,8 @@ p2p_port() { echo $((26656 + $1 * 3)); }
 rpc_port() { echo $((26657 + $1 * 3)); }
 abci_port() { echo $((26658 + $1 * 3)); }
 agent_port() { echo $((50000 + $1)); }
+sharing_report_port() { echo $((50200 + $1)); }
+sharing_consensus_port() { echo $((50400 + $1)); }
 load_endpoints_csv() {
   local endpoints=()
   local i rpc_p
@@ -292,7 +296,7 @@ kill_run_sessions() {
   fi
   while read -r session_name; do
     [[ -z "${session_name}" ]] && continue
-    if [[ "${session_name}" == ll_tm_tendermint_node_* || "${session_name}" == ll_tm_abci_* || "${session_name}" == ll_tm_tendermint_agent_* ]]; then
+    if [[ "${session_name}" == ll_tm_tendermint_node_* || "${session_name}" == ll_tm_abci_* || "${session_name}" == ll_tm_tendermint_agent_* || "${session_name}" == ll_tm_sharing ]]; then
       tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
     fi
   done <<< "${sessions}"
@@ -485,10 +489,19 @@ for ((i = 0; i < num_nodes; i++)); do
   fi
 done
 
+if [[ "${MODE}" == "sharing" ]]; then
+  : > "${sharing_hosts_config}"
+  for ((i = 0; i < num_nodes; i++)); do
+    # report-chain ids are 1-based: node_id host report_port agent_port consensus_port
+    echo "$((i + 1)) 127.0.0.1 $(sharing_report_port "${i}") $(agent_port "${i}") $(sharing_consensus_port "${i}")" \
+      >> "${sharing_hosts_config}"
+  done
+fi
+
 if (( LEARNING_AGENT_ENABLED == 1 )); then
   : > "${agent_hosts_config}"
   for ((i = 0; i < num_nodes; i++)); do
-    echo "${i} 127.0.0.1 0 0 $(agent_port "${i}") $(rpc_port "${i}")" >> "${agent_hosts_config}"
+    echo "${i} 127.0.0.1 0 0 $(agent_port "${i}") $(sharing_consensus_port "${i}")" >> "${agent_hosts_config}"
   done
 fi
 
@@ -499,7 +512,7 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
   echo "==> Starting learning agents (mode=${MODE})..."
   agent_mode_args=""
   if [[ "${MODE}" == "sharing" ]]; then
-    agent_mode_args="--sharing true --model-type ${AGENT_MODEL_TYPE}"
+    agent_mode_args="--sharing true --model-type ${AGENT_MODEL_TYPE} --collect-wait-ms 100"
   elif [[ "${MODE}" == "learning" ]]; then
     agent_mode_args="--model-type ${AGENT_MODEL_TYPE}"
   elif [[ "${MODE}" == "scheduled" ]]; then
@@ -525,6 +538,22 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
       exit 1
     fi
   done
+fi
+
+if [[ "${MODE}" == "sharing" ]]; then
+  echo "==> Starting report-chain (sharing) nodes..."
+  sharing_log="${logs_dir}/sharing.log"
+  rm -rf "${run_root}/sharing_wal"
+  # The report chain orders report batches with SmartBFT regardless of which
+  # protocol is being learned, so the same binary serves Tendermint runs.
+  tmux new-session -d -s ll_tm_sharing \
+    "cd \"${SMARTBFT_DIR}\" && exec go run ./examples/sharing --role inprocess --protocol tendermint --hosts-config \"${sharing_hosts_config}\" --data-dir \"${run_root}/sharing_wal\" --keep-data > \"${sharing_log}\" 2>&1"
+  sleep 3
+  if ! tmux has-session -t ll_tm_sharing 2>/dev/null; then
+    echo "Sharing session exited early" >&2
+    tail -n 80 "${sharing_log}" >&2 || true
+    exit 1
+  fi
 fi
 
 for ((i = 0; i < num_nodes; i++)); do

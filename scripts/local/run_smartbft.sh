@@ -37,6 +37,9 @@ AGENT_MODEL_TYPE="random"
 AGENT_MODEL_SET=0
 AGENT_HOST="127.0.0.1"
 AGENT_PORT=15501
+SHARING_REPORT_PORT=15601
+SHARING_CONSENSUS_PORT=15701
+SHARING_COLLECT_WAIT_MS=100
 LEARNING_NODE_ID=1
 SERVER_PORT_BASE=19100
 
@@ -68,7 +71,7 @@ cleanup() {
       signaled=0
       while read -r session_name; do
         [[ -z "${session_name}" ]] && continue
-        if [[ "${session_name}" == smartbft_agent_* || "${session_name}" == smartbft_server_* || "${session_name}" == smartbft_client ]]; then
+        if [[ "${session_name}" == smartbft_agent_* || "${session_name}" == smartbft_server_* || "${session_name}" == smartbft_client || "${session_name}" == smartbft_sharing ]]; then
           tmux send-keys -t "${session_name}" C-c >/dev/null 2>&1 || true
           signaled=1
         fi
@@ -78,7 +81,7 @@ cleanup() {
       fi
       while read -r session_name; do
         [[ -z "${session_name}" ]] && continue
-        if [[ "${session_name}" == smartbft_agent_* || "${session_name}" == smartbft_server_* || "${session_name}" == smartbft_client ]]; then
+        if [[ "${session_name}" == smartbft_agent_* || "${session_name}" == smartbft_server_* || "${session_name}" == smartbft_client || "${session_name}" == smartbft_sharing ]]; then
           tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
         fi
       done <<< "${sessions}"
@@ -529,8 +532,8 @@ if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; the
   echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear|cmab|cmab_old|continuous." >&2
   exit 2
 fi
-if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" ]]; then
-  echo "--model is only supported with learning mode for SmartBFT local runs." >&2
+if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
+  echo "--model is only supported with learning or sharing mode for SmartBFT local runs." >&2
   exit 2
 fi
 if (( DATASET_ENABLED == 1 )) && (( LEARNING_AGENT_ENABLED == 0 )); then
@@ -540,8 +543,10 @@ fi
 if (( LEARNING_AGENT_ENABLED == 1 )); then
   DATASET_ENABLED=1
 fi
+SHARING_ENABLED=0
 if [[ "${MODE}" == "sharing" ]]; then
-  echo "SmartBFT sharing mode starts one learning agent per node." >&2
+  SHARING_ENABLED=1
+  echo "SmartBFT sharing mode: one learning agent plus one report-chain node per replica." >&2
 fi
 
 AGENT_MODEL_ARGS=""
@@ -558,7 +563,7 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
     fi
   fi
 
-  if [[ "${MODE}" == "learning" ]]; then
+  if [[ "${MODE}" == "learning" || "${MODE}" == "sharing" ]]; then
     AGENT_MODEL_ARGS="--model-type ${AGENT_MODEL_TYPE}"
   elif [[ "${MODE}" == "scheduled" ]]; then
     AGENT_MODEL_ARGS="--model-type scheduled --schedule-file learning_agent/config/schedule_pbft.csv"
@@ -577,7 +582,7 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
 fi
 
 mkdir -p "${LOCAL_TMP_DIR}"
-rm -f "${OUTPUT_LOCAL}" "${LOCAL_TMP_DIR}/client.log" "${LOCAL_TMP_DIR}/smartbft.log" "${LOCAL_TMP_DIR}"/server_*.log "${LOCAL_TMP_DIR}"/agent_*.log "${LOCAL_TMP_DIR}"/agent*.csv
+rm -f "${OUTPUT_LOCAL}" "${LOCAL_TMP_DIR}/client.log" "${LOCAL_TMP_DIR}/smartbft.log" "${LOCAL_TMP_DIR}"/server_*.log "${LOCAL_TMP_DIR}"/agent_*.log "${LOCAL_TMP_DIR}"/agent*.csv "${LOCAL_TMP_DIR}/sharing.log"
 rm -rf "${LOCAL_TMP_DIR}/wal"
 cleanup
 cleanup_done=0
@@ -587,6 +592,25 @@ HOSTS_CONFIG="${LOCAL_TMP_DIR}/hosts.config"
 for ((n = 1; n <= NODES; n++)); do
   printf '%d 127.0.0.1 %d\n' "${n}" "$((SERVER_PORT_BASE + n))" >> "${HOSTS_CONFIG}"
 done
+
+AGENT_HOSTS_CONFIG="${LOCAL_TMP_DIR}/agent_hosts.config"
+SHARING_HOSTS_CONFIG="${LOCAL_TMP_DIR}/sharing_hosts.config"
+if (( SHARING_ENABLED == 1 )); then
+  : > "${AGENT_HOSTS_CONFIG}"
+  : > "${SHARING_HOSTS_CONFIG}"
+  for ((replica_id = 0; replica_id < NODES; replica_id++)); do
+    agent_port=$((AGENT_PORT + replica_id))
+    report_port=$((SHARING_REPORT_PORT + replica_id))
+    consensus_port=$((SHARING_CONSENSUS_PORT + replica_id))
+    # agent hosts config: node_id host <unused> <unused> agent_port consensus_port
+    printf '%d 127.0.0.1 0 0 %d %d\n' \
+      "${replica_id}" "${agent_port}" "${consensus_port}" >> "${AGENT_HOSTS_CONFIG}"
+    # sharing hosts config: node_id host report_port agent_port consensus_port
+    # report-chain ids are 1-based; the agent link is by port, not by id
+    printf '%d 127.0.0.1 %d %d %d\n' \
+      "$((replica_id + 1))" "${report_port}" "${agent_port}" "${consensus_port}" >> "${SHARING_HOSTS_CONFIG}"
+  done
+fi
 
 START_UNIX_MS="$(( ($(date +%s) + START_DELAY_S) * 1000 ))"
 EXPERIMENT_END_UNIX_MS="$((START_UNIX_MS + EXPERIMENT_TIME_S * 1000))"
@@ -631,10 +655,15 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
     if (( DATASET_ENABLED == 1 )); then
       dataset_args="--dataset-csv ${LOCAL_TMP_DIR}/agent${replica_id}.csv"
     fi
+    bind_args="--host \"${AGENT_HOST}\" --port ${agent_port}"
+    if (( SHARING_ENABLED == 1 )); then
+      # --sharing requires a hosts config; the bind port comes from it.
+      bind_args="--host \"${AGENT_HOST}\" --sharing true --hosts-config \"${AGENT_HOSTS_CONFIG}\" --collect-wait-ms ${SHARING_COLLECT_WAIT_MS}"
+    fi
     tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
     : > "${agent_log}"
     if ! tmux new-session -d -s "${session_name}" \
-      "cd \"${REPO_ROOT}\" && exec \"${AGENT_PYTHON_BIN}\" learning_agent/main.py --node-id ${replica_id} --protocol pbft --host \"${AGENT_HOST}\" --port ${agent_port} --signing false ${AGENT_MODEL_ARGS} ${dataset_args} ${failure_agent_args} > \"${agent_log}\" 2>&1"; then
+      "cd \"${REPO_ROOT}\" && exec \"${AGENT_PYTHON_BIN}\" learning_agent/main.py --node-id ${replica_id} --protocol pbft ${bind_args} --signing false ${AGENT_MODEL_ARGS} ${dataset_args} ${failure_agent_args} > \"${agent_log}\" 2>&1"; then
       echo "Failed to start tmux session ${session_name}." >&2
       exit 1
     fi
@@ -646,6 +675,29 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
       echo "Timed out waiting for learning agent at ${AGENT_HOST}:${agent_port}" >&2
       echo "Last learning-agent log lines:" >&2
       tail -n 80 "${LOCAL_TMP_DIR}/agent_${replica_id}.log" >&2 || true
+      exit 1
+    fi
+  done
+fi
+
+if (( SHARING_ENABLED == 1 )); then
+  echo "Starting SmartBFT report-chain (sharing) nodes..."
+  sharing_log="${LOCAL_TMP_DIR}/sharing.log"
+  : > "${sharing_log}"
+  rm -rf "${LOCAL_TMP_DIR}/sharing_wal"
+  tmux kill-session -t smartbft_sharing >/dev/null 2>&1 || true
+  # One process hosts every report-chain node locally; on a cluster each
+  # replica runs its own --role server instead.
+  if ! tmux new-session -d -s smartbft_sharing \
+    "cd \"${SMARTBFT_DIR}\" && exec go run ./examples/sharing --role inprocess --protocol pbft --hosts-config \"${SHARING_HOSTS_CONFIG}\" --data-dir \"${LOCAL_TMP_DIR}/sharing_wal\" --keep-data > \"${sharing_log}\" 2>&1"; then
+    echo "Failed to start tmux session smartbft_sharing." >&2
+    exit 1
+  fi
+  for ((replica_id = 0; replica_id < NODES; replica_id++)); do
+    consensus_port=$((SHARING_CONSENSUS_PORT + replica_id))
+    if ! wait_for_tcp "127.0.0.1" "${consensus_port}" "$(( $(date +%s) + 60 ))"; then
+      echo "Timed out waiting for sharing server at 127.0.0.1:${consensus_port}" >&2
+      tail -n 80 "${sharing_log}" >&2 || true
       exit 1
     fi
   done

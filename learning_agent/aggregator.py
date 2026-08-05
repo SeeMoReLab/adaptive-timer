@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from typing import Dict
 
 import numpy as np
+from google.protobuf.descriptor import FieldDescriptor
 
 import agent_pb2
 from models import get_report_feature_field_names
@@ -34,28 +35,52 @@ def _report_to_array(protocol: int, report: object) -> np.ndarray:
     return np.array([float(getattr(report, field_name)) for field_name in fields], dtype=float)
 
 
+_INTEGER_CPP_TYPES = frozenset(
+    {
+        FieldDescriptor.CPPTYPE_INT32,
+        FieldDescriptor.CPPTYPE_INT64,
+        FieldDescriptor.CPPTYPE_UINT32,
+        FieldDescriptor.CPPTYPE_UINT64,
+    }
+)
+
+
+def _integer_field_names(message_cls: type) -> frozenset:
+    """Integer fields of a report message, read from the descriptor.
+
+    A median is always a float, so every integer field needs rounding before it
+    can be assigned. Deriving the set from the descriptor keeps this correct
+    when report fields are added, which a hand maintained list does not.
+    """
+    return frozenset(
+        field.name
+        for field in message_cls.DESCRIPTOR.fields
+        if field.cpp_type in _INTEGER_CPP_TYPES
+    )
+
+
+def _report_message_class(protocol: int) -> type:
+    if protocol == agent_pb2.PROTOCOL_PBFT:
+        return agent_pb2.PbftReport
+    if protocol == agent_pb2.PROTOCOL_SBFT:
+        return agent_pb2.SbftReport
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        return agent_pb2.TendermintReport
+    raise ValueError(f"Unsupported protocol: {protocol}")
+
+
 def _array_to_report(protocol: int, values: np.ndarray) -> object:
     fields = get_report_feature_field_names(protocol)
-    kwargs = {
-        field_name: float(values[idx]) for idx, field_name in enumerate(fields)
-    }
+    message_cls = _report_message_class(protocol)
+    integer_fields = _integer_field_names(message_cls)
 
-    # Integer counters need explicit integer conversion for protobuf uint32 fields.
-    for int_field in (
-        "total_transactions",
-        "total_consensus_instances",
-        "leader_change_count",
-        "regency_change_count",
-    ):
-        if int_field in kwargs:
-            kwargs[int_field] = max(0, int(round(float(kwargs[int_field]))))
-
-    if protocol == agent_pb2.PROTOCOL_PBFT:
-        return agent_pb2.PbftReport(**kwargs)
-    if protocol == agent_pb2.PROTOCOL_SBFT:
-        return agent_pb2.SbftReport(**kwargs)
-    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
-        return agent_pb2.TendermintReport(**kwargs)
+    kwargs = {}
+    for idx, field_name in enumerate(fields):
+        value = float(values[idx])
+        if field_name in integer_fields:
+            value = max(0, int(round(value)))
+        kwargs[field_name] = value
+    return message_cls(**kwargs)
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 

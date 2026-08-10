@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+INVOCATION_DIR="$(pwd -P)"
+ORIGINAL_ARGS=("$@")
 
 TARGETS_FILE_DEFAULT="${REPO_ROOT}/scripts/cloudlab/tmp/cloudlab_ssh_targets.txt"
 TARGETS_FILE="${TARGETS_FILE_DEFAULT}"
@@ -23,14 +25,13 @@ LOG_FETCH_MAX_ATTEMPTS=3
 LOG_FETCH_RETRY_DELAY_S=1
 
 LOCAL_TMP_DIR="${REPO_ROOT}/scripts/cloudlab/tmp"
-OUTPUT_LOCAL="${LOCAL_TMP_DIR}/tendermint_output.txt"
-LOGS_LOCAL_DIR="${LOCAL_TMP_DIR}/tendermint_logs"
-LOCAL_PAYLOAD="${REPO_ROOT}/scripts/tmp/tendermint_cloudlab_payload.tar.gz"
+RUNS_ROOT="${LOCAL_TMP_DIR}/runs/tendermint"
+OUTPUT_DIR=""
 APPLIER_LOCAL_PATH="${REPO_ROOT}/scripts/apply_network_failures.py"
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--model <random|linear|cmab|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|linear|cmab|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -39,7 +40,9 @@ Arguments:
 
 Flags:
   --dataset         Collect per-replica learning-agent dataset CSVs as agentN.csv.
-  --log             Fetch remote Tendermint, ABCI, and client logs into scripts/cloudlab/tmp/tendermint_logs/.
+  --log             Fetch remote Tendermint, ABCI, and client logs into the run artifact directory.
+  --output-dir <path>
+                    Store artifacts here instead of creating a timestamped run directory.
   --model           Learning-agent model for learning/sharing modes: random|linear|cmab|continuous (default: random).
   -f <int>          Fault tolerance f. Number of nodes is derived as 3f+1 (default: 1).
   -t <int>          Load-generation duration in seconds (default: 60).
@@ -166,6 +169,15 @@ while [[ $# -gt 0 ]]; do
       DATASET_ENABLED=1
       shift
       ;;
+    --output-dir)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --output-dir." >&2
+        usage >&2
+        exit 2
+      fi
+      OUTPUT_DIR="${2}"
+      shift 2
+      ;;
     --model)
       if [[ $# -lt 2 || -z "${2}" ]]; then
         echo "Missing value for --model." >&2
@@ -246,6 +258,10 @@ if [[ ! -f "${REPO_ROOT}/config/tendermint/config.toml" ]]; then
   echo "Master Tendermint config not found: ${REPO_ROOT}/config/tendermint/config.toml" >&2
   exit 1
 fi
+if [[ ! -f "${REPO_ROOT}/config/tendermint/failure_spec.xml" ]]; then
+  echo "Tendermint failure spec not found: ${REPO_ROOT}/config/tendermint/failure_spec.xml" >&2
+  exit 1
+fi
 if [[ ! -f "${APPLIER_LOCAL_PATH}" ]]; then
   echo "Network applier script not found: ${APPLIER_LOCAL_PATH}" >&2
   exit 1
@@ -293,17 +309,61 @@ if [[ -z "${remote_host}" || -z "${remote_user}" ]]; then
   remote_user="${targets_users[0]}"
 fi
 
-mkdir -p "${LOCAL_TMP_DIR}" "$(dirname "${LOCAL_PAYLOAD}")"
+RUN_ID="$(date +%Y%m%d_%H%M%S)_$$"
+if [[ -z "${OUTPUT_DIR}" ]]; then
+  ARTIFACT_DIR="${RUNS_ROOT}/${RUN_ID}"
+else
+  OUTPUT_DIR="${OUTPUT_DIR/#\~/$HOME}"
+  if [[ "${OUTPUT_DIR}" == /* ]]; then
+    ARTIFACT_DIR="${OUTPUT_DIR}"
+  else
+    ARTIFACT_DIR="${INVOCATION_DIR}/${OUTPUT_DIR}"
+  fi
+fi
+mkdir -p "${ARTIFACT_DIR}" "${RUNS_ROOT}"
+ARTIFACT_DIR="$(cd "${ARTIFACT_DIR}" && pwd -P)"
+LATEST_LINK="${RUNS_ROOT}/latest"
+if [[ ! -e "${LATEST_LINK}" || -L "${LATEST_LINK}" ]]; then
+  ln -sfn "${ARTIFACT_DIR}" "${LATEST_LINK}"
+else
+  echo "Not updating ${LATEST_LINK}: path exists and is not a symlink." >&2
+fi
+
+OUTPUT_LOCAL="${ARTIFACT_DIR}/tendermint_output.txt"
+LOGS_LOCAL_DIR="${ARTIFACT_DIR}/logs"
+LOCAL_PAYLOAD="${ARTIFACT_DIR}/tendermint_cloudlab_payload.tar.gz"
 rm -f "${LOCAL_PAYLOAD}" "${OUTPUT_LOCAL}"
 : > "${OUTPUT_LOCAL}"
 LOCAL_NUM_NODES=$((F * 3 + 1))
-if (( DATASET_ENABLED == 1 )); then
-  rm -f "${LOCAL_TMP_DIR}"/agent*.csv
-fi
 if (( LOG_ENABLED == 1 )); then
   rm -rf "${LOGS_LOCAL_DIR}"
   mkdir -p "${LOGS_LOCAL_DIR}"
 fi
+
+cp "${REPO_ROOT}/config/tendermint/config.toml" "${ARTIFACT_DIR}/config.toml"
+cp "${REPO_ROOT}/config/tendermint/failure_spec.xml" "${ARTIFACT_DIR}/failure_spec.xml"
+cp "${TARGETS_FILE}" "${ARTIFACT_DIR}/cloudlab_ssh_targets.txt"
+if [[ "${MODE}" == "scheduled" ]]; then
+  cp "${REPO_ROOT}/learning_agent/config/schedule_tendermint.csv" "${ARTIFACT_DIR}/schedule_tendermint.csv"
+fi
+{
+  printf 'protocol=%q\n' "tendermint"
+  printf 'run_id=%q\n' "${RUN_ID}"
+  printf 'artifact_dir=%q\n' "${ARTIFACT_DIR}"
+  printf 'mode=%q\n' "${MODE}"
+  printf 'fault_tolerance=%q\n' "${F}"
+  printf 'experiment_time_s=%q\n' "${EXPERIMENT_TIME_S}"
+  printf 'agent_model=%q\n' "${AGENT_MODEL_TYPE}"
+  printf 'dataset_enabled=%q\n' "${DATASET_ENABLED}"
+  printf 'log_enabled=%q\n' "${LOG_ENABLED}"
+  printf 'targets_file=%q\n' "${TARGETS_FILE}"
+  printf 'command='
+  printf '%q ' "$0" "${ORIGINAL_ARGS[@]}"
+  printf '\n'
+} > "${ARTIFACT_DIR}/run.env"
+
+echo "Run artifacts: ${ARTIFACT_DIR}"
+echo "Latest Tendermint run: ${LATEST_LINK}"
 
 SHARING_PAYLOAD_PATHS=""
 if [[ "${MODE}" == "sharing" ]]; then
@@ -341,6 +401,7 @@ REMOTE_APPLIER="/tmp/tendermint_apply_network_failures_$$.py"
 echo "Copying payload to ${remote_user}@${remote_host}..."
 scp "${SSH_OPTS[@]}" "${LOCAL_PAYLOAD}" "${remote_user}@${remote_host}:${REMOTE_PAYLOAD}"
 scp "${SSH_OPTS[@]}" "${APPLIER_LOCAL_PATH}" "${remote_user}@${remote_host}:${REMOTE_APPLIER}"
+rm -f "${LOCAL_PAYLOAD}"
 
 echo "Running remote CometBFT experiment on ${remote_host} (mode=${MODE}, f=${F}, t=${EXPERIMENT_TIME_S}s)..."
 remote_failed=0
@@ -1111,9 +1172,9 @@ if (( LOG_ENABLED == 1 )); then
   fi
 fi
 if (( DATASET_ENABLED == 1 )); then
-  echo "Fetching learning-agent datasets to ${LOCAL_TMP_DIR}..."
+  echo "Fetching learning-agent datasets to ${ARTIFACT_DIR}..."
   for ((i = 0; i < LOCAL_NUM_NODES; i++)); do
-    local_csv="${LOCAL_TMP_DIR}/agent${i}.csv"
+    local_csv="${ARTIFACT_DIR}/agent${i}.csv"
     rm -f "${local_csv}"
     if ! scp "${SSH_OPTS[@]}" "${remote_user}@${remote_host}:tendermint_cloudlab/agent${i}.csv" "${local_csv}"; then
       echo "Missing or failed to fetch agent${i}.csv from ${remote_host}." >&2
@@ -1131,5 +1192,6 @@ if (( LOG_ENABLED == 1 )); then
   echo "Logs saved to ${LOGS_LOCAL_DIR} (including client.log)."
 fi
 if (( DATASET_ENABLED == 1 )); then
-  echo "Datasets saved to ${LOCAL_TMP_DIR}/agentN.csv."
+  echo "Datasets saved to ${ARTIFACT_DIR}/agentN.csv."
 fi
+echo "Run artifacts saved to ${ARTIFACT_DIR}."

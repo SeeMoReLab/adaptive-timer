@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+INVOCATION_DIR="$(pwd -P)"
+ORIGINAL_ARGS=("$@")
 
 TARGETS_FILE_DEFAULT="${REPO_ROOT}/scripts/cloudlab/tmp/cloudlab_ssh_targets.txt"
 SMARTBFT_SRC="${REPO_ROOT}/SmartBFT"
@@ -11,8 +13,8 @@ APPLIER_LOCAL_PATH="${REPO_ROOT}/scripts/apply_network_failures.py"
 CONFIG_DEFAULT="${REPO_ROOT}/config/pbft/smallbank.xml"
 FAILURE_SPEC_DEFAULT="${REPO_ROOT}/config/pbft/failure_spec.xml"
 LOCAL_TMP_DIR="${REPO_ROOT}/scripts/cloudlab/tmp"
-LOCAL_TAR="${LOCAL_TMP_DIR}/smartbft_payload.tar.gz"
-OUTPUT_LOCAL="${LOCAL_TMP_DIR}/smartbft_output.txt"
+RUNS_ROOT="${LOCAL_TMP_DIR}/runs/smartbft"
+OUTPUT_DIR=""
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new)
 
@@ -64,7 +66,7 @@ ARTIFACT_FETCH_RETRY_DELAY_S=1
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--backoff] [--model <random|linear|cmab|cmab_old|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--backoff] [--output-dir <path>] [--model <random|linear|cmab|cmab_old|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -75,6 +77,7 @@ Flags:
   --dataset                         Compatibility flag; agent modes collect the agent CSV automatically.
   --log                             Download client, server, applier, and agent logs.
   --backoff                         Enable request timeout backoff with a 10s maximum.
+  --output-dir <path>               Store artifacts here instead of creating a timestamped run directory.
   --verbose                         Enable SmartBFT debug logs on server replicas.
   --model <random|linear|cmab|cmab_old|continuous>
                                      Learning-agent model for learning mode (default: random).
@@ -291,6 +294,15 @@ while [[ $# -gt 0 ]]; do
       BACKOFF_ENABLED=1
       shift
       ;;
+    --output-dir)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --output-dir." >&2
+        usage >&2
+        exit 2
+      fi
+      OUTPUT_DIR="${2}"
+      shift 2
+      ;;
     --verbose)
       VERBOSE_ENABLED=1
       shift
@@ -504,6 +516,63 @@ if [[ ! -f "${TARGETS_FILE}" ]]; then
   exit 1
 fi
 
+RUN_ID="$(date +%Y%m%d_%H%M%S)_$$"
+if [[ -z "${OUTPUT_DIR}" ]]; then
+  ARTIFACT_DIR="${RUNS_ROOT}/${RUN_ID}"
+else
+  OUTPUT_DIR="${OUTPUT_DIR/#\~/$HOME}"
+  if [[ "${OUTPUT_DIR}" == /* ]]; then
+    ARTIFACT_DIR="${OUTPUT_DIR}"
+  else
+    ARTIFACT_DIR="${INVOCATION_DIR}/${OUTPUT_DIR}"
+  fi
+fi
+mkdir -p "${ARTIFACT_DIR}" "${RUNS_ROOT}"
+ARTIFACT_DIR="$(cd "${ARTIFACT_DIR}" && pwd -P)"
+LATEST_LINK="${RUNS_ROOT}/latest"
+if [[ ! -e "${LATEST_LINK}" || -L "${LATEST_LINK}" ]]; then
+  ln -sfn "${ARTIFACT_DIR}" "${LATEST_LINK}"
+else
+  echo "Not updating ${LATEST_LINK}: path exists and is not a symlink." >&2
+fi
+
+LOCAL_TAR="${ARTIFACT_DIR}/smartbft_payload.tar.gz"
+OUTPUT_LOCAL="${ARTIFACT_DIR}/smartbft_output.txt"
+cp "${CONFIG_PATH}" "${ARTIFACT_DIR}/smallbank.xml"
+cp "${TARGETS_FILE}" "${ARTIFACT_DIR}/cloudlab_ssh_targets.txt"
+if (( FAILURE_SPEC_ENABLED == 1 )); then
+  cp "${FAILURE_SPEC_PATH}" "${ARTIFACT_DIR}/failure_spec.xml"
+fi
+if [[ "${MODE}" == "scheduled" ]]; then
+  cp "${REPO_ROOT}/learning_agent/config/schedule_pbft.csv" "${ARTIFACT_DIR}/schedule_pbft.csv"
+fi
+{
+  printf 'protocol=%q\n' "smartbft"
+  printf 'run_id=%q\n' "${RUN_ID}"
+  printf 'artifact_dir=%q\n' "${ARTIFACT_DIR}"
+  printf 'mode=%q\n' "${MODE}"
+  printf 'fault_tolerance=%q\n' "${F}"
+  printf 'nodes=%q\n' "${NODES}"
+  printf 'experiment_time_s=%q\n' "${EXPERIMENT_TIME_S}"
+  printf 'batch_size=%q\n' "${BATCH_SIZE}"
+  printf 'batch_timeout=%q\n' "${BATCH_TIMEOUT}"
+  printf 'request_timeout=%q\n' "${REQUEST_TIMEOUT}"
+  printf 'submit_mode=%q\n' "${SUBMIT_MODE}"
+  printf 'agent_model=%q\n' "${AGENT_MODEL_TYPE}"
+  printf 'learning_window_mode=%q\n' "${LEARNING_WINDOW_MODE}"
+  printf 'backoff_enabled=%q\n' "${BACKOFF_ENABLED}"
+  printf 'dataset_enabled=%q\n' "${DATASET_ENABLED}"
+  printf 'log_enabled=%q\n' "${LOG_ENABLED}"
+  printf 'failure_spec_enabled=%q\n' "${FAILURE_SPEC_ENABLED}"
+  printf 'targets_file=%q\n' "${TARGETS_FILE}"
+  printf 'command='
+  printf '%q ' "$0" "${ORIGINAL_ARGS[@]}"
+  printf '\n'
+} > "${ARTIFACT_DIR}/run.env"
+
+echo "Run artifacts: ${ARTIFACT_DIR}"
+echo "Latest SmartBFT run: ${LATEST_LINK}"
+
 targets_nodes=()
 targets_hosts=()
 targets_users=()
@@ -597,11 +666,10 @@ if ! is_ipv4_literal "${node0_advertise_ip}"; then
 fi
 echo "Client reply advertise IP: ${node0_advertise_ip}"
 
-mkdir -p "${LOCAL_TMP_DIR}"
-HOSTS_CONFIG_LOCAL="${LOCAL_TMP_DIR}/smartbft_hosts.config"
-FAILURE_HOSTS_CONFIG_LOCAL="${LOCAL_TMP_DIR}/smartbft_hosts.failure.config"
-AGENT_HOSTS_CONFIG_LOCAL="${LOCAL_TMP_DIR}/smartbft_agent_hosts.config"
-SHARING_HOSTS_CONFIG_LOCAL="${LOCAL_TMP_DIR}/smartbft_sharing_hosts.config"
+HOSTS_CONFIG_LOCAL="${ARTIFACT_DIR}/smartbft_hosts.config"
+FAILURE_HOSTS_CONFIG_LOCAL="${ARTIFACT_DIR}/smartbft_hosts.failure.config"
+AGENT_HOSTS_CONFIG_LOCAL="${ARTIFACT_DIR}/smartbft_agent_hosts.config"
+SHARING_HOSTS_CONFIG_LOCAL="${ARTIFACT_DIR}/smartbft_sharing_hosts.config"
 : > "${HOSTS_CONFIG_LOCAL}"
 : > "${FAILURE_HOSTS_CONFIG_LOCAL}"
 : > "${AGENT_HOSTS_CONFIG_LOCAL}"
@@ -1386,7 +1454,7 @@ output_fetch_failed=0
 log_fetch_failed=0
 dataset_fetch_failed=0
 
-CLIENT_LOG_LOCAL="${LOCAL_TMP_DIR}/smartbft_client.log"
+CLIENT_LOG_LOCAL="${ARTIFACT_DIR}/client.log"
 echo "Fetching SmartBFT client log..."
 queue_artifact_download "node0" "${node0_host}" "${node0_user}" \
   "\$HOME/smartbft_cloudlab/logs/client.log" \
@@ -1396,7 +1464,7 @@ queue_artifact_download "node0" "${node0_host}" "${node0_user}" \
   "output"
 
 if (( LOG_ENABLED == 1 )); then
-  LOGS_LOCAL_DIR="${LOCAL_TMP_DIR}/smartbft_logs"
+  LOGS_LOCAL_DIR="${ARTIFACT_DIR}/logs"
   rm -rf "${LOGS_LOCAL_DIR}"
   mkdir -p "${LOGS_LOCAL_DIR}/servers" "${LOGS_LOCAL_DIR}/appliers" "${LOGS_LOCAL_DIR}/agents" "${LOGS_LOCAL_DIR}/sharing"
   for i in "${!server_nodes[@]}"; do
@@ -1455,7 +1523,7 @@ if (( LEARNING_AGENT_ENABLED == 1 )) && (( DATASET_ENABLED == 1 )); then
       queue_artifact_download "${node}" "${host}" "${user}" \
         "\$HOME/smartbft_cloudlab/agent${replica_id}.csv" \
         "smartbft_cloudlab/agent${replica_id}.csv" \
-        "${LOCAL_TMP_DIR}/agent${replica_id}.csv" \
+        "${ARTIFACT_DIR}/agent${replica_id}.csv" \
         "agent${replica_id}.csv" \
         "dataset" \
         1
@@ -1488,7 +1556,7 @@ fi
 if (( LEARNING_AGENT_ENABLED == 1 )) && (( DATASET_ENABLED == 1 )); then
   saved_agent_datasets=()
   for ((replica_id = 0; replica_id < NODES; replica_id++)); do
-    agent_dataset_local="${LOCAL_TMP_DIR}/agent${replica_id}.csv"
+    agent_dataset_local="${ARTIFACT_DIR}/agent${replica_id}.csv"
     if [[ -f "${agent_dataset_local}" ]]; then
       saved_agent_datasets+=("${agent_dataset_local}")
     fi
@@ -1506,3 +1574,4 @@ fi
 if (( teardown_failed != 0 )); then
   echo "Some namespace teardown steps failed; manual cleanup may be required." >&2
 fi
+echo "Run artifacts saved to ${ARTIFACT_DIR}."

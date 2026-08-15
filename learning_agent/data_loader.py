@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-import torch
+import numpy as np
 
 import agent_pb2
 from models import tendermint_timeouts_from_propose
@@ -44,10 +44,10 @@ class DatasetLoader:
         if not features:
             raise ValueError("Dataset must contain at least one sample.")
 
-        self._features = torch.tensor(features, dtype=torch.float32)
-        self._actions = torch.tensor(actions, dtype=torch.float32)
-        self._rewards = torch.tensor(rewards, dtype=torch.float32)
-        self._labels = torch.tensor(labels, dtype=torch.float32)
+        self._features = np.asarray(features, dtype=float)
+        self._actions = np.asarray(actions, dtype=float)
+        self._rewards = np.asarray(rewards, dtype=float)
+        self._labels = np.asarray(labels, dtype=float)
         self.batch_size = int(batch_size)
         self.shuffle = bool(shuffle)
         self._all_indices = list(range(len(features)))
@@ -65,18 +65,18 @@ class DatasetLoader:
         self._cursor = 0
         return self
 
-    def __next__(self) -> Dict[str, torch.Tensor]:
+    def __next__(self) -> Dict[str, np.ndarray]:
         if self._cursor >= len(self._indices):
             raise StopIteration
 
         batch_idx = self._indices[self._cursor : self._cursor + self.batch_size]
         self._cursor += self.batch_size
-        index_tensor = torch.tensor(batch_idx, dtype=torch.long)
+        indices = np.asarray(batch_idx, dtype=int)
         return {
-            "features": self._features.index_select(0, index_tensor),
-            "actions": self._actions.index_select(0, index_tensor),
-            "rewards": self._rewards.index_select(0, index_tensor),
-            "labels": self._labels.index_select(0, index_tensor)
+            "features": self._features[indices],
+            "actions": self._actions[indices],
+            "rewards": self._rewards[indices],
+            "labels": self._labels[indices],
         }
 
 

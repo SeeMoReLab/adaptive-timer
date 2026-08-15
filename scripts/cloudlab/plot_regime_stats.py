@@ -1,27 +1,33 @@
 """Faceted bar plot of a metric's mean by (timeout, regime) for a cloudlab run.
 
-Reads agent*.csv (each = one node), keeps matched_episode_features rows, folds the
-19 experiment phases into the named regimes from config/pbft/failure_spec.xml, and
+Reads completed episode rows from agent*.csv (each = one node), folds the 19
+experiment phases into the named regimes from config/pbft/failure_spec.xml, and
 plots one panel per regime: bars = election timeout (light->dark = short->long).
 The "best" bar per regime is outlined (highest for reward-like metrics, lowest for
-cost metrics such as leader_change_count / regency_change_count).
+cost metrics such as feature_leader_change_count.
 
 Usage (from anywhere):
     python scripts/cloudlab/plot_regime_stats.py --metric reward
-    python scripts/cloudlab/plot_regime_stats.py --metric leader_change_count --lower-is-better
-    python scripts/cloudlab/plot_regime_stats.py --metric regency_change_count --lower-is-better \
+    python scripts/cloudlab/plot_regime_stats.py --metric feature_leader_change_count --lower-is-better
+    python scripts/cloudlab/plot_regime_stats.py --metric feature_regency_change_count --lower-is-better \
         --data-dir scripts/cloudlab/tmp
 """
 import argparse
 import glob
 import math
 import os
+from pathlib import Path
+import sys
 
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "learning_agent"))
+from reward_utils import reward_from_throughput
 
 # phase index (0..18) -> regime, from config/pbft/failure_spec.xml
 REGIMES = [
@@ -33,13 +39,28 @@ REGIMES = [
     ("Network +150ms",            [17]),
     ("Recovery (clean)",          [18]),
 ]
-MATCHED_TRUE = {'1', 'true', 'yes', 'y'}
+
+
+def add_derived_reward(df):
+    if 'reward_throughput_tps' not in df.columns:
+        raise SystemExit(
+            "Column 'reward_throughput_tps' is required to derive reward."
+        )
+    df = df.copy()
+    df['reward'] = df['reward_throughput_tps'].astype(float).map(
+        reward_from_throughput
+    )
+    return df
 
 
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--metric', default='reward', help='column to average (reward, leader_change_count, ...)')
+    p.add_argument(
+        '--metric',
+        default='reward',
+        help='column to average; reward is derived from reward_throughput_tps',
+    )
     p.add_argument('--data-dir', default=os.path.join(here, 'tmp'), help='dir with agent*.csv')
     p.add_argument('--out-dir', default=None, help='output dir (default: --data-dir)')
     p.add_argument('--timeout-col', default='election_timeout_milliseconds_used')
@@ -54,16 +75,18 @@ def main():
     if not files:
         raise SystemExit(f'No agent*.csv in {args.data_dir}')
     df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
-    for col in (args.metric, args.timeout_col, args.phase_col):
+    metric = args.metric
+    if metric == 'reward':
+        df = add_derived_reward(df)
+    if metric not in df.columns and f'feature_{metric}' in df.columns:
+        metric = f'feature_{metric}'
+    for col in (metric, args.timeout_col, args.phase_col):
         if col not in df.columns:
             raise SystemExit(f"Column '{col}' not found. Available: {list(df.columns)}")
-    if 'matched_episode_features' in df.columns:
-        m = df['matched_episode_features'].astype(str).str.strip().str.lower().isin(MATCHED_TRUE)
-        df = df[m]
     df = df.copy()
     df[args.phase_col] = df[args.phase_col].astype(int)
     df[args.timeout_col] = df[args.timeout_col].astype(int)
-    df[args.metric] = df[args.metric].astype(float)
+    df[metric] = df[metric].astype(float)
 
     timeouts = sorted(df[args.timeout_col].unique())
     regimes = [(name, ph) for name, ph in REGIMES if df[args.phase_col].isin(ph).any()]
@@ -88,7 +111,7 @@ def main():
     print(f"{'regime':30s} " + "  ".join(f"{t}ms" for t in timeouts))
     for ax, (name, phases) in zip(flat, regimes):
         sub = df[df[args.phase_col].isin(phases)]
-        vals = [sub.loc[sub[args.timeout_col] == t, args.metric].mean() for t in timeouts]
+        vals = [sub.loc[sub[args.timeout_col] == t, metric].mean() for t in timeouts]
         ns = [int((sub[args.timeout_col] == t).sum()) for t in timeouts]
         bars = ax.bar([str(t) for t in timeouts], vals, color=[color[t] for t in timeouts], width=0.66, zorder=3)
         if any(np.isfinite(v) for v in vals):
@@ -108,7 +131,7 @@ def main():
         if not ax.has_data():
             ax.set_visible(False)
     for r in range(nrows):
-        axes[r, 0].set_ylabel(f'mean {args.metric}')
+        axes[r, 0].set_ylabel(f'mean {metric}')
 
     handles = [plt.Rectangle((0, 0), 1, 1, color=color[t]) for t in timeouts]
     handles.append(plt.Rectangle((0, 0), 1, 1, fc='white', ec=hilite, lw=2.5))

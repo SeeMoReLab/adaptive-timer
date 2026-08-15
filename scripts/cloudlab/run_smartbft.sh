@@ -66,7 +66,7 @@ ARTIFACT_FETCH_RETRY_DELAY_S=1
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--backoff] [--output-dir <path>] [--model <random|linear|cmab|cmab_old|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--backoff] [--output-dir <path>] [--model <random|linear|cmab|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -79,7 +79,7 @@ Flags:
   --backoff                         Enable request timeout backoff with a 10s maximum.
   --output-dir <path>               Store artifacts here instead of creating a timestamped run directory.
   --verbose                         Enable SmartBFT debug logs on server replicas.
-  --model <random|linear|cmab|cmab_old|continuous>
+  --model <random|linear|cmab|continuous>
                                      Learning-agent model for learning mode (default: random).
   -f <int>                          Fault tolerance f; nodes defaults to 3f+1 (default: 1).
   -t <int>                          Seconds to run after benchmark start (default: 300).
@@ -127,7 +127,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|linear|cmab|cmab_old|continuous) printf '%s\n' "${model_lower}" ;;
+    random|linear|cmab|continuous) printf '%s\n' "${model_lower}" ;;
     *) return 1 ;;
   esac
 }
@@ -457,7 +457,7 @@ if [[ -n "${CREATE_WORKERS}" ]] && (! [[ "${CREATE_WORKERS}" =~ ^[0-9]+$ ]] || (
   exit 2
 fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear|cmab|cmab_old|continuous." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear|cmab|continuous." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -565,6 +565,10 @@ fi
   printf 'log_enabled=%q\n' "${LOG_ENABLED}"
   printf 'failure_spec_enabled=%q\n' "${FAILURE_SPEC_ENABLED}"
   printf 'targets_file=%q\n' "${TARGETS_FILE}"
+  printf 'git_commit=%q\n' "$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
+  printf 'git_dirty=%q\n' "$([[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=no 2>/dev/null)" ]] && echo 1 || echo 0)"
+  printf 'smartbft_commit=%q\n' "$(git -C "${SMARTBFT_SRC}" rev-parse HEAD 2>/dev/null || echo unknown)"
+  printf 'smartbft_dirty=%q\n' "$([[ -n "$(git -C "${SMARTBFT_SRC}" status --porcelain --untracked-files=no 2>/dev/null)" ]] && echo 1 || echo 0)"
   printf 'command='
   printf '%q ' "$0" "${ORIGINAL_ARGS[@]}"
   printf '\n'

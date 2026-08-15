@@ -6,8 +6,8 @@ CSVs) and renders a grid: rows = agents, cols = timers. Each subplot shows the
 chosen timeout over episodes, with the injection phase shaded in the background.
 
 The CSV schema is auto-detected:
-  * tendermint  -> three timers (propose / prevote / precommit), levels 150/400/900
-  * SmartBFT    -> one timer   (election),                       levels 100/700/1900
+  * tendermint  -> propose levels 150/300/600, phase levels 50/100/200
+  * SmartBFT    -> one timer   (election),                       levels 300/800/1800
 
 Usage:
     python3 plot_agents.py [DATA_DIR] [--out PNG] [--split]
@@ -46,14 +46,14 @@ LINE_COLOR = "#1f3b73"
 
 # --- Schemas ------------------------------------------------------------
 TENDERMINT_TIMERS = [
-    ("propose_timeout_milliseconds_used", "propose"),
-    ("prevote_timeout_milliseconds_used", "prevote"),
-    ("precommit_timeout_milliseconds_used", "precommit"),
+    ("propose_timeout_milliseconds_used", "propose", [150, 300, 600]),
+    ("prevote_timeout_milliseconds_used", "prevote", [50, 100, 200]),
+    ("precommit_timeout_milliseconds_used", "precommit", [50, 100, 200]),
 ]
-TENDERMINT_LEVELS = [150, 400, 900]
 
-SMARTBFT_TIMERS = [("election_timeout_milliseconds_used", "election")]
-SMARTBFT_LEVELS = [100, 700, 1900]
+SMARTBFT_TIMERS = [
+    ("election_timeout_milliseconds_used", "election", [300, 800, 1800])
+]
 
 
 # Fault schedules: phase index -> (label, shade color).
@@ -84,13 +84,13 @@ SMARTBFT_PHASE_META = {
 
 
 def detect_schema(path):
-    """Return (timers, levels, phase_meta) by inspecting the CSV header."""
+    """Return (timers, phase_meta) by inspecting the CSV header."""
     with open(path, newline="") as fh:
         header = set(next(csv.reader(fh)))
     if ("election_timeout_milliseconds_used" in header
             and "propose_timeout_milliseconds_used" not in header):
-        return SMARTBFT_TIMERS, SMARTBFT_LEVELS, SMARTBFT_PHASE_META
-    return TENDERMINT_TIMERS, TENDERMINT_LEVELS, TENDERMINT_PHASE_META
+        return SMARTBFT_TIMERS, SMARTBFT_PHASE_META
+    return TENDERMINT_TIMERS, TENDERMINT_PHASE_META
 
 
 def phase_color(ph, meta):
@@ -116,16 +116,19 @@ def load_decisions(path, timers):
     with open(path, newline="") as fh:
         for r in csv.DictReader(fh):
             try:
-                ep = int(r["reward_episode"])
+                ep = int(r["episode"])
             except (KeyError, ValueError):
                 continue
             if ep in by_ep:
-                continue  # both matched-flag rows carry the same decision
+                continue
             try:
                 row = {
                     "episode": ep,
                     "phase": int(r["phase"]),
-                    "vals": {name: int(float(r[col])) for col, name in timers},
+                    "vals": {
+                        name: int(float(r[col]))
+                        for col, name, _ in timers
+                    },
                 }
             except (KeyError, ValueError):
                 continue
@@ -164,8 +167,7 @@ def main():
     if not files:
         raise SystemExit(f"No agent*.csv found in {args.data_dir}")
 
-    timers, levels, phase_meta = detect_schema(files[0])
-    ylo, yhi = levels[0] * 0.4, levels[-1] * 1.08
+    timers, phase_meta = detect_schema(files[0])
 
     agents = [(agent_index(f), load_decisions(f, timers)) for f in files]
     agents = [(i, rows) for i, rows in agents if rows]
@@ -173,9 +175,9 @@ def main():
     if n_agents == 0:
         raise SystemExit(
             f"agent*.csv found in {args.data_dir} but no rows matched the "
-            f"detected schema (timers={[c for c, _ in timers]}). Wrong dataset?")
+            f"detected schema (timers={[c for c, _, _ in timers]}). Wrong dataset?")
 
-    def draw_panel(ax, rows, tname, seen_phases):
+    def draw_panel(ax, rows, tname, levels, seen_phases):
         for s0, s1, ph in phase_spans(rows):
             ax.axvspan(s0 - 0.5, s1 + 0.5, color=phase_color(ph, phase_meta), alpha=0.5, lw=0)
             seen_phases.add(ph)
@@ -183,7 +185,7 @@ def main():
         ys = [row["vals"][tname] for row in rows]
         ax.step(eps, ys, where="post", color=LINE_COLOR, lw=1.1)
         ax.set_yticks(levels)
-        ax.set_ylim(ylo, yhi)
+        ax.set_ylim(levels[0] * 0.4, levels[-1] * 1.08)
         ax.margins(x=0.01)
         ax.grid(axis="y", ls=":", lw=0.6, alpha=0.5)
         ax.tick_params(length=3)
@@ -213,7 +215,7 @@ def main():
     if args.split:
         # One figure per timeout type; all agents stacked as rows.
         split_w = args.width if args.width else 16.0
-        for _, tname in timers:
+        for _, tname, levels in timers:
             seen = set()
             fig, axes = plt.subplots(
                 n_agents, 1, figsize=(split_w, args.row_height * n_agents),
@@ -221,7 +223,7 @@ def main():
             )
             for r, (aid, rows) in enumerate(agents):
                 ax = axes[r][0]
-                draw_panel(ax, rows, tname, seen)
+                draw_panel(ax, rows, tname, levels, seen)
                 ax.set_ylabel(f"agent {aid}\ntimeout (ms)", fontsize=10)
                 if r == n_agents - 1:
                     ax.set_xlabel("episode")
@@ -238,12 +240,12 @@ def main():
         fig, axes = plt.subplots(
             n_agents, len(timers),
             figsize=(grid_w, args.row_height * n_agents),
-            sharex=True, sharey=True, squeeze=False,
+            sharex=True, sharey=False, squeeze=False,
         )
         for r, (aid, rows) in enumerate(agents):
-            for c, (_, tname) in enumerate(timers):
+            for c, (_, tname, levels) in enumerate(timers):
                 ax = axes[r][c]
-                draw_panel(ax, rows, tname, seen)
+                draw_panel(ax, rows, tname, levels, seen)
                 if r == 0:
                     ax.set_title(f"{tname} timeout", fontsize=11, fontweight="bold")
                 if c == 0:
@@ -265,7 +267,10 @@ def main():
     n_dec = sum(len(r) for _, r in agents)
     for out in outputs:
         print(f"wrote {out}")
-    print(f"({n_agents} agents, {n_dec} decisions, timers={[c for c, _ in timers]})")
+    print(
+        f"({n_agents} agents, {n_dec} decisions, "
+        f"timers={[c for c, _, _ in timers]})"
+    )
 
 
 if __name__ == "__main__":

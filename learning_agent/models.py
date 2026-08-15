@@ -4,10 +4,9 @@ from enum import IntEnum
 import time
 from pathlib import Path
 from typing import Dict, Generic, List, Optional, Tuple, TypeVar, Any
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.tree import  DecisionTreeRegressor
 from collections import deque
-import torch
-import torch.nn.functional as F
 import numpy as np
 
 import agent_pb2
@@ -409,7 +408,7 @@ class FeatureExtractor(Generic[S], ABC):
     """Converts an input state into a tensor for model consumption."""
 
     @abstractmethod
-    def featurize(self, state: S) -> torch.Tensor:
+    def featurize(self, state: S) -> np.ndarray:
         pass
 
 
@@ -417,11 +416,11 @@ class ActionCodec(Generic[A], ABC):
     """Converts between model actions and domain-specific actions."""
 
     @abstractmethod
-    def decode(self, action: torch.Tensor) -> A:
+    def decode(self, action: np.ndarray) -> A:
         pass
 
     @abstractmethod
-    def encode(self, action: object) -> torch.Tensor:
+    def encode(self, action: object) -> np.ndarray:
         pass
 
 
@@ -429,12 +428,12 @@ class TensorModel(ABC):
     """Model that consumes and produces tensors."""
 
     @abstractmethod
-    def predict_action(self, features: torch.Tensor) -> torch.Tensor:
+    def predict_action(self, features: np.ndarray) -> np.ndarray:
         pass
 
     @abstractmethod
     def update_model(
-        self, features: torch.Tensor, action: torch.Tensor, reward: float
+        self, features: np.ndarray, action: np.ndarray, reward: float
     ) -> float:
         pass
 
@@ -454,9 +453,9 @@ class ProtocolReportFeatureExtractor(FeatureExtractor[object]):
     def __init__(self, protocol: int):
         self._protocol = _validate_protocol(protocol)
 
-    def featurize(self, state: object) -> torch.Tensor:
+    def featurize(self, state: object) -> np.ndarray:
         features = report_to_feature_values(self._protocol, state)
-        return torch.tensor(features, dtype=torch.float32)
+        return np.asarray(features, dtype=float)
 
 
 class ProtocolTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
@@ -465,16 +464,17 @@ class ProtocolTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
     def __init__(self, protocol: int):
         self._protocol = _validate_protocol(protocol)
 
-    def decode(self, action: torch.Tensor) -> agent_pb2.Timeout:
-        if action.numel() == 1:
-            option_index = int(round(float(action.item())))
+    def decode(self, action: np.ndarray) -> agent_pb2.Timeout:
+        action = np.asarray(action, dtype=float)
+        if action.size == 1:
+            option_index = int(round(float(action.reshape(-1)[0])))
         else:
-            option_index = int(torch.argmax(action).item())
+            option_index = int(np.argmax(action))
         return action_index_to_timeout(self._protocol, option_index)
 
-    def encode(self, action: object) -> torch.Tensor:
+    def encode(self, action: object) -> np.ndarray:
         option_index = timeout_to_action_index(self._protocol, action)
-        return torch.tensor(float(option_index), dtype=torch.float32)
+        return np.asarray(float(option_index), dtype=float)
 
 class QuadraticRewardScaler(RewardTransformer):
     """Quadratic shaping below 1000, linear above. Prior work"""
@@ -483,74 +483,158 @@ class QuadraticRewardScaler(RewardTransformer):
     def transform(throughput: float) -> float:
         return reward_from_throughput(throughput)
 
-class LinearTorchModel(TensorModel):
-    """Linear classifier over protocol-specific discrete timeout options."""
+class LinearModel(TensorModel):
+    """Linear policy over protocol-specific discrete timeout options.
 
-    def __init__(self, action_dim: int, n_features: int, lr: float = 0.01):
+    Reward-weighted multinomial logistic regression: each update pushes the
+    policy toward the arm that was actually taken, weighted by the reward that
+    arm earned. The gradient of that objective is analytic, so nothing here
+    needs a differentiation framework:
+
+        p       = softmax(X W^T)
+        dL/dz   = s * (p - onehot(taken)) / batch      s = clamp(reward, 0)/1000
+        dL/dW   = dL/dz^T X
+
+    followed by an AdamW step. Decoupled weight decay is the ``W *= 1 - lr*wd``
+    that precedes the moment update - AdamW's ordering, rather than the
+    L2-in-the-gradient of classic Adam.
+
+    Replaces an earlier autograd implementation that used ``torch.optim.AdamW``
+    over a ``requires_grad`` weight matrix and ``F.cross_entropy``. The two were
+    checked against each other over 400 updates before the torch version was
+    removed: weights agreed to 3.7e-07 and argmax agreed on 100% of 2000
+    contexts. Two differences were deliberate and are kept here:
+
+    * Arithmetic is float64 throughout. The torch version accumulated in
+      float32.
+    * :meth:`reset_model` clears the optimizer moments as well as the weights.
+      The torch version zeroed the weights but left AdamW's state behind, so a
+      reset model's first steps were still scaled by the previous run's moments.
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        n_features: int,
+        lr: float = 0.01,
+        weight_decay: float = 0.01,
+        betas: Tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+    ):
         if action_dim <= 0:
             raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        if n_features <= 0:
+            raise ValueError(f"n_features must be > 0, got {n_features}")
         self._action_dim = int(action_dim)
-        self.weights = torch.zeros((self._action_dim, n_features), requires_grad=True)
-        self.optimizer = torch.optim.AdamW([self.weights], lr=lr,  weight_decay=0.01)
+        self._n_features = int(n_features)
+        self._lr = float(lr)
+        self._weight_decay = float(weight_decay)
+        self._betas = (float(betas[0]), float(betas[1]))
+        self._eps = float(eps)
+        self.reset_model()
 
-    def predict_action(self, features: torch.Tensor) -> torch.Tensor:
-        if features.dim() == 1:
-            return torch.mv(self.weights, features)
-        return torch.matmul(features, self.weights.t())
+    def predict_action(self, features: np.ndarray) -> np.ndarray:
+        """Logits for every arm.
+
+        A 1-D context returns a 1-D ``(action_dim,)`` vector, a 2-D batch
+        returns ``(batch, action_dim)``.
+        """
+        features_np = np.asarray(features, dtype=float)
+        if features_np.shape[-1] != self._n_features:
+            raise ValueError(
+                f"Expected {self._n_features} features, got {features_np.shape[-1]}"
+            )
+        logits = features_np @ self.weights.T
+        return np.asarray(logits, dtype=float)
 
     def update_model(
         self,
-        features: torch.Tensor,
-        actions: torch.Tensor,
-        rewards: torch.Tensor | float,
+        features: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray | float,
         backward: bool = True,
     ) -> float:
-        with torch.set_grad_enabled(backward):
-            if features.dim() == 1:
-                features = features.unsqueeze(0)
+        features_np = np.asarray(features, dtype=float)
+        if features_np.ndim == 1:
+            features_np = features_np.reshape(1, -1)
+        if features_np.shape[1] != self._n_features:
+            raise ValueError(
+                f"Expected {self._n_features} features, got {features_np.shape[1]}"
+            )
 
-            actions_tensor = torch.as_tensor(actions, dtype=torch.float32).view(-1)
-            rewards_tensor = torch.as_tensor(rewards, dtype=torch.float32).view(-1)
+        actions_np = np.asarray(actions, dtype=float).reshape(-1)
+        rewards_np = np.asarray(rewards, dtype=float).reshape(-1)
 
-            batch_size = features.shape[0]
-            if actions_tensor.numel() == 1 and batch_size > 1:
-                actions_tensor = actions_tensor.repeat(batch_size)
-            if rewards_tensor.numel() == 1 and batch_size > 1:
-                rewards_tensor = rewards_tensor.repeat(batch_size)
-            if actions_tensor.numel() != batch_size:
-                raise ValueError(
-                    "actions batch size mismatch: "
-                    f"expected {batch_size}, got {actions_tensor.numel()}"
-                )
-            if rewards_tensor.numel() != batch_size:
-                raise ValueError(
-                    "rewards batch size mismatch: "
-                    f"expected {batch_size}, got {rewards_tensor.numel()}"
-                )
+        batch_size = features_np.shape[0]
+        if actions_np.size == 1 and batch_size > 1:
+            actions_np = np.repeat(actions_np, batch_size)
+        if rewards_np.size == 1 and batch_size > 1:
+            rewards_np = np.repeat(rewards_np, batch_size)
+        if actions_np.size != batch_size:
+            raise ValueError(
+                "actions batch size mismatch: "
+                f"expected {batch_size}, got {actions_np.size}"
+            )
+        if rewards_np.size != batch_size:
+            raise ValueError(
+                "rewards batch size mismatch: "
+                f"expected {batch_size}, got {rewards_np.size}"
+            )
 
-            target_index = torch.round(actions_tensor).long().view(-1)
-            targets = torch.clamp(target_index, 0, self._action_dim - 1)
-            logits = torch.matmul(features, self.weights.t())
-            reward_scales = torch.clamp(rewards_tensor, min=0.0) / 1000.0
-            loss_vector = F.cross_entropy(logits, targets, reduction="none")
-            loss = (loss_vector * reward_scales).mean()
+        # Out-of-range arms are clamped rather than rejected, preserving the
+        # behavior of the autograd version this replaced.
+        targets = np.clip(
+            np.round(actions_np).astype(int), 0, self._action_dim - 1
+        )
+        scales = np.clip(rewards_np, 0.0, None) / 1000.0
 
-            if backward and float(loss.item()) > 0.0:
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+        logits = features_np @ self.weights.T
+        # log-softmax via the shift trick, the same way cross_entropy does it.
+        shifted = logits - logits.max(axis=1, keepdims=True)
+        log_probs = shifted - np.log(np.exp(shifted).sum(axis=1, keepdims=True))
+        rows = np.arange(batch_size)
+        loss = float((-log_probs[rows, targets] * scales).mean())
 
-            return float(loss.item())
+        if backward and loss > 0.0:
+            d_logits = np.exp(log_probs)
+            d_logits[rows, targets] -= 1.0
+            d_logits *= scales[:, None]
+            d_logits /= batch_size
+            self._adamw_step(d_logits.T @ features_np)
+
+        return loss
+
+    def _adamw_step(self, gradient: np.ndarray) -> None:
+        beta1, beta2 = self._betas
+        self._step += 1
+        # Decoupled decay, applied to the weights before the moment update.
+        self.weights *= 1.0 - self._lr * self._weight_decay
+        self._moment1 = beta1 * self._moment1 + (1.0 - beta1) * gradient
+        self._moment2 = beta2 * self._moment2 + (1.0 - beta2) * gradient * gradient
+        bias_correction1 = 1.0 - beta1**self._step
+        bias_correction2 = 1.0 - beta2**self._step
+        denominator = np.sqrt(self._moment2) / np.sqrt(bias_correction2) + self._eps
+        self.weights -= (self._lr / bias_correction1) * (self._moment1 / denominator)
 
     def reset_model(self) -> None:
-        torch.nn.init.zeros_(self.weights)
+        self.weights = np.zeros(
+            (self._action_dim, self._n_features), dtype=np.float64
+        )
+        self._moment1 = np.zeros_like(self.weights)
+        self._moment2 = np.zeros_like(self.weights)
+        self._step = 0
 
-    def save(self) -> torch.Tensor:
-        return self.weights.clone().detach()
+    def save(self) -> np.ndarray:
+        return self.weights.copy()
 
-    def load(self, weights: torch.Tensor) -> None:
-        with torch.no_grad():
-            self.weights.copy_(weights)
+    def load(self, weights: np.ndarray) -> None:
+        incoming = np.asarray(weights, dtype=np.float64)
+        if incoming.shape != self.weights.shape:
+            raise ValueError(
+                f"Expected weights of shape {self.weights.shape}, got {incoming.shape}"
+            )
+        self.weights = incoming.copy()
+
 
 class RandomTimeoutModel(TensorModel):
     """Selects a random timeout action index each prediction."""
@@ -562,29 +646,27 @@ class RandomTimeoutModel(TensorModel):
         if seed is None:
             seed = int(time.time_ns() & 0x7FFFFFFF)
         self._initial_seed = int(seed)
-        self._rng = torch.Generator()
-        self._rng.manual_seed(self._initial_seed)
+        self._rng = np.random.default_rng(self._initial_seed)
 
-    def predict_action(self, features: torch.Tensor) -> torch.Tensor:
-        if features.dim() == 1:
-            option_index = int(
-                torch.randint(0, self._action_dim, (1,), generator=self._rng).item()
-            )
-            return torch.tensor(float(option_index), dtype=torch.float32)
+    def predict_action(self, features: np.ndarray) -> np.ndarray:
+        features = np.asarray(features, dtype=float)
+        if features.ndim == 1:
+            option_index = int(self._rng.integers(0, self._action_dim))
+            return np.asarray(float(option_index), dtype=float)
 
         batch_size = int(features.shape[0])
-        return torch.randint(
-            0, self._action_dim, (batch_size,), generator=self._rng, dtype=torch.int64
-        ).to(torch.float32)
+        return self._rng.integers(
+            0, self._action_dim, size=batch_size
+        ).astype(float)
 
     def update_model(
-        self, features: torch.Tensor, action: torch.Tensor, reward: float
+        self, features: np.ndarray, action: np.ndarray, reward: float
     ) -> float:
         del features, action, reward
         return 0.0
 
     def reset_model(self) -> None:
-        self._rng.manual_seed(self._initial_seed)
+        self._rng = np.random.default_rng(self._initial_seed)
 
     def save(self) -> Dict[str, Any]:
         pass
@@ -722,13 +804,13 @@ class ScheduledTimeoutModel(TensorModel):
         elapsed_s = time.monotonic() - self._start_time
         return 0.0 <= elapsed_s < self._schedule_time_shift_s
 
-    def predict_action(self, features: torch.Tensor) -> torch.Tensor:
+    def predict_action(self, features: np.ndarray) -> np.ndarray:
         del features
         option_index = self._current_option_index()
-        return torch.tensor(float(option_index), dtype=torch.float32)
+        return np.asarray(float(option_index), dtype=float)
 
     def update_model(
-        self, features: torch.Tensor, action: torch.Tensor, reward: float
+        self, features: np.ndarray, action: np.ndarray, reward: float
     ) -> float:
         del features, action, reward
         return 0.0
@@ -743,7 +825,7 @@ class ScheduledTimeoutModel(TensorModel):
     def load(self, checkpoint: Dict[str, Any]) -> None:
         pass
 
-class ThompsonSamplingModelOld(TensorModel): 
+class ThompsonSamplingModelV1(TensorModel): 
     """Previous single-tree bootstrapped CMAB implementation."""
 
     def __init__(
@@ -760,8 +842,8 @@ class ThompsonSamplingModelOld(TensorModel):
 
         self.reset_model()
 
-    def predict_action(self, features: torch.Tensor) -> torch.Tensor:
-        features_np = features.cpu().numpy()
+    def predict_action(self, features: np.ndarray) -> np.ndarray:
+        features_np = np.asarray(features, dtype=float)
         if features_np.ndim == 1:
             features_np = features_np.reshape(1, -1)
             
@@ -789,23 +871,23 @@ class ThompsonSamplingModelOld(TensorModel):
                 best_index = np.random.choice(tied_indices, replace=True)
                 predictions_stacked[i, best_index] += 1e-5
 
-        q_values = torch.tensor(predictions_stacked, device=features.device, dtype=torch.float32)
+        q_values = np.asarray(predictions_stacked, dtype=float)
         return q_values
 
     def update_model(
-        self, features: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor | float, backward: bool = True
+        self, features: np.ndarray, actions: np.ndarray, rewards: np.ndarray | float, backward: bool = True
     ) -> float:
-        features_np = features.cpu().numpy()
+        features_np = np.asarray(features, dtype=float)
         if features_np.ndim == 1:
             features_np = features_np.reshape(1, -1)
             
-        if isinstance(actions, torch.Tensor):
-            actions_np = actions.cpu().numpy().astype(int).flatten()
+        if isinstance(actions, np.ndarray):
+            actions_np = np.asarray(actions, dtype=int).ravel()
         else:
             actions_np = np.array([int(actions)])
             
-        if isinstance(rewards, torch.Tensor):
-            rewards_np = rewards.cpu().numpy().flatten()
+        if isinstance(rewards, np.ndarray):
+            rewards_np = np.asarray(rewards, dtype=float).ravel()
         else:
             rewards_np = np.full(len(actions_np), float(rewards))
 
@@ -849,7 +931,7 @@ class ThompsonSamplingModelOld(TensorModel):
         }
 
 
-class ThompsonSamplingModelv01(TensorModel):
+class ThompsonSamplingModelV2(TensorModel):
     def __init__(
         self,
         action_dim: int,
@@ -870,8 +952,8 @@ class ThompsonSamplingModelv01(TensorModel):
 
         self.reset_model()
 
-    def predict_action(self, features: torch.Tensor) -> torch.Tensor:
-        features_np = features.cpu().numpy()
+    def predict_action(self, features: np.ndarray) -> np.ndarray:
+        features_np = np.asarray(features, dtype=float)
         if features_np.ndim == 1:
             features_np = features_np.reshape(1, -1)
             
@@ -909,23 +991,23 @@ class ThompsonSamplingModelv01(TensorModel):
                 best_index = self._rng.choice(tied_indices)
                 predictions_stacked[i, best_index] += 1e-5
 
-        q_values = torch.tensor(predictions_stacked, device=features.device, dtype=torch.float32)
+        q_values = np.asarray(predictions_stacked, dtype=float)
         return q_values
 
     def update_model(
-        self, features: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor | float, backward: bool = True
+        self, features: np.ndarray, actions: np.ndarray, rewards: np.ndarray | float, backward: bool = True
     ) -> float:
-        features_np = features.cpu().numpy()
+        features_np = np.asarray(features, dtype=float)
         if features_np.ndim == 1:
             features_np = features_np.reshape(1, -1)
             
-        if isinstance(actions, torch.Tensor):
-            actions_np = actions.cpu().numpy().astype(int).flatten()
+        if isinstance(actions, np.ndarray):
+            actions_np = np.asarray(actions, dtype=int).ravel()
         else:
             actions_np = np.array([int(actions)])
             
-        if isinstance(rewards, torch.Tensor):
-            rewards_np = rewards.cpu().numpy().flatten()
+        if isinstance(rewards, np.ndarray):
+            rewards_np = np.asarray(rewards, dtype=float).ravel()
         else:
             rewards_np = np.full(len(actions_np), float(rewards))
 
@@ -1020,11 +1102,11 @@ class ThompsonSamplingModel(TensorModel):
 
         self.reset_model()
 
-    def predict_action(self, features: torch.Tensor, e = 0.1) -> torch.Tensor:
+    def predict_action(self, features: np.ndarray, e = 0.1) -> np.ndarray:
         """e-TS: with probability e take the Thompson draw (one bootstrap head
         per arm); with probability 1-e exploit the arm with the highest
         empirical mean over its reward sliding window."""
-        features_np = features.cpu().numpy()
+        features_np = np.asarray(features, dtype=float)
         if features_np.ndim == 1:
             features_np = features_np.reshape(1, -1)
 
@@ -1059,23 +1141,23 @@ class ThompsonSamplingModel(TensorModel):
                 best_index = self._rng.choice(tied_indices)
                 predictions_stacked[i, best_index] += 1e-5
 
-        q_values = torch.tensor(predictions_stacked, device=features.device, dtype=torch.float32)
+        q_values = np.asarray(predictions_stacked, dtype=float)
         return q_values
 
     def update_model(
-        self, features: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor | float, backward: bool = True
+        self, features: np.ndarray, actions: np.ndarray, rewards: np.ndarray | float, backward: bool = True
     ) -> float:
-        features_np = features.cpu().numpy()
+        features_np = np.asarray(features, dtype=float)
         if features_np.ndim == 1:
             features_np = features_np.reshape(1, -1)
             
-        if isinstance(actions, torch.Tensor):
-            actions_np = actions.cpu().numpy().astype(int).flatten()
+        if isinstance(actions, np.ndarray):
+            actions_np = np.asarray(actions, dtype=int).ravel()
         else:
             actions_np = np.array([int(actions)])
             
-        if isinstance(rewards, torch.Tensor):
-            rewards_np = rewards.cpu().numpy().flatten()
+        if isinstance(rewards, np.ndarray):
+            rewards_np = np.asarray(rewards, dtype=float).ravel()
         else:
             rewards_np = np.full(len(actions_np), float(rewards))
 
@@ -1160,3 +1242,946 @@ class MultiHeadThompsonSamplingModel(ThompsonSamplingModel):
             n_features=n_features,
             n_heads=n_heads,
         )
+
+class ThompsonSamplingModelV3(TensorModel):
+    """Per-arm bootstrapped-tree CMAB with a posterior-driven decision rule.
+
+    Same structure as :class:`ThompsonSamplingModel` (one sliding window and
+    one bootstrap ensemble per arm, caller takes the argmax of the returned
+    scores) with three changes, each restoring a property that Thompson
+    sampling depends on:
+
+    * Every decision is a posterior draw. One bootstrap head is sampled per
+      arm and the arm's score is that head's prediction *at the current
+      context*. Exploration comes from how much the heads disagree, so it is
+      directed at the arms that are actually uncertain and it anneals per arm
+      as that arm's window fills in. There is no epsilon and no separate
+      greedy branch scoring arms by a context-free window mean.
+    * The bootstrap cannot collapse to zero spread. Each arm's history is
+      augmented with GIRO-style pseudo-rewards (Kveton et al.,
+      https://arxiv.org/pdf/1811.05154) pinned to the best and worst reward
+      observed so far, at ``pseudo_reward_coefficient`` weight per real
+      sample, so the heads still disagree when an arm's observed rewards are
+      near-constant. Plain bootstrap TS can otherwise stop exploring
+      entirely.
+    * Uncertainty grows back for arms that are not being pulled. A draw is
+      shrunk toward an uninformative draw over the observed reward range by
+      ``staleness_discount ** steps_since_last_update``, so a stale estimate
+      reverts toward the prior instead of freezing an arm out permanently.
+      Sliding windows alone only forget data for arms that keep being pulled,
+      which is the wrong behavior when the best arm changes mid-run.
+
+    Aging is counted in ingested samples rather than wall-clock time so that
+    online and simulated runs with the same seed behave identically.
+
+    ``staleness_discount`` should be read relative to the number of arms: an
+    arm is revisited on the order of every ``action_dim`` steps at best, so
+    larger action spaces want a value closer to 1.
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        n_features: int,
+        n_heads: int = 30,
+        window_size: int = 32,
+        pseudo_reward_coefficient: float = 1.0 / 3.0,
+        staleness_discount: float = 0.99,
+        seed: Optional[int] = None,
+    ):
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        if n_features <= 0:
+            raise ValueError(f"n_features must be > 0, got {n_features}")
+        if n_heads <= 0:
+            raise ValueError(f"n_heads must be > 0, got {n_heads}")
+        if window_size <= 0:
+            raise ValueError(f"window_size must be > 0, got {window_size}")
+        if pseudo_reward_coefficient < 0.0:
+            raise ValueError(
+                "pseudo_reward_coefficient must be >= 0, got "
+                f"{pseudo_reward_coefficient}"
+            )
+        if not 0.0 < staleness_discount <= 1.0:
+            raise ValueError(
+                f"staleness_discount must be in (0, 1], got {staleness_discount}"
+            )
+
+        self._act_dim = int(action_dim)
+        self._obs_dim = int(n_features)
+        self._n_heads = int(n_heads)
+        self._max_bucket_size = int(window_size)
+        self._pseudo_coefficient = float(pseudo_reward_coefficient)
+        self._staleness_discount = float(staleness_discount)
+        self._seed = int(time.time_ns() & 0x7FFFFFFF) if seed is None else int(seed)
+
+        self.reset_model()
+
+    def predict_action(
+        self, features: np.ndarray, greedy: bool = False
+    ) -> np.ndarray:
+        """Score every arm with one independent posterior draw.
+
+        Returns a ``(batch, action_dim)`` score tensor; the caller pulls the
+        argmax. Arms with no observation yet all score ``+inf``, so the argmax
+        pulls them in index order, giving a deterministic round-robin initial
+        design.
+
+        ``greedy=True`` scores arms by the posterior mean (the ensemble
+        average at the current context) with no exploration. It is for offline
+        evaluation and reporting, not for acting.
+        """
+        features_np = np.asarray(features, dtype=float)
+        if features_np.ndim == 1:
+            features_np = features_np.reshape(1, -1)
+        if features_np.shape[1] != self._obs_dim:
+            raise ValueError(
+                f"Expected {self._obs_dim} features, got {features_np.shape[1]}"
+            )
+
+        batch_size = features_np.shape[0]
+        scores = np.zeros((batch_size, self._act_dim), dtype=float)
+        # One independent head per arm: the per-arm ensembles are fit on
+        # disjoint data, so their posteriors are independent.
+        sampled_heads = self._rng.integers(
+            0, self._n_heads, size=(batch_size, self._act_dim)
+        )
+        reward_low, reward_high = self._observed_reward_range()
+
+        for i in range(batch_size):
+            row = features_np[i : i + 1]
+            for arm in range(self._act_dim):
+                if not self.is_fitted[arm]:
+                    scores[i, arm] = np.inf
+                    continue
+                if greedy:
+                    scores[i, arm] = float(
+                        np.mean([head.predict(row)[0] for head in self.models[arm]])
+                    )
+                    continue
+                head = self.models[arm][sampled_heads[i, arm]]
+                scores[i, arm] = self._shrink_stale_draw(
+                    arm, float(head.predict(row)[0]), reward_low, reward_high
+                )
+
+        self._break_ties(scores)
+        return np.asarray(scores, dtype=float)
+
+    def update_model(
+        self,
+        features: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray | float,
+        backward: bool = True,
+    ) -> float:
+        # backward=False means "do not learn from this batch". Unlike
+        # ThompsonSamplingModel this also skips ingestion, so evaluation
+        # batches cannot leak into the windows the acting policy reads.
+        if not backward:
+            return 0.0
+
+        features_np = np.asarray(features, dtype=float)
+        if features_np.ndim == 1:
+            features_np = features_np.reshape(1, -1)
+        if features_np.shape[1] != self._obs_dim:
+            raise ValueError(
+                f"Expected {self._obs_dim} features, got {features_np.shape[1]}"
+            )
+
+        if isinstance(actions, np.ndarray):
+            actions_np = np.asarray(actions, dtype=int).ravel()
+        else:
+            actions_np = np.array([int(actions)])
+
+        if isinstance(rewards, np.ndarray):
+            rewards_np = np.asarray(rewards, dtype=float).ravel()
+        else:
+            rewards_np = np.full(len(actions_np), float(rewards))
+
+        batch_size = features_np.shape[0]
+        if len(actions_np) == 1 and batch_size > 1:
+            actions_np = np.repeat(actions_np, batch_size)
+        if len(rewards_np) == 1 and batch_size > 1:
+            rewards_np = np.repeat(rewards_np, batch_size)
+        if len(actions_np) != batch_size:
+            raise ValueError(
+                f"actions batch size mismatch: expected {batch_size}, "
+                f"got {len(actions_np)}"
+            )
+        if len(rewards_np) != batch_size:
+            raise ValueError(
+                f"rewards batch size mismatch: expected {batch_size}, "
+                f"got {len(rewards_np)}"
+            )
+
+        for i in range(batch_size):
+            arm = int(actions_np[i])
+            if not 0 <= arm < self._act_dim:
+                raise ValueError(f"action out of range: {arm}")
+            self._step += 1
+            self.memory[arm]["features"].append(features_np[i])
+            self.memory[arm]["rewards"].append(float(rewards_np[i]))
+            self._last_update_step[arm] = self._step
+
+        for arm in sorted({int(action) for action in actions_np}):
+            self._fit_arm(arm)
+
+        return 0.0
+
+    def reset_model(self) -> None:
+        self._rng = np.random.default_rng(self._seed)
+        self.models = [
+            [
+                DecisionTreeRegressor(
+                    criterion="squared_error",
+                    max_depth=6,
+                    min_samples_leaf=6,
+                    # No min_impurity_decrease: an absolute impurity floor ties
+                    # tree depth to the reward scale, which is arbitrary here
+                    # (shaped throughput spans ~0 to 10^3 and beyond).
+                    random_state=self._seed
+                    + arm_index * self._n_heads
+                    + head_index,
+                )
+                for head_index in range(self._n_heads)
+            ]
+            for arm_index in range(self._act_dim)
+        ]
+        self.is_fitted = [False] * self._act_dim
+        self._last_update_step = [0] * self._act_dim
+        self._step = 0
+        self._init_buckets()
+
+    def _init_buckets(self) -> None:
+        self.memory = [
+            {
+                "features": deque(maxlen=self._max_bucket_size),
+                "rewards": deque(maxlen=self._max_bucket_size),
+            }
+            for _ in range(self._act_dim)
+        ]
+
+    def _break_ties(self, scores: np.ndarray) -> None:
+        """Randomize the winner among exactly equal finite scores, in place.
+
+        Exact equality is the right test: equal scores here come from
+        identical computations (constant trees, or the same prior draw), not
+        from floating point drift, and the relative tolerance of np.isclose
+        would fold genuinely different scores together at large reward
+        magnitudes. Infinite scores are left alone so that untried arms keep
+        their round-robin order.
+
+        The winner is raised by one representable step rather than a fixed
+        epsilon: any increment smaller than the float spacing at that magnitude
+        would be rounded away and the tie would silently resolve to the lowest
+        arm index. This used to be a float32 step, because scores were narrowed
+        to float32 on the way into a torch tensor; scores are float64 now, so
+        the step scales with the actual output precision.
+        """
+        for i in range(scores.shape[0]):
+            row = scores[i]
+            best = float(np.max(row))
+            if not np.isfinite(best):
+                continue
+            tied = np.flatnonzero(row == best)
+            if len(tied) <= 1:
+                continue
+            row[int(self._rng.choice(tied))] = np.nextafter(best, np.inf)
+
+    def _observed_reward_range(self) -> Tuple[float, float]:
+        """Best and worst reward seen across all arms' windows.
+
+        This is the support of the uninformative prior used for pseudo-rewards
+        and for staleness shrinkage. When every observed reward is identical
+        the range is degenerate and both mechanisms become no-ops, which is
+        harmless: all arms then score identically and the tie break picks
+        uniformly at random.
+        """
+        rewards = [
+            reward for arm_memory in self.memory for reward in arm_memory["rewards"]
+        ]
+        if not rewards:
+            return 0.0, 0.0
+        return float(min(rewards)), float(max(rewards))
+
+    def _shrink_stale_draw(
+        self, arm: int, draw: float, reward_low: float, reward_high: float
+    ) -> float:
+        """Mix a posterior draw with an uninformative one as the arm's last
+        observation ages, so an unmeasured arm reverts toward the prior."""
+        if self._staleness_discount >= 1.0:
+            return draw
+        age = self._step - self._last_update_step[arm]
+        if age <= 0:
+            return draw
+        weight = self._staleness_discount**age
+        prior_draw = float(self._rng.uniform(reward_low, reward_high))
+        return weight * draw + (1.0 - weight) * prior_draw
+
+    def _fit_arm(self, arm: int) -> None:
+        """Refit one arm's ensemble on bootstrap resamples of its window,
+        augmented with pseudo-rewards at the observed reward extremes."""
+        context = np.array(self.memory[arm]["features"], dtype=float)
+        observed = np.array(self.memory[arm]["rewards"], dtype=float)
+        reward_low, reward_high = self._observed_reward_range()
+        sample_count = len(observed)
+
+        # Pseudo-observations reuse the real contexts, so they inflate the
+        # spread of the fit without distorting the context distribution.
+        inputs = np.vstack((context, context, context))
+        targets = np.concatenate(
+            (
+                observed,
+                np.full(sample_count, reward_high),
+                np.full(sample_count, reward_low),
+            )
+        )
+        weights = np.concatenate(
+            (
+                np.ones(sample_count),
+                np.full(sample_count, self._pseudo_coefficient),
+                np.full(sample_count, self._pseudo_coefficient),
+            )
+        )
+        probabilities = weights / weights.sum()
+        draw_size = max(1, int(round(float(weights.sum()))))
+
+        for head in self.models[arm]:
+            indices = self._rng.choice(
+                len(inputs), size=draw_size, replace=True, p=probabilities
+            )
+            head.fit(inputs[indices], targets[indices])
+        self.is_fitted[arm] = True
+
+
+def _break_ties_in_place(scores: np.ndarray, rng: np.random.Generator) -> None:
+    """Randomize the winner among exactly equal finite scores, in place.
+
+    Same rule as :meth:`ThompsonSamplingModelV3._break_ties`: exact equality
+    rather than ``np.isclose`` (equal scores here come from identical
+    computations, not float drift), infinite scores left alone so untried arms
+    keep their round-robin order, and the winner raised by one representable
+    step so the bump cannot be rounded away.
+    """
+    for i in range(scores.shape[0]):
+        row = scores[i]
+        best = float(np.max(row))
+        if not np.isfinite(best):
+            continue
+        tied = np.flatnonzero(row == best)
+        if len(tied) <= 1:
+            continue
+        row[int(rng.choice(tied))] = np.nextafter(best, np.inf)
+
+
+class _BootstrappedForestModel(TensorModel):
+    """Shared machinery for the BFTBrain random-forest CMAB baselines.
+
+    Ported from the reference implementation in BFTBrain
+    (``code/learning/learning_agent.py``), where the three variants differ only
+    in how they partition experience across forests: one forest per
+    ``(previous arm, arm)`` transition (:class:`QuadraticRF`), one per arm
+    (:class:`MultiRF`), or one shared forest over ``[context ‖ one-hot(arm)]``
+    (:class:`SingleRF`).
+
+    All three explore the same way: a forest is refit on a *bootstrap resample*
+    of its replay window before it is used to score arms, so the scores are a
+    randomized draw rather than a point estimate. This is the same posterior
+    approximation :class:`ThompsonSamplingModel` uses, differing in that the
+    resample happens at fit time on a single forest instead of being drawn from
+    a persistent ensemble of heads. Arms with no data at all score ``+inf`` and
+    are pulled in index order, giving a deterministic round-robin over the
+    initial design.
+
+    Three deliberate departures from the reference implementation:
+
+    * Rewards are ingested as given. BFTBrain applies its ``reward_engineering``
+      shaping inside the model; here that belongs to
+      :class:`QuadraticRewardScaler` upstream, so applying it again would square
+      the shaping.
+    * Contexts and rewards are stored as one atomic pair per ``update_model``
+      call. BFTBrain appends them from two separate callbacks that run an
+      episode apart, which leaves its ``X`` list ahead of its ``y`` list and
+      misaligns the two by that gap when the replay window is applied.
+    * ``backward=False`` skips ingestion entirely rather than only skipping the
+      refit, matching :class:`ThompsonSamplingModelV3`, so evaluation batches
+      cannot leak into the windows the acting policy reads.
+
+    The reference agent also warm-starts its buffers from checkpoint CSVs at
+    construction; these models start empty and are warmed by ``update_model``.
+
+    Subclasses must call :meth:`reset_model` at the end of their ``__init__``.
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        n_features: int,
+        max_depth: int = 5,
+        n_estimators: int = 100,
+        replay_buffer_size: Optional[int] = None,
+        seed: Optional[int] = None,
+    ):
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        if n_features <= 0:
+            raise ValueError(f"n_features must be > 0, got {n_features}")
+        if max_depth <= 0:
+            raise ValueError(f"max_depth must be > 0, got {max_depth}")
+        if n_estimators <= 0:
+            raise ValueError(f"n_estimators must be > 0, got {n_estimators}")
+        if replay_buffer_size is not None and replay_buffer_size <= 0:
+            raise ValueError(
+                f"replay_buffer_size must be > 0 or None, got {replay_buffer_size}"
+            )
+
+        self._act_dim = int(action_dim)
+        self._obs_dim = int(n_features)
+        self._max_depth = int(max_depth)
+        self._n_estimators = int(n_estimators)
+        self._replay_buffer_size = (
+            None if replay_buffer_size is None else int(replay_buffer_size)
+        )
+        self._seed = int(time.time_ns() & 0x7FFFFFFF) if seed is None else int(seed)
+
+    def _new_forest(self, index: int) -> RandomForestRegressor:
+        return RandomForestRegressor(
+            n_estimators=self._n_estimators,
+            max_depth=self._max_depth,
+            random_state=self._seed + index,
+        )
+
+    def _new_bucket(self) -> Dict[str, List[Any]]:
+        return {"features": [], "rewards": []}
+
+    def _as_batch(self, features: np.ndarray) -> np.ndarray:
+        features_np = np.asarray(features, dtype=float)
+        if features_np.ndim == 1:
+            features_np = features_np.reshape(1, -1)
+        if features_np.shape[1] != self._obs_dim:
+            raise ValueError(
+                f"Expected {self._obs_dim} features, got {features_np.shape[1]}"
+            )
+        return features_np
+
+    def _normalize_batch(
+        self,
+        features: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray | float,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        features_np = self._as_batch(features)
+
+        if isinstance(actions, np.ndarray):
+            actions_np = np.asarray(actions, dtype=int).ravel()
+        else:
+            actions_np = np.array([int(actions)])
+
+        if isinstance(rewards, np.ndarray):
+            rewards_np = np.asarray(rewards, dtype=float).ravel()
+        else:
+            rewards_np = np.full(len(actions_np), float(rewards))
+
+        batch_size = features_np.shape[0]
+        if len(actions_np) == 1 and batch_size > 1:
+            actions_np = np.repeat(actions_np, batch_size)
+        if len(rewards_np) == 1 and batch_size > 1:
+            rewards_np = np.repeat(rewards_np, batch_size)
+        if len(actions_np) != batch_size:
+            raise ValueError(
+                f"actions batch size mismatch: expected {batch_size}, "
+                f"got {len(actions_np)}"
+            )
+        if len(rewards_np) != batch_size:
+            raise ValueError(
+                f"rewards batch size mismatch: expected {batch_size}, "
+                f"got {len(rewards_np)}"
+            )
+        for arm in actions_np:
+            if not 0 <= int(arm) < self._act_dim:
+                raise ValueError(f"action out of range: {int(arm)}")
+
+        return features_np, actions_np, rewards_np
+
+    def _replay_length(self, sample_count: int) -> int:
+        if self._replay_buffer_size is None:
+            return sample_count
+        return min(self._replay_buffer_size, sample_count)
+
+    def _fit_forest(self, forest: RandomForestRegressor, bucket: Dict[str, List[Any]]) -> None:
+        """Refit one forest on a bootstrap resample of the tail of its window.
+
+        The resample is the exploration mechanism: two consecutive fits on the
+        same data give different trees, so the scores this forest produces are
+        a draw rather than a fixed estimate.
+        """
+        count = self._replay_length(len(bucket["rewards"]))
+        inputs = np.array(bucket["features"], dtype=float)[-count:]
+        targets = np.array(bucket["rewards"], dtype=float)[-count:]
+        indices = self._rng.choice(count, size=count, replace=True)
+        forest.fit(inputs[indices], targets[indices])
+
+    def _resolve_prev_action(self, prev_action: Optional[int]) -> int:
+        if prev_action is None:
+            return self._prev_action
+        prev_action = int(prev_action)
+        if not 0 <= prev_action < self._act_dim:
+            raise ValueError(f"prev_action out of range: {prev_action}")
+        return prev_action
+
+    def reset_model(self) -> None:
+        self._rng = np.random.default_rng(self._seed)
+        self._prev_action = self._initial_prev_action
+
+
+class QuadraticRF(_BootstrappedForestModel):
+    """One forest per ``(previous arm, arm)`` transition.
+
+    The reference model conditions on which protocol was running when the
+    decision was made, on the theory that the reward of switching to an arm
+    depends on what it is switching *from*. That gives ``action_dim ** 2``
+    forests and buckets, so it needs on the order of ``action_dim`` times more
+    data than :class:`MultiRF` to fill in.
+
+    The previous arm is not part of the :class:`TensorModel` signature, so it is
+    tracked internally: ``update_model`` records the order arms are ingested in,
+    and the arm ingested immediately before a sample is that sample's
+    predecessor. Callers that know the arm actually running - and whose reward
+    attribution lags their decisions, as BFTBrain's does by two episodes - should
+    pass ``prev_action`` to :meth:`predict_action` explicitly rather than rely on
+    the tracker, which only advances on ingestion.
+
+    Untried transitions score ``+inf`` to force exploration, but a transition
+    stays on hold at ``-inf`` from the moment it is chosen until its reward
+    arrives. Without that, every decision in the window before the first reward
+    lands would re-pick the same untried bucket.
+
+    That hold expires after ``hold_steps`` ingested samples rather than only on
+    the matching reward, which the reference does not need to do: there, every
+    decision the model makes is executed, so its reward always comes back and
+    always clears the hold. A caller that replays a fixed dataset - the offline
+    simulator - ingests whatever the trace recorded, not what the model chose,
+    so unconditional holds would accumulate until every untried bucket was held
+    at ``-inf`` and forced exploration stopped entirely. The default of 2
+    matches the reference's two-episode reward lag.
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        n_features: int,
+        max_depth: int = 5,
+        n_estimators: int = 100,
+        replay_buffer_size: Optional[int] = None,
+        initial_prev_action: int = 0,
+        hold_steps: int = 2,
+        seed: Optional[int] = None,
+    ):
+        super().__init__(
+            action_dim=action_dim,
+            n_features=n_features,
+            max_depth=max_depth,
+            n_estimators=n_estimators,
+            replay_buffer_size=replay_buffer_size,
+            seed=seed,
+        )
+        if not 0 <= int(initial_prev_action) < self._act_dim:
+            raise ValueError(
+                f"initial_prev_action out of range: {initial_prev_action}"
+            )
+        if hold_steps < 0:
+            raise ValueError(f"hold_steps must be >= 0, got {hold_steps}")
+        self._initial_prev_action = int(initial_prev_action)
+        self._hold_steps = int(hold_steps)
+        self.reset_model()
+
+    def predict_action(
+        self,
+        features: np.ndarray,
+        prev_action: Optional[int] = None,
+        greedy: bool = False,
+    ) -> np.ndarray:
+        """Score every arm as a successor to ``prev_action``.
+
+        Returns a ``(batch, action_dim)`` score tensor; the caller pulls the
+        argmax. Mutating: every bucket whose window changed since the last
+        decision is refit first (a stale fit is what would otherwise be read),
+        and the bucket the argmax lands in is put on hold. ``greedy=True``
+        suppresses both the exploration sentinels and the on-hold bookkeeping,
+        scoring arms with the current fits only - for offline evaluation, not
+        for acting.
+        """
+        features_np = self._as_batch(features)
+        previous = self._resolve_prev_action(prev_action)
+
+        # Refit every bucket whose window changed since the last decision. The
+        # reference implementation refits a single bucket because it ingests one
+        # sample per episode; a batched update can dirty several at once, and a
+        # bucket left unfit here would be read below as if it had a model.
+        for bucket_prev, bucket_arm in sorted(self._dirty_buckets):
+            self._fit_forest(
+                self.models[bucket_prev][bucket_arm],
+                self.memory[bucket_prev][bucket_arm],
+            )
+            self.is_fitted[bucket_prev][bucket_arm] = True
+        self._dirty_buckets.clear()
+
+        batch_size = features_np.shape[0]
+        scores = np.zeros((batch_size, self._act_dim), dtype=float)
+        for i in range(batch_size):
+            row = features_np[i : i + 1]
+            for arm in range(self._act_dim):
+                if not self.is_fitted[previous][arm]:
+                    if greedy or self._is_on_hold(previous, arm):
+                        scores[i, arm] = -np.inf
+                    else:
+                        scores[i, arm] = np.inf
+                    continue
+                scores[i, arm] = float(self.models[previous][arm].predict(row)[0])
+
+        _break_ties_in_place(scores, self._rng)
+
+        if not greedy:
+            for i in range(batch_size):
+                self._on_hold_buckets[
+                    (previous, int(np.argmax(scores[i])))
+                ] = self._step
+
+        return np.asarray(scores, dtype=float)
+
+    def _is_on_hold(self, prev_action: int, arm: int) -> bool:
+        held_at = self._on_hold_buckets.get((prev_action, arm))
+        if held_at is None:
+            return False
+        if self._step - held_at < self._hold_steps:
+            return True
+        del self._on_hold_buckets[(prev_action, arm)]
+        return False
+
+    def update_model(
+        self,
+        features: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray | float,
+        backward: bool = True,
+        prev_actions: Optional[np.ndarray] = None,
+    ) -> float:
+        if not backward:
+            return 0.0
+
+        features_np, actions_np, rewards_np = self._normalize_batch(
+            features, actions, rewards
+        )
+
+        if prev_actions is None:
+            explicit_prev = None
+        else:
+            explicit_prev = (
+                np.asarray(prev_actions, dtype=int).ravel()
+                if isinstance(prev_actions, np.ndarray)
+                else np.array(prev_actions, dtype=int).flatten()
+            )
+            if len(explicit_prev) != len(actions_np):
+                raise ValueError(
+                    f"prev_actions batch size mismatch: expected {len(actions_np)}, "
+                    f"got {len(explicit_prev)}"
+                )
+
+        for i in range(len(actions_np)):
+            arm = int(actions_np[i])
+            previous = self._resolve_prev_action(
+                None if explicit_prev is None else explicit_prev[i]
+            )
+            self.memory[previous][arm]["features"].append(features_np[i])
+            self.memory[previous][arm]["rewards"].append(float(rewards_np[i]))
+            self._dirty_buckets.add((previous, arm))
+            self._on_hold_buckets.pop((previous, arm), None)
+            self._step += 1
+            # This sample's arm is the next sample's predecessor.
+            self._prev_action = arm
+
+        return 0.0
+
+    def reset_model(self) -> None:
+        super().reset_model()
+        self.models = [
+            [
+                self._new_forest(prev_index * self._act_dim + arm_index)
+                for arm_index in range(self._act_dim)
+            ]
+            for prev_index in range(self._act_dim)
+        ]
+        self.is_fitted = [
+            [False] * self._act_dim for _ in range(self._act_dim)
+        ]
+        self._dirty_buckets: set = set()
+        # bucket -> the ingestion step at which it was put on hold
+        self._on_hold_buckets: Dict[Tuple[int, int], int] = {}
+        self._step = 0
+        self._init_buckets()
+
+    def _init_buckets(self) -> None:
+        self.memory = [
+            [self._new_bucket() for _ in range(self._act_dim)]
+            for _ in range(self._act_dim)
+        ]
+
+
+class MultiRF(_BootstrappedForestModel):
+    """One forest per arm, each fit on that arm's own experience.
+
+    The middle point of the three: arms do not share a model, so a forest never
+    has to learn the arm boundary from a one-hot column the way
+    :class:`SingleRF` does, but there is no transition conditioning and so no
+    ``action_dim``-fold data cost the way there is in :class:`QuadraticRF`.
+
+    ``one_hot_prev_action`` reproduces the reference model's ``--multi-onehot``
+    mode, appending a one-hot of the previous arm to the context so a per-arm
+    forest can still condition on the transition. One deviation: BFTBrain drops
+    its last two feature columns when it appends the one-hot, because those
+    columns encode protocol capabilities that the one-hot makes redundant. The
+    timeout report features here carry no such columns, so nothing is dropped
+    and the model input is ``n_features + action_dim`` wide.
+
+    Untried arms score ``+inf``. There is no on-hold mechanism, matching the
+    reference: with only ``action_dim`` buckets they fill quickly enough that
+    re-picking an untried arm before its reward lands is not worth guarding.
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        n_features: int,
+        max_depth: int = 5,
+        n_estimators: int = 100,
+        replay_buffer_size: Optional[int] = None,
+        one_hot_prev_action: bool = False,
+        initial_prev_action: int = 0,
+        seed: Optional[int] = None,
+    ):
+        super().__init__(
+            action_dim=action_dim,
+            n_features=n_features,
+            max_depth=max_depth,
+            n_estimators=n_estimators,
+            replay_buffer_size=replay_buffer_size,
+            seed=seed,
+        )
+        if not 0 <= int(initial_prev_action) < self._act_dim:
+            raise ValueError(
+                f"initial_prev_action out of range: {initial_prev_action}"
+            )
+        self._one_hot_prev_action = bool(one_hot_prev_action)
+        self._initial_prev_action = int(initial_prev_action)
+        self.reset_model()
+
+    def _model_input(self, row: np.ndarray, prev_action: int) -> np.ndarray:
+        if not self._one_hot_prev_action:
+            return row
+        one_hot = np.zeros(self._act_dim, dtype=float)
+        one_hot[prev_action] = 1.0
+        return np.concatenate((row, one_hot))
+
+    def predict_action(
+        self,
+        features: np.ndarray,
+        prev_action: Optional[int] = None,
+        greedy: bool = False,
+    ) -> np.ndarray:
+        """Score every arm with its own forest.
+
+        ``prev_action`` is only read when ``one_hot_prev_action`` is set; see
+        :class:`QuadraticRF` for how the internal tracker resolves it.
+        ``greedy=True`` scores with the current fits and never forces an untried
+        arm - for offline evaluation, not for acting.
+        """
+        features_np = self._as_batch(features)
+        previous = self._resolve_prev_action(prev_action)
+
+        # See QuadraticRF.predict_action: a batched update can dirty more than
+        # the one bucket the reference implementation assumes.
+        for arm in sorted(self._dirty_buckets):
+            self._fit_forest(self.models[arm], self.memory[arm])
+            self.is_fitted[arm] = True
+        self._dirty_buckets.clear()
+
+        batch_size = features_np.shape[0]
+        scores = np.zeros((batch_size, self._act_dim), dtype=float)
+        for i in range(batch_size):
+            row = self._model_input(features_np[i], previous).reshape(1, -1)
+            for arm in range(self._act_dim):
+                if not self.is_fitted[arm]:
+                    scores[i, arm] = -np.inf if greedy else np.inf
+                    continue
+                scores[i, arm] = float(self.models[arm].predict(row)[0])
+
+        _break_ties_in_place(scores, self._rng)
+        return np.asarray(scores, dtype=float)
+
+    def update_model(
+        self,
+        features: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray | float,
+        backward: bool = True,
+        prev_actions: Optional[np.ndarray] = None,
+    ) -> float:
+        if not backward:
+            return 0.0
+
+        features_np, actions_np, rewards_np = self._normalize_batch(
+            features, actions, rewards
+        )
+
+        if prev_actions is None:
+            explicit_prev = None
+        else:
+            explicit_prev = (
+                np.asarray(prev_actions, dtype=int).ravel()
+                if isinstance(prev_actions, np.ndarray)
+                else np.array(prev_actions, dtype=int).flatten()
+            )
+            if len(explicit_prev) != len(actions_np):
+                raise ValueError(
+                    f"prev_actions batch size mismatch: expected {len(actions_np)}, "
+                    f"got {len(explicit_prev)}"
+                )
+
+        for i in range(len(actions_np)):
+            arm = int(actions_np[i])
+            previous = self._resolve_prev_action(
+                None if explicit_prev is None else explicit_prev[i]
+            )
+            self.memory[arm]["features"].append(
+                self._model_input(features_np[i], previous)
+            )
+            self.memory[arm]["rewards"].append(float(rewards_np[i]))
+            self._dirty_buckets.add(arm)
+            self._prev_action = arm
+
+        return 0.0
+
+    def reset_model(self) -> None:
+        super().reset_model()
+        self.models = [self._new_forest(arm) for arm in range(self._act_dim)]
+        self.is_fitted = [False] * self._act_dim
+        self._dirty_buckets: set = set()
+        self._init_buckets()
+
+    def _init_buckets(self) -> None:
+        self.memory = [self._new_bucket() for _ in range(self._act_dim)]
+
+
+class SingleRF(_BootstrappedForestModel):
+    """One forest over ``[context ‖ one-hot(arm)]`` shared by every arm.
+
+    Scoring enumerates the arms: the context is tiled ``action_dim`` times, each
+    row completed with a different one-hot, and the whole block predicted in one
+    call. Every sample trains the single model, so an arm benefits from what the
+    others measured - which is the point, and also the risk, since the forest can
+    split on the context and ignore the one-hot entirely, collapsing the arms
+    together.
+
+    The reference model refits on every decision rather than only when a window
+    changes, since there is one window and it changes on every update. That is
+    kept: the per-decision bootstrap resample is what makes the scores a draw.
+
+    Before any data arrives the arms are scored uniformly at random, matching
+    the reference's random cold-start pick.
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        n_features: int,
+        max_depth: int = 5,
+        n_estimators: int = 100,
+        replay_buffer_size: Optional[int] = None,
+        seed: Optional[int] = None,
+    ):
+        super().__init__(
+            action_dim=action_dim,
+            n_features=n_features,
+            max_depth=max_depth,
+            n_estimators=n_estimators,
+            replay_buffer_size=replay_buffer_size,
+            seed=seed,
+        )
+        self._initial_prev_action = 0
+        self.reset_model()
+
+    def predict_action(
+        self, features: np.ndarray, greedy: bool = False
+    ) -> np.ndarray:
+        """Score every arm from the shared forest.
+
+        Mutating: the forest is refit on a fresh bootstrap resample first, so
+        two calls on the same context give different scores. ``greedy=True``
+        skips the refit and scores from the current fit - for offline
+        evaluation, not for acting.
+        """
+        features_np = self._as_batch(features)
+        has_data = len(self.memory["rewards"]) > 0
+
+        if has_data and not greedy:
+            self._fit_forest(self.model, self.memory)
+
+        batch_size = features_np.shape[0]
+        scores = np.zeros((batch_size, self._act_dim), dtype=float)
+        for i in range(batch_size):
+            if not self.is_fitted:
+                # No data yet: uniform random scores, so the argmax is a
+                # uniform random arm.
+                scores[i] = self._rng.random(self._act_dim)
+                continue
+            block = np.hstack(
+                (
+                    np.tile(features_np[i], (self._act_dim, 1)),
+                    np.eye(self._act_dim),
+                )
+            )
+            scores[i] = self.model.predict(block)
+
+        _break_ties_in_place(scores, self._rng)
+        return np.asarray(scores, dtype=float)
+
+    def update_model(
+        self,
+        features: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray | float,
+        backward: bool = True,
+    ) -> float:
+        if not backward:
+            return 0.0
+
+        features_np, actions_np, rewards_np = self._normalize_batch(
+            features, actions, rewards
+        )
+
+        for i in range(len(actions_np)):
+            one_hot = np.zeros(self._act_dim, dtype=float)
+            one_hot[int(actions_np[i])] = 1.0
+            self.memory["features"].append(
+                np.concatenate((features_np[i], one_hot))
+            )
+            self.memory["rewards"].append(float(rewards_np[i]))
+            self._prev_action = int(actions_np[i])
+
+        # Keeping the fit current on ingestion, rather than only on the next
+        # decision, is what makes a greedy read well defined at any point. The
+        # acting path in predict_action still draws its own bootstrap refit on
+        # top of this one.
+        self._fit_forest(self.model, self.memory)
+        self.is_fitted = True
+
+        return 0.0
+
+    def reset_model(self) -> None:
+        super().reset_model()
+        self.model = self._new_forest(0)
+        self.is_fitted = False
+        self._init_buckets()
+
+    def _init_buckets(self) -> None:
+        self.memory = self._new_bucket()

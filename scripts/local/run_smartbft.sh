@@ -93,7 +93,7 @@ trap cleanup EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--backoff] [--model <random|linear|cmab|cmab_old|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>]
+Usage: $0 [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--backoff] [--model <random|linear|cmab|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>]
 
 Arguments:
   mode              Optional; one of normal|heuristic|learning|sharing|scheduled (default: normal).
@@ -102,7 +102,7 @@ Flags:
   --dataset         Compatibility flag; agent modes collect one agent CSV per node.
   --log             Keep/copy SmartBFT benchmark and learning-agent logs.
   --backoff         Enable request timeout backoff with a 10s maximum.
-  --model           Learning-agent model for learning mode: random|linear|cmab|cmab_old|continuous (default: random).
+  --model           Learning-agent model for learning mode: random|linear|cmab|continuous (default: random).
   -f <int>          Fault tolerance f; nodes defaults to 3f+1 (default: 1).
   -t <int>          Seconds to run after benchmark start before stopping tmux sessions (default: 300).
 
@@ -153,7 +153,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|linear|cmab|cmab_old|continuous)
+    random|linear|cmab|continuous)
       printf '%s\n' "${model_lower}"
       ;;
     *)
@@ -529,7 +529,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear|cmab|cmab_old|continuous." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear|cmab|continuous." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then

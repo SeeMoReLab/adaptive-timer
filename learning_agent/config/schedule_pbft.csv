@@ -1,8 +1,5 @@
 # time_s,timeout_ms
 # Valid timeout_ms options: 300, 800, 1800
 # Negative time_s means pre-start offset (warmup)
--10,300
-0,300
-900,800
-2100,1800
-2400,300
+-10,800
+0,800

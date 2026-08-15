@@ -66,3 +66,5 @@ local_note.txt
 scripts/cloudlab/run_tendermint_static.sh
 scripts/cloudlab/run_tendermint_2t.sh
 scripts/cloudlab/tendermint
+
+learning_agent/plot/

@@ -2,7 +2,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-import torch
+import numpy as np
 
 import agent_pb2
 from continuous_bandit import (
@@ -31,7 +31,7 @@ class DiscreteTimeoutActionCodecTest(unittest.TestCase):
     def test_tendermint_arms_couple_phase_timeouts(self) -> None:
         codec = ProtocolTimeoutActionCodec(agent_pb2.PROTOCOL_TENDERMINT)
 
-        decoded = codec.decode(torch.tensor(1.0)).tendermint
+        decoded = codec.decode(np.asarray(1.0)).tendermint
         action = codec.encode(
             agent_pb2.TendermintTimeout(
                 propose_timeout_milliseconds=600,
@@ -116,8 +116,8 @@ class ContinuousTimeoutActionCodecTest(unittest.TestCase):
             agent_pb2.PROTOCOL_TENDERMINT
         )
 
-        pbft = pbft_codec.decode(torch.tensor([-1.0]))
-        tendermint = tendermint_codec.decode(torch.tensor([2.0]))
+        pbft = pbft_codec.decode(np.asarray([-1.0]))
+        tendermint = tendermint_codec.decode(np.asarray([2.0]))
 
         self.assertEqual(pbft.pbft.election_timeout_milliseconds, 300)
         self.assertEqual(tendermint.tendermint.propose_timeout_milliseconds, 600)
@@ -143,19 +143,19 @@ class ContinuousThompsonSamplingModelTest(unittest.TestCase):
     def test_reset_replays_deterministic_initial_design(self) -> None:
         codec = ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT)
         model = self._new_model(codec)
-        features = torch.tensor([1.0, 2.0])
+        features = np.asarray([1.0, 2.0])
 
         first = model.predict_action(features)
         second = model.predict_action(features)
         model.reset_model()
 
-        self.assertTrue(torch.equal(first, model.predict_action(features)))
-        self.assertTrue(torch.equal(second, model.predict_action(features)))
+        self.assertTrue(np.array_equal(first, model.predict_action(features)))
+        self.assertTrue(np.array_equal(second, model.predict_action(features)))
 
     def test_tendermint_update_and_prediction_stay_in_bounds(self) -> None:
         codec = ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_TENDERMINT)
         model = self._new_model(codec)
-        features = torch.tensor([10.0, 20.0])
+        features = np.asarray([10.0, 20.0])
         action = codec.encode(
             agent_pb2.TendermintTimeout(
                 propose_timeout_milliseconds=437,
@@ -168,8 +168,8 @@ class ContinuousThompsonSamplingModelTest(unittest.TestCase):
         for _ in range(5):
             predicted = model.predict_action(features)
             self.assertEqual(tuple(predicted.shape), (1,))
-            self.assertTrue(bool(torch.all(predicted >= 0.0)))
-            self.assertTrue(bool(torch.all(predicted <= 1.0)))
+            self.assertTrue(bool(np.all(predicted >= 0.0)))
+            self.assertTrue(bool(np.all(predicted <= 1.0)))
             timeout = codec.decode(predicted).tendermint
             self.assertGreaterEqual(timeout.propose_timeout_milliseconds, 150)
             self.assertLessEqual(timeout.propose_timeout_milliseconds, 600)

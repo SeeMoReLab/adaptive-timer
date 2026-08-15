@@ -2,7 +2,6 @@ import argparse
 import csv
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
-import torch
 from tqdm import tqdm
 import numpy as np
 import os
@@ -22,9 +21,14 @@ from data_loader import (
 from reward_utils import calculate_reward_from_report_row
 
 from models import (
-    LinearTorchModel,
+    LinearModel,
+    MultiRF,
+    QuadraticRF,
+    SingleRF,
     ThompsonSamplingModel,
-    ThompsonSamplingModelOld,
+    ThompsonSamplingModelV1,
+    ThompsonSamplingModelV2,
+    ThompsonSamplingModelV3,
     TensorModel,
     QuadraticRewardScaler,
     RewardTransformer,
@@ -50,22 +54,44 @@ PROTOCOL_NAME_TO_ENUM = {
 }
 
 MODEL_NAME_TO_TENSORMODEL = {
-    "linear": LinearTorchModel,
+    "linear": LinearModel,
+    # Contextual multi-armed bandits, oldest to newest. "cmab" is the current
+    # model; v1 through v3 are its predecessors, kept so a run can be compared
+    # against the iteration it came from.
     "cmab": ThompsonSamplingModel,
-    "cmab_old": ThompsonSamplingModelOld,
+    "cmab_v1": ThompsonSamplingModelV1,
+    "cmab_v2": ThompsonSamplingModelV2,
+    "cmab_v3": ThompsonSamplingModelV3,
+    # BFTBrain random-forest baselines, named after its --num-models values.
+    "quadratic_rf": QuadraticRF,
+    "multi_rf": MultiRF,
+    "single_rf": SingleRF,
 }
+
+# Models whose constructor takes a seed, so a run is reproducible from --seed
+# alone rather than from the global RNG state. ThompsonSamplingModelV1 is
+# absent because it has no seed parameter - it draws from the global numpy RNG.
+SEEDED_MODELS = (
+    ThompsonSamplingModel,
+    ThompsonSamplingModelV2,
+    ThompsonSamplingModelV3,
+    QuadraticRF,
+    MultiRF,
+    SingleRF,
+)
 
 DEFAULT_PBFT_PHASES = "0;1;2;3;4;5;0;2;1;5;4;2;1"
 
 def set_seed(seed: int) -> None:
+    """Seed the global RNGs.
+
+    Only affects code that reaches for module-level randomness - the loader's
+    shuffle, and any model that has not been given an explicit ``seed=``.
+    Models constructed from SEEDED_MODELS carry their own Generator and are
+    unaffected by this.
+    """
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed) 
-    
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 def _parse_protocol(value: str) -> int:
@@ -80,7 +106,7 @@ def _parse_protocol(value: str) -> int:
 def _parse_model(value: str) -> TensorModel:
     model = MODEL_NAME_TO_TENSORMODEL.get(value.strip().lower())
     if model is None:
-        valid = ", ".join(sorted({"linear", 'svm',"ppo","cmab", "cmab_old"}))
+        valid = ", ".join(sorted(MODEL_NAME_TO_TENSORMODEL))
         raise argparse.ArgumentTypeError(
             f"Unsupported model '{value}'. Valid options: {valid}"
         )
@@ -160,7 +186,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--model",
         type=_parse_model,
         default='linear',
-        help="Model: linear | svm",
+        help=(
+            "Model: linear | cmab | cmab_v1 | cmab_v2 | cmab_v3 "
+            "| quadratic_rf | multi_rf | single_rf"
+        ),
     )
     parser.add_argument(
         "--data-dir",
@@ -322,10 +351,10 @@ def evaluate_model(
             features = batch["features"], actions = batch["actions"], rewards = batch["rewards"], backward=False
         )
         logits = model.predict_action(batch["features"])
-        predicted = torch.argmax(logits, dim=1)
-        expected = torch.round(batch["labels"]).long()
-        total += int(expected.numel())
-        correct += int((predicted == expected).sum().item())
+        predicted = np.argmax(logits, axis=1)
+        expected = np.rint(batch["labels"]).astype(int)
+        total += int(expected.size)
+        correct += int((predicted == expected).sum())
         curr_timeout = [
             timeout_index_to_ms_for_protocol(protocol, idx)
             for idx in predicted.tolist()
@@ -555,22 +584,13 @@ def main() -> None:
     )
     scaler = QuadraticRewardScaler.transform if args.reward_scaler == "quadratic" else None
 
-    if args.model is ThompsonSamplingModel:
-        model = args.model(
-            action_dim=get_action_space_size(protocol_id),
-            n_features=get_report_feature_dim(protocol_id),
-            seed=args.seed,
-        )
-    elif args.model is ThompsonSamplingModelOld:
-        model = args.model(
-            action_dim=get_action_space_size(protocol_id),
-            n_features=get_report_feature_dim(protocol_id),
-        )
-    else:
-        model = args.model(
-        action_dim=get_action_space_size(protocol_id),
-        n_features=get_report_feature_dim(protocol_id),
-    )
+    model_kwargs = {
+        "action_dim": get_action_space_size(protocol_id),
+        "n_features": get_report_feature_dim(protocol_id),
+    }
+    if args.model in SEEDED_MODELS:
+        model_kwargs["seed"] = args.seed
+    model = args.model(**model_kwargs)
 
     os.makedirs(args.plot_dir, exist_ok=True)
     exp_path = os.path.join(args.plot_dir, args.experiment_name)

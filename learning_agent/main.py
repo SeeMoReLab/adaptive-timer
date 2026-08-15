@@ -17,7 +17,6 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import grpc
 from google.protobuf import empty_pb2
-import torch
 
 import agent_pb2
 import agent_pb2_grpc
@@ -29,9 +28,8 @@ from continuous_bandit import (
 from models import (
     ActionCodec,
     FeatureExtractor,
-    LinearTorchModel,
+    LinearModel,
     ThompsonSamplingModel,
-    ThompsonSamplingModelOld,
     ProtocolReportFeatureExtractor,
     ProtocolTimeoutActionCodec,
     RandomTimeoutModel,
@@ -1672,7 +1670,7 @@ def serve(
             seed=42,
         )
     elif model_type == "linear":
-        model = LinearTorchModel(
+        model = LinearModel(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
             lr=0.05,
@@ -1682,11 +1680,6 @@ def serve(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
             seed=42,
-        )
-    elif model_type == "cmab_old":
-        model = ThompsonSamplingModelOld(
-            action_dim=get_action_space_size(protocol),
-            n_features=get_report_feature_dim(protocol),
         )
     elif model_type == "scheduled":
         if schedule_file is None:
@@ -1840,7 +1833,6 @@ def main():
             "random",
             "linear",
             "cmab",
-            "cmab_old",
             "continuous",
             "scheduled",
             "thompson",
@@ -1849,10 +1841,11 @@ def main():
         help=(
             "random: random timeout selection; linear: learned linear model; "
             "cmab: bootstrapped ensemble contextual multi-armed bandit; "
-            "cmab_old: previous single-tree bootstrapped CMAB; "
             "continuous: bootstrapped continuous contextual bandit; "
             "thompson: deprecated alias for cmab; "
-            "scheduled: timeout from a time-based schedule CSV."
+            "scheduled: timeout from a time-based schedule CSV. "
+            "The earlier CMAB iterations (v1-v3) are simulator-only; see "
+            "simulator.py --model."
         ),
     )
 

@@ -4,6 +4,6 @@ grpcio-tools
 numpy
 pandas
 scikit-learn
-torch
+scipy
 tqdm
 matplotlib

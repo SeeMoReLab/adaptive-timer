@@ -4,8 +4,8 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
+from scipy.stats import qmc
 from sklearn.tree import DecisionTreeRegressor
-import torch
 
 import agent_pb2
 from models import (
@@ -70,12 +70,12 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
         )
         return min(upper_ms, max(lower_ms, int(round(math.exp(log_value)))))
 
-    def decode(self, action: torch.Tensor) -> agent_pb2.Timeout:
-        values = action.detach().cpu().to(torch.float64).reshape(-1)
-        if values.numel() != self._action_dim:
+    def decode(self, action: np.ndarray) -> agent_pb2.Timeout:
+        values = np.asarray(action, dtype=float).reshape(-1)
+        if values.size != self._action_dim:
             raise ValueError(
                 f"Expected {self._action_dim} continuous action values, "
-                f"got {values.numel()}"
+                f"got {values.size}"
             )
         timeout_values = [
             self._denormalize_value(float(values[index].item()), index)
@@ -99,7 +99,7 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
             )
         )
 
-    def encode(self, action: object) -> torch.Tensor:
+    def encode(self, action: object) -> np.ndarray:
         if isinstance(action, agent_pb2.Timeout):
             if self._protocol == agent_pb2.PROTOCOL_PBFT:
                 action = action.pbft
@@ -131,9 +131,9 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
             self._normalize_value(timeout_ms, index)
             for index, timeout_ms in enumerate(timeout_values)
         ]
-        return torch.tensor(normalized, dtype=torch.float32)
+        return np.asarray(normalized, dtype=float)
 
-    def anchor_actions(self) -> torch.Tensor:
+    def anchor_actions(self) -> np.ndarray:
         timeout_values = get_timeout_values_ms(self._protocol)
         timeout_tuples = [(value,) for value in timeout_values]
         normalized = [
@@ -143,7 +143,7 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
             ]
             for timeout_tuple in timeout_tuples
         ]
-        return torch.tensor(normalized, dtype=torch.float32)
+        return np.asarray(normalized, dtype=float)
 
 
 class ContinuousThompsonSamplingModel(TensorModel):
@@ -153,7 +153,7 @@ class ContinuousThompsonSamplingModel(TensorModel):
         self,
         action_dim: int,
         n_features: int,
-        anchor_actions: torch.Tensor,
+        anchor_actions: np.ndarray,
         initial_design_size: int,
         memory_size: int,
         n_heads: int = 100,
@@ -183,8 +183,8 @@ class ContinuousThompsonSamplingModel(TensorModel):
                 f"{exploration_probability}"
             )
 
-        anchors = torch.as_tensor(anchor_actions, dtype=torch.float32)
-        if anchors.dim() != 2 or anchors.shape[1] != action_dim:
+        anchors = np.asarray(anchor_actions, dtype=float)
+        if anchors.ndim != 2 or anchors.shape[1] != action_dim:
             raise ValueError(
                 "anchor_actions must have shape "
                 f"(N, {action_dim}), got {tuple(anchors.shape)}"
@@ -197,7 +197,7 @@ class ContinuousThompsonSamplingModel(TensorModel):
         self._initial_design_size = int(initial_design_size)
         self._memory_size = int(memory_size)
         self._exploration_probability = float(exploration_probability)
-        self._anchor_actions = anchors.cpu().numpy().astype(float)
+        self._anchor_actions = np.asarray(anchors, dtype=float).astype(float)
         self._seed = (
             int(time.time_ns() & 0x7FFFFFFF) if seed is None else int(seed)
         )
@@ -214,7 +214,7 @@ class ContinuousThompsonSamplingModel(TensorModel):
         )
 
     def _candidate_actions(self) -> np.ndarray:
-        sampled = self._candidate_engine.draw(self._candidate_count).cpu().numpy()
+        sampled = self._candidate_engine.random(self._candidate_count)
         candidate_parts = [sampled, self._anchor_actions]
         if self.memory["actions"]:
             candidate_parts.append(np.asarray(self.memory["actions"], dtype=float))
@@ -224,7 +224,7 @@ class ContinuousThompsonSamplingModel(TensorModel):
     def _predict_one(self, features: np.ndarray) -> np.ndarray:
         if self._design_count < self._initial_design_size:
             self._design_count += 1
-            return self._design_engine.draw(1).cpu().numpy()[0].astype(float)
+            return self._design_engine.random(1)[0].astype(float)
 
         candidates = self._candidate_actions()
         if not self.is_fitted:
@@ -246,9 +246,8 @@ class ContinuousThompsonSamplingModel(TensorModel):
         selected = int(self._rng.choice(best_indices))
         return candidates[selected]
 
-    def predict_action(self, features: torch.Tensor) -> torch.Tensor:
-        device = features.device
-        features_np = features.detach().cpu().numpy().astype(float)
+    def predict_action(self, features: np.ndarray) -> np.ndarray:
+        features_np = np.asarray(features, dtype=float)
         single = features_np.ndim == 1
         if single:
             features_np = features_np.reshape(1, -1)
@@ -258,11 +257,11 @@ class ContinuousThompsonSamplingModel(TensorModel):
             )
 
         actions = np.vstack([self._predict_one(row) for row in features_np])
-        result = torch.tensor(actions, device=device, dtype=torch.float32)
+        result = np.asarray(actions, dtype=float)
         return result[0] if single else result
 
-    def _action_rows(self, actions: torch.Tensor, batch_size: int) -> np.ndarray:
-        actions_np = torch.as_tensor(actions).detach().cpu().numpy().astype(float)
+    def _action_rows(self, actions: np.ndarray, batch_size: int) -> np.ndarray:
+        actions_np = np.asarray(actions, dtype=float)
         if actions_np.ndim == 0:
             actions_np = actions_np.reshape(1, 1)
         elif actions_np.ndim == 1:
@@ -286,12 +285,12 @@ class ContinuousThompsonSamplingModel(TensorModel):
 
     def update_model(
         self,
-        features: torch.Tensor,
-        actions: torch.Tensor,
-        rewards: torch.Tensor | float,
+        features: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray | float,
         backward: bool = True,
     ) -> float:
-        features_np = features.detach().cpu().numpy().astype(float)
+        features_np = np.asarray(features, dtype=float)
         if features_np.ndim == 1:
             features_np = features_np.reshape(1, -1)
         if features_np.shape[1] != self._obs_dim:
@@ -300,7 +299,7 @@ class ContinuousThompsonSamplingModel(TensorModel):
             )
 
         actions_np = self._action_rows(actions, features_np.shape[0])
-        rewards_np = torch.as_tensor(rewards, dtype=torch.float32).reshape(-1).numpy()
+        rewards_np = np.asarray(rewards, dtype=float).reshape(-1)
         if rewards_np.size == 1 and features_np.shape[0] > 1:
             rewards_np = np.repeat(rewards_np, features_np.shape[0])
         if rewards_np.size != features_np.shape[0]:
@@ -330,15 +329,16 @@ class ContinuousThompsonSamplingModel(TensorModel):
 
     def reset_model(self) -> None:
         self._rng = np.random.default_rng(self._seed)
-        self._design_engine = torch.quasirandom.SobolEngine(
-            dimension=self._action_dim,
-            scramble=True,
-            seed=self._seed,
+        # Owen-scrambled Sobol, as torch.quasirandom.SobolEngine provided
+        # before. Both use Joe-Kuo direction numbers, so the sequences are
+        # equivalent in distribution but not point-for-point identical: a run
+        # seeded the same as one from the torch version will explore the same
+        # space in a different order.
+        self._design_engine = qmc.Sobol(
+            d=self._action_dim, scramble=True, seed=self._seed
         )
-        self._candidate_engine = torch.quasirandom.SobolEngine(
-            dimension=self._action_dim,
-            scramble=True,
-            seed=self._seed + 1,
+        self._candidate_engine = qmc.Sobol(
+            d=self._action_dim, scramble=True, seed=self._seed + 1
         )
         self._design_count = 0
         self.models = [self._new_tree(index) for index in range(self._n_heads)]

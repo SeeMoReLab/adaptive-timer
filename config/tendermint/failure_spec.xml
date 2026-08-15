@@ -30,7 +30,7 @@
 
     <!-- Constant one-way packet delay applied for the whole experiment. -->
     <globalNetworkDelay>
-        <delayMs>0</delayMs>
+        <delayMs>5</delayMs>
     </globalNetworkDelay>
 
     <phases>
@@ -120,9 +120,9 @@
             </agent>
         </phase>
 
-        <!-- Small proposal delay -->
+        <!-- Proposal omission -->
         <phase>
-            <atTime>60</atTime>
+            <atTime>300</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -136,78 +136,90 @@
 
             <tendermint>
                 <proposalDelay>
-                    <delayMs>300</delayMs>
-                </proposalDelay>
-            </tendermint>
-        </phase>
-
-        <!-- Large proposal delay -->
-        <phase>
-            <atTime>120</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>0</delayMs>
-                    <burstDurationMs>0</burstDurationMs>
-                    <burstIntervalMs>0</burstIntervalMs>
-                </global>
-            </network>
-
-            <tendermint>
-                <proposalDelay>
-                    <delayMs>900</delayMs>
+                    <delayMs>10000</delayMs>
                 </proposalDelay>
             </tendermint>
         </phase>
 
         <!-- Small network delay -->
         <phase>
-            <atTime>180</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>150</delayMs>
-                    <burstDurationMs>200</burstDurationMs>
-                    <burstIntervalMs>10000</burstIntervalMs>
-                </global>
-            </network>
-        </phase>
-
-        <!-- Small network delay + small proposal delay -->
-        <phase>
-            <atTime>3600</atTime>
+            <atTime>600</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
 
                 <global>
                     <delayMs>50</delayMs>
-                    <burstDurationMs>200</burstDurationMs>
+                    <burstDurationMs>5000</burstDurationMs>
                     <burstIntervalMs>10000</burstIntervalMs>
                 </global>
             </network>
-
-            <tendermint>
-                <proposalDelay>
-                    <delayMs>300</delayMs>
-                </proposalDelay>
-            </tendermint>
         </phase>
 
-        <!-- Large network delay -->
         <phase>
-            <atTime>4500</atTime>
+            <atTime>900</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
 
                 <global>
                     <delayMs>150</delayMs>
-                    <burstDurationMs>500</burstDurationMs>
+                    <burstDurationMs>2000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+            </network>
+        </phase>
+
+        <phase>
+            <atTime>1200</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>50</delayMs>
+                    <burstDurationMs>5000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+            </network>
+
+            <tendermint>
+                <proposalDelay>
+                    <delayMs>10000</delayMs>
+                </proposalDelay>
+            </tendermint>
+        </phase>
+
+        <phase>
+            <atTime>1500</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>150</delayMs>
+                    <burstDurationMs>2000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+            </network>
+
+            <tendermint>
+                <proposalDelay>
+                    <delayMs>10000</delayMs>
+                </proposalDelay>
+            </tendermint>
+        </phase>
+
+        <!-- Large network delay -->
+        <phase>
+            <atTime>1800</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>150</delayMs>
+                    <burstDurationMs>5000</burstDurationMs>
                     <burstIntervalMs>10000</burstIntervalMs>
                 </global>
             </network>

@@ -1,10 +1,13 @@
 from abc import ABC, abstractmethod
+import copy
 import csv
+from dataclasses import dataclass, field
 from enum import IntEnum
 import time
 from pathlib import Path
 from typing import Dict, Generic, List, Optional, Tuple, TypeVar, Any
 from sklearn.tree import  DecisionTreeRegressor
+from xgboost import XGBRegressor
 from collections import deque
 import torch
 import torch.nn.functional as F
@@ -464,7 +467,6 @@ class ProtocolReportFeatureExtractor(FeatureExtractor[object]):
         features = report_to_feature_values(self._protocol, state)
         return torch.tensor(features, dtype=torch.float32)
 
-
 class ProtocolTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
     """Converts discrete arm indices to and from protocol timeout actions."""
 
@@ -597,6 +599,109 @@ class RandomTimeoutModel(TensorModel):
 
     def load(self, checkpoint: Dict[str, Any]) -> None:
         pass
+
+class PavlovTimeoutModel(TensorModel):
+    """Win-stay/lose-shift (Pavlov) timeout heuristic against the last reward.
+
+    A non-learning baseline: no context, no per-arm statistics, no threshold, no
+    calibration, O(1) state. Arms are ordered by ascending timeout, so for pbft
+    arm 1 = 300 ms, arm 2 = 800 ms, arm 3 = 1800 ms. The run opens on arm 1 and
+    the tracked reward starts at 0, so the first episode is always a win. Then,
+    every episode:
+
+        observed >= tracked -> keep the current arm
+        observed <  tracked -> step to the next arm (1 -> 2 -> 3 -> 1)
+        tracked = observed
+
+    Measured cost of the strict "compare against t-1" reference: per-episode
+    noise on real hardware is as large as the between-arm difference, so the
+    comparison is close to a coin flip and the rule churns. Over the fixed-arm
+    CloudLab runs (local/tps_rule.py, scripts/cloudlab/{300,800,1800}, 134
+    episodes, 30% switch cost) it switches on 56 of 134 episodes and yields
+    5444 tps, against 5935 for the best fixed arm and 8741 for a per-phase
+    oracle -- i.e. as specified it does not beat leaving the timeout alone.
+    local/tps_rule.py holds the variants that do, and re-measures either.
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        protocol: Optional[int] = None,
+        start_index: Optional[int] = None,
+    ):
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+
+        self._action_dim = int(action_dim)
+        # Walk the arms in ascending timeout order, not raw index order: for
+        # sbft/tendermint the index encodes a triple, so the two differ.
+        if protocol is None:
+            self._order = list(range(self._action_dim))
+        else:
+            protocol = _validate_protocol(protocol)
+            self._order = sorted(
+                range(self._action_dim),
+                key=lambda idx: timeout_index_to_ms_for_protocol(protocol, idx),
+            )
+        self._position = {idx: pos for pos, idx in enumerate(self._order)}
+
+        if start_index is None:
+            # Arm 1, the shortest timeout.
+            self._start_index = self._order[0]
+        else:
+            self._start_index = int(start_index)
+            if self._start_index not in self._position:
+                raise ValueError(
+                    f"start_index must be in [0, {self._action_dim}), "
+                    f"got {start_index}"
+                )
+
+        self.reset_model()
+
+    def _to_index(self, action: torch.Tensor) -> int:
+        if action.numel() == 1:
+            return int(round(float(action.item())))
+        return int(torch.argmax(action).item())
+
+    def predict_action(self, features: torch.Tensor) -> torch.Tensor:
+        if features.dim() == 1:
+            return torch.tensor(float(self._index), dtype=torch.float32)
+        batch_size = int(features.shape[0])
+        return torch.full((batch_size,), float(self._index), dtype=torch.float32)
+
+    def update_model(
+        self, features: torch.Tensor, action: torch.Tensor, reward: float
+    ) -> float:
+        del features
+        arm = self._to_index(action)
+        if arm in self._position:
+            # Follow the timeout that actually ran: in shared or consensus mode
+            # the applied arm need not be the one this replica predicted.
+            self._index = arm
+
+        value = float(reward)
+        if value < self._tracked:
+            self._index = self._order[
+                (self._position[self._index] + 1) % len(self._order)
+            ]
+        self._tracked = value
+        return 0.0
+
+    def reset_model(self) -> None:
+        self._tracked = 0.0
+        self._index = self._start_index
+
+    @property
+    def tracked_reward(self) -> float:
+        return self._tracked
+
+    def save(self) -> Dict[str, Any]:
+        return {"tracked": self._tracked, "index": self._index}
+
+    def load(self, checkpoint: Dict[str, Any]) -> None:
+        self._tracked = float(checkpoint.get("tracked", 0.0))
+        index = int(checkpoint.get("index", self._start_index))
+        self._index = index if index in self._position else self._start_index
 
 class ScheduledTimeoutModel(TensorModel):
     """Returns protocol-specific timeout option indices from a time-based schedule."""
@@ -859,7 +964,7 @@ class ThompsonSamplingModelv01(TensorModel):
         self,
         action_dim: int,
         n_features: int,
-        n_heads: int = 30,
+        n_heads: int = 100,
         seed: Optional[int] = None,
     ):
         if action_dim <= 0:
@@ -870,60 +975,56 @@ class ThompsonSamplingModelv01(TensorModel):
         self._act_dim = int(action_dim)
         self._obs_dim = int(n_features)
         self._n_heads = int(n_heads)
-        self._max_bucket_size = 512
+        self._max_bucket_size = 32
         self._seed = seed
 
         self.reset_model()
 
-    def predict_action(self, features: torch.Tensor, e = 0.5) -> torch.Tensor:
+    def predict_action(self, features: torch.Tensor, e = 0.1) -> torch.Tensor:
         """e-TS with forced coverage.
 
         - Any action absent from the shared sliding window is force-pulled
-        - with probability ``e`` take the Thompson draw  with
-          probability ``1-e`` exploit greedily on the MEDIAN windowed reward per
-          action"""
+          (ties between several absent actions break uniformly at random).
+        - Otherwise the ensemble is summarised per arm into a mean and a
+          variance over the fitted bootstrap heads. With probability ``e``
+          take the Thompson draw ``N(mean, var)`` (a Gaussian fit to the
+          bootstrap posterior instead of one randomly picked head); with
+          probability ``1-e`` exploit greedily on the mean."""
         features_np = features.cpu().numpy()
         if features_np.ndim == 1:
             features_np = features_np.reshape(1, -1)
 
         batch_size = features_np.shape[0]
         predictions_stacked = np.zeros((batch_size, self._act_dim), dtype=float)
-        sampled_heads = self._rng.integers(0, self._n_heads, size=batch_size)
         explore = self._rng.random(batch_size) < e
 
-        # Per-action median reward over the shared sliding window (greedy branch).
-        actions_arr = np.array(self.memory["actions"], dtype=int)
-        rewards_arr = np.array(self.memory["rewards"], dtype=float)
-        action_medians = np.zeros(self._act_dim, dtype=float)
-        for arm in range(self._act_dim):
-            mask = actions_arr == arm
-            if np.any(mask):
-                action_medians[arm] = np.mean(rewards_arr[mask])
-
-        for i, head_index in enumerate(sampled_heads):
-            if not explore[i]:
-                # Greedy: exploit the windowed median reward per action.
-                predictions_stacked[i, :] = action_medians
-                continue
-
-          
-            if self.is_fitted[head_index]:
-                state_rows = np.repeat(features_np[i : i + 1], self._act_dim, axis=0)
-                action_col = np.arange(self._act_dim, dtype=float).reshape(-1, 1)
-                state_action_input = np.hstack((state_rows, action_col))
-                predictions_stacked[i, :] = self.models[head_index].predict(
-                    state_action_input
-                )
-            else:
-                predictions_stacked[i, :] = 0.0
+        present_arms = {int(a) for a in self.memory["actions"]}
+        missing_arms = [a for a in range(self._act_dim) if a not in present_arms]
+        fitted_heads = [h for h in range(self._n_heads) if self.is_fitted[h]]
 
         for i in range(batch_size):
-            row_preds = predictions_stacked[i]
-            tied_indices = np.flatnonzero(np.isclose(row_preds, np.max(row_preds)))
+            state_rows = np.repeat(features_np[i : i + 1], self._act_dim, axis=0)
+            action_col = np.arange(self._act_dim, dtype=float).reshape(-1, 1)
+            state_action_input = np.hstack((state_rows, action_col))
 
-            if len(tied_indices) > 1:
-                best_index = self._rng.choice(tied_indices)
-                predictions_stacked[i, best_index] += 1e-5
+            if fitted_heads:
+                head_preds = np.stack(
+                    [self.models[h].predict(state_action_input) for h in fitted_heads]
+                )
+                mean = np.mean(head_preds, axis=0)
+                if explore[i]:
+                    std = (
+                        np.std(head_preds, axis=0, ddof=1)
+                        if len(fitted_heads) > 1
+                        else np.zeros_like(mean)
+                    )
+                    predictions_stacked[i, :] = self._rng.normal(mean, std)
+                else:
+                    predictions_stacked[i, :] = mean
+
+            # Coverage overrides either branch: absent arms must be re-pulled.
+            for arm in missing_arms:
+                predictions_stacked[i, arm] = 1e9
 
         q_values = torch.tensor(predictions_stacked, device=features.device, dtype=torch.float32)
         return q_values
@@ -990,8 +1091,8 @@ class ThompsonSamplingModelv01(TensorModel):
         self.models = [
             DecisionTreeRegressor(
                 criterion='squared_error',
-                max_depth=6,
-                min_samples_leaf=6,
+                max_depth=3,
+                min_samples_leaf=1,
                 min_impurity_decrease=0.01,
                 random_state=head_index,
             )
@@ -1031,14 +1132,16 @@ class ThompsonSamplingModel(TensorModel):
         self._act_dim = int(action_dim)
         self._obs_dim = int(n_features)
         self._n_heads = int(n_heads)
-        self._max_bucket_size = 8
+        self._max_bucket_size = 32
         self._seed = seed
 
         self.reset_model()
 
-    def predict_action(self, features: torch.Tensor, e = 0.25) -> torch.Tensor:
-        """e-TS: with probability e take the Thompson draw (one bootstrap head
-        per arm); with probability 1-e exploit the arm with the highest
+    def predict_action(self, features: torch.Tensor, e = 0.5) -> torch.Tensor:
+        """e-TS with forced coverage: any arm absent from the recent-pull
+        window (2x bucket size) is force-pulled so stale arms cannot starve.
+        Otherwise with probability e take the Thompson draw (one bootstrap
+        head per arm); with probability 1-e exploit the arm with the highest
         median over its ensemble of bootstrap-head predictions (each head
         outputs a mean, so this is a robust median-of-means)."""
         features_np = features.cpu().numpy()
@@ -1052,12 +1155,15 @@ class ThompsonSamplingModel(TensorModel):
             0, self._n_heads, size=(batch_size, self._act_dim)
         )
         explore = self._rng.random(batch_size) < e
+        recent_arms = {int(a) for a in self._recent_actions}
 
         for i in range(batch_size):
             row = features_np[i : i + 1]
             for arm in range(self._act_dim):
-                if not self.is_fitted[arm]:
-                    # Arm without a fitted window yet: force a pull.
+                if not self.is_fitted[arm] or arm not in recent_arms:
+                    # Arm without a fitted window yet, or with no pull in the
+                    # recent-action window: force a pull (ties between forced
+                    # arms break uniformly at random below).
                     predictions_stacked[i, arm] = 1e9
                     continue
                 if explore[i]:
@@ -1068,7 +1174,7 @@ class ThompsonSamplingModel(TensorModel):
                         self.models[arm][h].predict(row)[0]
                         for h in range(self._n_heads)
                     ]
-                    predictions_stacked[i, arm] = float(np.median(head_preds))
+                    predictions_stacked[i, arm] = float(np.mean(head_preds))
 
         for i in range(batch_size):
             row_preds = predictions_stacked[i]
@@ -1119,13 +1225,9 @@ class ThompsonSamplingModel(TensorModel):
                 raise ValueError(f"action out of range: {arm}")
             self.memory[arm]["features"].append(features_np[i])
             self.memory[arm]["rewards"].append(rewards_np[i])
+            self._recent_actions.append(arm)
 
         if backward:
-            window_max = max(
-                (max(m["rewards"]) for m in self.memory if m["rewards"]),
-                default=0.0,
-            )
-                                    
             for arm in sorted({int(a) for a in actions_np}):
                 X = np.array(self.memory[arm]["features"])
                 y = np.array(self.memory[arm]["rewards"])
@@ -1145,12 +1247,7 @@ class ThompsonSamplingModel(TensorModel):
                 DecisionTreeRegressor(
                     criterion='squared_error',
                     max_depth=6,
-                    # leaf >= _max_bucket_size/2 forces constant per-arm-mean
-                    # heads (no split possible on the small window). On the
-                    # simulator this maximizes delay_accuracy (~0.96); contextual
-                    # trees (leaf<=3, or a larger window) trade delay for base
-                    # accuracy. max_depth / min_impurity_decrease are inert here.
-                    min_samples_leaf=32,
+                    min_samples_leaf=6,
                     min_impurity_decrease=0.0,
                     random_state=arm_index * self._n_heads + head_index,
                 )
@@ -1169,6 +1266,464 @@ class ThompsonSamplingModel(TensorModel):
             }
             for _ in range(self._act_dim)
         ]
+    
+        self._recent_actions = deque(maxlen= self._max_bucket_size)
+
+@dataclass
+class _BlockPolicy:
+    """Q(i,m): the policy distribution frozen at the start of block m.
+
+    ``model`` is the tree that was in force there (None for block 0, before
+    anything is fitted) and ``epsilon`` is that block's exploration rate, so
+    the pair reproduces the exact sampling distribution Q^{nu_m}(.|x) used at
+    the time. ``length`` is block m's length, which doubles as the length of a
+    replay phase carrying index m."""
+
+    model: Optional[XGBRegressor]
+    epsilon: float
+    length: int
+
+
+@dataclass
+class _Replay:
+    """One in-flight replay phase: (m, [t, t + 2^m L - 1]) from Algorithm 1."""
+
+    index: int
+    rounds_left: int
+    rows: List[int] = field(default_factory=list)
+
+
+class CMAB(TensorModel):
+    def __init__(
+        self,
+        action_dim: int,
+        n_features: int,
+        epsilon: float = 0.01,
+        block_length: int = 8,
+        max_block_length: int = 256,
+        nu: float = 0.15,
+        max_depth: int = 12,
+        min_samples_leaf: int = 1,
+        n_estimators: int = 100,
+        learning_rate: float = 0.1,
+        enable_replay: bool = True,
+        replay_rate: float = 1.0,
+        replay_var_ratio: float = 4.0,
+        max_snapshots: int = 8,
+        decay_epsilon: bool = True,
+        seed: Optional[int] = None,
+    ):
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        if not 0.0 < epsilon <= 1.0:
+            raise ValueError(f"epsilon must be in (0, 1], got {epsilon}")
+        if block_length <= 0:
+            raise ValueError(f"block_length must be > 0, got {block_length}")
+        if replay_rate < 0.0:
+            raise ValueError(f"replay_rate must be >= 0, got {replay_rate}")
+        if min_samples_leaf < 1:
+            raise ValueError(f"min_samples_leaf must be >= 1, got {min_samples_leaf}")
+        if n_estimators < 1:
+            raise ValueError(f"n_estimators must be >= 1, got {n_estimators}")
+        if learning_rate <= 0.0:
+            raise ValueError(f"learning_rate must be > 0, got {learning_rate}")
+
+        self._act_dim = int(action_dim)
+        self._obs_dim = int(n_features)
+        self._epsilon = float(epsilon)
+        self._init_block_length = int(block_length)
+        self._max_block_length = int(max_block_length)
+        self._nu = float(nu)
+        self._max_depth = int(max_depth)
+        self._min_samples_leaf = int(min_samples_leaf)
+        self._n_estimators = int(n_estimators)
+        self._learning_rate = float(learning_rate)
+        self._enable_replay = bool(enable_replay)
+        self._replay_rate = float(replay_rate)
+        self._replay_var_ratio = float(replay_var_ratio)
+        self._max_snapshots = max(1, int(max_snapshots))
+        self._decay_epsilon = bool(decay_epsilon)
+        self._seed = seed
+
+        self.reset_model()
+
+    def _block_epsilon(self, block_index: int) -> float:
+        if not self._decay_epsilon:
+            return self._epsilon
+        return float(min(1.0, self._epsilon * (2.0 ** (-0.5 * block_index))))
+
+    def _maybe_start_replay(self) -> None:
+        if not self._enable_replay:
+            return
+        j = self._block_index
+        if j <= 0:
+            return
+        available = [
+            m
+            for m in range(min(j, len(self._block_policies)))
+            if self._block_policies[m].model is not None
+        ]
+        if not available:
+            return
+
+        weights = np.array([2.0 ** (-0.5 * m) for m in available], dtype=float)
+        p_rep = (
+            self._replay_rate
+            * (2.0 ** (-0.5 * j))
+            * float(weights.sum())
+            / float(self._init_block_length)
+        )
+        if self._rng.random() >= min(1.0, p_rep):
+            return
+
+        m = int(self._rng.choice(available, p=weights / weights.sum()))
+        length = int(self._block_policies[m].length)
+        self._replays.append(
+            _Replay(index=m, rounds_left=length)
+        )
+        self.replay_starts += 1
+
+    def _active_replay_index(self) -> Optional[int]:
+        """M_t from line 13, then m ~ Uniform(M_t) from line 17."""
+        indices = sorted({r.index for r in self._replays if r.rounds_left > 0})
+        if not indices:
+            return None
+        return int(self._rng.choice(indices))
+
+    def predict_action(self, features: torch.Tensor, e: Optional[float] = None) -> torch.Tensor:
+        override_epsilon = None if e is None else float(e)
+        features_np = features.cpu().numpy()
+        if features_np.ndim == 1:
+            features_np = features_np.reshape(1, -1)
+
+        batch_size = features_np.shape[0]
+        predictions_stacked = np.zeros((batch_size, self._act_dim), dtype=float)
+
+        pulled_arms = {int(a) for a in self.memory["actions"]}
+        missing_arms = [a for a in range(self._act_dim) if a not in pulled_arms]
+
+        self._pending = []
+        for i in range(batch_size):
+            # Step 1. Randomly start a replay phase.
+            self._maybe_start_replay()
+
+            # Step 2. Sample an action, replaying Q(i,m) when M_t is non-empty.
+            replay_m = self._active_replay_index()
+            if replay_m is None:
+                tree = self.model if self.is_fitted else None
+                epsilon = (
+                    self._block_epsilon(self._block_index)
+                    if override_epsilon is None
+                    else override_epsilon
+                )
+            else:
+                policy = self._block_policies[replay_m]
+                tree = policy.model
+                epsilon = policy.epsilon
+            if tree is not None:
+                predictions_stacked[i, :] = tree.predict(features_np[i : i + 1])[0]
+
+            if missing_arms:
+                arm = int(self._rng.choice(missing_arms))
+                missing_arms.remove(arm)
+                prob = 1.0 / self._act_dim
+            else:
+                row_preds = predictions_stacked[i]
+                tied = np.flatnonzero(np.isclose(row_preds, np.max(row_preds)))
+                greedy_arm = int(self._rng.choice(tied))
+                probs = np.full(self._act_dim, epsilon / self._act_dim)
+                probs[greedy_arm] += 1.0 - epsilon
+                arm = int(self._rng.choice(self._act_dim, p=probs))
+                prob = float(probs[arm])
+
+            predictions_stacked[i, arm] = predictions_stacked[i].max() + 1.0
+            open_replays = tuple(r for r in self._replays if r.rounds_left > 0)
+            self._pending.append((arm, prob, open_replays))
+            for replay in open_replays:
+                replay.rounds_left -= 1
+            self._last_prob_by_arm[arm] = prob
+
+        q_values = torch.tensor(predictions_stacked, device=features.device, dtype=torch.float32)
+        return q_values
+
+    def update_model(
+        self, features: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor | float, backward: bool = True
+    ) -> float:
+        features_np = features.cpu().numpy()
+        if features_np.ndim == 1:
+            features_np = features_np.reshape(1, -1)
+
+        if isinstance(actions, torch.Tensor):
+            actions_np = actions.cpu().numpy().astype(int).flatten()
+        else:
+            actions_np = np.array([int(actions)])
+
+        if isinstance(rewards, torch.Tensor):
+            rewards_np = rewards.cpu().numpy().flatten()
+        else:
+            rewards_np = np.full(len(actions_np), float(rewards))
+
+        if len(actions_np) == 1 and features_np.shape[0] > 1:
+            actions_np = np.repeat(actions_np, features_np.shape[0])
+        if len(rewards_np) == 1 and features_np.shape[0] > 1:
+            rewards_np = np.repeat(rewards_np, features_np.shape[0])
+        if len(actions_np) != features_np.shape[0]:
+            raise ValueError(
+                "actions batch size mismatch: "
+                f"expected {features_np.shape[0]}, got {len(actions_np)}"
+            )
+        if len(rewards_np) != features_np.shape[0]:
+            raise ValueError(
+                "rewards batch size mismatch: "
+                f"expected {features_np.shape[0]}, got {len(rewards_np)}"
+            )
+
+        pending = (
+            self._pending
+            if len(self._pending) == features_np.shape[0]
+            else None
+        )
+        self._pending = []
+
+        inserted = 0
+        for i in range(len(actions_np)):
+            arm = int(actions_np[i])
+            if not 0 <= arm < self._act_dim:
+                raise ValueError(f"action out of range: {arm}")
+
+            raw_reward = max(0.0, float(rewards_np[i]))
+            if raw_reward > self.global_r_max:
+                ratio = self.global_r_max / raw_reward
+                for target in self.memory["rewards"]:
+                    target *= ratio
+                self.global_r_max = raw_reward
+            scaled_reward = raw_reward / self.global_r_max
+
+            if pending is not None and pending[i][0] == arm:
+                prob = pending[i][1]
+            else:
+                prob = self._last_prob_by_arm.get(arm, 1.0 / self._act_dim)
+
+            ips_target = np.zeros(self._act_dim, dtype=float)
+            ips_target[arm] = scaled_reward / prob
+            self.memory["features"].append(features_np[i])
+            self.memory["actions"].append(arm)
+            self.memory["probs"].append(prob)
+            self.memory["rewards"].append(ips_target)
+            row = len(self.memory["rewards"]) - 1
+            self.current_block.append(row)
+            if pending is not None and pending[i][0] == arm:
+                for replay in pending[i][2]:
+                    replay.rows.append(row)
+            else:
+                for replay in self._replays:
+                    replay.rows.append(row)
+            inserted += 1
+
+        if backward and inserted and len(self.memory["rewards"]) > 0:
+            X = np.array(self.memory["features"])
+            Y = np.array(self.memory["rewards"])
+            self.model.fit(X, Y)
+            self.is_fitted = True
+            if self._run_expired_replays(X, Y):
+                return 0.0
+            self._check_shift(X, Y)
+
+        return 0.0
+
+
+    def _run_expired_replays(self, X: np.ndarray, Y: np.ndarray) -> bool:
+        expired = [r for r in self._replays if r.rounds_left <= 0]
+        if not expired:
+            return False
+        self._replays = [r for r in self._replays if r.rounds_left > 0]
+
+        prior = list(range(self._block_start_row))
+        for replay in expired:
+            if not replay.rows or not prior:
+                continue
+            self.replay_tests += 1
+            if self._end_of_replay_test(replay, prior, X, Y):
+                self.replay_restarts += 1
+                self._hard_reset()
+                return True
+        return False
+
+    def _end_of_replay_test(
+        self, replay: _Replay, prior: List[int], X: np.ndarray, Y: np.ndarray
+    ) -> bool:
+
+        rows_a = np.asarray(replay.rows, dtype=int)
+        rows_b = np.asarray(prior, dtype=int)
+        policy = self._block_policies[replay.index]
+
+        threshold = self._nu * float(
+            np.sqrt(self._init_block_length / max(1, policy.length))
+        )
+
+        candidates = self._candidate_policies(X)
+        regret_a = self._empirical_regret(rows_a, Y, candidates)
+        regret_b = self._empirical_regret(rows_b, Y, candidates)
+        for name, r_a in regret_a.items():
+            r_b = regret_b.get(name)
+            if r_b is None:
+                continue
+            if r_a - 4.0 * r_b >= threshold:       
+                self.replay_fail_reasons["regret_worse"] += 1
+                return True
+            if r_b - 4.0 * r_a >= threshold:      
+                self.replay_fail_reasons["regret_better"] += 1
+                return True
+
+        for actions in candidates.values():         
+            v_a = self._propensity_variance(rows_a, actions, policy, X)
+            v_b = self._propensity_variance(rows_b, actions, policy, X)
+            if v_a - self._replay_var_ratio * v_b >= 0.0:
+                self.replay_fail_reasons["variance"] += 1
+                return True
+        return False
+
+    def _candidate_policies(self, X: np.ndarray) -> Dict[str, np.ndarray]:
+        n_rows = X.shape[0]
+        candidates: Dict[str, np.ndarray] = {
+            f"const{a}": np.full(n_rows, a, dtype=int) for a in range(self._act_dim)
+        }
+        for m, policy in enumerate(self._block_policies):
+            if policy.model is not None:
+                candidates[f"block{m}"] = np.argmax(policy.model.predict(X), axis=1)
+        if self.is_fitted:
+            candidates["current"] = np.argmax(self.model.predict(X), axis=1)
+        return candidates
+
+    def _empirical_regret(
+        self, rows: np.ndarray, Y: np.ndarray, candidates: Dict[str, np.ndarray]
+    ) -> Dict[str, float]:
+        values: Dict[str, float] = {}
+        for name, actions in candidates.items():
+            value = self._snips(rows, actions[rows], Y)
+            if value is not None:
+                values[name] = value
+        if not values:
+            return {}
+        best = max(values.values())
+        return {name: best - value for name, value in values.items()}
+
+    def _snips(
+        self, rows: np.ndarray, policy_actions: np.ndarray, Y: np.ndarray
+    ) -> Optional[float]:
+        actions = np.asarray(self.memory["actions"], dtype=int)[rows]
+        probs = np.asarray(self.memory["probs"], dtype=float)[rows]
+        matched = actions == policy_actions
+        if not matched.any():
+            return None
+        weight_sum = float((matched / probs).sum())
+        if weight_sum <= 0.0:
+            return None
+        return float(Y[rows, policy_actions].sum() / weight_sum)
+
+    def _propensity_variance(
+        self,
+        rows: np.ndarray,
+        policy_actions: np.ndarray,
+        policy: _BlockPolicy,
+        X: np.ndarray,
+    ) -> float:
+        if policy.model is None:
+            return float(self._act_dim)
+        greedy = np.argmax(policy.model.predict(X[rows]), axis=1)
+        floor = policy.epsilon / self._act_dim
+        probs = np.where(policy_actions[rows] == greedy, 1.0 - policy.epsilon + floor, floor)
+        return float(np.mean(1.0 / probs))
+
+    def _check_shift(self, X: np.ndarray, Y: np.ndarray) -> None:
+        pulled_arms = {int(a) for a in self.memory["actions"]}
+        if len(pulled_arms) < self._act_dim:
+            return
+        if len(self.current_block) < self.block_length:
+            return
+
+        if self.prev_block:
+            v_old = self._policy_value(self.prev_block, X, Y)
+            v_new = self._policy_value(self.current_block, X, Y)
+            if v_old is None or v_new is None:
+                self._soft_reset()
+                return
+            if abs(v_old - v_new) > self._nu:
+                self._hard_reset()
+                return
+            self.block_length = min(self.block_length * 2, self._max_block_length)
+        self._soft_reset()
+
+    def _policy_value(
+        self, block: List[int], X: np.ndarray, Y: np.ndarray
+    ) -> Optional[float]:
+        rows = np.asarray(block, dtype=int)
+        greedy = np.argmax(self.model.predict(X[rows]), axis=1)
+        actions = np.asarray(self.memory["actions"])[rows]
+        probs = np.asarray(self.memory["probs"])[rows]
+        matched = actions == greedy
+        if not matched.any():
+            return None
+        weight_sum = float((matched / probs).sum())
+        return float(Y[rows, greedy].sum() / weight_sum)
+
+    def reset_model(self) -> None:
+        self._rng = np.random.default_rng(self._seed)
+        self.global_r_max = 1.0
+        self._last_prob_by_arm = {}
+        self.replay_starts = 0
+        self.replay_tests = 0
+        self.replay_restarts = 0
+        self.replay_fail_reasons = {"regret_worse": 0, "regret_better": 0, "variance": 0}
+        self._hard_reset()
+
+    def _hard_reset(self):
+        self.model = XGBRegressor(
+            objective='reg:squarederror',
+            n_estimators=self._n_estimators,
+            learning_rate=self._learning_rate,
+            max_depth=self._max_depth,
+            min_child_weight=self._min_samples_leaf,
+            random_state=42,
+            n_jobs=1,
+            verbosity=0,
+        )
+        self.is_fitted = False
+        self.memory = {
+                "features": list(),
+                "actions": list(),
+                "probs": list(),
+                "rewards": list(),
+            }
+        self.block_length = self._init_block_length
+        self.current_block = list()
+        self.prev_block = list()
+        self._pending = list()
+        self._block_index = 0
+        self._block_start_row = 0
+        self._replays = list()
+        self._block_policies = [
+            _BlockPolicy(model=None, epsilon=self._block_epsilon(0), length=self.block_length)
+        ]
+
+    def _soft_reset(self):
+        self.prev_block = self.current_block
+        self.current_block = list()
+        self._block_index += 1
+        self._block_start_row = len(self.memory["rewards"])
+        self._replays = list()
+        self._block_policies.append(
+            _BlockPolicy(
+                model=copy.deepcopy(self.model) if self.is_fitted else None,
+                epsilon=self._block_epsilon(self._block_index),
+                length=self.block_length,
+            )
+        )
+
+        for stale in self._block_policies[: -self._max_snapshots]:
+            stale.model = None
+
+
 
 class MultiHeadThompsonSamplingModel(ThompsonSamplingModel):
     """Backward-compatible name for the bootstrapped ensemble CMAB model (v03)."""

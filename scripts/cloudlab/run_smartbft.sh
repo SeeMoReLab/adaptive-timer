@@ -37,6 +37,11 @@ SUBMIT_MODE="broadcast"
 CREATE_WORKERS=""
 SERVER_PORT_BASE=19100
 AGENT_PORT=15501
+SHARING_REPORT_PORT=15601
+SHARING_CONSENSUS_PORT=15701
+# Empty means "use the agent's own default" (1000ms); sharing mode lowers it below.
+AGENT_COLLECT_WAIT_MS=""
+SHARING_COLLECT_WAIT_MS_DEFAULT=300
 LEARNING_NODE_ID=1
 INITIAL_TIMEOUT="5s"
 LEARNING_WINDOW_MODE="consensus"
@@ -61,7 +66,7 @@ ARTIFACT_FETCH_RETRY_DELAY_S=1
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--backoff] [--model <random|linear|cmab|cmab_old|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--backoff] [--model <random|pavlov|linear|cmab|cmab_old|cmab_reset|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -73,7 +78,7 @@ Flags:
   --log                             Download client, server, applier, and agent logs.
   --backoff                         Enable request timeout backoff with a 10s maximum.
   --verbose                         Enable SmartBFT debug logs on server replicas.
-  --model <random|linear|cmab|cmab_old|continuous>
+  --model <random|pavlov|linear|cmab|cmab_old|cmab_reset|continuous>
                                      Learning-agent model for learning mode (default: random).
   -f <int>                          Fault tolerance f; nodes defaults to 3f+1 (default: 1).
   -t <int>                          Seconds to run after benchmark start (default: 300).
@@ -94,6 +99,11 @@ SmartBFT options:
 
 Learning-agent options:
   --agent-port <port>               Learning-agent port inside each replica namespace (default: 15501).
+  --sharing-report-port <port>      Report-chain peer port in sharing mode (default: 15601).
+  --sharing-consensus-port <port>   Report-chain agent-facing port in sharing mode (default: 15701).
+  --collect-wait-ms <int>           Agent wait after 2f+1 reports before consensus submit
+                                     (agent default 1000; sharing mode defaults to 300 so the
+                                     decision lands inside the replica's reply-wait window).
   --learning-node-id <id>           Deprecated; SmartBFT CloudLab now starts one agent per node.
   --initial-timeout <duration>      Initial PBFT timeout value reported by SmartBFT (default: 5s).
   --learning-window-mode <mode>     Episode boundaries: consensus|wall-clock (default: consensus).
@@ -104,6 +114,8 @@ Learning-agent options:
                                      Post-apply warm-up in wall-clock mode (default: 3s).
   --learning-reward-duration <duration>
                                      Reward window in wall-clock mode (default: 5s).
+                                     These four match SmartBFT's own wall-clock defaults
+                                     and sum to the episode cadence (20s).
 
 Notes:
   Request timeout backoff is disabled unless --backoff is supplied.
@@ -121,7 +133,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|linear|cmab|cmab_old|continuous) printf '%s\n' "${model_lower}" ;;
+    random|pavlov|linear|cmab|cmab_old|cmab_reset|continuous) printf '%s\n' "${model_lower}" ;;
     *) return 1 ;;
   esac
 }
@@ -351,6 +363,18 @@ while [[ $# -gt 0 ]]; do
       AGENT_PORT="${2:-}"
       shift 2
       ;;
+    --sharing-report-port)
+      SHARING_REPORT_PORT="${2:-}"
+      shift 2
+      ;;
+    --sharing-consensus-port)
+      SHARING_CONSENSUS_PORT="${2:-}"
+      shift 2
+      ;;
+    --collect-wait-ms)
+      AGENT_COLLECT_WAIT_MS="${2:-}"
+      shift 2
+      ;;
     --learning-node-id)
       LEARNING_NODE_ID="${2:-}"
       shift 2
@@ -407,7 +431,7 @@ fi
 if (( NODES_SET == 0 )); then
   NODES="$((3 * F + 1))"
 fi
-for value_name in NODES EXPERIMENT_TIME_S BATCH_SIZE SERVER_PORT_BASE AGENT_PORT; do
+for value_name in NODES EXPERIMENT_TIME_S BATCH_SIZE SERVER_PORT_BASE AGENT_PORT SHARING_REPORT_PORT SHARING_CONSENSUS_PORT; do
   value="${!value_name}"
   if ! [[ "${value}" =~ ^[0-9]+$ ]] || (( value < 1 )); then
     echo "Invalid ${value_name}: ${value}" >&2
@@ -441,12 +465,13 @@ if [[ -n "${CREATE_WORKERS}" ]] && (! [[ "${CREATE_WORKERS}" =~ ^[0-9]+$ ]] || (
   echo "Invalid --create-workers value: ${CREATE_WORKERS}." >&2
   exit 2
 fi
-if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear|cmab|cmab_old|continuous." >&2
+if ! AGENT_MODEL_TYPE_NORMALIZED="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_old|cmab_reset|continuous." >&2
   exit 2
 fi
-if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" ]]; then
-  echo "--model is only supported with learning mode for SmartBFT CloudLab runs." >&2
+AGENT_MODEL_TYPE="${AGENT_MODEL_TYPE_NORMALIZED}"
+if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
+  echo "--model is only supported with learning or sharing mode for SmartBFT CloudLab runs." >&2
   exit 2
 fi
 if ! mode_enables_learning_agent "${MODE}"; then
@@ -462,7 +487,32 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
   DATASET_ENABLED=1
 fi
 if [[ "${MODE}" == "sharing" ]]; then
-  echo "SmartBFT sharing mode starts one learning agent per node." >&2
+  SHARING_ENABLED=1
+else
+  SHARING_ENABLED=0
+fi
+if (( SHARING_ENABLED == 1 )); then
+  # Every replica lives in its own network namespace, so all three learning
+  # ports may repeat across replicas but must differ from each other.
+  if [[ "${SHARING_REPORT_PORT}" == "${SHARING_CONSENSUS_PORT}" \
+     || "${SHARING_REPORT_PORT}" == "${AGENT_PORT}" \
+     || "${SHARING_CONSENSUS_PORT}" == "${AGENT_PORT}" ]]; then
+    echo "Sharing ports must be distinct: agent=${AGENT_PORT} report=${SHARING_REPORT_PORT} consensus=${SHARING_CONSENSUS_PORT}" >&2
+    exit 2
+  fi
+  # The replica gives up on a recommendation after --learning-reply-wait, measured
+  # from its own report. Sharing adds collect_wait + report-chain consensus +
+  # delivery on top, so the agent's default 1000ms collect wait alone exhausts a
+  # 1s reply wait and every episode falls back to the initial timeout.
+  if [[ -z "${AGENT_COLLECT_WAIT_MS}" ]]; then
+    AGENT_COLLECT_WAIT_MS="${SHARING_COLLECT_WAIT_MS_DEFAULT}"
+  fi
+  echo "SmartBFT sharing mode: one learning agent plus one report-chain server per replica." >&2
+fi
+if [[ -n "${AGENT_COLLECT_WAIT_MS}" ]] \
+  && (! [[ "${AGENT_COLLECT_WAIT_MS}" =~ ^[0-9]+$ ]] || (( AGENT_COLLECT_WAIT_MS < 1 ))); then
+  echo "Invalid --collect-wait-ms value: ${AGENT_COLLECT_WAIT_MS}" >&2
+  exit 2
 fi
 
 LOCAL_SSH_KEY_PATH="${LOCAL_SSH_KEY_PATH/#\~/$HOME}"
@@ -595,8 +645,17 @@ echo "Client reply advertise IP: ${node0_advertise_ip}"
 mkdir -p "${LOCAL_TMP_DIR}"
 HOSTS_CONFIG_LOCAL="${LOCAL_TMP_DIR}/smartbft_hosts.config"
 FAILURE_HOSTS_CONFIG_LOCAL="${LOCAL_TMP_DIR}/smartbft_hosts.failure.config"
+# Sharing mode needs two more configs in two different formats:
+#   sharing_hosts: node_id host report_port agent_port consensus_port  (Go report chain,
+#                  node ids are 1-based because SmartBFT rejects node id 0)
+#   agent_hosts:   node_id host _ _ agent_port consensus_port          (Python agent,
+#                  node ids stay 0-based to match replica ids used by the failure spec)
+SHARING_HOSTS_CONFIG_LOCAL="${LOCAL_TMP_DIR}/smartbft_sharing_hosts.config"
+AGENT_HOSTS_CONFIG_LOCAL="${LOCAL_TMP_DIR}/smartbft_agent_hosts.config"
 : > "${HOSTS_CONFIG_LOCAL}"
 : > "${FAILURE_HOSTS_CONFIG_LOCAL}"
+: > "${SHARING_HOSTS_CONFIG_LOCAL}"
+: > "${AGENT_HOSTS_CONFIG_LOCAL}"
 for ((replica_id = 0; replica_id < NODES; replica_id++)); do
   machine_idx=$((replica_id / replicas_per_server_machine))
   slot=$((replica_id % replicas_per_server_machine))
@@ -605,6 +664,10 @@ for ((replica_id = 0; replica_id < NODES; replica_id++)); do
   port=$((SERVER_PORT_BASE + node_id))
   printf '%d %s %d\n' "${node_id}" "${ip}" "${port}" >> "${HOSTS_CONFIG_LOCAL}"
   printf '%d %s %d\n' "${replica_id}" "${ip}" "${port}" >> "${FAILURE_HOSTS_CONFIG_LOCAL}"
+  printf '%d %s %d %d %d\n' "${node_id}" "${ip}" "${SHARING_REPORT_PORT}" "${AGENT_PORT}" \
+    "${SHARING_CONSENSUS_PORT}" >> "${SHARING_HOSTS_CONFIG_LOCAL}"
+  printf '%d %s %d %d %d %d\n' "${replica_id}" "${ip}" "${port}" "${port}" "${AGENT_PORT}" \
+    "${SHARING_CONSENSUS_PORT}" >> "${AGENT_HOSTS_CONFIG_LOCAL}"
 done
 
 echo "Selected mode: ${MODE}"
@@ -618,8 +681,12 @@ else
 fi
 echo "SmartBFT verbose server logs: ${VERBOSE_ENABLED}"
 echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (dataset=${DATASET_ENABLED}, log=${LOG_ENABLED})"
-if [[ "${MODE}" == "learning" ]]; then
+if [[ "${MODE}" == "learning" || "${MODE}" == "sharing" ]]; then
   echo "Learning-agent model: ${AGENT_MODEL_TYPE}"
+fi
+if (( SHARING_ENABLED == 1 )); then
+  echo "Report chain: agent_port=${AGENT_PORT} report_port=${SHARING_REPORT_PORT} consensus_port=${SHARING_CONSENSUS_PORT}"
+  echo "Agent collect wait: ${AGENT_COLLECT_WAIT_MS}ms (must leave room inside --learning-reply-wait ${LEARNING_REPLY_WAIT})"
 fi
 
 echo "Creating SmartBFT CloudLab payload tarball..."
@@ -643,12 +710,14 @@ for i in "${!targets_nodes[@]}"; do
     scp "${SSH_OPTS[@]}" "${LOCAL_TAR}" "${user}@${host}:${remote_tar}"
     scp "${SSH_OPTS[@]}" "${HOSTS_CONFIG_LOCAL}" "${user}@${host}:/tmp/smartbft_hosts_$$.config"
     scp "${SSH_OPTS[@]}" "${FAILURE_HOSTS_CONFIG_LOCAL}" "${user}@${host}:/tmp/smartbft_hosts_failure_$$.config"
+    scp "${SSH_OPTS[@]}" "${SHARING_HOSTS_CONFIG_LOCAL}" "${user}@${host}:/tmp/smartbft_sharing_hosts_$$.config"
+    scp "${SSH_OPTS[@]}" "${AGENT_HOSTS_CONFIG_LOCAL}" "${user}@${host}:/tmp/smartbft_agent_hosts_$$.config"
     scp "${SSH_OPTS[@]}" "${CONFIG_PATH}" "${user}@${host}:${remote_config}"
     if (( FAILURE_SPEC_ENABLED == 1 )); then
       remote_failure_spec="/tmp/smartbft_failure_spec_$$.xml"
       scp "${SSH_OPTS[@]}" "${FAILURE_SPEC_PATH}" "${user}@${host}:${remote_failure_spec}"
     fi
-    ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${remote_tar}" "/tmp/smartbft_hosts_$$.config" "/tmp/smartbft_hosts_failure_$$.config" "${remote_config}" "${remote_failure_spec}" <<'REMOTE'
+    ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${remote_tar}" "/tmp/smartbft_hosts_$$.config" "/tmp/smartbft_hosts_failure_$$.config" "${remote_config}" "${remote_failure_spec}" "/tmp/smartbft_sharing_hosts_$$.config" "/tmp/smartbft_agent_hosts_$$.config" "${SHARING_ENABLED}" <<'REMOTE'
 set -euo pipefail
 
 tar_path="$1"
@@ -656,6 +725,9 @@ hosts_path="$2"
 failure_hosts_path="$3"
 config_path="$4"
 failure_spec_path="$5"
+sharing_hosts_path="$6"
+agent_hosts_path="$7"
+sharing_enabled="$8"
 run_root="$HOME/smartbft_cloudlab"
 
 remove_path_with_sudo_fallback() {
@@ -680,13 +752,16 @@ tar --warning=no-unknown-keyword -xzf "${tar_path}" -C "${run_root}"
 mkdir -p "${run_root}/bin" "${run_root}/logs" "${run_root}/wal"
 cp "${hosts_path}" "${run_root}/hosts.config"
 cp "${failure_hosts_path}" "${run_root}/hosts.failure.config"
+cp "${sharing_hosts_path}" "${run_root}/sharing_hosts.config"
+cp "${agent_hosts_path}" "${run_root}/agent_hosts.config"
 mkdir -p "${run_root}/config/pbft"
 cp "${config_path}" "${run_root}/config/pbft/smallbank.xml"
 if [[ -n "${failure_spec_path}" ]]; then
   cp "${failure_spec_path}" "${run_root}/config/pbft/failure_spec.xml"
 fi
 chmod +x "${run_root}/scripts/apply_network_failures.py"
-rm -f "${tar_path}" "${hosts_path}" "${failure_hosts_path}" "${config_path}"
+rm -f "${tar_path}" "${hosts_path}" "${failure_hosts_path}" "${config_path}" \
+  "${sharing_hosts_path}" "${agent_hosts_path}"
 if [[ -n "${failure_spec_path}" ]]; then
   rm -f "${failure_spec_path}"
 fi
@@ -708,6 +783,10 @@ fi
 cd "${run_root}/SmartBFT"
 echo "Using Go toolchain: $(go version)"
 GOCACHE="${run_root}/gocache" go build -o "${run_root}/bin/smartbft-smallbank" ./examples/smallbank
+if [[ "${sharing_enabled}" == "1" ]]; then
+  GOCACHE="${run_root}/gocache" go build -o "${run_root}/bin/smartbft-sharing" ./examples/sharing
+  mkdir -p "${run_root}/sharing_wal"
+fi
 REMOTE
   ) &
   pids+=("$!")
@@ -955,6 +1034,78 @@ else
   echo "Failure spec disabled; not starting network appliers."
 fi
 
+if (( SHARING_ENABLED == 1 )); then
+  echo "Starting SmartBFT report-chain (sharing) servers..."
+  sharing_start_failed=0
+  sharing_start_pids=()
+  sharing_start_nodes=()
+  for i in "${!server_nodes[@]}"; do
+    node="${server_nodes[$i]}"
+    host="${server_hosts[$i]}"
+    user="${server_users[$i]}"
+    machine_idx="${i}"
+    (
+      ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- \
+        "${replicas_per_server_machine}" \
+        "${machine_idx}" \
+        "${VERBOSE_ENABLED}" <<'REMOTE'
+set -euo pipefail
+
+replicas_per_machine="$1"
+machine_idx="$2"
+verbose_enabled="$3"
+run_root="$HOME/smartbft_cloudlab"
+
+verbose_args=""
+if [[ "${verbose_enabled}" == "1" ]]; then
+  verbose_args="--verbose"
+fi
+
+for ((n = 0; n < replicas_per_machine; n++)); do
+  replica_id=$((machine_idx * replicas_per_machine + n))
+  # The report chain is a SmartBFT cluster of its own, so its node ids are 1-based.
+  sharing_node_id=$((replica_id + 1))
+  ns_name="smartbft-r${replica_id}"
+  session_name="smartbft_sharing_${replica_id}"
+  sharing_log="${run_root}/logs/sharing_${replica_id}.log"
+  data_dir="${run_root}/sharing_wal/r${replica_id}"
+  sudo -n rm -rf "${data_dir}"
+  sudo -n mkdir -p "${data_dir}"
+  tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
+  tmux new-session -d -s "${session_name}" \
+    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec ./bin/smartbft-sharing --role server --node-id ${sharing_node_id} --hosts-config \"${run_root}/sharing_hosts.config\" --protocol pbft --data-dir \"${data_dir}\" ${verbose_args}' > \"${sharing_log}\" 2>&1"
+done
+
+sleep 3
+for ((n = 0; n < replicas_per_machine; n++)); do
+  replica_id=$((machine_idx * replicas_per_machine + n))
+  session_name="smartbft_sharing_${replica_id}"
+  sharing_log="${run_root}/logs/sharing_${replica_id}.log"
+  if ! tmux has-session -t "${session_name}" 2>/dev/null; then
+    echo "Sharing server session exited early: ${session_name}" >&2
+    tail -n 80 "${sharing_log}" >&2 || true
+    exit 1
+  fi
+done
+REMOTE
+    ) &
+    sharing_start_pids+=("$!")
+    sharing_start_nodes+=("${node}")
+  done
+  for i in "${!sharing_start_pids[@]}"; do
+    if wait "${sharing_start_pids[$i]}"; then
+      echo "  - ${sharing_start_nodes[$i]}: sharing servers started"
+    else
+      echo "  - ${sharing_start_nodes[$i]}: failed to start sharing servers" >&2
+      sharing_start_failed=1
+    fi
+  done
+  if (( sharing_start_failed != 0 )); then
+    echo "SmartBFT sharing-server start failed on one or more nodes." >&2
+    exit 1
+  fi
+fi
+
 if (( LEARNING_AGENT_ENABLED == 1 )); then
   echo "Starting SmartBFT learning agents..."
   agent_start_failed=0
@@ -973,7 +1124,8 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
         "${MODE}" \
         "${DATASET_ENABLED}" \
         "${AGENT_MODEL_TYPE}" \
-        "${AGENT_PORT}" <<'REMOTE'
+        "${AGENT_PORT}" \
+        "${AGENT_COLLECT_WAIT_MS}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
@@ -983,13 +1135,28 @@ mode="$4"
 dataset_enabled="$5"
 model_type="$6"
 agent_port="$7"
+collect_wait_ms="${8:-}"
 run_root="$HOME/smartbft_cloudlab"
+
+agent_collect_args=""
+if [[ -n "${collect_wait_ms}" ]]; then
+  agent_collect_args="--collect-wait-ms ${collect_wait_ms}"
+fi
 
 agent_model_args=""
 if [[ "${mode}" == "learning" || "${mode}" == "sharing" ]]; then
   agent_model_args="--model-type ${model_type}"
 elif [[ "${mode}" == "scheduled" ]]; then
   agent_model_args="--model-type scheduled --schedule-file learning_agent/config/schedule_pbft.csv"
+fi
+
+# --sharing=true is rejected together with --port, so sharing mode binds through
+# the hosts config instead (which defaults --host to 0.0.0.0, keeping the
+# replica's own 127.0.0.1 agent target working while peers reach the overlay IP).
+if [[ "${mode}" == "sharing" ]]; then
+  agent_bind_args="--hosts-config ${run_root}/agent_hosts.config --sharing true"
+else
+  agent_bind_args="--host 127.0.0.1 --port ${agent_port}"
 fi
 
 for ((n = 0; n < replicas_per_machine; n++)); do
@@ -1004,7 +1171,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   fi
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   tmux new-session -d -s "${session_name}" \
-    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec python3 learning_agent/main.py --node-id ${replica_id} --protocol pbft --host 127.0.0.1 --port ${agent_port} --signing false ${agent_model_args} ${dataset_args} --failure-spec \"${run_root}/config/pbft/failure_spec.xml\" --injection-start-unix-ms ${start_unix_ms}' > \"${agent_log}\" 2>&1"
+    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec python3 learning_agent/main.py --node-id ${replica_id} --protocol pbft ${agent_bind_args} --signing false ${agent_model_args} ${agent_collect_args} ${dataset_args} --failure-spec \"${run_root}/config/pbft/failure_spec.xml\" --injection-start-unix-ms ${start_unix_ms}' > \"${agent_log}\" 2>&1"
 done
 
 sleep 2
@@ -1246,14 +1413,14 @@ sessions="$(tmux ls -F '#S' 2>/dev/null || true)"
 [[ -z "${sessions}" ]] && exit 0
 printf '%s\n' "${sessions}" | while read -r session_name; do
   [[ -z "${session_name}" ]] && continue
-  if [[ "${session_name}" == smartbft_server_* || "${session_name}" == smartbft_applier_* || "${session_name}" == smartbft_agent_* || "${session_name}" == smartbft_client ]]; then
+  if [[ "${session_name}" == smartbft_server_* || "${session_name}" == smartbft_applier_* || "${session_name}" == smartbft_agent_* || "${session_name}" == smartbft_sharing_* || "${session_name}" == smartbft_client ]]; then
     tmux send-keys -t "${session_name}" C-c >/dev/null 2>&1 || true
   fi
 done
 sleep 3
 printf '%s\n' "${sessions}" | while read -r session_name; do
   [[ -z "${session_name}" ]] && continue
-  if [[ "${session_name}" == smartbft_server_* || "${session_name}" == smartbft_applier_* || "${session_name}" == smartbft_agent_* || "${session_name}" == smartbft_client ]]; then
+  if [[ "${session_name}" == smartbft_server_* || "${session_name}" == smartbft_applier_* || "${session_name}" == smartbft_agent_* || "${session_name}" == smartbft_sharing_* || "${session_name}" == smartbft_client ]]; then
     tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   fi
 done
@@ -1345,6 +1512,9 @@ if (( LOG_ENABLED == 1 )); then
   LOGS_LOCAL_DIR="${LOCAL_TMP_DIR}/smartbft_logs"
   rm -rf "${LOGS_LOCAL_DIR}"
   mkdir -p "${LOGS_LOCAL_DIR}/servers" "${LOGS_LOCAL_DIR}/appliers" "${LOGS_LOCAL_DIR}/agents"
+  if (( SHARING_ENABLED == 1 )); then
+    mkdir -p "${LOGS_LOCAL_DIR}/sharing"
+  fi
   for i in "${!server_nodes[@]}"; do
     node="${server_nodes[$i]}"
     host="${server_hosts[$i]}"
@@ -1374,6 +1544,15 @@ if (( LOG_ENABLED == 1 )); then
           "smartbft_cloudlab/logs/agent_${replica_id}.log" \
           "${LOGS_LOCAL_DIR}/agents/agent_${replica_id}.log" \
           "agent_${replica_id}.log" \
+          "log" \
+          1
+      fi
+      if (( SHARING_ENABLED == 1 )); then
+        queue_artifact_download "${node}" "${host}" "${user}" \
+          "\$HOME/smartbft_cloudlab/logs/sharing_${replica_id}.log" \
+          "smartbft_cloudlab/logs/sharing_${replica_id}.log" \
+          "${LOGS_LOCAL_DIR}/sharing/sharing_${replica_id}.log" \
+          "sharing_${replica_id}.log" \
           "log" \
           1
       fi

@@ -29,10 +29,12 @@ from models import (
     ActionCodec,
     FeatureExtractor,
     LinearTorchModel,
+    CMAB,
     ThompsonSamplingModelv01,
     ThompsonSamplingModelOld,
     ProtocolReportFeatureExtractor,
     ProtocolTimeoutActionCodec,
+    PavlovTimeoutModel,
     RandomTimeoutModel,
     ScheduledTimeoutModel,
     TensorModel,
@@ -1498,11 +1500,16 @@ def serve(
             anchor_actions=action_codec.anchor_actions(),
             initial_design_size=discrete_action_count,
             memory_size=discrete_action_count * 32,
-            seed=42,
+            seed=42 + node_id,
         )
     elif model_type == "random":
         model = RandomTimeoutModel(
             action_dim=get_action_space_size(protocol),
+        )
+    elif model_type == "pavlov":
+        model = PavlovTimeoutModel(
+            action_dim=get_action_space_size(protocol),
+            protocol=protocol,
         )
     elif model_type == "linear":
         model = LinearTorchModel(
@@ -1520,6 +1527,12 @@ def serve(
         model = ThompsonSamplingModelOld(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
+        )
+    elif model_type == "cmab_reset":
+        model = CMAB(
+            action_dim=get_action_space_size(protocol),
+            n_features=get_report_feature_dim(protocol),
+            seed=42,
         )
     elif model_type == "scheduled":
         if schedule_file is None:
@@ -1671,18 +1684,23 @@ def main():
         type=str,
         choices=(
             "random",
+            "pavlov",
             "linear",
             "cmab",
             "cmab_old",
+            "cmab_reset",
             "continuous",
             "scheduled",
             "thompson",
         ),
         default="random",
         help=(
-            "random: random timeout selection; linear: learned linear model; "
+            "random: random timeout selection; "
+            "pavlov: win-stay/lose-shift heuristic vs the last reward (no learning); "
+            "linear: learned linear model; "
             "cmab: bootstrapped ensemble contextual multi-armed bandit; "
             "cmab_old: previous single-tree bootstrapped CMAB; "
+            "cmab_shared: FC-TS regime-bank CMAB; "
             "continuous: bootstrapped continuous contextual bandit; "
             "thompson: deprecated alias for cmab; "
             "scheduled: timeout from a time-based schedule CSV."

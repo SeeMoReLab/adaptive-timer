@@ -877,6 +877,11 @@ class ThompsonSamplingModelV1(TensorModel):
     def update_model(
         self, features: np.ndarray, actions: np.ndarray, rewards: np.ndarray | float, backward: bool = True
     ) -> float:
+        # An evaluation batch must not enter the replay memory: evaluate_model
+        # calls this with backward=False twice per episode, so ingesting here
+        # would record every episode three times over.
+        if not backward:
+            return 0.0
         features_np = np.asarray(features, dtype=float)
         if features_np.ndim == 1:
             features_np = features_np.reshape(1, -1)
@@ -997,6 +1002,11 @@ class ThompsonSamplingModelV2(TensorModel):
     def update_model(
         self, features: np.ndarray, actions: np.ndarray, rewards: np.ndarray | float, backward: bool = True
     ) -> float:
+        # An evaluation batch must not enter the replay memory: evaluate_model
+        # calls this with backward=False twice per episode, so ingesting here
+        # would record every episode three times over.
+        if not backward:
+            return 0.0
         features_np = np.asarray(features, dtype=float)
         if features_np.ndim == 1:
             features_np = features_np.reshape(1, -1)
@@ -1147,6 +1157,11 @@ class ThompsonSamplingModel(TensorModel):
     def update_model(
         self, features: np.ndarray, actions: np.ndarray, rewards: np.ndarray | float, backward: bool = True
     ) -> float:
+        # An evaluation batch must not enter the replay memory: evaluate_model
+        # calls this with backward=False twice per episode, so ingesting here
+        # would record every episode three times over.
+        if not backward:
+            return 0.0
         features_np = np.asarray(features, dtype=float)
         if features_np.ndim == 1:
             features_np = features_np.reshape(1, -1)
@@ -1617,17 +1632,18 @@ class _BootstrappedForestModel(TensorModel):
         self,
         action_dim: int,
         n_features: int,
-        max_depth: int = 5,
+        max_depth: Optional[int] = 5,
         n_estimators: int = 100,
         replay_buffer_size: Optional[int] = None,
+        log_reward: bool = False,
         seed: Optional[int] = None,
     ):
         if action_dim <= 0:
             raise ValueError(f"action_dim must be > 0, got {action_dim}")
         if n_features <= 0:
             raise ValueError(f"n_features must be > 0, got {n_features}")
-        if max_depth <= 0:
-            raise ValueError(f"max_depth must be > 0, got {max_depth}")
+        if max_depth is not None and max_depth <= 0:
+            raise ValueError(f"max_depth must be > 0 or None, got {max_depth}")
         if n_estimators <= 0:
             raise ValueError(f"n_estimators must be > 0, got {n_estimators}")
         if replay_buffer_size is not None and replay_buffer_size <= 0:
@@ -1637,11 +1653,12 @@ class _BootstrappedForestModel(TensorModel):
 
         self._act_dim = int(action_dim)
         self._obs_dim = int(n_features)
-        self._max_depth = int(max_depth)
+        self._max_depth = None if max_depth is None else int(max_depth)
         self._n_estimators = int(n_estimators)
         self._replay_buffer_size = (
             None if replay_buffer_size is None else int(replay_buffer_size)
         )
+        self._log_reward = bool(log_reward)
         self._seed = int(time.time_ns() & 0x7FFFFFFF) if seed is None else int(seed)
 
     def _new_forest(self, index: int) -> RandomForestRegressor:
@@ -1702,6 +1719,24 @@ class _BootstrappedForestModel(TensorModel):
                 raise ValueError(f"action out of range: {int(arm)}")
 
         return features_np, actions_np, rewards_np
+
+    def _transform_reward(self, reward: float) -> float:
+        """Optionally fit on signed log reward instead of raw reward.
+
+        A squared-error tree fit on raw reward spends its splits where the
+        absolute variance is, which here is the high-throughput phases. On this
+        dataset an arm's reward spans roughly 590 to 11,000 across phases, so a
+        590-to-809 distinction - which is the entire phase 7 decision - is
+        worth about a hundredth as much loss as a distinction between two
+        phases whose answer the model already has right. The decision only ever
+        needs the argmax within a phase, which is a ratio question, so a
+        monotone log makes every phase contribute in proportion while leaving
+        the within-phase ordering untouched. Signed, so non-positive rewards
+        stay ordered.
+        """
+        if not self._log_reward:
+            return reward
+        return float(np.sign(reward) * np.log1p(abs(reward)))
 
     def _replay_length(self, sample_count: int) -> int:
         if self._replay_buffer_size is None:
@@ -1770,9 +1805,10 @@ class QuadraticRF(_BootstrappedForestModel):
         self,
         action_dim: int,
         n_features: int,
-        max_depth: int = 5,
+        max_depth: Optional[int] = 5,
         n_estimators: int = 100,
         replay_buffer_size: Optional[int] = None,
+        log_reward: bool = False,
         initial_prev_action: int = 0,
         hold_steps: int = 2,
         seed: Optional[int] = None,
@@ -1783,6 +1819,7 @@ class QuadraticRF(_BootstrappedForestModel):
             max_depth=max_depth,
             n_estimators=n_estimators,
             replay_buffer_size=replay_buffer_size,
+            log_reward=log_reward,
             seed=seed,
         )
         if not 0 <= int(initial_prev_action) < self._act_dim:
@@ -1893,7 +1930,7 @@ class QuadraticRF(_BootstrappedForestModel):
                 None if explicit_prev is None else explicit_prev[i]
             )
             self.memory[previous][arm]["features"].append(features_np[i])
-            self.memory[previous][arm]["rewards"].append(float(rewards_np[i]))
+            self.memory[previous][arm]["rewards"].append(self._transform_reward(float(rewards_np[i])))
             self._dirty_buckets.add((previous, arm))
             self._on_hold_buckets.pop((previous, arm), None)
             self._step += 1
@@ -1952,9 +1989,10 @@ class MultiRF(_BootstrappedForestModel):
         self,
         action_dim: int,
         n_features: int,
-        max_depth: int = 5,
+        max_depth: Optional[int] = 5,
         n_estimators: int = 100,
         replay_buffer_size: Optional[int] = None,
+        log_reward: bool = False,
         one_hot_prev_action: bool = False,
         initial_prev_action: int = 0,
         seed: Optional[int] = None,
@@ -1965,6 +2003,7 @@ class MultiRF(_BootstrappedForestModel):
             max_depth=max_depth,
             n_estimators=n_estimators,
             replay_buffer_size=replay_buffer_size,
+            log_reward=log_reward,
             seed=seed,
         )
         if not 0 <= int(initial_prev_action) < self._act_dim:
@@ -2055,7 +2094,7 @@ class MultiRF(_BootstrappedForestModel):
             self.memory[arm]["features"].append(
                 self._model_input(features_np[i], previous)
             )
-            self.memory[arm]["rewards"].append(float(rewards_np[i]))
+            self.memory[arm]["rewards"].append(self._transform_reward(float(rewards_np[i])))
             self._dirty_buckets.add(arm)
             self._prev_action = arm
 
@@ -2094,9 +2133,10 @@ class SingleRF(_BootstrappedForestModel):
         self,
         action_dim: int,
         n_features: int,
-        max_depth: int = 5,
+        max_depth: Optional[int] = 5,
         n_estimators: int = 100,
         replay_buffer_size: Optional[int] = None,
+        log_reward: bool = False,
         seed: Optional[int] = None,
     ):
         super().__init__(
@@ -2105,6 +2145,7 @@ class SingleRF(_BootstrappedForestModel):
             max_depth=max_depth,
             n_estimators=n_estimators,
             replay_buffer_size=replay_buffer_size,
+            log_reward=log_reward,
             seed=seed,
         )
         self._initial_prev_action = 0
@@ -2165,7 +2206,7 @@ class SingleRF(_BootstrappedForestModel):
             self.memory["features"].append(
                 np.concatenate((features_np[i], one_hot))
             )
-            self.memory["rewards"].append(float(rewards_np[i]))
+            self.memory["rewards"].append(self._transform_reward(float(rewards_np[i])))
             self._prev_action = int(actions_np[i])
 
         # Keeping the fit current on ingestion, rather than only on the next
@@ -2185,3 +2226,448 @@ class SingleRF(_BootstrappedForestModel):
 
     def _init_buckets(self) -> None:
         self.memory = self._new_bucket()
+
+
+class NeighborhoodRobustBandit(TensorModel):
+    """claude_v1 - contextual bandit that commits locally and breaks ties by
+    what holds in the surrounding region.
+
+    Built against two observed failure modes on the smartbft_wallclock phase
+    sweep:
+
+    * :class:`ThompsonSamplingModelV1` never settles. It refits one tree on a
+      bootstrap of its buffer on every decision, and that jitter has no term
+      that decays, so more experience does not make it more decisive.
+    * :class:`ThompsonSamplingModel` is slow to leave a timeout when the
+      workload changes - notably going from phase 2 back to phase 1, where it
+      holds 800ms well past the point 300ms became correct. The cause is that
+      80% of its decisions score arms by a context-free mean over a 32-sample
+      window, so right after a change the window is still describing the phase
+      it just left.
+
+    Both are addressed by the same structure rather than by two mechanisms.
+
+    **Value estimate.** Every observation is kept as a ``(standardized context,
+    arm, reward)`` triple, forever. An arm's value at a context is estimated
+    from the samples within ``radius`` of it. Because the estimate is keyed on
+    position in context space rather than recency, leaving a regime does not
+    degrade what is known about it, and returning does not require relearning.
+
+    **Commitment.** The posterior width is ``sqrt(variance / (n_local +
+    prior_weight))`` where ``n_local`` counts samples inside the radius, so it
+    keeps shrinking as evidence accumulates and the model does settle. This is
+    what :class:`ThompsonSamplingModelV1` lacks: its uncertainty is a fixed
+    property of the bootstrap, not a function of how much it knows.
+
+    **Adaptation.** Commitment is local, so it costs nothing when the workload
+    moves. A context in a region with no samples inside the radius scores
+    ``+inf`` and is explored immediately - there is no window to flush and no
+    change detector to trigger. The model is decisive where it has looked and
+    curious where it has not, at the same time.
+
+    **Robust tie-break.** The posterior mean is a shrinkage blend
+
+        mu = (n_local * mu_local + prior_weight * mu_wide) / (n_local + prior_weight)
+
+    where ``mu_wide`` is the arm's mean over the ``wide_neighbors`` nearest
+    samples - a much broader region. The wide estimate is an empirical prior:
+    it decides nothing once local evidence is strong, and it decides everything
+    when local evidence cannot.
+
+    That second case is the phase-2 problem. There, 300ms and 800ms differ by
+    about 5% against reward noise roughly seven times the gap, so no amount of
+    local sampling separates them - the arms are genuinely tied on measured
+    reward. The surrounding region is dominated by phase 1, where 300ms wins by
+    88%, so the prior lands the tie on 300ms. Since 300ms is also correct for
+    phase 1, the phase 2 -> 1 transition then costs nothing: there is no switch
+    left to be slow about. The model never has to tell phases 1 and 2 apart,
+    which matters because they are the least separable pair in the dataset -
+    0.22 apart in standardized units, against within-phase spreads of 0.52 and
+    0.72.
+
+    **Mechanisms.**
+
+    * ``prior_cold_start`` - an arm with no samples inside the radius, but
+      samples elsewhere, is scored from the wide neighborhood at prior
+      confidence rather than ``+inf``. Entering a regime with no opinion at all
+      costs a full round of blind probing every time the workload moves.
+    * ``robust`` - the local estimate is a median with a MAD spread. A
+      neighborhood straddling two regimes carries a few samples from the wrong
+      one whose rewards can be an order of magnitude off.
+    * ``exploration_probability`` - fraction of decisions that are posterior
+      draws rather than the posterior mean. It turns out to matter very little
+      here (0.816 to 0.827 acceptance across 0.1 to 0.6), which is itself the
+      finding: what limits this model is the variance of the estimate, not how
+      often it explores.
+
+    ``pool_batch`` and ``coordinate`` are **off by default and should stay
+    off.** Both act across the rows of a batch, and a batch only ever has more
+    than one row inside the simulator, where the loader packs an episode's four
+    ``report_node_id`` rows together. In production each node runs its own
+    agent and ``predict_action`` receives a single context (main.py: featurize
+    returns one row); sharing mode aggregates reports into one report first.
+    Enabling them improves simulator numbers by exploiting a property of the
+    harness that production does not have. With them off, this model returns
+    the same decision for a context whether it is passed alone or alongside
+    others.
+
+    **Measured on the 0..8..0 sweep, 40 episodes/phase, 3 seeds, scored against
+    the acceptable-timeout sets:**
+
+    ==========================  =========  ======
+    metric                      this       cmab
+    ==========================  =========  ======
+    acceptance, all episodes    0.827      0.895
+    acceptance, steady state    0.865      0.876
+    commitment                  0.769      0.957
+    episodes to settle          17.6       8.5
+    episodes to settle, 2 -> 1  0.7        40.0
+    ==========================  =========  ======
+
+    **This model is worse than cmab on every aggregate metric.** The one thing
+    it does better is the case it was built for: when phase 1 returns from
+    phase 2, cmab scores 0.00 for the entire 40-episode visit - it never
+    recovers 300ms at all - while this model is correct within one episode,
+    because it chose 300ms throughout phase 2 and had nothing to switch.
+
+    The reason it loses elsewhere is estimate variance. cmab averages 32 recent
+    samples of an arm and ignores context entirely, which is very stable and
+    commits hard; this averages the few nearest contexts, which tracks the
+    workload but is noisier, so it neither commits as firmly nor settles as
+    fast. Widening the local neighborhood does not fix it - acceptance falls
+    from 0.821 at 8 neighbors to 0.782 at 48, because a wider neighborhood
+    reaches into adjacent phases with different optima. Closing this gap needs
+    a better similarity than Euclidean distance over standardized features -
+    a learned metric, or tree-derived proximity - not more tuning.
+        """
+
+    def __init__(
+        self,
+        action_dim: int,
+        n_features: int,
+        radius: float = 1.5,
+        local_neighbors: int = 8,
+        wide_neighbors: int = 64,
+        prior_weight: float = 16.0,
+        exploration_probability: float = 0.1,
+        robust: bool = True,
+        pool_batch: bool = False,
+        prior_cold_start: bool = True,
+        min_variance_fraction: float = 0.005,
+        memory_size: int = 20_000,
+        coordinate: bool = False,
+        seed: Optional[int] = None,
+    ):
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        if n_features <= 0:
+            raise ValueError(f"n_features must be > 0, got {n_features}")
+        if radius <= 0.0:
+            raise ValueError(f"radius must be > 0, got {radius}")
+        if local_neighbors <= 0:
+            raise ValueError(f"local_neighbors must be > 0, got {local_neighbors}")
+        if wide_neighbors <= 0:
+            raise ValueError(f"wide_neighbors must be > 0, got {wide_neighbors}")
+        if prior_weight < 0.0:
+            raise ValueError(f"prior_weight must be >= 0, got {prior_weight}")
+        if not 0.0 <= exploration_probability <= 1.0:
+            raise ValueError(
+                "exploration_probability must be in [0, 1], got "
+                f"{exploration_probability}"
+            )
+        if not 0.0 <= min_variance_fraction <= 1.0:
+            raise ValueError(
+                f"min_variance_fraction must be in [0, 1], got {min_variance_fraction}"
+            )
+        if memory_size <= 0:
+            raise ValueError(f"memory_size must be > 0, got {memory_size}")
+
+        self._act_dim = int(action_dim)
+        self._obs_dim = int(n_features)
+        self._radius = float(radius)
+        self._local_neighbors = int(local_neighbors)
+        self._wide_neighbors = int(wide_neighbors)
+        self._prior_weight = float(prior_weight)
+        self._exploration_probability = float(exploration_probability)
+        self._robust = bool(robust)
+        self._pool_batch = bool(pool_batch)
+        self._prior_cold_start = bool(prior_cold_start)
+        self._min_variance_fraction = float(min_variance_fraction)
+        self._memory_size = int(memory_size)
+        self._coordinate = bool(coordinate)
+        self._seed = int(time.time_ns() & 0x7FFFFFFF) if seed is None else int(seed)
+        self.reset_model()
+
+    # -- standardization ----------------------------------------------------
+
+    def _observe_features(self, rows: np.ndarray) -> None:
+        """Welford, so features are comparable without a pre-pass over data."""
+        for row in rows:
+            self._feature_count += 1
+            delta = row - self._feature_mean
+            self._feature_mean += delta / self._feature_count
+            self._feature_m2 += delta * (row - self._feature_mean)
+
+    def _standardize(self, rows: np.ndarray) -> np.ndarray:
+        if self._feature_count < 2:
+            return rows - self._feature_mean
+        scale = np.sqrt(np.maximum(self._feature_m2 / (self._feature_count - 1), 0.0))
+        scale[scale <= 0.0] = 1.0
+        return (rows - self._feature_mean) / scale
+
+    def _global_reward_variance(self) -> float:
+        if self._reward_count < 2:
+            return 1.0
+        return max(self._reward_m2 / (self._reward_count - 1), 1e-12)
+
+    # -- decisions ----------------------------------------------------------
+
+    def predict_action(self, features: np.ndarray, greedy: bool = False) -> np.ndarray:
+        rows = self._as_batch(features)
+        batch_size = rows.shape[0]
+        scores = np.zeros((batch_size, self._act_dim), dtype=float)
+
+        if not self._contexts:
+            scores[:] = np.inf
+            self._deal_unexplored(scores, rows)
+            return scores
+
+        stored = self._standardize(np.asarray(self._contexts, dtype=float))
+        arms = np.asarray(self._arms, dtype=int)
+        rewards = np.asarray(self._rewards, dtype=float)
+        queries = self._standardize(rows)
+        scale = np.sqrt(self._obs_dim)
+
+        # One coin per row, so a batch naturally splits between exploiting and
+        # probing rather than doing the same thing on all four nodes.
+        explore = self._rng.random(batch_size) < self._exploration_probability
+
+        # Per (row, arm): posterior mean, its variance, and its weight in
+        # samples. Collected first so the batch can be pooled before drawing.
+        means = np.zeros((batch_size, self._act_dim), dtype=float)
+        variances = np.zeros((batch_size, self._act_dim), dtype=float)
+        weights = np.zeros((batch_size, self._act_dim), dtype=float)
+        unknown = np.zeros((batch_size, self._act_dim), dtype=bool)
+
+        for i, query in enumerate(queries):
+            # RMS per feature, so radius means the same thing at any width.
+            distances = np.linalg.norm(stored - query, axis=1) / scale
+            for arm in range(self._act_dim):
+                mask = arms == arm
+                if not mask.any():
+                    unknown[i, arm] = True
+                    continue
+                arm_distances = distances[mask]
+                arm_rewards = rewards[mask]
+
+                n_local = int((arm_distances <= self._radius).sum())
+                if n_local == 0 and not self._prior_cold_start:
+                    unknown[i, arm] = True
+                    continue
+
+                # The mean comes from a tight neighborhood and the confidence
+                # from a broad one, because the two want different widths here.
+                # Between-phase centroid distance (0.22-0.44) is smaller than
+                # within-phase pairwise spread (~0.7-1.0), so any radius wide
+                # enough to gather same-phase samples also gathers neighboring
+                # phases. Taking the mean from the few nearest keeps it honest;
+                # counting the whole region for confidence lets the posterior
+                # actually narrow with experience, which a fixed neighbor count
+                # can never do - its width floors at sqrt(var / k).
+                tight = min(self._local_neighbors, arm_rewards.size)
+                closest = np.argpartition(arm_distances, tight - 1)[:tight]
+                local_rewards = arm_rewards[closest]
+                if self._robust and tight > 2:
+                    # A neighborhood straddling two regimes carries a few
+                    # samples from the wrong one, whose rewards can be an order
+                    # of magnitude off. The median ignores them, the mean does
+                    # not - and phase 7 sits next to phases whose 800ms reward
+                    # is several times its own.
+                    mu_local = float(np.median(local_rewards))
+                    deviation = np.median(np.abs(local_rewards - mu_local))
+                    variance = float((1.4826 * deviation) ** 2)
+                else:
+                    mu_local = float(local_rewards.mean())
+                    variance = (
+                        float(local_rewards.var(ddof=1))
+                        if tight > 1
+                        else self._global_reward_variance()
+                    )
+
+                # The wide neighborhood is the empirical prior.
+                k = min(self._wide_neighbors, arm_rewards.size)
+                widest = np.argpartition(arm_distances, k - 1)[:k]
+                wide_rewards = arm_rewards[widest]
+                mu_wide = float(wide_rewards.mean())
+                wide_variance = (
+                    float(wide_rewards.var(ddof=1))
+                    if k > 1
+                    else self._global_reward_variance()
+                )
+
+                weight = n_local + self._prior_weight
+                if n_local == 0:
+                    # Nothing measured inside the radius, but this arm has been
+                    # measured elsewhere. Entering a new regime with no opinion
+                    # at all costs a full round of blind probing every time the
+                    # workload moves; the wide neighborhood is a weak guess and
+                    # a weak guess beats none. Confidence stays at prior_weight
+                    # alone, so it is still explored - just not from scratch.
+                    means[i, arm] = mu_wide
+                    variances[i, arm] = wide_variance
+                    weights[i, arm] = self._prior_weight
+                    continue
+                means[i, arm] = (
+                    n_local * mu_local + self._prior_weight * mu_wide
+                ) / weight
+                variances[i, arm] = variance
+                weights[i, arm] = weight
+
+        if self._pool_batch and batch_size > 1:
+            # Every row of a batch is one node's view of the same workload, so
+            # their estimates are repeated measurements of one quantity. Pooling
+            # them before drawing removes the row-to-row disagreement that comes
+            # from feature noise rather than from real uncertainty - which is
+            # what a context-free window mean gets for free, and what a purely
+            # per-row context model gives up. Exploration is unaffected: the
+            # draw still happens per row, off the pooled estimate.
+            for arm in range(self._act_dim):
+                known = ~unknown[:, arm]
+                if known.sum() < 2:
+                    continue
+                total = weights[known, arm].sum()
+                pooled_mean = float((means[known, arm] * weights[known, arm]).sum() / total)
+                # Confidence is averaged, not summed: the rows overlap heavily
+                # in the samples they drew on, so adding their weights would
+                # claim far more independent evidence than exists.
+                pooled_weight = float(weights[known, arm].mean())
+                pooled_variance = float(variances[known, arm].mean())
+                means[known, arm] = pooled_mean
+                weights[known, arm] = pooled_weight
+                variances[known, arm] = pooled_variance
+
+        floor = self._min_variance_fraction * self._global_reward_variance()
+        for i in range(batch_size):
+            for arm in range(self._act_dim):
+                if unknown[i, arm]:
+                    scores[i, arm] = np.inf
+                elif greedy or not explore[i]:
+                    scores[i, arm] = means[i, arm]
+                else:
+                    scores[i, arm] = float(
+                        self._rng.normal(
+                            means[i, arm],
+                            np.sqrt(max(variances[i, arm], floor) / weights[i, arm]),
+                        )
+                    )
+
+        self._break_ties(scores)
+        self._deal_unexplored(scores, rows)
+        return scores
+
+    def _deal_unexplored(self, scores: np.ndarray, rows: np.ndarray) -> None:
+        """Spread a cold start across the batch instead of stacking it.
+
+        Rows are separate nodes and the generator gives each its own timeout,
+        so when several arms are unexplored the batch can measure them in
+        parallel. Left alone they all tie at ``+inf`` and the argmax hands
+        every row the lowest index, turning one episode of work into one per
+        arm.
+
+        This assumes nodes may legitimately run different timeouts at once,
+        which holds for the offline sweep but not for main.py's sharing mode,
+        where the fleet must act in lockstep for an aggregated reward to refer
+        to a single action. Pass ``coordinate=False`` there.
+        """
+        if not self._coordinate or scores.shape[0] < 2:
+            return
+        unexplored = [
+            arm for arm in range(self._act_dim) if np.isposinf(scores[:, arm]).all()
+        ]
+        if len(unexplored) < 2:
+            return
+        self._rng.shuffle(unexplored)
+        for position, arm in enumerate(unexplored):
+            if position >= scores.shape[0]:
+                break
+            scores[position] = -np.inf
+            scores[position, arm] = np.inf
+
+    def _break_ties(self, scores: np.ndarray) -> None:
+        """Randomize the winner among exactly equal finite scores, in place.
+
+        Infinite scores are left alone so unexplored arms keep a deterministic
+        round-robin order rather than being shuffled by two mechanisms at once.
+        """
+        for i in range(scores.shape[0]):
+            row = scores[i]
+            best = float(np.max(row))
+            if not np.isfinite(best):
+                continue
+            tied = np.flatnonzero(row == best)
+            if len(tied) > 1:
+                row[int(self._rng.choice(tied))] = np.nextafter(best, np.inf)
+
+    # -- learning -----------------------------------------------------------
+
+    def update_model(
+        self,
+        features: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray | float,
+        backward: bool = True,
+    ) -> float:
+        if not backward:
+            return 0.0
+        rows = self._as_batch(features)
+        arms = np.asarray(actions, dtype=int).ravel()
+        values = np.asarray(rewards, dtype=float).ravel()
+        batch_size = rows.shape[0]
+        if arms.size == 1 and batch_size > 1:
+            arms = np.repeat(arms, batch_size)
+        if values.size == 1 and batch_size > 1:
+            values = np.repeat(values, batch_size)
+        if arms.size != batch_size:
+            raise ValueError(
+                f"actions batch size mismatch: expected {batch_size}, got {arms.size}"
+            )
+        if values.size != batch_size:
+            raise ValueError(
+                f"rewards batch size mismatch: expected {batch_size}, got {values.size}"
+            )
+
+        self._observe_features(rows)
+        for row, arm, value in zip(rows, arms, values):
+            arm = int(arm)
+            if not 0 <= arm < self._act_dim:
+                raise ValueError(f"action out of range: {arm}")
+            self._contexts.append(row.copy())
+            self._arms.append(arm)
+            self._rewards.append(float(value))
+            self._reward_count += 1
+            delta = float(value) - self._reward_mean
+            self._reward_mean += delta / self._reward_count
+            self._reward_m2 += delta * (float(value) - self._reward_mean)
+        return 0.0
+
+    def _as_batch(self, features: np.ndarray) -> np.ndarray:
+        rows = np.asarray(features, dtype=float)
+        if rows.ndim == 1:
+            rows = rows.reshape(1, -1)
+        if rows.shape[1] != self._obs_dim:
+            raise ValueError(
+                f"Expected {self._obs_dim} features, got {rows.shape[1]}"
+            )
+        return rows
+
+    def reset_model(self) -> None:
+        self._rng = np.random.default_rng(self._seed)
+        self._feature_count = 0
+        self._feature_mean = np.zeros(self._obs_dim, dtype=float)
+        self._feature_m2 = np.zeros(self._obs_dim, dtype=float)
+        self._reward_count = 0
+        self._reward_mean = 0.0
+        self._reward_m2 = 0.0
+        self._contexts: deque = deque(maxlen=self._memory_size)
+        self._arms: deque = deque(maxlen=self._memory_size)
+        self._rewards: deque = deque(maxlen=self._memory_size)

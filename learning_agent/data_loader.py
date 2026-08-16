@@ -25,6 +25,9 @@ class CsvTrainingData:
     actions: List[float]
     rewards: List[float]
     labels: List[float]
+    # Optional (n_samples, action_dim) 0/1 matrix marking every timeout that
+    # counts as correct for the row's phase, not just the single best one.
+    accepted: Optional[List[List[float]]] = None
 
 
 class DatasetLoader:
@@ -36,6 +39,7 @@ class DatasetLoader:
         labels: Sequence[float],
         batch_size: int = 1,
         shuffle: bool = False,
+        accepted: Optional[Sequence[Sequence[float]]] = None,
     ) -> None:
         if len(features) != len(actions) or len(actions) != len(rewards):
             raise ValueError("features/actions/rewards length mismatch")
@@ -48,6 +52,12 @@ class DatasetLoader:
         self._actions = np.asarray(actions, dtype=float)
         self._rewards = np.asarray(rewards, dtype=float)
         self._labels = np.asarray(labels, dtype=float)
+        self._accepted = None if accepted is None else np.asarray(accepted, dtype=float)
+        if self._accepted is not None and len(self._accepted) != len(features):
+            raise ValueError(
+                f"accepted length mismatch: expected {len(features)}, "
+                f"got {len(self._accepted)}"
+            )
         self.batch_size = int(batch_size)
         self.shuffle = bool(shuffle)
         self._all_indices = list(range(len(features)))
@@ -77,6 +87,7 @@ class DatasetLoader:
             "actions": self._actions[indices],
             "rewards": self._rewards[indices],
             "labels": self._labels[indices],
+            "accepted": None if self._accepted is None else self._accepted[indices],
         }
 
 

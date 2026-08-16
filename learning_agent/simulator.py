@@ -23,6 +23,7 @@ from reward_utils import calculate_reward_from_report_row
 from models import (
     LinearModel,
     MultiRF,
+    NeighborhoodRobustBandit,
     QuadraticRF,
     SingleRF,
     ThompsonSamplingModel,
@@ -62,6 +63,9 @@ MODEL_NAME_TO_TENSORMODEL = {
     "cmab_v1": ThompsonSamplingModelV1,
     "cmab_v2": ThompsonSamplingModelV2,
     "cmab_v3": ThompsonSamplingModelV3,
+    # Contextual bandit with local commitment and a region-level prior
+    # for ties that reward evidence cannot resolve.
+    "claude_v1": NeighborhoodRobustBandit,
     # BFTBrain random-forest baselines, named after its --num-models values.
     "quadratic_rf": QuadraticRF,
     "multi_rf": MultiRF,
@@ -78,6 +82,7 @@ SEEDED_MODELS = (
     QuadraticRF,
     MultiRF,
     SingleRF,
+    NeighborhoodRobustBandit,
 )
 
 DEFAULT_PBFT_PHASES = "0;1;2;3;4;5;0;2;1;5;4;2;1"
@@ -112,6 +117,64 @@ def _parse_model(value: str) -> TensorModel:
         )
     return model
 
+def _parse_acceptable(value: str) -> Dict[int, set]:
+    """Parse ``0:*;2:300,800;3:800,1800`` into {phase: {timeout_ms, ...}}.
+
+    A phase can have more than one timeout that is genuinely correct - either
+    because the alternatives are statistically indistinguishable in reward, or
+    because the workload tolerates both. Scoring against a single argmax marks
+    those choices wrong and understates any model that picks them. Phases left
+    out of the spec keep the single-best-timeout behaviour; ``*`` accepts any
+    timeout, for phases where the choice does not matter.
+    """
+    acceptable: Dict[int, set] = {}
+    for clause in value.split(";"):
+        clause = clause.strip()
+        if not clause:
+            continue
+        if ":" not in clause:
+            raise argparse.ArgumentTypeError(
+                f"Expected 'phase:timeout[,timeout...]', got {clause!r}"
+            )
+        phase_text, timeouts_text = clause.split(":", 1)
+        try:
+            phase = int(phase_text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"Bad phase in {clause!r}")
+        if timeouts_text.strip() == "*":
+            acceptable[phase] = None  # filled in once the protocol is known
+            continue
+        try:
+            acceptable[phase] = {int(t) for t in timeouts_text.split(",") if t.strip()}
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"Bad timeout list in {clause!r}")
+        if not acceptable[phase]:
+            raise argparse.ArgumentTypeError(f"No timeouts given in {clause!r}")
+    return acceptable
+
+
+def _resolve_acceptable(
+    acceptable: Optional[Dict[int, set]], protocol: int
+) -> Optional[Dict[int, set]]:
+    """Expand ``*`` and reject timeouts the protocol does not offer."""
+    if acceptable is None:
+        return None
+    valid = set(get_timeout_values_ms(protocol))
+    resolved = {}
+    for phase, timeouts in acceptable.items():
+        if timeouts is None:
+            resolved[phase] = set(valid)
+            continue
+        unknown = timeouts - valid
+        if unknown:
+            raise argparse.ArgumentTypeError(
+                f"Phase {phase}: timeouts {sorted(unknown)} are not valid for this "
+                f"protocol. Valid: {sorted(valid)}"
+            )
+        resolved[phase] = timeouts
+    return resolved
+
+
 def _parse_data(
     reader: csv.DictReader,
     protocol: int,
@@ -119,6 +182,7 @@ def _parse_data(
     timeout_values_ms: Sequence[int],
     phase_options: Dict[int, int],
     reward_transform: Optional[Callable[[float], float]] = None,
+    acceptable: Optional[Dict[int, set]] = None,
 ) -> CsvTrainingData:
     reward_transform = reward_transform or (lambda value: value)
 
@@ -126,6 +190,7 @@ def _parse_data(
     actions: List[float] = []
     rewards: List[float] = []
     labels: List[float] = []
+    accepted: List[List[float]] = []
 
     if reader.fieldnames is None:
         raise ValueError(f"Missing a header row.")
@@ -166,11 +231,27 @@ def _parse_data(
         rewards.append(float(reward_transform(reward_value)))
         labels.append(float(label_index))
 
+        if acceptable is not None:
+            phase_value = int(float(row["phase"]))
+            allowed = acceptable.get(phase_value)
+            row_accept = [0.0] * len(timeout_values_ms)
+            if allowed is None:
+                row_accept[int(label_index)] = 1.0
+            else:
+                for timeout_ms in allowed:
+                    row_accept[timeout_values_ms.index(timeout_ms)] = 1.0
+            accepted.append(row_accept)
 
     if not features:
         raise ValueError("No completed episode rows found.")
 
-    return CsvTrainingData(features=features, actions=actions, rewards=rewards, labels=labels)
+    return CsvTrainingData(
+        features=features,
+        actions=actions,
+        rewards=rewards,
+        labels=labels,
+        accepted=accepted or None,
+    )
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -187,7 +268,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=_parse_model,
         default='linear',
         help=(
-            "Model: linear | cmab | cmab_v1 | cmab_v2 | cmab_v3 "
+            "Model: linear | cmab | cmab_v1 | cmab_v2 | cmab_v3 | claude_v1 "
             "| quadratic_rf | multi_rf | single_rf"
         ),
     )
@@ -231,9 +312,34 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    parser.add_argument(
+        "--acceptable-timeouts",
+        type=_parse_acceptable,
+        default=None,
+        help=(
+            "Phases where more than one timeout counts as correct, e.g. "
+            "'0:*;2:300,800;3:800,1800;4:800,1800;8:*'. Phases not listed are "
+            "scored against the single best timeout, which is the default "
+            "behaviour."
+        ),
+    )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Rows handed to the model per predict_action/update_model call. "
+            "Defaults to 1 because that is what production does: each node "
+            "runs its own agent and featurize() returns a single report "
+            "(sharing mode aggregates to one report first). A batch here only "
+            "ever groups one episode's per-node rows, so anything above 1 lets "
+            "a model see several nodes' contexts in a single call and pool or "
+            "coordinate across them - which inflates simulator results by "
+            "exploiting something the real agent never has."
+        ),
+    )
     parser.add_argument("--eval-ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -255,6 +361,7 @@ def generate_data(
     phase_options: Dict[int, int],
     num_episode: int = 1,
     prev_timeout: List[int] = None,
+    acceptable: Optional[Dict[int, set]] = None,
 ) -> Tuple[DatasetLoader, int]:
     phase_data, new_start_episode = generator.generate_local_report(
         phase_index=int(phase),
@@ -271,6 +378,7 @@ def generate_data(
         timeout_values_ms=get_timeout_values_ms(PROTOCOL_NAME_TO_ENUM[protocol]),
         phase_options=phase_options,
         reward_transform=scaler,
+        acceptable=acceptable,
     )
 
     loader = DatasetLoader(
@@ -280,6 +388,7 @@ def generate_data(
         labels=parsed_data.labels,
         batch_size=batch_size,
         shuffle=True,
+        accepted=parsed_data.accepted,
     )
 
     return loader, new_start_episode
@@ -345,6 +454,11 @@ def evaluate_model(
     total = 0
     correct = 0
     weighted_loss_sum = 0.0
+    # Accumulated across batches, not overwritten by the last one. This list is
+    # handed to the generator as prev_timeout, so dropping earlier batches
+    # silently discards the decisions those rows made - visible whenever
+    # batch_size is below the node count.
+    curr_timeout: List[int] = []
 
     for batch in eval_loader:
         weighted_loss_sum += model.update_model(
@@ -354,11 +468,17 @@ def evaluate_model(
         predicted = np.argmax(logits, axis=1)
         expected = np.rint(batch["labels"]).astype(int)
         total += int(expected.size)
-        correct += int((predicted == expected).sum())
-        curr_timeout = [
+        accepted = batch.get("accepted")
+        if accepted is None:
+            correct += int((predicted == expected).sum())
+        else:
+            # A phase can have more than one timeout that is genuinely right;
+            # scoring against a single argmax marks those choices wrong.
+            correct += int(accepted[np.arange(len(predicted)), predicted].sum())
+        curr_timeout.extend(
             timeout_index_to_ms_for_protocol(protocol, idx)
             for idx in predicted.tolist()
-        ]
+        )
 
     accuracy = (correct / total) if total else 0.0
 
@@ -582,7 +702,21 @@ def main() -> None:
         f"Initiating Experiment [Model:] {args.model} "
         f"[Protocol:] {protocol_name} [Phases:] {phase_spec}"
     )
+    if args.batch_size > 1:
+        print(
+            f"WARNING: --batch-size {args.batch_size} hands the model several "
+            "nodes' reports in one call. Production calls predict_action with a "
+            "single report, so results above 1 may not transfer."
+        )
     scaler = QuadraticRewardScaler.transform if args.reward_scaler == "quadratic" else None
+    acceptable = _resolve_acceptable(args.acceptable_timeouts, protocol_id)
+    if acceptable:
+        print(
+            "Scoring these phases against multiple acceptable timeouts: "
+            + ", ".join(
+                f"{phase}->{sorted(timeouts)}" for phase, timeouts in sorted(acceptable.items())
+            )
+        )
 
     model_kwargs = {
         "action_dim": get_action_space_size(protocol_id),
@@ -647,7 +781,8 @@ def main() -> None:
                 batch_size=args.batch_size,
                 phase_options=generator.phase_options,
                 num_episode=1,
-                prev_timeout=curr_timeout
+                prev_timeout=curr_timeout,
+                acceptable=acceptable,
             )
             
             inf_start_t = time.perf_counter()

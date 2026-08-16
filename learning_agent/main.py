@@ -28,8 +28,10 @@ from continuous_bandit import (
 )
 from models import (
     ActionCodec,
+    CMAB,
     FeatureExtractor,
     LinearTorchModel,
+    PavlovTimeoutModel,
     ThompsonSamplingModel,
     ThompsonSamplingModelOld,
     ProtocolReportFeatureExtractor,
@@ -1677,6 +1679,13 @@ def serve(
             n_features=get_report_feature_dim(protocol),
             lr=0.05,
         )
+    elif model_type == "pavlov":
+        # Win-stay/lose-shift baseline: no context and no learning, so it takes
+        # neither n_features nor a seed. protocol only fixes the arm ordering.
+        model = PavlovTimeoutModel(
+            action_dim=get_action_space_size(protocol),
+            protocol=protocol,
+        )
     elif model_type in ("cmab", "thompson"):
         model = ThompsonSamplingModel(
             action_dim=get_action_space_size(protocol),
@@ -1687,6 +1696,12 @@ def serve(
         model = ThompsonSamplingModelOld(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
+        )
+    elif model_type == "cmab_reset":
+        model = CMAB(
+            action_dim=get_action_space_size(protocol),
+            n_features=get_report_feature_dim(protocol),
+            seed=42,
         )
     elif model_type == "scheduled":
         if schedule_file is None:
@@ -1838,18 +1853,23 @@ def main():
         type=str,
         choices=(
             "random",
+            "pavlov",
             "linear",
             "cmab",
             "cmab_old",
+            "cmab_reset",
             "continuous",
             "scheduled",
             "thompson",
         ),
         default="random",
         help=(
-            "random: random timeout selection; linear: learned linear model; "
+            "random: random timeout selection; "
+            "pavlov: win-stay/lose-shift heuristic vs the last reward (no learning); "
+            "linear: learned linear model; "
             "cmab: bootstrapped ensemble contextual multi-armed bandit; "
             "cmab_old: previous single-tree bootstrapped CMAB; "
+            "cmab_reset: ADA-ILTCB+ epoch-restart CMAB; "
             "continuous: bootstrapped continuous contextual bandit; "
             "thompson: deprecated alias for cmab; "
             "scheduled: timeout from a time-based schedule CSV."

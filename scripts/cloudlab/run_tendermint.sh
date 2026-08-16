@@ -31,7 +31,7 @@ APPLIER_LOCAL_PATH="${REPO_ROOT}/scripts/apply_network_failures.py"
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|linear|cmab|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -43,7 +43,7 @@ Flags:
   --log             Fetch remote Tendermint, ABCI, and client logs into the run artifact directory.
   --output-dir <path>
                     Store artifacts here instead of creating a timestamped run directory.
-  --model           Learning-agent model for learning/sharing modes: random|linear|cmab|continuous (default: random).
+  --model           Learning-agent model for learning/sharing modes: random|pavlov|linear|cmab|cmab_reset|continuous (default: random).
   -f <int>          Fault tolerance f. Number of nodes is derived as 3f+1 (default: 1).
   -t <int>          Load-generation duration in seconds (default: 60).
 EOF
@@ -64,7 +64,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|linear|cmab|continuous)
+    random|pavlov|linear|cmab|cmab_reset|continuous)
       printf '%s\n' "${model_lower}"
       ;;
     *)
@@ -227,7 +227,7 @@ else
   LEARNING_AGENT_ENABLED=1
 fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|linear|cmab|continuous." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|continuous." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -448,10 +448,13 @@ if ! [[ "${load_send_period_ms}" =~ ^[0-9]+$ ]] || (( load_send_period_ms < 1 ))
   echo "Invalid load_send_period_ms: ${load_send_period_ms}" >&2
   exit 2
 fi
-if [[ "${agent_model_type}" != "random" && "${agent_model_type}" != "linear" && "${agent_model_type}" != "cmab" && "${agent_model_type}" != "continuous" ]]; then
-  echo "Invalid agent_model_type: ${agent_model_type}. Use random|linear|cmab|continuous." >&2
-  exit 2
-fi
+case "${agent_model_type}" in
+  random|pavlov|linear|cmab|cmab_reset|continuous) ;;
+  *)
+    echo "Invalid agent_model_type: ${agent_model_type}. Use random|pavlov|linear|cmab|cmab_reset|continuous." >&2
+    exit 2
+    ;;
+esac
 if [[ "${mode}" != "learning" && "${mode}" != "sharing" && "${agent_model_type}" != "random" ]]; then
   echo "agent_model_type is only supported with learning/sharing mode." >&2
   exit 2

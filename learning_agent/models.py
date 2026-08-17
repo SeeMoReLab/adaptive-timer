@@ -2983,6 +2983,13 @@ class CMAB(TensorModel):
     def update_model(
         self, features: np.ndarray, actions: np.ndarray, rewards: np.ndarray | float, backward: bool = True
     ) -> float:
+        # An evaluation batch must not enter the replay memory: evaluate_model
+        # calls this with backward=False twice per episode, so ingesting here
+        # would record every episode three times over. Guarding only the fit
+        # below is not enough - the ingest loop also grows current_block and
+        # appends rows to every open replay, which distorts the block schedule.
+        if not backward:
+            return 0.0
         features_np = np.asarray(features, dtype=float)
         if features_np.ndim == 1:
             features_np = features_np.reshape(1, -1)

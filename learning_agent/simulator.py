@@ -21,6 +21,7 @@ from data_loader import (
 from reward_utils import calculate_reward_from_report_row
 
 from models import (
+    CMAB,
     LinearModel,
     MultiRF,
     NeighborhoodRobustBandit,
@@ -63,6 +64,9 @@ MODEL_NAME_TO_TENSORMODEL = {
     "cmab_v1": ThompsonSamplingModelV1,
     "cmab_v2": ThompsonSamplingModelV2,
     "cmab_v3": ThompsonSamplingModelV3,
+    # Blocked CMAB with replay-triggered resets. Not an iteration of "cmab" -
+    # a separate line, boosted-tree based, so it needs xgboost installed.
+    "cmab_reset": CMAB,
     # Contextual bandit with local commitment and a region-level prior
     # for ties that reward evidence cannot resolve.
     "claude_v1": NeighborhoodRobustBandit,
@@ -79,6 +83,7 @@ SEEDED_MODELS = (
     ThompsonSamplingModel,
     ThompsonSamplingModelV2,
     ThompsonSamplingModelV3,
+    CMAB,
     QuadraticRF,
     MultiRF,
     SingleRF,

@@ -15,26 +15,26 @@ import agent_pb2
 from reward_utils import reward_from_throughput
 
 
-def _load_xgb_regressor():
-    """Import XGBRegressor on demand.
+# def _load_xgb_regressor():
+#     """Import XGBRegressor on demand.
 
-    CMAB is the only model that needs xgboost. Importing it at module scope
-    would make every other model in this file unusable wherever that optional
-    dependency is absent, so resolve it at the point of use and fail loudly.
-    """
-    try:
-        from xgboost import XGBRegressor
-    except Exception as exc:
-        # Not just ImportError: a present-but-unloadable xgboost raises
-        # XGBoostError here (e.g. missing libomp on macOS), and that is the
-        # same failure from the caller's point of view.
-        raise ImportError(
-            "CMAB requires a working 'xgboost' install, which could not be "
-            "imported. Install it with `pip install -r "
-            "learning_agent/requirements.txt`; on macOS xgboost also needs "
-            "the OpenMP runtime (`brew install libomp`). Original error above."
-        ) from exc
-    return XGBRegressor
+#     CMAB is the only model that needs xgboost. Importing it at module scope
+#     would make every other model in this file unusable wherever that optional
+#     dependency is absent, so resolve it at the point of use and fail loudly.
+#     """
+#     try:
+#         from xgboost import XGBRegressor
+#     except Exception as exc:
+#         # Not just ImportError: a present-but-unloadable xgboost raises
+#         # XGBoostError here (e.g. missing libomp on macOS), and that is the
+#         # same failure from the caller's point of view.
+#         raise ImportError(
+#             "CMAB requires a working 'xgboost' install, which could not be "
+#             "imported. Install it with `pip install -r "
+#             "learning_agent/requirements.txt`; on macOS xgboost also needs "
+#             "the OpenMP runtime (`brew install libomp`). Original error above."
+#         ) from exc
+#     return XGBRegressor
 
 S = TypeVar("S")  # generic state type
 A = TypeVar("A")  # generic action type

@@ -1,5 +1,6 @@
 import argparse
 import csv
+import inspect
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from tqdm import tqdm
@@ -25,6 +26,7 @@ from models import (
     LinearModel,
     MultiRF,
     NeighborhoodRobustBandit,
+    PavlovTimeoutModel,
     QuadraticRF,
     SingleRF,
     ThompsonSamplingModel,
@@ -70,6 +72,9 @@ MODEL_NAME_TO_TENSORMODEL = {
     # Contextual bandit with local commitment and a region-level prior
     # for ties that reward evidence cannot resolve.
     "claude_v1": NeighborhoodRobustBandit,
+    # Win-stay/lose-shift heuristic. Context-free and non-learning, so it is a
+    # floor to beat rather than an iteration of the bandits above.
+    "pavlov": PavlovTimeoutModel,
     # BFTBrain random-forest baselines, named after its --num-models values.
     "quadratic_rf": QuadraticRF,
     "multi_rf": MultiRF,
@@ -89,6 +94,10 @@ SEEDED_MODELS = (
     SingleRF,
     NeighborhoodRobustBandit,
 )
+
+# Heuristics with no contextual model, so no n_features and no seed. The
+# protocol is passed instead: it fixes the arm ordering they step through.
+CONTEXT_FREE_MODELS = (PavlovTimeoutModel,)
 
 DEFAULT_PBFT_PHASES = "0;1;2;3;4;5;0;2;1;5;4;2;1"
 
@@ -121,6 +130,61 @@ def _parse_model(value: str) -> TensorModel:
             f"Unsupported model '{value}'. Valid options: {valid}"
         )
     return model
+
+def _takes_batch_update(model: TensorModel) -> bool:
+    """True for models whose update_model consumes a whole batch.
+
+    Two signatures live in models.py. The learned models take
+    (features, actions, rewards, backward=) and vectorise internally. The
+    heuristics follow TensorModel's declared signature (features, action,
+    reward) and are inherently sequential -- PavlovTimeoutModel compares each
+    reward against the previous one and steps one arm on a loss -- so their
+    batches must be replayed a row at a time, in order. Detected by signature
+    rather than by class so a new model needs no entry here.
+    """
+    return "backward" in inspect.signature(model.update_model).parameters
+
+
+def update_model_batch(
+    model: TensorModel,
+    features: np.ndarray,
+    actions: np.ndarray,
+    rewards: np.ndarray,
+    backward: bool = True,
+) -> float:
+    if _takes_batch_update(model):
+        return model.update_model(features, actions, rewards, backward=backward)
+
+    # Sequential replay. The heuristics are updated even on the eval pass: their
+    # policy *is* the reward comparison, so skipping it would pin them to one arm.
+    features = np.asarray(features)
+    actions = np.asarray(actions)
+    rewards = np.asarray(rewards)
+    rows = int(features.shape[0]) if features.ndim > 1 else 1
+    total = 0.0
+    for i in range(rows):
+        row_features = features[i] if features.ndim > 1 else features
+        row_action = actions[i] if actions.ndim > 0 else actions
+        row_reward = rewards[i] if rewards.ndim > 0 else rewards
+        total += float(model.update_model(row_features, row_action, float(row_reward)))
+    return total / max(rows, 1)
+
+
+def predict_logits(
+    model: TensorModel, features: np.ndarray, action_dim: int
+) -> np.ndarray:
+    """Always return (batch, action_dim) so argmax(axis=1) is valid.
+
+    Learned models emit per-arm scores already. The heuristics emit a 1-D array
+    of chosen arm indices, which argmax(axis=1) cannot consume, so promote it to
+    one-hot -- argmax then recovers exactly the arm the heuristic picked.
+    """
+    out = np.asarray(model.predict_action(features))
+    if out.ndim == 2:
+        return out
+    index = np.clip(np.rint(out.reshape(-1)).astype(int), 0, action_dim - 1)
+    return np.eye(action_dim, dtype=float)[index]
+
 
 def _parse_acceptable(value: str) -> Dict[int, set]:
     """Parse ``0:*;2:300,800;3:800,1800`` into {phase: {timeout_ms, ...}}.
@@ -272,10 +336,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--model",
         type=_parse_model,
         default='linear',
-        help=(
-            "Model: linear | cmab | cmab_v1 | cmab_v2 | cmab_v3 | claude_v1 "
-            "| quadratic_rf | multi_rf | single_rf"
-        ),
+        # Listed from the registry so a new model never has to be named twice.
+        help="Model: " + " | ".join(sorted(MODEL_NAME_TO_TENSORMODEL)),
     )
     parser.add_argument(
         "--data-dir",
@@ -438,7 +500,8 @@ def _run_epoch(model: TensorModel, loader: DatasetLoader, backward: bool) -> flo
     batch_count = 0
 
     for batch in loader:
-        loss_sum += model.update_model(
+        loss_sum += update_model_batch(
+            model,
             batch["features"],
             batch["actions"],
             batch["rewards"],
@@ -466,10 +529,12 @@ def evaluate_model(
     curr_timeout: List[int] = []
 
     for batch in eval_loader:
-        weighted_loss_sum += model.update_model(
-            features = batch["features"], actions = batch["actions"], rewards = batch["rewards"], backward=False
+        weighted_loss_sum += update_model_batch(
+            model, batch["features"], batch["actions"], batch["rewards"], backward=False
         )
-        logits = model.predict_action(batch["features"])
+        logits = predict_logits(
+            model, batch["features"], get_action_space_size(protocol)
+        )
         predicted = np.argmax(logits, axis=1)
         expected = np.rint(batch["labels"]).astype(int)
         total += int(expected.size)
@@ -723,10 +788,16 @@ def main() -> None:
             )
         )
 
-    model_kwargs = {
-        "action_dim": get_action_space_size(protocol_id),
-        "n_features": get_report_feature_dim(protocol_id),
-    }
+    if args.model in CONTEXT_FREE_MODELS:
+        model_kwargs = {
+            "action_dim": get_action_space_size(protocol_id),
+            "protocol": protocol_id,
+        }
+    else:
+        model_kwargs = {
+            "action_dim": get_action_space_size(protocol_id),
+            "n_features": get_report_feature_dim(protocol_id),
+        }
     if args.model in SEEDED_MODELS:
         model_kwargs["seed"] = args.seed
     model = args.model(**model_kwargs)

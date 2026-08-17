@@ -2811,9 +2811,7 @@ class _BlockPolicy:
     the time. ``length`` is block m's length, which doubles as the length of a
     replay phase carrying index m."""
 
-    # Typed as Any so the module imports without xgboost present;
-    # see _load_xgb_regressor.
-    model: Optional[Any]
+    model: Optional[DecisionTreeRegressor]
     epsilon: float
     length: int
 
@@ -2834,10 +2832,10 @@ class CMAB(TensorModel):
         n_features: int,
         epsilon: float = 0.01,
         block_length: int = 8,
-        max_block_length: int = 256,
+        max_block_length: int = 32,
         nu: float = 0.15,
         max_depth: int = 12,
-        min_samples_leaf: int = 1,
+        min_samples_leaf: int = 3,
         n_estimators: int = 100,
         learning_rate: float = 0.1,
         enable_replay: bool = True,
@@ -3219,15 +3217,11 @@ class CMAB(TensorModel):
         self._hard_reset()
 
     def _hard_reset(self):
-        self.model = _load_xgb_regressor()(
-            objective='reg:squarederror',
-            n_estimators=self._n_estimators,
-            learning_rate=self._learning_rate,
+        self.model = DecisionTreeRegressor(
+            criterion='squared_error',
             max_depth=self._max_depth,
-            min_child_weight=self._min_samples_leaf,
+            min_samples_leaf=self._min_samples_leaf,
             random_state=42,
-            n_jobs=1,
-            verbosity=0,
         )
         self.is_fitted = False
         self.memory = {

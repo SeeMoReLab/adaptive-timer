@@ -26,6 +26,7 @@ from models import (
     LinearModel,
     MultiRF,
     NeighborhoodRobustBandit,
+    PBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE,
     PavlovTimeoutModel,
     QuadraticRF,
     SingleRF,
@@ -244,6 +245,16 @@ def _resolve_acceptable(
     return resolved
 
 
+def _default_acceptable(protocol: int) -> Optional[Dict[int, set]]:
+    """Return the protocol-specific default phase scoring policy."""
+    if protocol != agent_pb2.PROTOCOL_PBFT:
+        return None
+    return {
+        phase: set(timeouts)
+        for phase, timeouts in PBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE.items()
+    }
+
+
 def _parse_data(
     reader: csv.DictReader,
     protocol: int,
@@ -385,9 +396,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Phases where more than one timeout counts as correct, e.g. "
-            "'0:*;2:300,800;3:800,1800;4:800,1800;8:*'. Phases not listed are "
-            "scored against the single best timeout, which is the default "
-            "behaviour."
+            "'0:*;2:300,800;3:800,1800;6:*'. When omitted, PBFT uses its "
+            "built-in phase policy and other protocols score phases against "
+            "their single best timeout."
         ),
     )
     parser.add_argument("--verbose", action="store_true")
@@ -779,7 +790,10 @@ def main() -> None:
             "single report, so results above 1 may not transfer."
         )
     scaler = QuadraticRewardScaler.transform if args.reward_scaler == "quadratic" else None
-    acceptable = _resolve_acceptable(args.acceptable_timeouts, protocol_id)
+    acceptable_spec = args.acceptable_timeouts
+    if acceptable_spec is None:
+        acceptable_spec = _default_acceptable(protocol_id)
+    acceptable = _resolve_acceptable(acceptable_spec, protocol_id)
     if acceptable:
         print(
             "Scoring these phases against multiple acceptable timeouts: "

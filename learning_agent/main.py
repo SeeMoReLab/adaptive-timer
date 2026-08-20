@@ -35,6 +35,7 @@ from models import (
     ProtocolReportFeatureExtractor,
     ProtocolTimeoutActionCodec,
     RandomTimeoutModel,
+    ScheduledTimeoutActionCodec,
     ScheduledTimeoutModel,
     TensorModel,
     get_action_space_size,
@@ -1708,7 +1709,9 @@ def serve(
         raise ValueError(f"Unsupported model type: {model_type}")
 
     feature_extractor = ProtocolReportFeatureExtractor(protocol)
-    if model_type != "continuous":
+    if model_type == "scheduled":
+        action_codec = ScheduledTimeoutActionCodec(protocol)
+    elif model_type != "continuous":
         action_codec = ProtocolTimeoutActionCodec(protocol)
     if aggregate_function == "median":
         aggregator: BaseAggregator = MedianAggregator(protocol=protocol)

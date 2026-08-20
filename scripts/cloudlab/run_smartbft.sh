@@ -63,6 +63,45 @@ OVERLAY_HOST_OFFSET=10
 ARTIFACT_FETCH_MAX_PARALLEL=4
 ARTIFACT_FETCH_MAX_ATTEMPTS=3
 ARTIFACT_FETCH_RETRY_DELAY_S=1
+LOCAL_RUN_LOCK_DIRS=("")
+
+cleanup_local_run_locks() {
+  local lock_dir
+  for lock_dir in "${LOCAL_RUN_LOCK_DIRS[@]}"; do
+    [[ -z "${lock_dir}" ]] && continue
+    rmdir "${lock_dir}" 2>/dev/null || true
+  done
+}
+
+acquire_local_run_lock() {
+  local lock_dir="$1"
+  local description="$2"
+  local existing
+  for existing in "${LOCAL_RUN_LOCK_DIRS[@]}"; do
+    [[ -z "${existing}" ]] && continue
+    if [[ "${existing}" == "${lock_dir}" ]]; then
+      return 0
+    fi
+  done
+  if ! mkdir "${lock_dir}" 2>/dev/null; then
+    echo "Cannot start SmartBFT run: ${description} is already in use." >&2
+    echo "Active-run lock: ${lock_dir}" >&2
+    return 1
+  fi
+  LOCAL_RUN_LOCK_DIRS+=("${lock_dir}")
+}
+
+acquire_target_lock() {
+  local user="$1"
+  local host="$2"
+  local lock_root="${LOCAL_TMP_DIR}/active-target-locks"
+  local lock_key
+  mkdir -p "${lock_root}"
+  lock_key="$(printf '%s' "${host}" | cksum | awk '{print $1}')"
+  acquire_local_run_lock "${lock_root}/target_${lock_key}.lock" "target ${user}@${host}"
+}
+
+trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
@@ -515,26 +554,41 @@ if [[ ! -f "${TARGETS_FILE}" ]]; then
   echo "Targets file not found: ${TARGETS_FILE}" >&2
   exit 1
 fi
+while read -r node host user _; do
+  [[ -z "${node:-}" ]] && continue
+  [[ "${node:0:1}" == "#" ]] && continue
+  if [[ -z "${host:-}" || -z "${user:-}" ]]; then
+    continue
+  fi
+  acquire_target_lock "${user}" "${host}"
+done < "${TARGETS_FILE}"
 
-RUN_ID="$(date +%Y%m%d_%H%M%S)_$$"
 if [[ -z "${OUTPUT_DIR}" ]]; then
-  ARTIFACT_DIR="${RUNS_ROOT}/${RUN_ID}"
+  mkdir -p "${RUNS_ROOT}"
+  while true; do
+    RUN_ID="$(date +%Y%m%d_%H%M%S)"
+    ARTIFACT_DIR="${RUNS_ROOT}/${RUN_ID}"
+    if mkdir "${ARTIFACT_DIR}" 2>/dev/null; then
+      break
+    fi
+    if [[ ! -e "${ARTIFACT_DIR}" ]]; then
+      echo "Failed to create run artifact directory: ${ARTIFACT_DIR}" >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
 else
+  RUN_ID="$(date +%Y%m%d_%H%M%S)"
   OUTPUT_DIR="${OUTPUT_DIR/#\~/$HOME}"
   if [[ "${OUTPUT_DIR}" == /* ]]; then
     ARTIFACT_DIR="${OUTPUT_DIR}"
   else
     ARTIFACT_DIR="${INVOCATION_DIR}/${OUTPUT_DIR}"
   fi
+  mkdir -p "${ARTIFACT_DIR}"
 fi
-mkdir -p "${ARTIFACT_DIR}" "${RUNS_ROOT}"
 ARTIFACT_DIR="$(cd "${ARTIFACT_DIR}" && pwd -P)"
-LATEST_LINK="${RUNS_ROOT}/latest"
-if [[ ! -e "${LATEST_LINK}" || -L "${LATEST_LINK}" ]]; then
-  ln -sfn "${ARTIFACT_DIR}" "${LATEST_LINK}"
-else
-  echo "Not updating ${LATEST_LINK}: path exists and is not a symlink." >&2
-fi
+acquire_local_run_lock "${ARTIFACT_DIR}/.active-run.lock" "artifact directory ${ARTIFACT_DIR}"
 
 LOCAL_TAR="${ARTIFACT_DIR}/smartbft_payload.tar.gz"
 OUTPUT_LOCAL="${ARTIFACT_DIR}/smartbft_output.txt"
@@ -575,7 +629,6 @@ fi
 } > "${ARTIFACT_DIR}/run.env"
 
 echo "Run artifacts: ${ARTIFACT_DIR}"
-echo "Latest SmartBFT run: ${LATEST_LINK}"
 
 targets_nodes=()
 targets_hosts=()
@@ -1087,6 +1140,13 @@ agent_port="$7"
 sharing_enabled="$8"
 sharing_collect_wait_ms="$9"
 run_root="$HOME/smartbft_cloudlab"
+learning_agent_python="${HOME}/.venvs/adaptive-timer-learning-agent/bin/python"
+
+if [[ ! -x "${learning_agent_python}" ]]; then
+  echo "Learning-agent virtual environment not found on $(hostname): ${learning_agent_python}" >&2
+  echo "Run scripts/cloudlab/setup.sh for this target file first." >&2
+  exit 1
+fi
 
 agent_model_args=""
 if [[ "${mode}" == "learning" || "${mode}" == "sharing" ]]; then
@@ -1113,7 +1173,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   fi
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   tmux new-session -d -s "${session_name}" \
-    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec python3 learning_agent/main.py --node-id ${replica_id} --protocol pbft ${bind_args} --signing false ${agent_model_args} ${dataset_args} --failure-spec \"${run_root}/config/pbft/failure_spec.xml\" --injection-start-unix-ms ${start_unix_ms}' > \"${agent_log}\" 2>&1"
+    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec \"${learning_agent_python}\" learning_agent/main.py --node-id ${replica_id} --protocol pbft ${bind_args} --signing false ${agent_model_args} ${dataset_args} --failure-spec \"${run_root}/config/pbft/failure_spec.xml\" --injection-start-unix-ms ${start_unix_ms}' > \"${agent_log}\" 2>&1"
 
   if [[ "${sharing_enabled}" == "1" ]]; then
     sharing_session="smartbft_sharing_${replica_id}"

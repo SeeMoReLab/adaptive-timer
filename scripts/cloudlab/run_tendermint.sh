@@ -28,6 +28,45 @@ LOCAL_TMP_DIR="${REPO_ROOT}/scripts/cloudlab/tmp"
 RUNS_ROOT="${LOCAL_TMP_DIR}/runs/tendermint"
 OUTPUT_DIR=""
 APPLIER_LOCAL_PATH="${REPO_ROOT}/scripts/apply_network_failures.py"
+LOCAL_RUN_LOCK_DIRS=("")
+
+cleanup_local_run_locks() {
+  local lock_dir
+  for lock_dir in "${LOCAL_RUN_LOCK_DIRS[@]}"; do
+    [[ -z "${lock_dir}" ]] && continue
+    rmdir "${lock_dir}" 2>/dev/null || true
+  done
+}
+
+acquire_local_run_lock() {
+  local lock_dir="$1"
+  local description="$2"
+  local existing
+  for existing in "${LOCAL_RUN_LOCK_DIRS[@]}"; do
+    [[ -z "${existing}" ]] && continue
+    if [[ "${existing}" == "${lock_dir}" ]]; then
+      return 0
+    fi
+  done
+  if ! mkdir "${lock_dir}" 2>/dev/null; then
+    echo "Cannot start Tendermint run: ${description} is already in use." >&2
+    echo "Active-run lock: ${lock_dir}" >&2
+    return 1
+  fi
+  LOCAL_RUN_LOCK_DIRS+=("${lock_dir}")
+}
+
+acquire_target_lock() {
+  local user="$1"
+  local host="$2"
+  local lock_root="${LOCAL_TMP_DIR}/active-target-locks"
+  local lock_key
+  mkdir -p "${lock_root}"
+  lock_key="$(printf '%s' "${host}" | cksum | awk '{print $1}')"
+  acquire_local_run_lock "${lock_root}/target_${lock_key}.lock" "target ${user}@${host}"
+}
+
+trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
@@ -308,26 +347,34 @@ if [[ -z "${remote_host}" || -z "${remote_user}" ]]; then
   remote_host="${targets_hosts[0]}"
   remote_user="${targets_users[0]}"
 fi
+acquire_target_lock "${remote_user}" "${remote_host}"
 
-RUN_ID="$(date +%Y%m%d_%H%M%S)_$$"
 if [[ -z "${OUTPUT_DIR}" ]]; then
-  ARTIFACT_DIR="${RUNS_ROOT}/${RUN_ID}"
+  mkdir -p "${RUNS_ROOT}"
+  while true; do
+    RUN_ID="$(date +%Y%m%d_%H%M%S)"
+    ARTIFACT_DIR="${RUNS_ROOT}/${RUN_ID}"
+    if mkdir "${ARTIFACT_DIR}" 2>/dev/null; then
+      break
+    fi
+    if [[ ! -e "${ARTIFACT_DIR}" ]]; then
+      echo "Failed to create run artifact directory: ${ARTIFACT_DIR}" >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
 else
+  RUN_ID="$(date +%Y%m%d_%H%M%S)"
   OUTPUT_DIR="${OUTPUT_DIR/#\~/$HOME}"
   if [[ "${OUTPUT_DIR}" == /* ]]; then
     ARTIFACT_DIR="${OUTPUT_DIR}"
   else
     ARTIFACT_DIR="${INVOCATION_DIR}/${OUTPUT_DIR}"
   fi
+  mkdir -p "${ARTIFACT_DIR}"
 fi
-mkdir -p "${ARTIFACT_DIR}" "${RUNS_ROOT}"
 ARTIFACT_DIR="$(cd "${ARTIFACT_DIR}" && pwd -P)"
-LATEST_LINK="${RUNS_ROOT}/latest"
-if [[ ! -e "${LATEST_LINK}" || -L "${LATEST_LINK}" ]]; then
-  ln -sfn "${ARTIFACT_DIR}" "${LATEST_LINK}"
-else
-  echo "Not updating ${LATEST_LINK}: path exists and is not a symlink." >&2
-fi
+acquire_local_run_lock "${ARTIFACT_DIR}/.active-run.lock" "artifact directory ${ARTIFACT_DIR}"
 
 OUTPUT_LOCAL="${ARTIFACT_DIR}/tendermint_output.txt"
 LOGS_LOCAL_DIR="${ARTIFACT_DIR}/logs"
@@ -363,7 +410,6 @@ fi
 } > "${ARTIFACT_DIR}/run.env"
 
 echo "Run artifacts: ${ARTIFACT_DIR}"
-echo "Latest Tendermint run: ${LATEST_LINK}"
 
 SHARING_PAYLOAD_PATHS=""
 if [[ "${MODE}" == "sharing" ]]; then
@@ -503,6 +549,7 @@ overlay_bridge_ip="${overlay_a}.${overlay_b}.${overlay_subnet}.1"
 max_overlay_nodes=$((255 - overlay_host_offset))
 run_as_user="$(id -un)"
 run_as_home="${HOME}"
+learning_agent_python="${run_as_home}/.venvs/adaptive-timer-learning-agent/bin/python"
 
 # Ensure caller can always try to fetch a run log, even on early failures.
 : > "${output_file}"
@@ -865,8 +912,13 @@ if (( learning_agent_enabled == 1 )); then
     echo "Missing Tendermint schedule file: ${schedule_file}" >&2
     exit 1
   fi
-  if ! python3 -c "import grpc, torch, sklearn, cryptography" >/dev/null 2>&1; then
-    echo "Learning-agent mode requires grpc/torch/sklearn/cryptography in python3." >&2
+  if [[ ! -x "${learning_agent_python}" ]]; then
+    echo "Learning-agent virtual environment not found: ${learning_agent_python}" >&2
+    echo "Run scripts/cloudlab/setup.sh first." >&2
+    exit 1
+  fi
+  if ! "${learning_agent_python}" -c "import cryptography, grpc, sklearn" >/dev/null 2>&1; then
+    echo "Learning-agent dependencies are unavailable in ${learning_agent_python}." >&2
     echo "Run scripts/cloudlab/setup.sh first." >&2
     exit 1
   fi
@@ -975,7 +1027,7 @@ if (( learning_agent_enabled == 1 )); then
       dataset_args="--dataset-csv \"${run_root}/agent${i}.csv\""
     fi
     tmux new-session -d -s "${agent_session}" \
-      "sudo -n ip netns exec ${ns} sudo -n -u ${run_as_user} env HOME=${run_as_home} PATH=${run_as_home}/go/bin:${PATH} PYTHONDONTWRITEBYTECODE=1 bash -lc 'cd \"${run_root}\" && exec python3 \"${learning_agent_dir}/main.py\" --node-id \"${i}\" --protocol tendermint --hosts-config \"${agent_hosts_config}\" --failure-spec \"${failure_spec}\" --injection-start-unix-ms \"${start_unix_ms}\" ${agent_mode_args} ${dataset_args}' > \"${agent_log}\" 2>&1"
+      "sudo -n ip netns exec ${ns} sudo -n -u ${run_as_user} env HOME=${run_as_home} PATH=${run_as_home}/go/bin:${PATH} PYTHONDONTWRITEBYTECODE=1 bash -lc 'cd \"${run_root}\" && exec \"${learning_agent_python}\" \"${learning_agent_dir}/main.py\" --node-id \"${i}\" --protocol tendermint --hosts-config \"${agent_hosts_config}\" --failure-spec \"${failure_spec}\" --injection-start-unix-ms \"${start_unix_ms}\" ${agent_mode_args} ${dataset_args}' > \"${agent_log}\" 2>&1"
   done
   sleep 1
   for ((i = 0; i < num_nodes; i++)); do

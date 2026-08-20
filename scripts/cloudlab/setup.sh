@@ -116,6 +116,7 @@ if command -v apt-get >/dev/null 2>&1; then
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
     openjdk-17-jre-headless \
     python3-pip \
+    python3-venv \
     tmux \
     golang-go \
     build-essential \
@@ -232,22 +233,28 @@ pids=()
 nodes=()
 while read -r node host user; do
   (
-    remote_req_path="/tmp/learning_agent_requirements.txt"
+    remote_req_path="/tmp/learning_agent_requirements_$$_${node}.txt"
     ssh "${SSH_OPTS[@]}" "${user}@${host}" \
       "cat > \"${remote_req_path}\"" < "${LEARNING_AGENT_REQUIREMENTS}"
     ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- "${remote_req_path}" <<'REMOTE'
 set -euo pipefail
 
 requirements_path="$1"
+venv_dir="${HOME}/.venvs/adaptive-timer-learning-agent"
 if ! command -v python3 >/dev/null 2>&1; then
   echo "python3 not found on $(hostname)" >&2
   exit 1
 fi
-if ! python3 -m pip --version >/dev/null 2>&1; then
-  echo "python3 -m pip not found on $(hostname)" >&2
+if ! python3 -m venv --help >/dev/null 2>&1; then
+  echo "python3 venv support not found on $(hostname)" >&2
   exit 1
 fi
-PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --user -r "${requirements_path}"
+if [[ ! -x "${venv_dir}/bin/python" ]]; then
+  mkdir -p "$(dirname "${venv_dir}")"
+  python3 -m venv "${venv_dir}"
+fi
+PIP_DISABLE_PIP_VERSION_CHECK=1 "${venv_dir}/bin/python" -m pip install -r "${requirements_path}"
+"${venv_dir}/bin/python" -c "import cryptography, grpc, matplotlib, numpy, pandas, scipy, sklearn, tqdm, xgboost"
 rm -f "${requirements_path}"
 REMOTE
   ) &
@@ -258,9 +265,9 @@ done < "${tmp_all_nodes}"
 pip_failed=0
 for i in "${!pids[@]}"; do
   if wait "${pids[$i]}"; then
-    echo "  - ${nodes[$i]}: pip requirements installed"
+    echo "  - ${nodes[$i]}: learning-agent virtual environment ready"
   else
-    echo "  - ${nodes[$i]}: pip requirements install failed" >&2
+    echo "  - ${nodes[$i]}: learning-agent virtual environment setup failed" >&2
     pip_failed=1
   fi
 done

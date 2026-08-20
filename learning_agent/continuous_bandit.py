@@ -21,9 +21,11 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
 
     def __init__(self, protocol: int):
         self._protocol = int(protocol)
-        timeout_values = get_timeout_values_ms(self._protocol)
-        lower_ms = min(timeout_values)
-        upper_ms = max(timeout_values)
+        # timeout_values = get_timeout_values_ms(self._protocol)
+        # lower_ms = min(timeout_values)
+        # upper_ms = max(timeout_values)
+        lower_ms = 100
+        upper_ms = 10000
         if lower_ms <= 0 or upper_ms <= lower_ms:
             raise ValueError(
                 f"Invalid continuous timeout bounds: {lower_ms}..{upper_ms}ms"

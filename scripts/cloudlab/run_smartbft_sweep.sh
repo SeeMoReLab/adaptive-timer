@@ -9,8 +9,7 @@ FAILURE_SPEC="${REPO_ROOT}/config/pbft/failure_spec.xml"
 SCHEDULE="${REPO_ROOT}/learning_agent/config/schedule_pbft.csv"
 TMP_ROOT="${SCRIPT_DIR}/tmp"
 
-# Keep in sync with PBFT_TIMEOUT_OPTIONS in learning_agent/models.py.
-VALID_TIMEOUTS_MS=(300 800 1800)
+MAX_TIMEOUT_MS=4294967295
 
 duration_s=""
 timeouts_spec=""
@@ -32,7 +31,8 @@ Arguments:
 Flags:
   -d <seconds>      Experiment duration for each run.
   -t <timeouts>     Semicolon-separated PBFT election timeout values in ms,
-                    e.g. '300;800;1800'. Valid values: ${VALID_TIMEOUTS_MS[*]}.
+                    e.g. '300;437;1800'. Each value must be between 1 and
+                    ${MAX_TIMEOUT_MS}.
   --learning-window-mode <consensus|wall-clock>
                     Episode boundary mode forwarded to run_smartbft.sh.
                     Omitted by default, so run_smartbft.sh picks its own.
@@ -132,15 +132,12 @@ fi
 IFS=';' read -r -a timeouts <<< "${timeouts_spec}"
 
 for timeout_ms in "${timeouts[@]}"; do
-  timeout_valid=0
-  for valid_ms in "${VALID_TIMEOUTS_MS[@]}"; do
-    if [[ "${timeout_ms}" == "${valid_ms}" ]]; then
-      timeout_valid=1
-      break
-    fi
-  done
-  if (( timeout_valid == 0 )); then
-    echo "Unsupported PBFT timeout: ${timeout_ms}ms. Valid options: ${VALID_TIMEOUTS_MS[*]}" >&2
+  if (( ${#timeout_ms} > ${#MAX_TIMEOUT_MS} )); then
+    echo "PBFT timeout is too large: ${timeout_ms}ms. Maximum: ${MAX_TIMEOUT_MS}ms." >&2
+    exit 2
+  fi
+  if (( 10#${timeout_ms} > MAX_TIMEOUT_MS )); then
+    echo "PBFT timeout is too large: ${timeout_ms}ms. Maximum: ${MAX_TIMEOUT_MS}ms." >&2
     exit 2
   fi
 done

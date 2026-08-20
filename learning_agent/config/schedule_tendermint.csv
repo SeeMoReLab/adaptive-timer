@@ -1,4 +1,5 @@
 # time_s,propose_timeout_ms
+# propose_timeout_ms may be any integer from 1 through 4294967295
 # prevote_timeout_ms and precommit_timeout_ms are derived as propose_timeout_ms / 3
 -10,150
 0,150

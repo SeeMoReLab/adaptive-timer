@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+NETWORK_DELAY_JITTER_RATIO = 0.20
+
 
 @dataclass(frozen=True)
 class BurstDelay:
@@ -517,7 +519,7 @@ def _netem_qdisc_cmd(
     verb: str,
     netem_limit: int,
 ) -> List[str]:
-    return [
+    command = [
         tc_bin,
         "qdisc",
         verb,
@@ -533,6 +535,10 @@ def _netem_qdisc_cmd(
         "delay",
         f"{delay_ms:g}ms",
     ]
+    if delay_ms > 0:
+        jitter_ms = delay_ms * NETWORK_DELAY_JITTER_RATIO
+        command.append(f"{jitter_ms:g}ms")
+    return command
 
 
 def _set_rule_delay(

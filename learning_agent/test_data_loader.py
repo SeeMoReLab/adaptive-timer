@@ -11,20 +11,22 @@ from reward_utils import (
 
 
 class RewardExtractionTest(unittest.TestCase):
-    def test_derives_quadratic_reward_from_reward_report_throughput(self) -> None:
+    def test_gives_full_credit_to_throughput_below_the_knee(self) -> None:
         row = {
             "reward_throughput_tps": "500",
             "reward": "999999",
         }
 
-        self.assertEqual(reward_from_report_row(row, row_number=2), 250.0)
+        self.assertEqual(reward_from_report_row(row, row_number=2), 0.5)
 
-    def test_keeps_throughput_linear_at_and_above_threshold(self) -> None:
+    def test_discounts_throughput_above_the_knee(self) -> None:
+        # 500 tps past the 1000 tps knee is worth 0.25 * 500 / 1000 = 0.125,
+        # a quarter of what the same 500 tps is worth below the knee.
         self.assertEqual(
             reward_from_report_row(
                 {"reward_throughput_tps": "1500"}, row_number=2
             ),
-            1500.0,
+            1.125,
         )
 
     def test_requires_reward_report_throughput(self) -> None:
@@ -72,8 +74,8 @@ class RewardExtractionTest(unittest.TestCase):
             precommit_latency_ms=5.0,
         )
 
-        self.assertEqual(pbft_reward, 250.0)
-        self.assertEqual(sbft_reward, 250.0)
+        self.assertEqual(pbft_reward, 0.5)
+        self.assertEqual(sbft_reward, 0.5)
         self.assertAlmostEqual(tendermint_reward, 0.4944)
 
     def test_tendermint_csv_reward_uses_complete_reward_report(self) -> None:

@@ -10,7 +10,9 @@ from continuous_bandit import (
     ContinuousTimeoutActionCodec,
 )
 from models import (
+    PBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE,
     ProtocolTimeoutActionCodec,
+    ScheduledTimeoutActionCodec,
     ScheduledTimeoutModel,
     get_action_space_size,
     get_timeout_values_ms,
@@ -18,6 +20,26 @@ from models import (
 
 
 class DiscreteTimeoutActionCodecTest(unittest.TestCase):
+    def test_pbft_uses_updated_discrete_arms(self) -> None:
+        self.assertEqual(
+            get_timeout_values_ms(agent_pb2.PROTOCOL_PBFT),
+            (300, 800, 1800),
+        )
+
+    def test_pbft_phase_accuracy_policy(self) -> None:
+        self.assertEqual(
+            PBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE,
+            {
+                0: frozenset({300, 800, 1800}),
+                1: frozenset({300}),
+                2: frozenset({300, 800}),
+                3: frozenset({800, 1800}),
+                4: frozenset({800}),
+                5: frozenset({1800}),
+                6: frozenset({300, 800, 1800}),
+            },
+        )
+
     def test_existing_pbft_arm_encoding_is_unchanged(self) -> None:
         codec = ProtocolTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT)
         timeout = agent_pb2.PbftTimeout(election_timeout_milliseconds=800)
@@ -58,6 +80,53 @@ class DiscreteTimeoutActionCodecTest(unittest.TestCase):
             )
 
 
+class ScheduledTimeoutActionCodecTest(unittest.TestCase):
+    def test_pbft_accepts_non_discrete_timeout(self) -> None:
+        codec = ScheduledTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT)
+
+        decoded = codec.decode(np.asarray(437.0))
+        encoded = codec.encode(decoded)
+
+        self.assertEqual(decoded.pbft.election_timeout_milliseconds, 437)
+        self.assertEqual(encoded.tolist(), [437.0])
+
+    def test_tendermint_derives_phase_timeouts(self) -> None:
+        codec = ScheduledTimeoutActionCodec(agent_pb2.PROTOCOL_TENDERMINT)
+
+        decoded = codec.decode(np.asarray(437.0))
+        encoded = codec.encode(decoded)
+
+        self.assertEqual(decoded.tendermint.propose_timeout_milliseconds, 437)
+        self.assertEqual(decoded.tendermint.prevote_timeout_milliseconds, 146)
+        self.assertEqual(decoded.tendermint.precommit_timeout_milliseconds, 146)
+        self.assertEqual(encoded.tolist(), [437.0])
+
+    def test_sbft_accepts_three_non_discrete_timeouts(self) -> None:
+        codec = ScheduledTimeoutActionCodec(agent_pb2.PROTOCOL_SBFT)
+
+        decoded = codec.decode(np.asarray([437.0, 521.0, 89.0]))
+        encoded = codec.encode(decoded)
+
+        self.assertEqual(decoded.sbft.election_timeout_milliseconds, 437)
+        self.assertEqual(decoded.sbft.slow_path_timeout_milliseconds, 521)
+        self.assertEqual(decoded.sbft.batch_timeout_milliseconds, 89)
+        self.assertEqual(encoded.tolist(), [437.0, 521.0, 89.0])
+
+    def test_rejects_values_outside_uint32_range(self) -> None:
+        codec = ScheduledTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT)
+
+        for invalid_value in (0, -1, 4294967296):
+            with self.subTest(invalid_value=invalid_value):
+                with self.assertRaises(ValueError):
+                    codec.decode(np.asarray(float(invalid_value)))
+
+    def test_rejects_fractional_milliseconds(self) -> None:
+        codec = ScheduledTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT)
+
+        with self.assertRaises(ValueError):
+            codec.decode(np.asarray(437.5))
+
+
 class TendermintTimeoutOptionsTest(unittest.TestCase):
     def test_tendermint_has_three_proposal_driven_arms(self) -> None:
         self.assertEqual(
@@ -74,8 +143,8 @@ class TendermintTimeoutOptionsTest(unittest.TestCase):
             path = Path(tmp) / "schedule.csv"
             path.write_text(
                 "# time_s,propose_timeout_ms\n"
-                "0,150\n"
-                "10,600\n",
+                "0,437\n"
+                "10,821\n",
                 encoding="utf-8",
             )
 
@@ -84,7 +153,22 @@ class TendermintTimeoutOptionsTest(unittest.TestCase):
                 path,
             )
 
-        self.assertEqual(model._schedule, [(0.0, 0), (10.0, 2)])
+        self.assertEqual(model._schedule, [(0.0, (437,)), (10.0, (821,))])
+        timeout = ScheduledTimeoutActionCodec(
+            agent_pb2.PROTOCOL_TENDERMINT
+        ).decode(model.predict_action(np.asarray([])))
+        self.assertEqual(timeout.tendermint.propose_timeout_milliseconds, 437)
+
+    def test_schedule_reports_invalid_timeout_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "schedule.csv"
+            path.write_text("0,0\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "line 1"):
+                ScheduledTimeoutModel.from_csv(
+                    agent_pb2.PROTOCOL_TENDERMINT,
+                    path,
+                )
 
 
 class ContinuousTimeoutActionCodecTest(unittest.TestCase):

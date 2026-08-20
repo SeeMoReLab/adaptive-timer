@@ -6,13 +6,25 @@ import agent_pb2
 
 REWARD_THROUGHPUT_FIELD = "reward_throughput_tps"
 
+# Throughput reward is concave: every transaction per second up to the knee is
+# worth full credit, and everything above it is discounted. The agent should
+# therefore treat losing 200 tps at 600 tps as a much bigger deal than losing
+# 200 tps at 3000 tps, which is what we want when the timeout choice is really
+# about staying out of the degraded regime rather than about peak speed.
+REWARD_THROUGHPUT_KNEE_TPS = 1000.0
+
+# Marginal value of throughput above the knee, relative to below it. 0.25 means
+# 1000 extra tps past the knee is worth as much as 250 tps below it.
+REWARD_THROUGHPUT_ABOVE_KNEE_WEIGHT = 0.25
+
 
 def reward_from_throughput(throughput_tps: float) -> float:
     """Apply the reward shaping used by the online learning agent."""
     value = float(max(0.0, throughput_tps))
-    if value < 1000.0:
-        return (value / 1000.0) ** 2 * 1000.0
-    return value
+    if value <= REWARD_THROUGHPUT_KNEE_TPS:
+        return value / REWARD_THROUGHPUT_KNEE_TPS
+    excess = (value - REWARD_THROUGHPUT_KNEE_TPS) / REWARD_THROUGHPUT_KNEE_TPS
+    return 1.0 + REWARD_THROUGHPUT_ABOVE_KNEE_WEIGHT * excess
 
 
 def calculate_pbft_reward(

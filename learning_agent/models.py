@@ -60,6 +60,15 @@ PBFT_TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
 PBFT_TIMEOUT_INDEX_TO_MS: Dict[int, int] = {
     idx: value_ms for idx, value_ms in enumerate(PBFT_TIMEOUT_VALUES_MS)
 }
+PBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE = {
+    0: frozenset(PBFT_TIMEOUT_VALUES_MS),
+    1: frozenset({300}),
+    2: frozenset({300, 800}),
+    3: frozenset({800, 1800}),
+    4: frozenset({800}),
+    5: frozenset({1800}),
+    6: frozenset(PBFT_TIMEOUT_VALUES_MS),
+}
 
 
 class TimeoutOption(IntEnum):
@@ -500,6 +509,157 @@ class ProtocolTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
         option_index = timeout_to_action_index(self._protocol, action)
         return np.asarray(float(option_index), dtype=float)
 
+
+UINT32_MAX = (1 << 32) - 1
+
+
+def _validate_scheduled_timeout_ms(value: object, field_name: str) -> int:
+    if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
+        timeout_ms = int(value)
+    elif isinstance(value, (float, np.floating)) and np.isfinite(value):
+        numeric_value = float(value)
+        if not numeric_value.is_integer():
+            raise ValueError(
+                f"{field_name} must be an integer number of milliseconds, got {value}"
+            )
+        timeout_ms = int(numeric_value)
+    else:
+        raise ValueError(
+            f"{field_name} must be an integer number of milliseconds, got {value!r}"
+        )
+
+    if timeout_ms < 1 or timeout_ms > UINT32_MAX:
+        raise ValueError(
+            f"{field_name} must be between 1 and {UINT32_MAX} milliseconds, "
+            f"got {timeout_ms}"
+        )
+    return timeout_ms
+
+
+class ScheduledTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
+    """Converts raw scheduled millisecond values to protocol timeout actions."""
+
+    def __init__(self, protocol: int):
+        self._protocol = _validate_protocol(protocol)
+
+    @property
+    def action_dim(self) -> int:
+        if self._protocol == agent_pb2.PROTOCOL_SBFT:
+            return 3
+        return 1
+
+    def decode(self, action: np.ndarray) -> agent_pb2.Timeout:
+        try:
+            values = np.asarray(action, dtype=float).reshape(-1)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"Scheduled timeout action must contain numeric values, got {action!r}"
+            ) from exc
+        if values.size != self.action_dim:
+            raise ValueError(
+                f"Expected {self.action_dim} scheduled timeout value(s), "
+                f"got {values.size}"
+            )
+
+        if self._protocol == agent_pb2.PROTOCOL_PBFT:
+            election_timeout_ms = _validate_scheduled_timeout_ms(
+                values[0], "PBFT election timeout"
+            )
+            return agent_pb2.Timeout(
+                pbft=agent_pb2.PbftTimeout(
+                    election_timeout_milliseconds=election_timeout_ms
+                )
+            )
+
+        if self._protocol == agent_pb2.PROTOCOL_SBFT:
+            election_timeout_ms = _validate_scheduled_timeout_ms(
+                values[0], "SBFT election timeout"
+            )
+            slow_path_timeout_ms = _validate_scheduled_timeout_ms(
+                values[1], "SBFT slow-path timeout"
+            )
+            batch_timeout_ms = _validate_scheduled_timeout_ms(
+                values[2], "SBFT batch timeout"
+            )
+            return agent_pb2.Timeout(
+                sbft=agent_pb2.SbftTimeout(
+                    election_timeout_milliseconds=election_timeout_ms,
+                    slow_path_timeout_milliseconds=slow_path_timeout_ms,
+                    batch_timeout_milliseconds=batch_timeout_ms,
+                )
+            )
+
+        propose_timeout_ms = _validate_scheduled_timeout_ms(
+            values[0], "Tendermint propose timeout"
+        )
+        propose_timeout_ms, prevote_timeout_ms, precommit_timeout_ms = (
+            tendermint_timeouts_from_propose(propose_timeout_ms)
+        )
+        return agent_pb2.Timeout(
+            tendermint=agent_pb2.TendermintTimeout(
+                propose_timeout_milliseconds=propose_timeout_ms,
+                prevote_timeout_milliseconds=prevote_timeout_ms,
+                precommit_timeout_milliseconds=precommit_timeout_ms,
+            )
+        )
+
+    def encode(self, action: object) -> np.ndarray:
+        if isinstance(action, agent_pb2.Timeout):
+            expected_field = {
+                agent_pb2.PROTOCOL_PBFT: "pbft",
+                agent_pb2.PROTOCOL_SBFT: "sbft",
+                agent_pb2.PROTOCOL_TENDERMINT: "tendermint",
+            }[self._protocol]
+            actual_field = action.WhichOneof("value")
+            if actual_field != expected_field:
+                raise ValueError(
+                    f"Expected {expected_field} timeout, got {actual_field or 'none'}"
+                )
+            action = getattr(action, expected_field)
+
+        if self._protocol == agent_pb2.PROTOCOL_PBFT:
+            timeout_values = [
+                _validate_scheduled_timeout_ms(
+                    getattr(action, "election_timeout_milliseconds"),
+                    "PBFT election timeout",
+                )
+            ]
+        elif self._protocol == agent_pb2.PROTOCOL_SBFT:
+            timeout_values = [
+                _validate_scheduled_timeout_ms(
+                    getattr(action, "election_timeout_milliseconds"),
+                    "SBFT election timeout",
+                ),
+                _validate_scheduled_timeout_ms(
+                    getattr(action, "slow_path_timeout_milliseconds"),
+                    "SBFT slow-path timeout",
+                ),
+                _validate_scheduled_timeout_ms(
+                    getattr(action, "batch_timeout_milliseconds"),
+                    "SBFT batch timeout",
+                ),
+            ]
+        else:
+            propose_timeout_ms = _validate_scheduled_timeout_ms(
+                getattr(action, "propose_timeout_milliseconds"),
+                "Tendermint propose timeout",
+            )
+            expected = tendermint_timeouts_from_propose(propose_timeout_ms)
+            actual = (
+                propose_timeout_ms,
+                int(getattr(action, "prevote_timeout_milliseconds")),
+                int(getattr(action, "precommit_timeout_milliseconds")),
+            )
+            if actual != expected:
+                raise ValueError(
+                    "Tendermint prevote and precommit timeouts must be "
+                    f"one-third of propose timeout: expected {expected}, got {actual}"
+                )
+            timeout_values = [propose_timeout_ms]
+
+        return np.asarray(timeout_values, dtype=float)
+
+
 class QuadraticRewardScaler(RewardTransformer):
     """Quadratic shaping below 1000, linear above. Prior work"""
 
@@ -699,22 +859,27 @@ class RandomTimeoutModel(TensorModel):
         pass
 
 class ScheduledTimeoutModel(TensorModel):
-    """Returns protocol-specific timeout option indices from a time-based schedule."""
+    """Returns raw protocol timeout values from a time-based schedule."""
 
     def __init__(
         self,
         protocol: int,
-        schedule: List[Tuple[float, int]],
+        schedule: List[Tuple[float, object]],
         start_monotonic: Optional[float] = None,
     ):
         self._protocol = _validate_protocol(protocol)
+        self._action_codec = ScheduledTimeoutActionCodec(self._protocol)
         if not schedule:
             raise ValueError("Schedule must contain at least one entry.")
-        self._schedule = sorted(
-            [(float(time_s), int(option_index)) for time_s, option_index in schedule],
-            key=lambda entry: entry[0],
-        )
-        self._effective_schedule: List[Tuple[float, int]] = []
+        normalized_schedule: List[Tuple[float, Tuple[int, ...]]] = []
+        for time_s, raw_action in schedule:
+            timeout = self._action_codec.decode(raw_action)
+            normalized_action = tuple(
+                int(value) for value in self._action_codec.encode(timeout).reshape(-1)
+            )
+            normalized_schedule.append((float(time_s), normalized_action))
+        self._schedule = sorted(normalized_schedule, key=lambda entry: entry[0])
+        self._effective_schedule: List[Tuple[float, Tuple[int, ...]]] = []
         self._schedule_time_shift_s = 0.0
         self._rebuild_effective_schedule()
         self._start_time = (
@@ -730,7 +895,8 @@ class ScheduledTimeoutModel(TensorModel):
         start_monotonic: Optional[float] = None,
     ) -> "ScheduledTimeoutModel":
         protocol = _validate_protocol(protocol)
-        schedule: List[Tuple[float, int]] = []
+        action_codec = ScheduledTimeoutActionCodec(protocol)
+        schedule: List[Tuple[float, object]] = []
         with path.open("r", newline="") as handle:
             reader = csv.reader(handle)
             for lineno, row in enumerate(reader, start=1):
@@ -751,8 +917,12 @@ class ScheduledTimeoutModel(TensorModel):
                         raise ValueError(
                             f"Invalid PBFT schedule at line {lineno}: expected 2 columns time_s,election_timeout_ms."
                         )
-                    timeout_ms = int(row[1].strip())
-                    option_index = pbft_timeout_ms_to_index(timeout_ms)
+                    try:
+                        raw_action: object = int(row[1].strip())
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Invalid PBFT timeout at line {lineno}: {row[1]!r}"
+                        ) from exc
                 elif protocol == agent_pb2.PROTOCOL_SBFT:
                     if len(row) < 4:
                         raise ValueError(
@@ -760,14 +930,16 @@ class ScheduledTimeoutModel(TensorModel):
                             f"{lineno}: expected 4 columns "
                             "time_s,election_timeout_ms,slow_path_timeout_ms,batch_timeout_ms."
                         )
-                    election_timeout_ms = int(row[1].strip())
-                    slow_path_timeout_ms = int(row[2].strip())
-                    batch_timeout_ms = int(row[3].strip())
-                    option_index = _sbft_triple_to_index(
-                        election_timeout_ms,
-                        slow_path_timeout_ms,
-                        batch_timeout_ms,
-                    )
+                    try:
+                        raw_action = (
+                            int(row[1].strip()),
+                            int(row[2].strip()),
+                            int(row[3].strip()),
+                        )
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Invalid SBFT timeout at line {lineno}: {row[1:4]}"
+                        ) from exc
                 else:
                     if len(row) < 2:
                         raise ValueError(
@@ -775,11 +947,20 @@ class ScheduledTimeoutModel(TensorModel):
                             f"{lineno}: expected 2 columns "
                             "time_s,propose_timeout_ms."
                         )
-                    propose_timeout_ms = int(row[1].strip())
-                    option_index = tendermint_propose_timeout_ms_to_index(
-                        propose_timeout_ms
-                    )
-                schedule.append((time_s, option_index))
+                    try:
+                        raw_action = int(row[1].strip())
+                    except ValueError as exc:
+                        raise ValueError(
+                            "Invalid Tendermint propose timeout at line "
+                            f"{lineno}: {row[1]!r}"
+                        ) from exc
+                try:
+                    action_codec.decode(raw_action)
+                except (ValueError, OverflowError) as exc:
+                    raise ValueError(
+                        f"Invalid schedule timeout at line {lineno}: {exc}"
+                    ) from exc
+                schedule.append((time_s, raw_action))
         if not schedule:
             raise ValueError(f"No schedule entries found in {path}.")
         return cls(protocol, schedule, start_monotonic=start_monotonic)
@@ -790,37 +971,58 @@ class ScheduledTimeoutModel(TensorModel):
         first_switch_time_s = float(self._schedule[0][0])
         self._schedule_time_shift_s = -min(0.0, first_switch_time_s)
         self._effective_schedule = [
-            (switch_time_s + self._schedule_time_shift_s, option_index)
-            for switch_time_s, option_index in self._schedule
+            (switch_time_s + self._schedule_time_shift_s, raw_action)
+            for switch_time_s, raw_action in self._schedule
         ]
 
     def set_start_monotonic(self, start_monotonic: float) -> None:
         self._start_time = float(start_monotonic)
         self._active_row = -1
 
-    def _current_option_index(self) -> int:
+    def _current_action(self) -> np.ndarray:
         elapsed_s = time.monotonic() - self._start_time
         active_row = 0
-        option_index = self._effective_schedule[0][1]
-        for row_idx, (switch_time_s, schedule_option_index) in enumerate(
+        raw_action = self._effective_schedule[0][1]
+        for row_idx, (switch_time_s, schedule_action) in enumerate(
             self._effective_schedule
         ):
             if elapsed_s >= switch_time_s:
                 active_row = row_idx
-                option_index = schedule_option_index
+                raw_action = schedule_action
             else:
                 break
         if active_row != self._active_row:
-            switch_time_s, active_option_index = self._effective_schedule[active_row]
+            switch_time_s, active_action = self._effective_schedule[active_row]
             source_switch_time_s, _ = self._schedule[active_row]
+            timeout = self._action_codec.decode(active_action)
+            if self._protocol == agent_pb2.PROTOCOL_PBFT:
+                description = (
+                    "election_timeout_ms="
+                    f"{timeout.pbft.election_timeout_milliseconds}"
+                )
+            elif self._protocol == agent_pb2.PROTOCOL_SBFT:
+                description = (
+                    f"election_timeout_ms={timeout.sbft.election_timeout_milliseconds}, "
+                    f"slow_path_timeout_ms={timeout.sbft.slow_path_timeout_milliseconds}, "
+                    f"batch_timeout_ms={timeout.sbft.batch_timeout_milliseconds}"
+                )
+            else:
+                description = (
+                    "propose_timeout_ms="
+                    f"{timeout.tendermint.propose_timeout_milliseconds}, "
+                    "prevote_timeout_ms="
+                    f"{timeout.tendermint.prevote_timeout_milliseconds}, "
+                    "precommit_timeout_ms="
+                    f"{timeout.tendermint.precommit_timeout_milliseconds}"
+                )
             print(
                 "[scheduled-model] active schedule: "
                 f"time_s>={switch_time_s:g}, "
                 f"source_time_s={source_switch_time_s:g}, "
-                f"{describe_action(self._protocol, active_option_index)}"
+                f"{description}"
             )
             self._active_row = active_row
-        return option_index
+        return np.asarray(raw_action, dtype=float)
 
     def is_warmup_active(self) -> bool:
         if self._schedule_time_shift_s <= 0.0:
@@ -830,8 +1032,7 @@ class ScheduledTimeoutModel(TensorModel):
 
     def predict_action(self, features: np.ndarray) -> np.ndarray:
         del features
-        option_index = self._current_option_index()
-        return np.asarray(float(option_index), dtype=float)
+        return self._current_action()
 
     def update_model(
         self, features: np.ndarray, action: np.ndarray, reward: float

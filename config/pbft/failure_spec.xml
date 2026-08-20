@@ -191,7 +191,7 @@
 
                 <global>
                     <delayMs>50</delayMs>
-                    <burstDurationMs>1000</burstDurationMs>
+                    <burstDurationMs>10000</burstDurationMs>
                     <burstIntervalMs>10000</burstIntervalMs>
                 </global>
             </network>
@@ -204,48 +204,8 @@
                 <precedence>global,source,edge</precedence>
 
                 <global>
-                    <delayMs>150</delayMs>
-                    <burstDurationMs>250</burstDurationMs>
-                    <burstIntervalMs>10000</burstIntervalMs>
-                </global>
-            </network>
-        </phase>
-
-        <phase>
-            <atTime>1500</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
                     <delayMs>50</delayMs>
-                    <burstDurationMs>1000</burstDurationMs>
-                    <burstIntervalMs>10000</burstIntervalMs>
-                </global>
-            </network>
-
-            <pbft>
-                <proposalDelay>
-                    <interval>60</interval>
-                    <replicas>
-                        <replica>
-                            <id>leader</id>
-                            <delayMs>300</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </pbft>
-        </phase>
-
-        <phase>
-            <atTime>1800</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>150</delayMs>
-                    <burstDurationMs>250</burstDurationMs>
+                    <burstDurationMs>10000</burstDurationMs>
                     <burstIntervalMs>10000</burstIntervalMs>
                 </global>
             </network>
@@ -265,21 +225,21 @@
 
         <!-- Large network delay -->
         <phase>
-            <atTime>2100</atTime>
+            <atTime>1500</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
 
                 <global>
                     <delayMs>150</delayMs>
-                    <burstDurationMs>1000</burstDurationMs>
+                    <burstDurationMs>10000</burstDurationMs>
                     <burstIntervalMs>10000</burstIntervalMs>
                 </global>
             </network>
         </phase>
 
         <phase>
-            <atTime>2400</atTime>
+            <atTime>1800</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>

@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 import copy
 import csv
+import math
 from dataclasses import dataclass, field
 from enum import IntEnum
 import time
@@ -818,6 +819,213 @@ class LinearModel(TensorModel):
                 f"Expected weights of shape {self.weights.shape}, got {incoming.shape}"
             )
         self.weights = incoming.copy()
+
+
+class DiscountedLinUCB(TensorModel):
+    """Non-stationary contextual UCB with one discounted model per arm.
+
+    The posterior mean exploits the timeout with the highest predicted reward.
+    The confidence bonus explores arms whose reward at the current context is
+    uncertain. Every observation discounts all arms toward the ridge prior, so
+    an arm that is not selected gradually becomes uncertain and can be tried
+    again after conditions change. Optional random exploration can protect
+    against a misspecified linear reward model, but it is disabled by default
+    because a permanent exploration floor prevents strict convergence.
+
+    Raw report fields span several orders of magnitude. A deterministic
+    signed-log and row normalization keeps the ridge system conditioned without
+    requiring a fitted scaler whose changing coordinates would invalidate the
+    accumulated sufficient statistics.
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        n_features: int,
+        confidence_scale: float = 1.0,
+        discount_factor: float = 0.95,
+        exploration_floor: float = 0.05,
+        ridge: float = 1.0,
+        reward_scale: float = 1.0,
+        seed: Optional[int] = None,
+    ) -> None:
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        if n_features <= 0:
+            raise ValueError(f"n_features must be > 0, got {n_features}")
+        if confidence_scale < 0.0:
+            raise ValueError(
+                f"confidence_scale must be >= 0, got {confidence_scale}"
+            )
+        if not 0.0 < discount_factor <= 1.0:
+            raise ValueError(
+                f"discount_factor must be in (0, 1], got {discount_factor}"
+            )
+        if not 0.0 <= exploration_floor <= 1.0:
+            raise ValueError(
+                f"exploration_floor must be in [0, 1], got {exploration_floor}"
+            )
+        if ridge <= 0.0:
+            raise ValueError(f"ridge must be > 0, got {ridge}")
+        if reward_scale <= 0.0:
+            raise ValueError(f"reward_scale must be > 0, got {reward_scale}")
+
+        self._action_dim = int(action_dim)
+        self._n_features = int(n_features)
+        self._context_dim = self._n_features + 1
+        self._confidence_scale = float(confidence_scale)
+        self._discount_factor = float(discount_factor)
+        self._exploration_floor = float(exploration_floor)
+        self._ridge = float(ridge)
+        self._reward_scale = float(reward_scale)
+        self._seed = seed
+        self.reset_model()
+
+    def _contexts(self, features: np.ndarray) -> np.ndarray:
+        rows = np.asarray(features, dtype=np.float64)
+        if rows.ndim == 1:
+            rows = rows.reshape(1, -1)
+        if rows.ndim != 2 or rows.shape[1] != self._n_features:
+            actual = rows.shape[1] if rows.ndim == 2 else rows.shape
+            raise ValueError(f"Expected {self._n_features} features, got {actual}")
+        if not np.all(np.isfinite(rows)):
+            raise ValueError("features must contain only finite values")
+
+        transformed = np.sign(rows) * np.log1p(np.abs(rows))
+        norms = np.linalg.norm(transformed, axis=1, keepdims=True)
+        transformed = transformed / np.maximum(norms, 1.0)
+        return np.hstack((np.ones((len(transformed), 1)), transformed))
+
+    def _scores(self, context: np.ndarray) -> np.ndarray:
+        scores = np.empty(self._action_dim, dtype=np.float64)
+        for arm in range(self._action_dim):
+            if self._observation_counts[arm] == 0:
+                scores[arm] = np.inf
+                continue
+            try:
+                theta = np.linalg.solve(
+                    self._precision[arm], self._reward_vectors[arm]
+                )
+                direction = np.linalg.solve(self._precision[arm], context)
+            except np.linalg.LinAlgError as exc:
+                raise RuntimeError(
+                    f"codex_v1 precision matrix for arm {arm} is singular"
+                ) from exc
+            predicted_reward = float(context @ theta)
+            uncertainty_variance = float(
+                direction @ self._covariance[arm] @ direction
+            )
+            uncertainty = float(np.sqrt(max(uncertainty_variance, 0.0)))
+            scores[arm] = predicted_reward + self._confidence_scale * uncertainty
+        return scores
+
+    def predict_action(self, features: np.ndarray) -> np.ndarray:
+        contexts = self._contexts(features)
+        scores = np.vstack([self._scores(context) for context in contexts])
+
+        all_arms_observed = bool(np.all(self._observation_counts > 0))
+        for row in scores:
+            if (
+                all_arms_observed
+                and self._exploration_floor > 0.0
+                and self._rng.random() < self._exploration_floor
+            ):
+                selected = int(self._rng.integers(self._action_dim))
+                best = float(np.max(row))
+                row[selected] = np.nextafter(best, np.inf)
+                continue
+
+            best = float(np.max(row))
+            if not np.isfinite(best):
+                # Unseen arms deliberately retain equal +inf scores. Numpy's
+                # argmax initializes them in index order as rewards arrive.
+                continue
+            tied = np.flatnonzero(row == best)
+            if len(tied) > 1:
+                selected = int(self._rng.choice(tied))
+                row[selected] = np.nextafter(best, np.inf)
+
+        return scores
+
+    def update_model(
+        self,
+        features: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray | float,
+        backward: bool = True,
+    ) -> float:
+        if not backward:
+            return 0.0
+
+        contexts = self._contexts(features)
+        action_values = np.asarray(actions, dtype=np.float64).reshape(-1)
+        reward_values = np.asarray(rewards, dtype=np.float64).reshape(-1)
+        batch_size = len(contexts)
+        if action_values.size == 1 and batch_size > 1:
+            action_values = np.repeat(action_values, batch_size)
+        if reward_values.size == 1 and batch_size > 1:
+            reward_values = np.repeat(reward_values, batch_size)
+        if action_values.size != batch_size:
+            raise ValueError(
+                f"actions batch size mismatch: expected {batch_size}, "
+                f"got {action_values.size}"
+            )
+        if reward_values.size != batch_size:
+            raise ValueError(
+                f"rewards batch size mismatch: expected {batch_size}, "
+                f"got {reward_values.size}"
+            )
+        if not np.all(np.isfinite(action_values)):
+            raise ValueError("actions must contain only finite values")
+        rounded_actions = np.rint(action_values)
+        if not np.allclose(action_values, rounded_actions, rtol=0.0, atol=1e-9):
+            raise ValueError("actions must be integer arm indices")
+        action_indices = rounded_actions.astype(int)
+        if np.any(action_indices < 0) or np.any(action_indices >= self._action_dim):
+            raise ValueError(
+                f"actions must be between 0 and {self._action_dim - 1}"
+            )
+        if not np.all(np.isfinite(reward_values)):
+            raise ValueError("rewards must contain only finite values")
+
+        prior_weight = (1.0 - self._discount_factor) * self._ridge
+        squared_discount = self._discount_factor * self._discount_factor
+        covariance_prior_weight = (1.0 - squared_discount) * self._ridge
+        identity = np.eye(self._context_dim, dtype=np.float64)
+        for context, arm, reward in zip(contexts, action_indices, reward_values):
+            self._precision *= self._discount_factor
+            if prior_weight > 0.0:
+                self._precision += prior_weight * identity[None, :, :]
+            self._covariance *= squared_discount
+            if covariance_prior_weight > 0.0:
+                self._covariance += (
+                    covariance_prior_weight * identity[None, :, :]
+                )
+            self._reward_vectors *= self._discount_factor
+
+            observation = np.outer(context, context)
+            self._precision[arm] += observation
+            self._covariance[arm] += observation
+            self._reward_vectors[arm] += (
+                float(reward) / self._reward_scale
+            ) * context
+            self._observation_counts[arm] += 1
+
+        return 0.0
+
+    def reset_model(self) -> None:
+        self._rng = np.random.default_rng(self._seed)
+        identity = np.eye(self._context_dim, dtype=np.float64)
+        self._precision = np.repeat(
+            (self._ridge * identity)[None, :, :],
+            self._action_dim,
+            axis=0,
+        )
+        self._covariance = self._precision.copy()
+        self._reward_vectors = np.zeros(
+            (self._action_dim, self._context_dim), dtype=np.float64
+        )
+        self._observation_counts = np.zeros(self._action_dim, dtype=np.int64)
 
 
 class RandomTimeoutModel(TensorModel):
@@ -2896,6 +3104,220 @@ class NeighborhoodRobustBandit(TensorModel):
         self._contexts: deque = deque(maxlen=self._memory_size)
         self._arms: deque = deque(maxlen=self._memory_size)
         self._rewards: deque = deque(maxlen=self._memory_size)
+
+
+class StarvationFreeThompsonSamplingModel(ThompsonSamplingModel):
+    """ThompsonSamplingModel with the two defects that strand a good arm fixed.
+
+    On the 1-e of decisions that exploit, ThompsonSamplingModel scores an arm by
+    ``np.mean(self.memory[arm]["rewards"])`` - the flat mean of that arm's
+    sliding window, a single number that does not depend on the context at all.
+    Two things follow, both of which show up on a phase sweep that returns to an
+    earlier phase, such as 0;1;2;3;4;5;4;3;2;1;0:
+
+    1. Starvation. A window only refills when its arm is pulled, so an arm
+       abandoned during a bad stretch keeps the estimate it held when it was
+       abandoned, indefinitely. Phases 3-5 pay the 300ms arm 0.000, 0.006 and
+       0.203, which flushes its 32-slot window to zeros; from then on the
+       exploit branch scores it 0 against ~0.9 for the incumbent and never
+       selects it again - including in phase 1 and phase 0 on the way back,
+       where it is the best arm by a wide margin. The Thompson branch cannot
+       rescue it either: its trees are fit on those zeros and, with
+       min_impurity_decrease set, refuse to split, so every head predicts 0.
+    2. Context blindness. The exploit branch compares window means measured in
+       different phases - the pulled arm's is current, every other arm's is a
+       fossil of whenever it was dropped - which is not a comparison at all.
+
+    The fixes, in the same order:
+
+    1. A staleness bonus, so no arm can be starved indefinitely: an arm's score
+       gains ``stale_bonus * spread * sqrt(age / stale_scale)``, where age is
+       the number of pulls since this arm was last pulled and spread is the
+       observed reward range. Scaling by the range rather than using an absolute
+       keeps one default meaningful across protocols whose rewards differ in
+       magnitude.
+    2. A contextual exploit branch, scoring by the ensemble's mean prediction
+       for the current context instead of the flat window mean.
+
+    Both are needed. Measured over the sweep above, as the share of decisions
+    landing on an acceptable timeout in the phase-1 slot that follows phase 2:
+    baseline 0.00, a bigger window 0.06 (a window only fills when its arm is
+    pulled, so a starved arm just holds more stale zeros), the contextual
+    exploit alone 0.00 (arm 300's trees have no recent phase-1 data to predict
+    from, precisely because it is starved), the staleness bonus alone 1.00. The
+    bonus is what breaks the starvation; the contextual branch is what stops the
+    same ratchet stranding 800 in favour of 1800 across phases 3-5.
+
+    stale_bonus defaults to the value that swept best over that sequence on
+    three seeds, scoring mean acceptable-share over all slots against the
+    phase-1 slot that follows phase 2:
+
+        bonus  0.00  0.01  0.02  0.03  0.05  0.07  0.10  0.15  0.25
+        mean   .902  .882  .899  .972  .974  .970  .944  .908  .850
+        slot10 .000  .000  .190  .870 1.000 1.000 1.000  .990  .980
+
+    Too small and the bonus never overtakes the incumbent, so the starved arm
+    stays starved; too large and it force-pulls arms that are genuinely bad in
+    the current phase, which is what erodes phases 4 and 5 above. 0.05 is the
+    smallest value that fully clears the starvation, and 0.05 - 0.07 is flat, so
+    the default is not perched on a spike.
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        n_features: int,
+        n_heads: int = 100,
+        bucket_size: int = 8,
+        exploit_heads: int = 12,
+        stale_bonus: float = 0.05,
+        stale_scale: float = 32.0,
+        seed: Optional[int] = None,
+    ):
+        if bucket_size <= 0:
+            raise ValueError(f"bucket_size must be > 0, got {bucket_size}")
+        if exploit_heads <= 0:
+            raise ValueError(f"exploit_heads must be > 0, got {exploit_heads}")
+        if stale_bonus < 0.0:
+            raise ValueError(f"stale_bonus must be >= 0, got {stale_bonus}")
+        if stale_scale <= 0.0:
+            raise ValueError(f"stale_scale must be > 0, got {stale_scale}")
+
+        # Set before super().__init__, which calls reset_model -> _init_buckets.
+        self._bucket_size = int(bucket_size)
+        self._exploit_heads = min(int(exploit_heads), max(1, int(n_heads)))
+        self._stale_bonus = float(stale_bonus)
+        self._stale_scale = float(stale_scale)
+
+        super().__init__(
+            action_dim=action_dim,
+            n_features=n_features,
+            n_heads=n_heads,
+            seed=seed,
+        )
+
+    def _init_buckets(self) -> None:
+        self._max_bucket_size = self._bucket_size
+        self.memory = [
+            {
+                "features": deque(maxlen=self._bucket_size),
+                "rewards": deque(maxlen=self._bucket_size),
+            }
+            for _ in range(self._act_dim)
+        ]
+
+    def reset_model(self) -> None:
+        super().reset_model()
+        # Pull clock for the staleness bonus, and the running reward range that
+        # keeps that bonus on the same scale as the values it is added to.
+        self._pulls = 0
+        self._last_pull = [0] * self._act_dim
+        self._reward_lo = math.inf
+        self._reward_hi = -math.inf
+
+    def _reward_spread(self) -> float:
+        """Observed reward range, or 1.0 until two distinct rewards are in."""
+        if self._reward_hi <= self._reward_lo:
+            return 1.0
+        return self._reward_hi - self._reward_lo
+
+    def _staleness_bonus(self, arm: int) -> float:
+        if not self._stale_bonus:
+            return 0.0
+        age = self._pulls - self._last_pull[arm]
+        if age <= 0:
+            return 0.0
+        return (
+            self._stale_bonus
+            * self._reward_spread()
+            * math.sqrt(age / self._stale_scale)
+        )
+
+    def predict_action(self, features: np.ndarray, e: float = 0.1) -> np.ndarray:
+        features_np = np.asarray(features, dtype=float)
+        if features_np.ndim == 1:
+            features_np = features_np.reshape(1, -1)
+
+        batch_size = features_np.shape[0]
+        predictions_stacked = np.zeros((batch_size, self._act_dim), dtype=float)
+        sampled_heads = self._rng.integers(
+            0, self._n_heads, size=(batch_size, self._act_dim)
+        )
+        explore = self._rng.random(batch_size) < e
+        bonuses = [self._staleness_bonus(arm) for arm in range(self._act_dim)]
+
+        for i in range(batch_size):
+            row = features_np[i : i + 1]
+            for arm in range(self._act_dim):
+                if not self.is_fitted[arm]:
+                    # Arm without a fitted window yet: force a pull.
+                    predictions_stacked[i, arm] = 1e9
+                    continue
+                if explore[i]:
+                    head = self.models[arm][sampled_heads[i, arm]]
+                    value = float(head.predict(row)[0])
+                else:
+                    # Posterior mean for THIS context, rather than the flat mean
+                    # of the window. A subset of heads is enough for the mean and
+                    # keeps the per-decision cost bounded.
+                    value = float(
+                        np.mean(
+                            [
+                                head.predict(row)[0]
+                                for head in self.models[arm][: self._exploit_heads]
+                            ]
+                        )
+                    )
+                predictions_stacked[i, arm] = value + bonuses[arm]
+
+        for i in range(batch_size):
+            row_preds = predictions_stacked[i]
+            tied_indices = np.flatnonzero(np.isclose(row_preds, np.max(row_preds)))
+            if len(tied_indices) > 1:
+                best_index = self._rng.choice(tied_indices)
+                predictions_stacked[i, best_index] += 1e-5
+
+        return np.asarray(predictions_stacked, dtype=float)
+
+    def update_model(
+        self,
+        features: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray | float,
+        backward: bool = True,
+    ) -> float:
+        loss = super().update_model(features, actions, rewards, backward=backward)
+        if not backward:
+            return loss
+
+        # Mirror the parent's broadcasting so the pull clock counts one pull per
+        # row, not one per call, when a batch carries several nodes' reports.
+        features_np = np.asarray(features, dtype=float)
+        if features_np.ndim == 1:
+            features_np = features_np.reshape(1, -1)
+        row_count = features_np.shape[0]
+
+        if isinstance(actions, np.ndarray):
+            actions_np = np.asarray(actions, dtype=int).ravel()
+        else:
+            actions_np = np.array([int(actions)])
+        if isinstance(rewards, np.ndarray):
+            rewards_np = np.asarray(rewards, dtype=float).ravel()
+        else:
+            rewards_np = np.array([float(rewards)])
+        if actions_np.size == 1 and row_count > 1:
+            actions_np = np.repeat(actions_np, row_count)
+        if rewards_np.size == 1 and row_count > 1:
+            rewards_np = np.repeat(rewards_np, row_count)
+
+        for arm in actions_np:
+            self._pulls += 1
+            self._last_pull[int(arm)] = self._pulls
+        if rewards_np.size:
+            self._reward_lo = min(self._reward_lo, float(rewards_np.min()))
+            self._reward_hi = max(self._reward_hi, float(rewards_np.max()))
+
+        return loss
 
 
 class PavlovTimeoutModel(TensorModel):

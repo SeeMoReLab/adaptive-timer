@@ -28,9 +28,11 @@ from continuous_bandit import (
 from models import (
     ActionCodec,
     CMAB,
+    DiscountedLinUCB,
     FeatureExtractor,
     LinearModel,
     PavlovTimeoutModel,
+    StarvationFreeThompsonSamplingModel,
     ThompsonSamplingModel,
     ProtocolReportFeatureExtractor,
     ProtocolTimeoutActionCodec,
@@ -1697,6 +1699,18 @@ def serve(
             n_features=get_report_feature_dim(protocol),
             seed=42,
         )
+    elif model_type == "claude_v2":
+        model = StarvationFreeThompsonSamplingModel(
+            action_dim=get_action_space_size(protocol),
+            n_features=get_report_feature_dim(protocol),
+            seed=42,
+        )
+    elif model_type == "codex_v1":
+        model = DiscountedLinUCB(
+            action_dim=get_action_space_size(protocol),
+            n_features=get_report_feature_dim(protocol),
+            seed=42,
+        )
     elif model_type == "scheduled":
         if schedule_file is None:
             raise ValueError("--schedule-file is required when --model-type=scheduled")
@@ -1853,6 +1867,8 @@ def main():
             "linear",
             "cmab",
             "cmab_reset",
+            "claude_v2",
+            "codex_v1",
             "continuous",
             "scheduled",
             "thompson",
@@ -1865,6 +1881,9 @@ def main():
             "cmab: bootstrapped ensemble contextual multi-armed bandit; "
             "cmab_reset: blocked CMAB with replay-triggered resets "
             "(requires xgboost); "
+            "claude_v2: cmab with the staleness bonus and contextual exploit "
+            "that stop an arm being starved after a bad phase; "
+            "codex_v1: discounted LinUCB, one ridge model per arm; "
             "continuous: bootstrapped continuous contextual bandit; "
             "thompson: deprecated alias for cmab; "
             "scheduled: timeout from a time-based schedule CSV. "

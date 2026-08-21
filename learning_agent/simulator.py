@@ -23,6 +23,7 @@ from reward_utils import calculate_reward_from_report_row
 
 from models import (
     CMAB,
+    DiscountedLinUCB,
     LinearModel,
     MultiRF,
     NeighborhoodRobustBandit,
@@ -30,6 +31,7 @@ from models import (
     PavlovTimeoutModel,
     QuadraticRF,
     SingleRF,
+    StarvationFreeThompsonSamplingModel,
     ThompsonSamplingModel,
     ThompsonSamplingModelV1,
     ThompsonSamplingModelV2,
@@ -60,6 +62,7 @@ PROTOCOL_NAME_TO_ENUM = {
 
 MODEL_NAME_TO_TENSORMODEL = {
     "linear": LinearModel,
+    "codex_v1": DiscountedLinUCB,
     # Contextual multi-armed bandits, oldest to newest. "cmab" is the current
     # model; v1 through v3 are its predecessors, kept so a run can be compared
     # against the iteration it came from.
@@ -73,6 +76,10 @@ MODEL_NAME_TO_TENSORMODEL = {
     # Contextual bandit with local commitment and a region-level prior
     # for ties that reward evidence cannot resolve.
     "claude_v1": NeighborhoodRobustBandit,
+    # "cmab" with its two starvation defects fixed: a staleness bonus so an arm
+    # abandoned during a bad phase can be reconsidered, and an exploit branch
+    # that scores the current context instead of the arm's flat window mean.
+    "claude_v2": StarvationFreeThompsonSamplingModel,
     # Win-stay/lose-shift heuristic. Context-free and non-learning, so it is a
     # floor to beat rather than an iteration of the bandits above.
     "pavlov": PavlovTimeoutModel,
@@ -86,6 +93,7 @@ MODEL_NAME_TO_TENSORMODEL = {
 # alone rather than from the global RNG state. ThompsonSamplingModelV1 is
 # absent because it has no seed parameter - it draws from the global numpy RNG.
 SEEDED_MODELS = (
+    DiscountedLinUCB,
     ThompsonSamplingModel,
     ThompsonSamplingModelV2,
     ThompsonSamplingModelV3,
@@ -94,6 +102,7 @@ SEEDED_MODELS = (
     MultiRF,
     SingleRF,
     NeighborhoodRobustBandit,
+    StarvationFreeThompsonSamplingModel,
 )
 
 # Heuristics with no contextual model, so no n_features and no seed. The

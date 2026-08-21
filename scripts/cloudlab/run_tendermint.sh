@@ -70,7 +70,7 @@ trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -82,7 +82,8 @@ Flags:
   --log             Fetch remote Tendermint, ABCI, and client logs into the run artifact directory.
   --output-dir <path>
                     Store artifacts here instead of creating a timestamped run directory.
-  --model           Learning-agent model for learning/sharing modes: random|pavlov|linear|cmab|cmab_reset|continuous (default: random).
+  --model           Learning-agent model for learning/sharing modes: random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous (default: random).
+                    claude and codex select claude_v2 and codex_v1.
   -f <int>          Fault tolerance f. Number of nodes is derived as 3f+1 (default: 1).
   -t <int>          Load-generation duration in seconds (default: 60).
 EOF
@@ -105,6 +106,15 @@ normalize_agent_model_type() {
   case "${model_lower}" in
     random|pavlov|linear|cmab|cmab_reset|continuous)
       printf '%s\n' "${model_lower}"
+      ;;
+    # Short names for the two newest bandits. main.py knows them by their
+    # versioned names, so translate here and let everything downstream - the
+    # remote validation included - carry the name main.py accepts.
+    claude)
+      printf '%s\n' "claude_v2"
+      ;;
+    codex)
+      printf '%s\n' "codex_v1"
       ;;
     *)
       return 1
@@ -266,7 +276,7 @@ else
   LEARNING_AGENT_ENABLED=1
 fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|continuous." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -495,9 +505,9 @@ if ! [[ "${load_send_period_ms}" =~ ^[0-9]+$ ]] || (( load_send_period_ms < 1 ))
   exit 2
 fi
 case "${agent_model_type}" in
-  random|pavlov|linear|cmab|cmab_reset|continuous) ;;
+  random|pavlov|linear|cmab|cmab_reset|claude_v2|codex_v1|continuous) ;;
   *)
-    echo "Invalid agent_model_type: ${agent_model_type}. Use random|pavlov|linear|cmab|cmab_reset|continuous." >&2
+    echo "Invalid agent_model_type: ${agent_model_type}. Use random|pavlov|linear|cmab|cmab_reset|claude_v2|codex_v1|continuous." >&2
     exit 2
     ;;
 esac

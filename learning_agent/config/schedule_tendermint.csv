@@ -3,6 +3,5 @@
 # prevote_timeout_ms and precommit_timeout_ms are derived as propose_timeout_ms / 3
 -10,150
 0,150
-600,300
-1800,600
-2100,150
+590,450
+1190,750

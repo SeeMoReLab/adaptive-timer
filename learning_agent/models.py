@@ -93,14 +93,14 @@ TIMEOUT_INDEX_TO_MS: Dict[int, int] = {
 
 class TendermintProposeTimeoutOption(IntEnum):
     TIMEOUT_150_MS = 150
-    TIMEOUT_300_MS = 300
-    TIMEOUT_600_MS = 600
+    TIMEOUT_450_MS = 450
+    TIMEOUT_750_MS = 750
 
 
 TENDERMINT_PROPOSE_TIMEOUT_OPTIONS: Tuple[TendermintProposeTimeoutOption, ...] = (
     TendermintProposeTimeoutOption.TIMEOUT_150_MS,
-    TendermintProposeTimeoutOption.TIMEOUT_300_MS,
-    TendermintProposeTimeoutOption.TIMEOUT_600_MS,
+    TendermintProposeTimeoutOption.TIMEOUT_450_MS,
+    TendermintProposeTimeoutOption.TIMEOUT_750_MS,
 )
 TENDERMINT_PROPOSE_TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(
     int(option) for option in TENDERMINT_PROPOSE_TIMEOUT_OPTIONS

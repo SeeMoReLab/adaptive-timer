@@ -87,7 +87,7 @@ def calculate_tendermint_reward(
     precommit_latency_ms: float,
 ) -> float:
     """Calculate an online Tendermint reward from a complete reward report."""
-    return (throughput_tps - 0.3 * p90_consensus_latency_ms) / 1000.0
+    return (throughput_tps - p90_consensus_latency_ms) / 4000.0
 
 
 def reward_from_report_row(

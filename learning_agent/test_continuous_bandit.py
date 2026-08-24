@@ -56,15 +56,15 @@ class DiscreteTimeoutActionCodecTest(unittest.TestCase):
         decoded = codec.decode(np.asarray(1.0)).tendermint
         action = codec.encode(
             agent_pb2.TendermintTimeout(
-                propose_timeout_milliseconds=600,
-                prevote_timeout_milliseconds=200,
-                precommit_timeout_milliseconds=200,
+                propose_timeout_milliseconds=750,
+                prevote_timeout_milliseconds=250,
+                precommit_timeout_milliseconds=250,
             )
         )
 
-        self.assertEqual(decoded.propose_timeout_milliseconds, 300)
-        self.assertEqual(decoded.prevote_timeout_milliseconds, 100)
-        self.assertEqual(decoded.precommit_timeout_milliseconds, 100)
+        self.assertEqual(decoded.propose_timeout_milliseconds, 450)
+        self.assertEqual(decoded.prevote_timeout_milliseconds, 150)
+        self.assertEqual(decoded.precommit_timeout_milliseconds, 150)
         self.assertEqual(float(action.item()), 2.0)
 
     def test_tendermint_encode_rejects_uncoupled_timeouts(self) -> None:
@@ -73,7 +73,7 @@ class DiscreteTimeoutActionCodecTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             codec.encode(
                 agent_pb2.TendermintTimeout(
-                    propose_timeout_milliseconds=300,
+                    propose_timeout_milliseconds=450,
                     prevote_timeout_milliseconds=50,
                     precommit_timeout_milliseconds=50,
                 )
@@ -131,7 +131,7 @@ class TendermintTimeoutOptionsTest(unittest.TestCase):
     def test_tendermint_has_three_proposal_driven_arms(self) -> None:
         self.assertEqual(
             get_timeout_values_ms(agent_pb2.PROTOCOL_TENDERMINT),
-            (150, 300, 600),
+            (150, 450, 750),
         )
         self.assertEqual(
             get_action_space_size(agent_pb2.PROTOCOL_TENDERMINT),

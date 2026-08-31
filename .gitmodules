@@ -7,3 +7,6 @@
 [submodule "SmartBFT"]
 	path = SmartBFT
 	url = https://github.com/SeeMoReLab/SmartBFT.git
+[submodule "autobahn"]
+	path = autobahn
+	url = https://github.com/SeeMoReLab/autobahn.git

@@ -49,8 +49,6 @@ LEARNING_FEATURE_DURATION="10s"
 LEARNING_REPLY_WAIT="2s"
 LEARNING_WARMUP_DURATION="3s"
 LEARNING_REWARD_DURATION="5s"
-BACKOFF_ENABLED=0
-REQUEST_TIMEOUT_BACKOFF_MAX="10s"
 CONFIG_PATH="${CONFIG_DEFAULT}"
 FAILURE_SPEC_PATH="${FAILURE_SPEC_DEFAULT}"
 FAILURE_SPEC_ENABLED=1
@@ -105,7 +103,7 @@ trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--backoff] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -115,7 +113,6 @@ Arguments:
 Flags:
   --dataset                         Compatibility flag; agent modes collect the agent CSV automatically.
   --log                             Download client, server, applier, and agent logs.
-  --backoff                         Enable request timeout backoff with a 10s maximum.
   --output-dir <path>               Store artifacts here instead of creating a timestamped run directory.
   --verbose                         Enable SmartBFT debug logs on server replicas.
   --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous>
@@ -150,9 +147,6 @@ Learning-agent options:
                                      Post-apply warm-up in wall-clock mode (default: 3s).
   --learning-reward-duration <duration>
                                      Reward window in wall-clock mode (default: 5s).
-
-Notes:
-  Request timeout backoff is disabled unless --backoff is supplied.
 EOF
 }
 
@@ -333,10 +327,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --log)
       LOG_ENABLED=1
-      shift
-      ;;
-    --backoff)
-      BACKOFF_ENABLED=1
       shift
       ;;
     --output-dir)
@@ -620,7 +610,6 @@ fi
   printf 'submit_mode=%q\n' "${SUBMIT_MODE}"
   printf 'agent_model=%q\n' "${AGENT_MODEL_TYPE}"
   printf 'learning_window_mode=%q\n' "${LEARNING_WINDOW_MODE}"
-  printf 'backoff_enabled=%q\n' "${BACKOFF_ENABLED}"
   printf 'dataset_enabled=%q\n' "${DATASET_ENABLED}"
   printf 'log_enabled=%q\n' "${LOG_ENABLED}"
   printf 'failure_spec_enabled=%q\n' "${FAILURE_SPEC_ENABLED}"
@@ -762,11 +751,6 @@ echo "Selected mode: ${MODE}"
 echo "SmartBFT nodes: ${NODES} (f=${F}, replicas_per_server_machine=${replicas_per_server_machine})"
 echo "Submit mode: ${SUBMIT_MODE}"
 echo "Batch size: ${BATCH_SIZE}; batch timeout: ${BATCH_TIMEOUT}; request timeout: ${REQUEST_TIMEOUT}"
-if (( BACKOFF_ENABLED == 1 )); then
-  echo "Request timeout backoff: enabled (max=${REQUEST_TIMEOUT_BACKOFF_MAX})"
-else
-  echo "Request timeout backoff: disabled"
-fi
 echo "SmartBFT verbose server logs: ${VERBOSE_ENABLED}"
 echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (dataset=${DATASET_ENABLED}, log=${LOG_ENABLED})"
 if [[ "${MODE}" == "learning" ]]; then
@@ -1255,8 +1239,6 @@ for i in "${!server_nodes[@]}"; do
 	      "${LEARNING_REPLY_WAIT}" \
 	      "${LEARNING_WARMUP_DURATION}" \
 	      "${LEARNING_REWARD_DURATION}" \
-	      "${BACKOFF_ENABLED}" \
-	      "${REQUEST_TIMEOUT_BACKOFF_MAX}" \
 	      "${VERBOSE_ENABLED}" <<'REMOTE'
 set -euo pipefail
 
@@ -1275,9 +1257,7 @@ learning_feature_duration="${12}"
 learning_reply_wait="${13}"
 learning_warmup_duration="${14}"
 learning_reward_duration="${15}"
-backoff_enabled="${16}"
-backoff_max="${17}"
-verbose_enabled="${18}"
+verbose_enabled="${16}"
 run_root="$HOME/smartbft_cloudlab"
 
 for ((n = 0; n < replicas_per_machine; n++)); do
@@ -1298,9 +1278,6 @@ for ((n = 0; n < replicas_per_machine; n++)); do
     "--data-dir" "${data_dir}"
     "--keep-data"
   )
-	  if [[ "${backoff_enabled}" == "1" ]]; then
-	    args+=("--request-timeout-backoff" "--request-timeout-backoff-max" "${backoff_max}")
-	  fi
 	  if [[ "${failure_enabled}" == "1" ]]; then
 	    args+=("--failure-spec" "${run_root}/config/pbft/failure_spec.xml" "--failure-start-unix-ms" "${start_unix_ms}")
 	  fi

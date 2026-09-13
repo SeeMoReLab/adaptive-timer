@@ -27,6 +27,24 @@ def _extract_state(report_local: agent_pb2.ReportLocal, protocol: int) -> object
                 f"ReportLocal for node {report_local.node_id} missing tendermint_state"
             )
         return report_local.tendermint_state
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        if not report_local.HasField("hotstuff_state"):
+            raise ValueError(
+                f"ReportLocal for node {report_local.node_id} missing hotstuff_state"
+            )
+        return report_local.hotstuff_state
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        if not report_local.HasField("autobahn_state"):
+            raise ValueError(
+                f"ReportLocal for node {report_local.node_id} missing autobahn_state"
+            )
+        return report_local.autobahn_state
+    if protocol == agent_pb2.PROTOCOL_SMARTBFT:
+        if not report_local.HasField("smartbft_state"):
+            raise ValueError(
+                f"ReportLocal for node {report_local.node_id} missing smartbft_state"
+            )
+        return report_local.smartbft_state
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -66,6 +84,12 @@ def _report_message_class(protocol: int) -> type:
         return agent_pb2.SbftReport
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
         return agent_pb2.TendermintReport
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        return agent_pb2.HotstuffReport
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        return agent_pb2.AutobahnReport
+    if protocol == agent_pb2.PROTOCOL_SMARTBFT:
+        return agent_pb2.SmartbftReport
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -99,6 +123,9 @@ class BaseAggregator(ABC):
             agent_pb2.PROTOCOL_PBFT,
             agent_pb2.PROTOCOL_SBFT,
             agent_pb2.PROTOCOL_TENDERMINT,
+            agent_pb2.PROTOCOL_HOTSTUFF,
+            agent_pb2.PROTOCOL_AUTOBAHN,
+            agent_pb2.PROTOCOL_SMARTBFT,
         ):
             raise ValueError(f"Unsupported protocol: {protocol}")
         self.protocol = protocol

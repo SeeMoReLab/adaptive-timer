@@ -46,8 +46,11 @@ from models import (
     report_to_feature_values,
 )
 from reward_utils import (
+    calculate_autobahn_reward,
+    calculate_hotstuff_reward,
     calculate_pbft_reward,
     calculate_sbft_reward,
+    calculate_smartbft_reward,
     calculate_tendermint_reward,
 )
 
@@ -82,8 +85,14 @@ def _parse_bool(value: str) -> bool:
 
 def reward_engineering(protocol: int, report: object) -> float:
     """Calculate a protocol-specific reward from a complete reward report."""
-    if protocol == agent_pb2.PROTOCOL_PBFT:
-        return calculate_pbft_reward(
+    if protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
+        # SmartbftReport has the PbftReport field layout but its own reward.
+        calculator = (
+            calculate_pbft_reward
+            if protocol == agent_pb2.PROTOCOL_PBFT
+            else calculate_smartbft_reward
+        )
+        return calculator(
             total_transactions=int(report.total_transactions),
             total_consensus_instances=int(report.total_consensus_instances),
             avg_consensus_latency_ms=float(report.avg_consensus_latency_ms),
@@ -135,6 +144,48 @@ def reward_engineering(protocol: int, report: object) -> float:
             prevote_latency_ms=float(report.prevote_latency_ms),
             precommit_latency_ms=float(report.precommit_latency_ms),
         )
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        return calculate_hotstuff_reward(
+            total_transactions=int(report.total_transactions),
+            total_consensus_instances=int(report.total_consensus_instances),
+            avg_consensus_latency_ms=float(report.avg_consensus_latency_ms),
+            p50_consensus_latency_ms=float(report.p50_consensus_latency_ms),
+            p95_consensus_latency_ms=float(report.p95_consensus_latency_ms),
+            throughput_tps=float(report.throughput_tps),
+            avg_batch_size=float(report.avg_batch_size),
+            p95_batch_size=float(report.p95_batch_size),
+            leader_change_count=int(report.leader_change_count),
+            regency_change_count=int(report.regency_change_count),
+            timeout_ms=int(report.timeout_ms),
+            avg_inter_commit_gap_ms=float(report.avg_inter_commit_gap_ms),
+            p50_inter_commit_gap_ms=float(report.p50_inter_commit_gap_ms),
+            p95_inter_commit_gap_ms=float(report.p95_inter_commit_gap_ms),
+            view_change_count=int(report.view_change_count),
+            no_progress_view_change_count=int(
+                report.no_progress_view_change_count
+            ),
+        )
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        return calculate_autobahn_reward(
+            total_transactions=int(report.total_transactions),
+            total_consensus_instances=int(report.total_consensus_instances),
+            avg_consensus_latency_ms=float(report.avg_consensus_latency_ms),
+            p50_consensus_latency_ms=float(report.p50_consensus_latency_ms),
+            p95_consensus_latency_ms=float(report.p95_consensus_latency_ms),
+            throughput_tps=float(report.throughput_tps),
+            avg_batch_size=float(report.avg_batch_size),
+            p95_batch_size=float(report.p95_batch_size),
+            leader_change_count=int(report.leader_change_count),
+            regency_change_count=int(report.regency_change_count),
+            timeout_ms=int(report.timeout_ms),
+            avg_inter_commit_gap_ms=float(report.avg_inter_commit_gap_ms),
+            p50_inter_commit_gap_ms=float(report.p50_inter_commit_gap_ms),
+            p95_inter_commit_gap_ms=float(report.p95_inter_commit_gap_ms),
+            view_change_count=int(report.view_change_count),
+            no_progress_view_change_count=int(
+                report.no_progress_view_change_count
+            ),
+        )
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -142,7 +193,19 @@ PROTOCOL_NAME_TO_ENUM = {
     "pbft": agent_pb2.PROTOCOL_PBFT,
     "sbft": agent_pb2.PROTOCOL_SBFT,
     "tendermint": agent_pb2.PROTOCOL_TENDERMINT,
+    "hotstuff": agent_pb2.PROTOCOL_HOTSTUFF,
+    "autobahn": agent_pb2.PROTOCOL_AUTOBAHN,
+    "smartbft": agent_pb2.PROTOCOL_SMARTBFT,
 }
+
+# Protocols whose report windows are bounded by wall-clock time rather than by
+# consensus ticks: window_consensus_count == 0 marks a wall-clock window.
+WALL_CLOCK_PROTOCOLS = (
+    agent_pb2.PROTOCOL_PBFT,
+    agent_pb2.PROTOCOL_HOTSTUFF,
+    agent_pb2.PROTOCOL_AUTOBAHN,
+    agent_pb2.PROTOCOL_SMARTBFT,
+)
 
 
 def _parse_protocol(value: str) -> int:
@@ -160,7 +223,7 @@ def _protocols_compatible(incoming_protocol: int, expected_protocol: int) -> boo
 
 
 def _dataset_timeout_field_names(protocol: int) -> Tuple[str, ...]:
-    if protocol == agent_pb2.PROTOCOL_PBFT:
+    if protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
         return ("election_timeout_milliseconds_used",)
     if protocol == agent_pb2.PROTOCOL_SBFT:
         return (
@@ -174,11 +237,19 @@ def _dataset_timeout_field_names(protocol: int) -> Tuple[str, ...]:
             "prevote_timeout_milliseconds_used",
             "precommit_timeout_milliseconds_used",
         )
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        return ("timeout_delay_milliseconds_used",)
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        return (
+            "timeout_delay_milliseconds_used",
+            "car_timeout_milliseconds_used",
+            "fast_path_timeout_milliseconds_used",
+        )
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
 def _dataset_timeout_values(protocol: int, timeout_used: object) -> Tuple[object, ...]:
-    if protocol == agent_pb2.PROTOCOL_PBFT:
+    if protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
         return (getattr(timeout_used, "election_timeout_milliseconds", ""),)
     if protocol == agent_pb2.PROTOCOL_SBFT:
         return (
@@ -191,6 +262,14 @@ def _dataset_timeout_values(protocol: int, timeout_used: object) -> Tuple[object
             getattr(timeout_used, "propose_timeout_milliseconds", ""),
             getattr(timeout_used, "prevote_timeout_milliseconds", ""),
             getattr(timeout_used, "precommit_timeout_milliseconds", ""),
+        )
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        return (getattr(timeout_used, "timeout_delay_milliseconds", ""),)
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        return (
+            getattr(timeout_used, "timeout_delay_milliseconds", ""),
+            getattr(timeout_used, "car_timeout_milliseconds", ""),
+            getattr(timeout_used, "fast_path_timeout_milliseconds", ""),
         )
     raise ValueError(f"Unsupported protocol: {protocol}")
 
@@ -208,6 +287,18 @@ def _extract_state(report: agent_pb2.ReportLocal, protocol: int) -> object:
         if not report.HasField("tendermint_state"):
             raise ValueError("ReportLocal missing tendermint_state")
         return report.tendermint_state
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        if not report.HasField("hotstuff_state"):
+            raise ValueError("ReportLocal missing hotstuff_state")
+        return report.hotstuff_state
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        if not report.HasField("autobahn_state"):
+            raise ValueError("ReportLocal missing autobahn_state")
+        return report.autobahn_state
+    if protocol == agent_pb2.PROTOCOL_SMARTBFT:
+        if not report.HasField("smartbft_state"):
+            raise ValueError("ReportLocal missing smartbft_state")
+        return report.smartbft_state
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -220,6 +311,15 @@ def _set_state(report: agent_pb2.ReportLocal, protocol: int, state: object) -> N
         return
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
         report.tendermint_state.CopyFrom(state)
+        return
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        report.hotstuff_state.CopyFrom(state)
+        return
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        report.autobahn_state.CopyFrom(state)
+        return
+    if protocol == agent_pb2.PROTOCOL_SMARTBFT:
+        report.smartbft_state.CopyFrom(state)
         return
     raise ValueError(f"Unsupported protocol: {protocol}")
 
@@ -245,6 +345,21 @@ def _extract_reward_payload(protocol: int, reward: agent_pb2.Reward) -> Optional
         if not reward.HasField("tendermint"):
             return None
         payload = reward.tendermint
+        return payload.episode, payload.report, payload.timeout_used
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        if not reward.HasField("hotstuff"):
+            return None
+        payload = reward.hotstuff
+        return payload.episode, payload.report, payload.timeout_used
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        if not reward.HasField("autobahn"):
+            return None
+        payload = reward.autobahn
+        return payload.episode, payload.report, payload.timeout_used
+    if protocol == agent_pb2.PROTOCOL_SMARTBFT:
+        if not reward.HasField("smartbft"):
+            return None
+        payload = reward.smartbft
         return payload.episode, payload.report, payload.timeout_used
     return None
 
@@ -677,12 +792,12 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 [int(report.window_consensus_count) for report in reports]
             )
         )
-        is_wall_clock_pbft = (
-            self._protocol == agent_pb2.PROTOCOL_PBFT
+        is_wall_clock = (
+            self._protocol in WALL_CLOCK_PROTOCOLS
             and window_consensus_count == 0
         )
         if report_seq < start_tick or (
-            report_seq == start_tick and not is_wall_clock_pbft
+            report_seq == start_tick and not is_wall_clock
         ):
             raise ValueError(
                 f"Invalid consensus report window: start={start_tick}, seq={report_seq}"
@@ -740,10 +855,11 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 break
         return active_index
 
-    def _dirty_pbft_state(self, state: agent_pb2.PbftReport) -> agent_pb2.PbftReport:
+    def _dirty_pbft_state(self, state: object) -> object:
+        """Dirty a PbftReport or SmartbftReport; both share the same layout."""
         baseline_total_tx = max(int(state.total_transactions), 1)
         baseline_total_cons = max(int(state.total_consensus_instances), 1)
-        dirty_report = agent_pb2.PbftReport()
+        dirty_report = state.__class__()
         dirty_report.CopyFrom(state)
         dirty_report.total_transactions = self._rng.randint(0, baseline_total_tx * 3)
         dirty_report.total_consensus_instances = self._rng.randint(0, baseline_total_cons * 3)
@@ -911,13 +1027,149 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         )
         return dirty_report
 
+    def _dirty_hotstuff_state(
+        self, state: agent_pb2.HotstuffReport
+    ) -> agent_pb2.HotstuffReport:
+        baseline_total_tx = max(int(state.total_transactions), 1)
+        baseline_total_cons = max(int(state.total_consensus_instances), 1)
+        dirty_report = agent_pb2.HotstuffReport()
+        dirty_report.CopyFrom(state)
+        dirty_report.total_transactions = self._rng.randint(0, baseline_total_tx * 3)
+        dirty_report.total_consensus_instances = self._rng.randint(0, baseline_total_cons * 3)
+        dirty_report.avg_consensus_latency_ms = float(
+            max(0.0, float(state.avg_consensus_latency_ms) * self._rng.uniform(0.4, 2.0))
+        )
+        dirty_report.p50_consensus_latency_ms = float(
+            max(
+                dirty_report.avg_consensus_latency_ms,
+                float(state.p50_consensus_latency_ms) * self._rng.uniform(0.4, 2.1),
+            )
+        )
+        dirty_report.p95_consensus_latency_ms = float(
+            max(
+                dirty_report.p50_consensus_latency_ms,
+                float(state.p95_consensus_latency_ms) * self._rng.uniform(0.4, 2.2),
+            )
+        )
+        dirty_report.throughput_tps = float(
+            max(0.0, float(state.throughput_tps) * self._rng.uniform(0.4, 1.8))
+        )
+        dirty_report.avg_batch_size = float(
+            max(0.0, float(state.avg_batch_size) * self._rng.uniform(0.4, 1.6))
+        )
+        dirty_report.p95_batch_size = float(
+            max(
+                float(dirty_report.avg_batch_size),
+                float(state.p95_batch_size) * self._rng.uniform(0.4, 1.8),
+            )
+        )
+        dirty_report.leader_change_count = self._rng.randint(
+            0, max(int(state.leader_change_count), 1) * 3
+        )
+        dirty_report.regency_change_count = self._rng.randint(
+            0, max(int(state.regency_change_count), 1) * 3
+        )
+        dirty_report.timeout_ms = max(0, int(round(float(state.timeout_ms) * self._rng.uniform(0.8, 1.2))))
+        dirty_report.avg_inter_commit_gap_ms = float(
+            max(0.0, float(state.avg_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.0))
+        )
+        dirty_report.p50_inter_commit_gap_ms = float(
+            max(
+                0.0,
+                float(state.p50_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.1),
+            )
+        )
+        dirty_report.p95_inter_commit_gap_ms = float(
+            max(
+                dirty_report.p50_inter_commit_gap_ms,
+                float(state.p95_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.2),
+            )
+        )
+        dirty_report.view_change_count = self._rng.randint(
+            0, max(int(state.view_change_count), 1) * 3
+        )
+        dirty_report.no_progress_view_change_count = self._rng.randint(
+            0, max(int(state.no_progress_view_change_count), 1) * 3
+        )
+        return dirty_report
+
+    def _dirty_autobahn_state(
+        self, state: agent_pb2.AutobahnReport
+    ) -> agent_pb2.AutobahnReport:
+        baseline_total_tx = max(int(state.total_transactions), 1)
+        baseline_total_cons = max(int(state.total_consensus_instances), 1)
+        dirty_report = agent_pb2.AutobahnReport()
+        dirty_report.CopyFrom(state)
+        dirty_report.total_transactions = self._rng.randint(0, baseline_total_tx * 3)
+        dirty_report.total_consensus_instances = self._rng.randint(0, baseline_total_cons * 3)
+        dirty_report.avg_consensus_latency_ms = float(
+            max(0.0, float(state.avg_consensus_latency_ms) * self._rng.uniform(0.4, 2.0))
+        )
+        dirty_report.p50_consensus_latency_ms = float(
+            max(
+                dirty_report.avg_consensus_latency_ms,
+                float(state.p50_consensus_latency_ms) * self._rng.uniform(0.4, 2.1),
+            )
+        )
+        dirty_report.p95_consensus_latency_ms = float(
+            max(
+                dirty_report.p50_consensus_latency_ms,
+                float(state.p95_consensus_latency_ms) * self._rng.uniform(0.4, 2.2),
+            )
+        )
+        dirty_report.throughput_tps = float(
+            max(0.0, float(state.throughput_tps) * self._rng.uniform(0.4, 1.8))
+        )
+        dirty_report.avg_batch_size = float(
+            max(0.0, float(state.avg_batch_size) * self._rng.uniform(0.4, 1.6))
+        )
+        dirty_report.p95_batch_size = float(
+            max(
+                float(dirty_report.avg_batch_size),
+                float(state.p95_batch_size) * self._rng.uniform(0.4, 1.8),
+            )
+        )
+        dirty_report.leader_change_count = self._rng.randint(
+            0, max(int(state.leader_change_count), 1) * 3
+        )
+        dirty_report.regency_change_count = self._rng.randint(
+            0, max(int(state.regency_change_count), 1) * 3
+        )
+        dirty_report.timeout_ms = max(0, int(round(float(state.timeout_ms) * self._rng.uniform(0.8, 1.2))))
+        dirty_report.avg_inter_commit_gap_ms = float(
+            max(0.0, float(state.avg_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.0))
+        )
+        dirty_report.p50_inter_commit_gap_ms = float(
+            max(
+                0.0,
+                float(state.p50_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.1),
+            )
+        )
+        dirty_report.p95_inter_commit_gap_ms = float(
+            max(
+                dirty_report.p50_inter_commit_gap_ms,
+                float(state.p95_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.2),
+            )
+        )
+        dirty_report.view_change_count = self._rng.randint(
+            0, max(int(state.view_change_count), 1) * 3
+        )
+        dirty_report.no_progress_view_change_count = self._rng.randint(
+            0, max(int(state.no_progress_view_change_count), 1) * 3
+        )
+        return dirty_report
+
     def _dirty_state(self, state: object) -> object:
-        if self._protocol == agent_pb2.PROTOCOL_PBFT:
+        if self._protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
             return self._dirty_pbft_state(state)
         if self._protocol == agent_pb2.PROTOCOL_SBFT:
             return self._dirty_sbft_state(state)
         if self._protocol == agent_pb2.PROTOCOL_TENDERMINT:
             return self._dirty_tendermint_state(state)
+        if self._protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+            return self._dirty_hotstuff_state(state)
+        if self._protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+            return self._dirty_autobahn_state(state)
         raise ValueError(f"Unsupported protocol: {self._protocol}")
 
     def _log_completed_episode_row_locked(
@@ -954,18 +1206,18 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 "Protocol mismatch in report: "
                 f"expected={self._protocol}, got={request.protocol}",
             )
-        is_wall_clock_pbft = (
-            self._protocol == agent_pb2.PROTOCOL_PBFT
+        is_wall_clock = (
+            self._protocol in WALL_CLOCK_PROTOCOLS
             and int(request.window_consensus_count) == 0
         )
         if int(request.report_seq) < int(request.start_tick) or (
             int(request.report_seq) == int(request.start_tick)
-            and not is_wall_clock_pbft
+            and not is_wall_clock
         ):
             context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
                 "Invalid report window: report_seq must be greater than start_tick "
-                "unless this is a wall-clock PBFT window.",
+                "unless this is a wall-clock window.",
             )
         try:
             incoming_state = _extract_state(request, self._protocol)
@@ -1050,13 +1302,13 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             return empty_pb2.Empty()
         if not _protocols_compatible(request.protocol, self._protocol):
             return empty_pb2.Empty()
-        is_wall_clock_pbft = (
-            self._protocol == agent_pb2.PROTOCOL_PBFT
+        is_wall_clock = (
+            self._protocol in WALL_CLOCK_PROTOCOLS
             and int(request.window_consensus_count) == 0
         )
         if int(request.report_seq) < int(request.start_tick) or (
             int(request.report_seq) == int(request.start_tick)
-            and not is_wall_clock_pbft
+            and not is_wall_clock
         ):
             return empty_pb2.Empty()
         if not self._verify_report(request):
@@ -1085,7 +1337,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         print(f"[episode {request.episode}] consensus batch {len(request.reports)} reports")
         for report in request.reports:
             local = _extract_state(report, self._protocol)
-            if self._protocol == agent_pb2.PROTOCOL_PBFT:
+            if self._protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
                 print(
                     f"node={report.node_id} "
                     f"total_tx={local.total_transactions} "
@@ -1104,6 +1356,20 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                     f"avg_latency_ms={local.avg_consensus_latency_ms:.6f} "
                     f"p95_latency_ms={local.p95_consensus_latency_ms:.6f} "
                     f"timeout_violation_rate={local.timeout_violation_rate:.6f}"
+                )
+            elif self._protocol in (
+                agent_pb2.PROTOCOL_HOTSTUFF,
+                agent_pb2.PROTOCOL_AUTOBAHN,
+            ):
+                print(
+                    f"node={report.node_id} "
+                    f"total_tx={local.total_transactions} "
+                    f"throughput={local.throughput_tps:.6f} "
+                    f"avg_latency_ms={local.avg_consensus_latency_ms:.6f} "
+                    f"p50_latency_ms={local.p50_consensus_latency_ms:.6f} "
+                    f"p95_latency_ms={local.p95_consensus_latency_ms:.6f} "
+                    f"timeout_ms={local.timeout_ms} "
+                    f"view_changes={local.view_change_count}"
                 )
             else:
                 print(
@@ -1511,13 +1777,21 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             reward_report=reward_report,
             feature_report=feature_report,
         )
-        if self._protocol == agent_pb2.PROTOCOL_PBFT:
+        if self._protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
             reward_timeout = f"{timeout_used.election_timeout_milliseconds}"
         elif self._protocol == agent_pb2.PROTOCOL_SBFT:
             reward_timeout = (
                 f"{timeout_used.election_timeout_milliseconds}/"
                 f"{timeout_used.slow_path_timeout_milliseconds}/"
                 f"{timeout_used.batch_timeout_milliseconds}"
+            )
+        elif self._protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+            reward_timeout = f"{timeout_used.timeout_delay_milliseconds}"
+        elif self._protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+            reward_timeout = (
+                f"{timeout_used.timeout_delay_milliseconds}/"
+                f"{timeout_used.car_timeout_milliseconds}/"
+                f"{timeout_used.fast_path_timeout_milliseconds}"
             )
         else:
             reward_timeout = (
@@ -1566,12 +1840,12 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         report_seq: int,
         window_consensus_count: int,
     ) -> agent_pb2.Timeout:
-        is_wall_clock_pbft = (
-            self._protocol == agent_pb2.PROTOCOL_PBFT
+        is_wall_clock = (
+            self._protocol in WALL_CLOCK_PROTOCOLS
             and window_consensus_count == 0
         )
         if report_seq < start_tick or (
-            report_seq == start_tick and not is_wall_clock_pbft
+            report_seq == start_tick and not is_wall_clock
         ):
             raise ValueError(
                 f"Invalid report window for timeout prediction: start={start_tick}, seq={report_seq}"
@@ -1855,7 +2129,7 @@ def main():
         type=_parse_protocol,
         default=agent_pb2.PROTOCOL_PBFT,
         help=(
-            "Protocol for this agent: pbft, sbft, or tendermint."
+            "Protocol for this agent: pbft, smartbft, sbft, tendermint, hotstuff, or autobahn."
         ),
     )
     parser.add_argument(
@@ -1912,10 +2186,12 @@ def main():
         type=Path,
         default=None,
         help=(
-            "Path to schedule CSV. PBFT format: time_s,election_timeout_ms. "
+            "Path to schedule CSV. PBFT and SmartBFT format: time_s,election_timeout_ms. "
             "SBFT format: time_s,election_timeout_ms,slow_path_timeout_ms,batch_timeout_ms. "
             "Tendermint format: time_s,propose_timeout_ms; prevote and "
             "precommit are derived as one-third of propose. "
+            "HotStuff format: time_s,timeout_ms. "
+            "Autobahn format: time_s,timeout_delay_ms,car_timeout_ms,fast_path_timeout_ms. "
             "Negative time_s values are allowed for pre-start offsets; schedule "
             "activations are shifted so the earliest entry begins at time 0. "
             "Required when --model-type=scheduled."

@@ -12,10 +12,17 @@ import agent_pb2_grpc
 PBFT_TIMEOUT_OPTIONS_MS = (300, 800, 1800)
 SBFT_TIMEOUT_OPTIONS_MS = (150, 400, 900)
 TENDERMINT_PROPOSE_TIMEOUT_OPTIONS_MS = (150, 450, 750)
+HOTSTUFF_TIMEOUT_DELAY_OPTIONS_MS = (800, 2000, 5000)
+AUTOBAHN_TIMEOUT_DELAY_OPTIONS_MS = (800, 2000, 5000)
+AUTOBAHN_CAR_TIMEOUT_OPTIONS_MS = (500, 1500, 5000)
+AUTOBAHN_FAST_PATH_TIMEOUT_OPTIONS_MS = (500, 1500, 5000)
 PROTOCOL_NAME_TO_ENUM = {
     "pbft": agent_pb2.PROTOCOL_PBFT,
     "sbft": agent_pb2.PROTOCOL_SBFT,
     "tendermint": agent_pb2.PROTOCOL_TENDERMINT,
+    "hotstuff": agent_pb2.PROTOCOL_HOTSTUFF,
+    "autobahn": agent_pb2.PROTOCOL_AUTOBAHN,
+    "smartbft": agent_pb2.PROTOCOL_SMARTBFT,
 }
 
 
@@ -54,7 +61,7 @@ class LearningAgentClient:
             report_seq=report_seq,
             window_consensus_count=(
                 report.total_consensus_instances
-                if protocol == agent_pb2.PROTOCOL_PBFT
+                if protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT)
                 else 0
             ),
         )
@@ -64,6 +71,12 @@ class LearningAgentClient:
             local_report.sbft_state.CopyFrom(report)
         elif protocol == agent_pb2.PROTOCOL_TENDERMINT:
             local_report.tendermint_state.CopyFrom(report)
+        elif protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+            local_report.hotstuff_state.CopyFrom(report)
+        elif protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+            local_report.autobahn_state.CopyFrom(report)
+        elif protocol == agent_pb2.PROTOCOL_SMARTBFT:
+            local_report.smartbft_state.CopyFrom(report)
         else:
             raise ValueError(f"Unsupported protocol: {protocol}")
 
@@ -112,7 +125,10 @@ def _load_hosts_config(path: Path) -> Dict[int, str]:
     return entries
 
 
-def _random_pbft_report(rng: random.Random) -> agent_pb2.PbftReport:
+def _random_pbft_report(
+    rng: random.Random, report_cls: type = agent_pb2.PbftReport
+) -> object:
+    """Random PbftReport, or a SmartbftReport when report_cls says so."""
     total_transactions = rng.randint(500, 20000)
     avg_batch_size = rng.uniform(1.0, 200.0)
     total_consensus_instances = max(
@@ -135,7 +151,7 @@ def _random_pbft_report(rng: random.Random) -> agent_pb2.PbftReport:
     )
     view_change_count = rng.randint(0, 8)
     no_progress_view_change_count = rng.randint(0, view_change_count)
-    return agent_pb2.PbftReport(
+    return report_cls(
         total_transactions=total_transactions,
         total_consensus_instances=total_consensus_instances,
         avg_consensus_latency_ms=avg_consensus_latency_ms,
@@ -192,19 +208,115 @@ def _random_sbft_report(rng: random.Random) -> agent_pb2.SbftReport:
     )
 
 
+def _random_hotstuff_report(rng: random.Random) -> agent_pb2.HotstuffReport:
+    total_transactions = rng.randint(500, 20000)
+    avg_batch_size = rng.uniform(1.0, 200.0)
+    total_consensus_instances = max(
+        1, int(round(total_transactions / max(avg_batch_size, 1.0)))
+    )
+    avg_consensus_latency_ms = rng.uniform(1.0, 200.0)
+    p95_consensus_latency_ms = rng.uniform(
+        avg_consensus_latency_ms, max(avg_consensus_latency_ms, avg_consensus_latency_ms * 2.0)
+    )
+    p50_consensus_latency_ms = rng.uniform(avg_consensus_latency_ms, p95_consensus_latency_ms)
+    throughput_tps = total_transactions / rng.uniform(0.5, 5.0)
+    p95_batch_size = rng.uniform(avg_batch_size, max(avg_batch_size, avg_batch_size * 1.5))
+    leader_change_count = rng.randint(0, 8)
+    regency_change_count = rng.randint(0, 8)
+    timeout_ms = rng.choice(HOTSTUFF_TIMEOUT_DELAY_OPTIONS_MS)
+    avg_inter_commit_gap_ms = rng.uniform(1.0, 250.0)
+    p50_inter_commit_gap_ms = rng.uniform(1.0, avg_inter_commit_gap_ms)
+    p95_inter_commit_gap_ms = rng.uniform(
+        avg_inter_commit_gap_ms, max(avg_inter_commit_gap_ms, avg_inter_commit_gap_ms * 2.0)
+    )
+    view_change_count = rng.randint(0, 8)
+    no_progress_view_change_count = rng.randint(0, view_change_count)
+    return agent_pb2.HotstuffReport(
+        total_transactions=total_transactions,
+        total_consensus_instances=total_consensus_instances,
+        avg_consensus_latency_ms=avg_consensus_latency_ms,
+        p50_consensus_latency_ms=p50_consensus_latency_ms,
+        p95_consensus_latency_ms=p95_consensus_latency_ms,
+        throughput_tps=throughput_tps,
+        avg_batch_size=avg_batch_size,
+        p95_batch_size=p95_batch_size,
+        leader_change_count=leader_change_count,
+        regency_change_count=regency_change_count,
+        timeout_ms=timeout_ms,
+        avg_inter_commit_gap_ms=avg_inter_commit_gap_ms,
+        p50_inter_commit_gap_ms=p50_inter_commit_gap_ms,
+        p95_inter_commit_gap_ms=p95_inter_commit_gap_ms,
+        view_change_count=view_change_count,
+        no_progress_view_change_count=no_progress_view_change_count,
+    )
+
+
+def _random_autobahn_report(rng: random.Random) -> agent_pb2.AutobahnReport:
+    total_transactions = rng.randint(500, 20000)
+    avg_batch_size = rng.uniform(1.0, 200.0)
+    total_consensus_instances = max(
+        1, int(round(total_transactions / max(avg_batch_size, 1.0)))
+    )
+    avg_consensus_latency_ms = rng.uniform(1.0, 200.0)
+    p95_consensus_latency_ms = rng.uniform(
+        avg_consensus_latency_ms, max(avg_consensus_latency_ms, avg_consensus_latency_ms * 2.0)
+    )
+    p50_consensus_latency_ms = rng.uniform(avg_consensus_latency_ms, p95_consensus_latency_ms)
+    throughput_tps = total_transactions / rng.uniform(0.5, 5.0)
+    p95_batch_size = rng.uniform(avg_batch_size, max(avg_batch_size, avg_batch_size * 1.5))
+    leader_change_count = rng.randint(0, 8)
+    regency_change_count = rng.randint(0, 8)
+    timeout_ms = rng.choice(AUTOBAHN_TIMEOUT_DELAY_OPTIONS_MS)
+    avg_inter_commit_gap_ms = rng.uniform(1.0, 250.0)
+    p50_inter_commit_gap_ms = rng.uniform(1.0, avg_inter_commit_gap_ms)
+    p95_inter_commit_gap_ms = rng.uniform(
+        avg_inter_commit_gap_ms, max(avg_inter_commit_gap_ms, avg_inter_commit_gap_ms * 2.0)
+    )
+    view_change_count = rng.randint(0, 8)
+    no_progress_view_change_count = rng.randint(0, view_change_count)
+    return agent_pb2.AutobahnReport(
+        total_transactions=total_transactions,
+        total_consensus_instances=total_consensus_instances,
+        avg_consensus_latency_ms=avg_consensus_latency_ms,
+        p50_consensus_latency_ms=p50_consensus_latency_ms,
+        p95_consensus_latency_ms=p95_consensus_latency_ms,
+        throughput_tps=throughput_tps,
+        avg_batch_size=avg_batch_size,
+        p95_batch_size=p95_batch_size,
+        leader_change_count=leader_change_count,
+        regency_change_count=regency_change_count,
+        timeout_ms=timeout_ms,
+        avg_inter_commit_gap_ms=avg_inter_commit_gap_ms,
+        p50_inter_commit_gap_ms=p50_inter_commit_gap_ms,
+        p95_inter_commit_gap_ms=p95_inter_commit_gap_ms,
+        view_change_count=view_change_count,
+        no_progress_view_change_count=no_progress_view_change_count,
+    )
+
+
 def _random_report(protocol: int, rng: random.Random) -> object:
     if protocol == agent_pb2.PROTOCOL_PBFT:
         return _random_pbft_report(rng)
+    if protocol == agent_pb2.PROTOCOL_SMARTBFT:
+        return _random_pbft_report(rng, agent_pb2.SmartbftReport)
     if protocol == agent_pb2.PROTOCOL_SBFT:
         return _random_sbft_report(rng)
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
         return _random_tendermint_report(rng)
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        return _random_hotstuff_report(rng)
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        return _random_autobahn_report(rng)
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
 def _random_timeout_used(protocol: int, rng: random.Random) -> object:
     if protocol == agent_pb2.PROTOCOL_PBFT:
         return agent_pb2.PbftTimeout(
+            election_timeout_milliseconds=rng.choice(PBFT_TIMEOUT_OPTIONS_MS)
+        )
+    if protocol == agent_pb2.PROTOCOL_SMARTBFT:
+        return agent_pb2.SmartbftTimeout(
             election_timeout_milliseconds=rng.choice(PBFT_TIMEOUT_OPTIONS_MS)
         )
     if protocol == agent_pb2.PROTOCOL_SBFT:
@@ -224,6 +336,19 @@ def _random_timeout_used(protocol: int, rng: random.Random) -> object:
             prevote_timeout_milliseconds=phase_timeout_ms,
             precommit_timeout_milliseconds=phase_timeout_ms,
         )
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        return agent_pb2.HotstuffTimeout(
+            timeout_delay_milliseconds=rng.choice(HOTSTUFF_TIMEOUT_DELAY_OPTIONS_MS)
+        )
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        timeout_delay_ms = rng.choice(AUTOBAHN_TIMEOUT_DELAY_OPTIONS_MS)
+        car_timeout_ms = rng.choice(AUTOBAHN_CAR_TIMEOUT_OPTIONS_MS)
+        fast_path_timeout_ms = rng.choice(AUTOBAHN_FAST_PATH_TIMEOUT_OPTIONS_MS)
+        return agent_pb2.AutobahnTimeout(
+            timeout_delay_milliseconds=timeout_delay_ms,
+            car_timeout_milliseconds=car_timeout_ms,
+            fast_path_timeout_milliseconds=fast_path_timeout_ms,
+        )
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -234,7 +359,7 @@ def _print_sent_payload(
     report: object,
     reward: Optional[agent_pb2.Reward],
 ) -> None:
-    if protocol == agent_pb2.PROTOCOL_PBFT:
+    if protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
         print(
             "Sent ReportLocal:",
             f"node_id={node_id}",
@@ -252,6 +377,16 @@ def _print_sent_payload(
             f"total_transactions={int(report.total_transactions)}",
             f"throughput_tps={float(report.throughput_tps):.2f}",
             f"timeout_violation_rate={float(report.timeout_violation_rate):.3f}",
+        )
+    elif protocol in (agent_pb2.PROTOCOL_HOTSTUFF, agent_pb2.PROTOCOL_AUTOBAHN):
+        print(
+            "Sent ReportLocal:",
+            f"node_id={node_id}",
+            f"episode={episode}",
+            f"protocol={agent_pb2.Protocol.Name(protocol)}",
+            f"total_transactions={int(report.total_transactions)}",
+            f"throughput_tps={float(report.throughput_tps):.2f}",
+            f"view_change_count={int(report.view_change_count)}",
         )
     else:
         print(
@@ -272,6 +407,10 @@ def _print_sent_payload(
         timeout_ms = reward.pbft.timeout_used.election_timeout_milliseconds
         reward_episode = reward.pbft.episode
         timeout_desc = f"reward.election_timeout_ms={timeout_ms}"
+    elif reward.HasField("smartbft"):
+        timeout_ms = reward.smartbft.timeout_used.election_timeout_milliseconds
+        reward_episode = reward.smartbft.episode
+        timeout_desc = f"reward.election_timeout_ms={timeout_ms}"
     elif reward.HasField("sbft"):
         election_timeout_ms = reward.sbft.timeout_used.election_timeout_milliseconds
         slow_path_timeout_ms = reward.sbft.timeout_used.slow_path_timeout_milliseconds
@@ -291,6 +430,20 @@ def _print_sent_payload(
             f"reward.propose_timeout_ms={propose_timeout_ms} "
             f"reward.prevote_timeout_ms={prevote_timeout_ms} "
             f"reward.precommit_timeout_ms={precommit_timeout_ms}"
+        )
+    elif reward.HasField("hotstuff"):
+        timeout_delay_ms = reward.hotstuff.timeout_used.timeout_delay_milliseconds
+        reward_episode = reward.hotstuff.episode
+        timeout_desc = f"reward.timeout_delay_ms={timeout_delay_ms}"
+    elif reward.HasField("autobahn"):
+        timeout_delay_ms = reward.autobahn.timeout_used.timeout_delay_milliseconds
+        car_timeout_ms = reward.autobahn.timeout_used.car_timeout_milliseconds
+        fast_path_timeout_ms = reward.autobahn.timeout_used.fast_path_timeout_milliseconds
+        reward_episode = reward.autobahn.episode
+        timeout_desc = (
+            f"reward.timeout_delay_ms={timeout_delay_ms} "
+            f"reward.car_timeout_ms={car_timeout_ms} "
+            f"reward.fast_path_timeout_ms={fast_path_timeout_ms}"
         )
     else:
         reward_episode = -1
@@ -319,6 +472,13 @@ def _print_timeout_status(status: agent_pb2.TimeoutStatus) -> None:
             window_desc,
         )
         return
+    if status.timeout.HasField("smartbft"):
+        print(
+            "Timeout ready:",
+            f"election_timeout_ms={status.timeout.smartbft.election_timeout_milliseconds}",
+            window_desc,
+        )
+        return
     if status.timeout.HasField("sbft"):
         print(
             "Timeout ready:",
@@ -340,6 +500,26 @@ def _print_timeout_status(status: agent_pb2.TimeoutStatus) -> None:
             f"{status.timeout.tendermint.prevote_timeout_milliseconds}",
             "precommit_timeout_ms="
             f"{status.timeout.tendermint.precommit_timeout_milliseconds}",
+            window_desc,
+        )
+        return
+    if status.timeout.HasField("hotstuff"):
+        print(
+            "Timeout ready:",
+            "timeout_delay_ms="
+            f"{status.timeout.hotstuff.timeout_delay_milliseconds}",
+            window_desc,
+        )
+        return
+    if status.timeout.HasField("autobahn"):
+        print(
+            "Timeout ready:",
+            "timeout_delay_ms="
+            f"{status.timeout.autobahn.timeout_delay_milliseconds}",
+            "car_timeout_ms="
+            f"{status.timeout.autobahn.car_timeout_milliseconds}",
+            "fast_path_timeout_ms="
+            f"{status.timeout.autobahn.fast_path_timeout_milliseconds}",
             window_desc,
         )
         return
@@ -402,7 +582,7 @@ def main() -> None:
         "--protocol",
         type=_parse_protocol,
         default=agent_pb2.PROTOCOL_PBFT,
-        help="Protocol: pbft, sbft, or tendermint.",
+        help="Protocol: pbft, smartbft, sbft, tendermint, hotstuff, or autobahn.",
     )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
@@ -458,11 +638,35 @@ def main() -> None:
                         timeout_used=timeout_used,
                     )
                 )
+            elif args.protocol == agent_pb2.PROTOCOL_SMARTBFT:
+                reward = agent_pb2.Reward(
+                    smartbft=agent_pb2.SmartbftReward(
+                        episode=args.episode - 1,
+                        report=_random_pbft_report(rng, agent_pb2.SmartbftReport),
+                        timeout_used=timeout_used,
+                    )
+                )
             elif args.protocol == agent_pb2.PROTOCOL_SBFT:
                 reward = agent_pb2.Reward(
                     sbft=agent_pb2.SbftReward(
                         episode=args.episode - 1,
                         report=_random_sbft_report(rng),
+                        timeout_used=timeout_used,
+                    )
+                )
+            elif args.protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+                reward = agent_pb2.Reward(
+                    hotstuff=agent_pb2.HotstuffReward(
+                        episode=args.episode - 1,
+                        report=_random_hotstuff_report(rng),
+                        timeout_used=timeout_used,
+                    )
+                )
+            elif args.protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+                reward = agent_pb2.Reward(
+                    autobahn=agent_pb2.AutobahnReward(
+                        episode=args.episode - 1,
+                        report=_random_autobahn_report(rng),
                         timeout_used=timeout_used,
                     )
                 )

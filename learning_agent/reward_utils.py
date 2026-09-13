@@ -50,6 +50,34 @@ def calculate_pbft_reward(
     return reward_from_throughput(throughput_tps)
 
 
+def calculate_smartbft_reward(
+    *,
+    total_transactions: int,
+    total_consensus_instances: int,
+    avg_consensus_latency_ms: float,
+    p50_consensus_latency_ms: float,
+    p95_consensus_latency_ms: float,
+    throughput_tps: float,
+    avg_batch_size: float,
+    p95_batch_size: float,
+    leader_change_count: int,
+    regency_change_count: int,
+    timeout_ms: int,
+    avg_inter_commit_gap_ms: float,
+    p50_inter_commit_gap_ms: float,
+    p95_inter_commit_gap_ms: float,
+    view_change_count: int,
+    no_progress_view_change_count: int,
+) -> float:
+    """Calculate an online SmartBFT reward from a complete reward report.
+
+    SmartbftReport has the same fields as PbftReport, so this takes the same
+    arguments as calculate_pbft_reward but is tuned independently of the Rust
+    PBFT baseline.
+    """
+    return reward_from_throughput(throughput_tps)
+
+
 def calculate_sbft_reward(
     *,
     total_transactions: int,
@@ -90,6 +118,52 @@ def calculate_tendermint_reward(
     return (throughput_tps - p90_consensus_latency_ms) / 4000.0
 
 
+def calculate_hotstuff_reward(
+    *,
+    total_transactions: int,
+    total_consensus_instances: int,
+    avg_consensus_latency_ms: float,
+    p50_consensus_latency_ms: float,
+    p95_consensus_latency_ms: float,
+    throughput_tps: float,
+    avg_batch_size: float,
+    p95_batch_size: float,
+    leader_change_count: int,
+    regency_change_count: int,
+    timeout_ms: int,
+    avg_inter_commit_gap_ms: float,
+    p50_inter_commit_gap_ms: float,
+    p95_inter_commit_gap_ms: float,
+    view_change_count: int,
+    no_progress_view_change_count: int,
+) -> float:
+    """Calculate an online HotStuff reward from a complete reward report."""
+    return reward_from_throughput(throughput_tps)
+
+
+def calculate_autobahn_reward(
+    *,
+    total_transactions: int,
+    total_consensus_instances: int,
+    avg_consensus_latency_ms: float,
+    p50_consensus_latency_ms: float,
+    p95_consensus_latency_ms: float,
+    throughput_tps: float,
+    avg_batch_size: float,
+    p95_batch_size: float,
+    leader_change_count: int,
+    regency_change_count: int,
+    timeout_ms: int,
+    avg_inter_commit_gap_ms: float,
+    p50_inter_commit_gap_ms: float,
+    p95_inter_commit_gap_ms: float,
+    view_change_count: int,
+    no_progress_view_change_count: int,
+) -> float:
+    """Calculate an online Autobahn reward from a complete reward report."""
+    return reward_from_throughput(throughput_tps)
+
+
 def reward_from_report_row(
     row: Mapping[str, Optional[str]], row_number: int
 ) -> float:
@@ -113,12 +187,18 @@ _REPORT_TYPES: Mapping[int, Type[object]] = {
     agent_pb2.PROTOCOL_PBFT: agent_pb2.PbftReport,
     agent_pb2.PROTOCOL_SBFT: agent_pb2.SbftReport,
     agent_pb2.PROTOCOL_TENDERMINT: agent_pb2.TendermintReport,
+    agent_pb2.PROTOCOL_HOTSTUFF: agent_pb2.HotstuffReport,
+    agent_pb2.PROTOCOL_AUTOBAHN: agent_pb2.AutobahnReport,
+    agent_pb2.PROTOCOL_SMARTBFT: agent_pb2.SmartbftReport,
 }
 
 _REPORT_REWARD_CALCULATORS: Mapping[int, Callable[..., float]] = {
     agent_pb2.PROTOCOL_PBFT: calculate_pbft_reward,
     agent_pb2.PROTOCOL_SBFT: calculate_sbft_reward,
     agent_pb2.PROTOCOL_TENDERMINT: calculate_tendermint_reward,
+    agent_pb2.PROTOCOL_HOTSTUFF: calculate_hotstuff_reward,
+    agent_pb2.PROTOCOL_AUTOBAHN: calculate_autobahn_reward,
+    agent_pb2.PROTOCOL_SMARTBFT: calculate_smartbft_reward,
 }
 
 

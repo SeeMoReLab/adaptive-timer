@@ -111,6 +111,82 @@ TENDERMINT_PROPOSE_TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
 }
 
 
+class HotstuffTimeoutOption(IntEnum):
+    TIMEOUT_800_MS = 800
+    TIMEOUT_2000_MS = 2000
+    TIMEOUT_5000_MS = 5000
+
+
+HOTSTUFF_TIMEOUT_OPTIONS: Tuple[HotstuffTimeoutOption, ...] = (
+    HotstuffTimeoutOption.TIMEOUT_800_MS,
+    HotstuffTimeoutOption.TIMEOUT_2000_MS,
+    HotstuffTimeoutOption.TIMEOUT_5000_MS,
+)
+HOTSTUFF_TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(
+    int(option) for option in HOTSTUFF_TIMEOUT_OPTIONS
+)
+HOTSTUFF_TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
+    value_ms: idx for idx, value_ms in enumerate(HOTSTUFF_TIMEOUT_VALUES_MS)
+}
+HOTSTUFF_TIMEOUT_INDEX_TO_MS: Dict[int, int] = {
+    idx: value_ms for idx, value_ms in enumerate(HOTSTUFF_TIMEOUT_VALUES_MS)
+}
+
+
+class AutobahnTimeoutDelayOption(IntEnum):
+    TIMEOUT_800_MS = 800
+    TIMEOUT_2000_MS = 2000
+    TIMEOUT_5000_MS = 5000
+
+
+class AutobahnCarTimeoutOption(IntEnum):
+    TIMEOUT_500_MS = 500
+    TIMEOUT_1500_MS = 1500
+    TIMEOUT_5000_MS = 5000
+
+
+class AutobahnFastPathTimeoutOption(IntEnum):
+    TIMEOUT_500_MS = 500
+    TIMEOUT_1500_MS = 1500
+    TIMEOUT_5000_MS = 5000
+
+
+AUTOBAHN_TIMEOUT_DELAY_OPTIONS: Tuple[AutobahnTimeoutDelayOption, ...] = (
+    AutobahnTimeoutDelayOption.TIMEOUT_800_MS,
+    AutobahnTimeoutDelayOption.TIMEOUT_2000_MS,
+    AutobahnTimeoutDelayOption.TIMEOUT_5000_MS,
+)
+AUTOBAHN_TIMEOUT_DELAY_VALUES_MS: Tuple[int, ...] = tuple(
+    int(option) for option in AUTOBAHN_TIMEOUT_DELAY_OPTIONS
+)
+AUTOBAHN_TIMEOUT_DELAY_MS_TO_INDEX: Dict[int, int] = {
+    value_ms: idx for idx, value_ms in enumerate(AUTOBAHN_TIMEOUT_DELAY_VALUES_MS)
+}
+AUTOBAHN_CAR_TIMEOUT_OPTIONS: Tuple[AutobahnCarTimeoutOption, ...] = (
+    AutobahnCarTimeoutOption.TIMEOUT_500_MS,
+    AutobahnCarTimeoutOption.TIMEOUT_1500_MS,
+    AutobahnCarTimeoutOption.TIMEOUT_5000_MS,
+)
+AUTOBAHN_CAR_TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(
+    int(option) for option in AUTOBAHN_CAR_TIMEOUT_OPTIONS
+)
+AUTOBAHN_CAR_TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
+    value_ms: idx for idx, value_ms in enumerate(AUTOBAHN_CAR_TIMEOUT_VALUES_MS)
+}
+AUTOBAHN_FAST_PATH_TIMEOUT_OPTIONS: Tuple[AutobahnFastPathTimeoutOption, ...] = (
+    AutobahnFastPathTimeoutOption.TIMEOUT_500_MS,
+    AutobahnFastPathTimeoutOption.TIMEOUT_1500_MS,
+    AutobahnFastPathTimeoutOption.TIMEOUT_5000_MS,
+)
+AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(
+    int(option) for option in AUTOBAHN_FAST_PATH_TIMEOUT_OPTIONS
+)
+AUTOBAHN_FAST_PATH_TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
+    value_ms: idx
+    for idx, value_ms in enumerate(AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS)
+}
+
+
 class PhaseMapping(IntEnum):
     PHASE_0 = PbftTimeoutOption.TIMEOUT_300_MS
     PHASE_1 = PbftTimeoutOption.TIMEOUT_300_MS
@@ -182,6 +258,42 @@ TENDERMINT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "prevote_latency_ms",
     "precommit_latency_ms",
 )
+HOTSTUFF_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
+    "total_transactions",
+    "total_consensus_instances",
+    "avg_consensus_latency_ms",
+    "p50_consensus_latency_ms",
+    "p95_consensus_latency_ms",
+    "throughput_tps",
+    "avg_batch_size",
+    "p95_batch_size",
+    "leader_change_count",
+    "regency_change_count",
+    "timeout_ms",
+    "avg_inter_commit_gap_ms",
+    "p50_inter_commit_gap_ms",
+    "p95_inter_commit_gap_ms",
+    "view_change_count",
+    "no_progress_view_change_count",
+)
+AUTOBAHN_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
+    "total_transactions",
+    "total_consensus_instances",
+    "avg_consensus_latency_ms",
+    "p50_consensus_latency_ms",
+    "p95_consensus_latency_ms",
+    "throughput_tps",
+    "avg_batch_size",
+    "p95_batch_size",
+    "leader_change_count",
+    "regency_change_count",
+    "timeout_ms",
+    "avg_inter_commit_gap_ms",
+    "p50_inter_commit_gap_ms",
+    "p95_inter_commit_gap_ms",
+    "view_change_count",
+    "no_progress_view_change_count",
+)
 
 
 def _protocol_name(protocol: int) -> str:
@@ -196,6 +308,9 @@ def _validate_protocol(protocol: int) -> int:
         agent_pb2.PROTOCOL_PBFT,
         agent_pb2.PROTOCOL_SBFT,
         agent_pb2.PROTOCOL_TENDERMINT,
+        agent_pb2.PROTOCOL_HOTSTUFF,
+        agent_pb2.PROTOCOL_AUTOBAHN,
+        agent_pb2.PROTOCOL_SMARTBFT,
     ):
         raise ValueError(f"Unsupported protocol: {_protocol_name(protocol)}")
     return int(protocol)
@@ -203,10 +318,14 @@ def _validate_protocol(protocol: int) -> int:
 
 def get_report_feature_field_names(protocol: int) -> Tuple[str, ...]:
     protocol = _validate_protocol(protocol)
-    if protocol == agent_pb2.PROTOCOL_PBFT:
+    if protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
         return PBFT_REPORT_FEATURE_FIELD_NAMES
     if protocol == agent_pb2.PROTOCOL_SBFT:
         return SBFT_REPORT_FEATURE_FIELD_NAMES
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        return HOTSTUFF_REPORT_FEATURE_FIELD_NAMES
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        return AUTOBAHN_REPORT_FEATURE_FIELD_NAMES
     return TENDERMINT_REPORT_FEATURE_FIELD_NAMES
 
 
@@ -216,10 +335,14 @@ def get_report_feature_dim(protocol: int) -> int:
 
 def get_timeout_values_ms(protocol: int) -> Tuple[int, ...]:
     protocol = _validate_protocol(protocol)
-    if protocol == agent_pb2.PROTOCOL_PBFT:
+    if protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
         return PBFT_TIMEOUT_VALUES_MS
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
         return TENDERMINT_PROPOSE_TIMEOUT_VALUES_MS
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        return HOTSTUFF_TIMEOUT_VALUES_MS
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        return AUTOBAHN_TIMEOUT_DELAY_VALUES_MS
     return TIMEOUT_VALUES_MS
 
 
@@ -258,12 +381,88 @@ def pbft_timeout_index_to_ms(index: int) -> int:
     return PBFT_TIMEOUT_VALUES_MS[index]
 
 
+def hotstuff_timeout_ms_to_index(timeout_ms: int) -> int:
+    try:
+        return HOTSTUFF_TIMEOUT_MS_TO_INDEX[timeout_ms]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported HotStuff timeout {timeout_ms}ms. "
+            f"Valid options: {HOTSTUFF_TIMEOUT_VALUES_MS}"
+        ) from exc
+
+
+def hotstuff_timeout_index_to_ms(index: int) -> int:
+    if index < 0:
+        return HOTSTUFF_TIMEOUT_VALUES_MS[0]
+    if index >= len(HOTSTUFF_TIMEOUT_VALUES_MS):
+        return HOTSTUFF_TIMEOUT_VALUES_MS[-1]
+    return HOTSTUFF_TIMEOUT_VALUES_MS[index]
+
+
+def autobahn_timeout_delay_ms_to_index(timeout_ms: int) -> int:
+    try:
+        return AUTOBAHN_TIMEOUT_DELAY_MS_TO_INDEX[timeout_ms]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported Autobahn timeout delay {timeout_ms}ms. "
+            f"Valid options: {AUTOBAHN_TIMEOUT_DELAY_VALUES_MS}"
+        ) from exc
+
+
+def autobahn_timeout_delay_index_to_ms(index: int) -> int:
+    if index < 0:
+        return AUTOBAHN_TIMEOUT_DELAY_VALUES_MS[0]
+    if index >= len(AUTOBAHN_TIMEOUT_DELAY_VALUES_MS):
+        return AUTOBAHN_TIMEOUT_DELAY_VALUES_MS[-1]
+    return AUTOBAHN_TIMEOUT_DELAY_VALUES_MS[index]
+
+
+def autobahn_car_timeout_ms_to_index(timeout_ms: int) -> int:
+    try:
+        return AUTOBAHN_CAR_TIMEOUT_MS_TO_INDEX[timeout_ms]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported Autobahn car timeout {timeout_ms}ms. "
+            f"Valid options: {AUTOBAHN_CAR_TIMEOUT_VALUES_MS}"
+        ) from exc
+
+
+def autobahn_car_timeout_index_to_ms(index: int) -> int:
+    if index < 0:
+        return AUTOBAHN_CAR_TIMEOUT_VALUES_MS[0]
+    if index >= len(AUTOBAHN_CAR_TIMEOUT_VALUES_MS):
+        return AUTOBAHN_CAR_TIMEOUT_VALUES_MS[-1]
+    return AUTOBAHN_CAR_TIMEOUT_VALUES_MS[index]
+
+
+def autobahn_fast_path_timeout_ms_to_index(timeout_ms: int) -> int:
+    try:
+        return AUTOBAHN_FAST_PATH_TIMEOUT_MS_TO_INDEX[timeout_ms]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported Autobahn fast-path timeout {timeout_ms}ms. "
+            f"Valid options: {AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS}"
+        ) from exc
+
+
+def autobahn_fast_path_timeout_index_to_ms(index: int) -> int:
+    if index < 0:
+        return AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS[0]
+    if index >= len(AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS):
+        return AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS[-1]
+    return AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS[index]
+
+
 def timeout_index_to_ms_for_protocol(protocol: int, index: int) -> int:
     protocol = _validate_protocol(protocol)
-    if protocol == agent_pb2.PROTOCOL_PBFT:
+    if protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
         return pbft_timeout_index_to_ms(index)
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
         return tendermint_propose_timeout_index_to_ms(index)
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        return hotstuff_timeout_index_to_ms(index)
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        return autobahn_timeout_delay_index_to_ms(index)
     return timeout_index_to_ms(index)
 
 
@@ -289,6 +488,33 @@ def _sbft_index_to_triple(index: int) -> Tuple[int, int, int]:
         timeout_index_to_ms(election_idx),
         timeout_index_to_ms(slow_idx),
         timeout_index_to_ms(batch_idx),
+    )
+
+
+def _autobahn_triple_to_index(
+    timeout_delay_ms: int, car_timeout_ms: int, fast_path_timeout_ms: int
+) -> int:
+    delay_idx = autobahn_timeout_delay_ms_to_index(timeout_delay_ms)
+    car_idx = autobahn_car_timeout_ms_to_index(car_timeout_ms)
+    fast_idx = autobahn_fast_path_timeout_ms_to_index(fast_path_timeout_ms)
+    car_base = len(AUTOBAHN_CAR_TIMEOUT_VALUES_MS)
+    fast_base = len(AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS)
+    return (delay_idx * car_base * fast_base) + (car_idx * fast_base) + fast_idx
+
+
+def _autobahn_index_to_triple(index: int) -> Tuple[int, int, int]:
+    car_base = len(AUTOBAHN_CAR_TIMEOUT_VALUES_MS)
+    fast_base = len(AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS)
+    total = len(AUTOBAHN_TIMEOUT_DELAY_VALUES_MS) * car_base * fast_base
+    bounded = max(0, min(index, total - 1))
+    delay_idx = bounded // (car_base * fast_base)
+    rem = bounded % (car_base * fast_base)
+    car_idx = rem // fast_base
+    fast_idx = rem % fast_base
+    return (
+        autobahn_timeout_delay_index_to_ms(delay_idx),
+        autobahn_car_timeout_index_to_ms(car_idx),
+        autobahn_fast_path_timeout_index_to_ms(fast_idx),
     )
 
 
@@ -347,12 +573,20 @@ def _tendermint_index_to_triple(index: int) -> Tuple[int, int, int]:
 
 def get_action_space_size(protocol: int) -> int:
     protocol = _validate_protocol(protocol)
-    if protocol == agent_pb2.PROTOCOL_PBFT:
+    if protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
         return len(PBFT_TIMEOUT_VALUES_MS)
     if protocol == agent_pb2.PROTOCOL_SBFT:
         return len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS)
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
         return len(TENDERMINT_PROPOSE_TIMEOUT_VALUES_MS)
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        return len(HOTSTUFF_TIMEOUT_VALUES_MS)
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        return (
+            len(AUTOBAHN_TIMEOUT_DELAY_VALUES_MS)
+            * len(AUTOBAHN_CAR_TIMEOUT_VALUES_MS)
+            * len(AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS)
+        )
     raise ValueError(f"Unsupported protocol: {_protocol_name(protocol)}")
 
 
@@ -364,7 +598,7 @@ def report_to_feature_values(protocol: int, state: object) -> List[float]:
 
 def timeout_to_action_index(protocol: int, timeout_used: object) -> int:
     protocol = _validate_protocol(protocol)
-    if protocol == agent_pb2.PROTOCOL_PBFT:
+    if protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
         timeout_msg = timeout_used
         return pbft_timeout_ms_to_index(int(timeout_msg.election_timeout_milliseconds))
     if protocol == agent_pb2.PROTOCOL_SBFT:
@@ -381,6 +615,16 @@ def timeout_to_action_index(protocol: int, timeout_used: object) -> int:
             int(timeout_msg.prevote_timeout_milliseconds),
             int(timeout_msg.precommit_timeout_milliseconds),
         )
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        timeout_msg = timeout_used
+        return hotstuff_timeout_ms_to_index(int(timeout_msg.timeout_delay_milliseconds))
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        timeout_msg = timeout_used
+        return _autobahn_triple_to_index(
+            int(timeout_msg.timeout_delay_milliseconds),
+            int(timeout_msg.car_timeout_milliseconds),
+            int(timeout_msg.fast_path_timeout_milliseconds),
+        )
     raise ValueError(f"Unsupported protocol: {_protocol_name(protocol)}")
 
 
@@ -390,6 +634,13 @@ def action_index_to_timeout(protocol: int, index: int) -> agent_pb2.Timeout:
         timeout_ms = pbft_timeout_index_to_ms(index)
         return agent_pb2.Timeout(
             pbft=agent_pb2.PbftTimeout(election_timeout_milliseconds=timeout_ms)
+        )
+    if protocol == agent_pb2.PROTOCOL_SMARTBFT:
+        timeout_ms = pbft_timeout_index_to_ms(index)
+        return agent_pb2.Timeout(
+            smartbft=agent_pb2.SmartbftTimeout(
+                election_timeout_milliseconds=timeout_ms
+            )
         )
     if protocol == agent_pb2.PROTOCOL_SBFT:
         election_timeout_ms, slow_path_timeout_ms, batch_timeout_ms = _sbft_index_to_triple(
@@ -413,12 +664,28 @@ def action_index_to_timeout(protocol: int, index: int) -> agent_pb2.Timeout:
                 precommit_timeout_milliseconds=precommit_timeout_ms,
             )
         )
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        timeout_ms = hotstuff_timeout_index_to_ms(index)
+        return agent_pb2.Timeout(
+            hotstuff=agent_pb2.HotstuffTimeout(timeout_delay_milliseconds=timeout_ms)
+        )
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        timeout_delay_ms, car_timeout_ms, fast_path_timeout_ms = _autobahn_index_to_triple(
+            index
+        )
+        return agent_pb2.Timeout(
+            autobahn=agent_pb2.AutobahnTimeout(
+                timeout_delay_milliseconds=timeout_delay_ms,
+                car_timeout_milliseconds=car_timeout_ms,
+                fast_path_timeout_milliseconds=fast_path_timeout_ms,
+            )
+        )
     raise ValueError(f"Unsupported protocol: {_protocol_name(protocol)}")
 
 
 def describe_action(protocol: int, index: int) -> str:
     protocol = _validate_protocol(protocol)
-    if protocol == agent_pb2.PROTOCOL_PBFT:
+    if protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
         return f"election_timeout_ms={pbft_timeout_index_to_ms(index)}"
     if protocol == agent_pb2.PROTOCOL_SBFT:
         election_timeout_ms, slow_path_timeout_ms, batch_timeout_ms = _sbft_index_to_triple(
@@ -428,6 +695,17 @@ def describe_action(protocol: int, index: int) -> str:
             f"election_timeout_ms={election_timeout_ms}, "
             f"slow_path_timeout_ms={slow_path_timeout_ms}, "
             f"batch_timeout_ms={batch_timeout_ms}"
+        )
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        return f"timeout_delay_ms={hotstuff_timeout_index_to_ms(index)}"
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        timeout_delay_ms, car_timeout_ms, fast_path_timeout_ms = _autobahn_index_to_triple(
+            index
+        )
+        return (
+            f"timeout_delay_ms={timeout_delay_ms}, "
+            f"car_timeout_ms={car_timeout_ms}, "
+            f"fast_path_timeout_ms={fast_path_timeout_ms}"
         )
     propose_timeout_ms, prevote_timeout_ms, precommit_timeout_ms = _tendermint_index_to_triple(
         index
@@ -545,7 +823,7 @@ class ScheduledTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
 
     @property
     def action_dim(self) -> int:
-        if self._protocol == agent_pb2.PROTOCOL_SBFT:
+        if self._protocol in (agent_pb2.PROTOCOL_SBFT, agent_pb2.PROTOCOL_AUTOBAHN):
             return 3
         return 1
 
@@ -572,6 +850,16 @@ class ScheduledTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
                 )
             )
 
+        if self._protocol == agent_pb2.PROTOCOL_SMARTBFT:
+            election_timeout_ms = _validate_scheduled_timeout_ms(
+                values[0], "SmartBFT election timeout"
+            )
+            return agent_pb2.Timeout(
+                smartbft=agent_pb2.SmartbftTimeout(
+                    election_timeout_milliseconds=election_timeout_ms
+                )
+            )
+
         if self._protocol == agent_pb2.PROTOCOL_SBFT:
             election_timeout_ms = _validate_scheduled_timeout_ms(
                 values[0], "SBFT election timeout"
@@ -587,6 +875,34 @@ class ScheduledTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
                     election_timeout_milliseconds=election_timeout_ms,
                     slow_path_timeout_milliseconds=slow_path_timeout_ms,
                     batch_timeout_milliseconds=batch_timeout_ms,
+                )
+            )
+
+        if self._protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+            timeout_delay_ms = _validate_scheduled_timeout_ms(
+                values[0], "HotStuff timeout delay"
+            )
+            return agent_pb2.Timeout(
+                hotstuff=agent_pb2.HotstuffTimeout(
+                    timeout_delay_milliseconds=timeout_delay_ms
+                )
+            )
+
+        if self._protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+            timeout_delay_ms = _validate_scheduled_timeout_ms(
+                values[0], "Autobahn timeout delay"
+            )
+            car_timeout_ms = _validate_scheduled_timeout_ms(
+                values[1], "Autobahn car timeout"
+            )
+            fast_path_timeout_ms = _validate_scheduled_timeout_ms(
+                values[2], "Autobahn fast-path timeout"
+            )
+            return agent_pb2.Timeout(
+                autobahn=agent_pb2.AutobahnTimeout(
+                    timeout_delay_milliseconds=timeout_delay_ms,
+                    car_timeout_milliseconds=car_timeout_ms,
+                    fast_path_timeout_milliseconds=fast_path_timeout_ms,
                 )
             )
 
@@ -610,6 +926,9 @@ class ScheduledTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
                 agent_pb2.PROTOCOL_PBFT: "pbft",
                 agent_pb2.PROTOCOL_SBFT: "sbft",
                 agent_pb2.PROTOCOL_TENDERMINT: "tendermint",
+                agent_pb2.PROTOCOL_HOTSTUFF: "hotstuff",
+                agent_pb2.PROTOCOL_AUTOBAHN: "autobahn",
+                agent_pb2.PROTOCOL_SMARTBFT: "smartbft",
             }[self._protocol]
             actual_field = action.WhichOneof("value")
             if actual_field != expected_field:
@@ -618,7 +937,7 @@ class ScheduledTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
                 )
             action = getattr(action, expected_field)
 
-        if self._protocol == agent_pb2.PROTOCOL_PBFT:
+        if self._protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
             timeout_values = [
                 _validate_scheduled_timeout_ms(
                     getattr(action, "election_timeout_milliseconds"),
@@ -638,6 +957,28 @@ class ScheduledTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
                 _validate_scheduled_timeout_ms(
                     getattr(action, "batch_timeout_milliseconds"),
                     "SBFT batch timeout",
+                ),
+            ]
+        elif self._protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+            timeout_values = [
+                _validate_scheduled_timeout_ms(
+                    getattr(action, "timeout_delay_milliseconds"),
+                    "HotStuff timeout delay",
+                )
+            ]
+        elif self._protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+            timeout_values = [
+                _validate_scheduled_timeout_ms(
+                    getattr(action, "timeout_delay_milliseconds"),
+                    "Autobahn timeout delay",
+                ),
+                _validate_scheduled_timeout_ms(
+                    getattr(action, "car_timeout_milliseconds"),
+                    "Autobahn car timeout",
+                ),
+                _validate_scheduled_timeout_ms(
+                    getattr(action, "fast_path_timeout_milliseconds"),
+                    "Autobahn fast-path timeout",
                 ),
             ]
         else:
@@ -1120,10 +1461,10 @@ class ScheduledTimeoutModel(TensorModel):
                         f"Invalid schedule time at line {lineno}: {row}"
                     ) from exc
 
-                if protocol == agent_pb2.PROTOCOL_PBFT:
+                if protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
                     if len(row) < 2:
                         raise ValueError(
-                            f"Invalid PBFT schedule at line {lineno}: expected 2 columns time_s,election_timeout_ms."
+                            f"Invalid PBFT/SmartBFT schedule at line {lineno}: expected 2 columns time_s,election_timeout_ms."
                         )
                     try:
                         raw_action: object = int(row[1].strip())
@@ -1147,6 +1488,34 @@ class ScheduledTimeoutModel(TensorModel):
                     except ValueError as exc:
                         raise ValueError(
                             f"Invalid SBFT timeout at line {lineno}: {row[1:4]}"
+                        ) from exc
+                elif protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+                    if len(row) < 2:
+                        raise ValueError(
+                            f"Invalid HotStuff schedule at line {lineno}: expected 2 columns time_s,timeout_ms."
+                        )
+                    try:
+                        raw_action = int(row[1].strip())
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Invalid HotStuff timeout at line {lineno}: {row[1]!r}"
+                        ) from exc
+                elif protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+                    if len(row) < 4:
+                        raise ValueError(
+                            "Invalid Autobahn schedule at line "
+                            f"{lineno}: expected 4 columns "
+                            "time_s,timeout_delay_ms,car_timeout_ms,fast_path_timeout_ms."
+                        )
+                    try:
+                        raw_action = (
+                            int(row[1].strip()),
+                            int(row[2].strip()),
+                            int(row[3].strip()),
+                        )
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Invalid Autobahn timeout at line {lineno}: {row[1:4]}"
                         ) from exc
                 else:
                     if len(row) < 2:
@@ -1208,11 +1577,30 @@ class ScheduledTimeoutModel(TensorModel):
                     "election_timeout_ms="
                     f"{timeout.pbft.election_timeout_milliseconds}"
                 )
+            elif self._protocol == agent_pb2.PROTOCOL_SMARTBFT:
+                description = (
+                    "election_timeout_ms="
+                    f"{timeout.smartbft.election_timeout_milliseconds}"
+                )
             elif self._protocol == agent_pb2.PROTOCOL_SBFT:
                 description = (
                     f"election_timeout_ms={timeout.sbft.election_timeout_milliseconds}, "
                     f"slow_path_timeout_ms={timeout.sbft.slow_path_timeout_milliseconds}, "
                     f"batch_timeout_ms={timeout.sbft.batch_timeout_milliseconds}"
+                )
+            elif self._protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+                description = (
+                    "timeout_delay_ms="
+                    f"{timeout.hotstuff.timeout_delay_milliseconds}"
+                )
+            elif self._protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+                description = (
+                    "timeout_delay_ms="
+                    f"{timeout.autobahn.timeout_delay_milliseconds}, "
+                    "car_timeout_ms="
+                    f"{timeout.autobahn.car_timeout_milliseconds}, "
+                    "fast_path_timeout_ms="
+                    f"{timeout.autobahn.fast_path_timeout_milliseconds}"
                 )
             else:
                 description = (

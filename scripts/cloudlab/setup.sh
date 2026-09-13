@@ -120,6 +120,9 @@ if command -v apt-get >/dev/null 2>&1; then
     tmux \
     golang-go \
     build-essential \
+    clang \
+    protobuf-compiler \
+    pkg-config \
     curl \
     tar
 else
@@ -195,6 +198,25 @@ ensure_modern_go_toolchain() {
 
 ensure_modern_go_toolchain
 
+# Rust toolchain for the autobahn workspace (batched HotStuff/PBFT/SBFT and
+# Autobahn itself). rustup installs to ~/.cargo; the run scripts prepend
+# ~/.cargo/bin to PATH on remote execution.
+ensure_rust_toolchain() {
+  export PATH="${HOME}/.cargo/bin:${PATH}"
+  if command -v cargo >/dev/null 2>&1; then
+    return 0
+  fi
+  curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal
+  hash -r
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "Rust toolchain installation failed on $(hostname)." >&2
+    return 1
+  fi
+}
+
+ensure_rust_toolchain
+
 # Allow module-aware commands to auto-fix go.mod/go.sum during build/install.
 # This avoids failures like:
 #   "go: updates to go.mod needed; to update it: go mod tidy"
@@ -204,6 +226,9 @@ java -version >/dev/null 2>&1
 python3 -m pip --version >/dev/null 2>&1
 tmux -V >/dev/null 2>&1
 go version
+cargo --version
+protoc --version >/dev/null 2>&1
+clang --version >/dev/null 2>&1
 make --version >/dev/null 2>&1
 curl --version >/dev/null 2>&1
 tar --version >/dev/null 2>&1

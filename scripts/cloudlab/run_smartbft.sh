@@ -10,8 +10,8 @@ TARGETS_FILE_DEFAULT="${REPO_ROOT}/scripts/cloudlab/tmp/cloudlab_ssh_targets.txt
 SMARTBFT_SRC="${REPO_ROOT}/SmartBFT"
 LEARNING_AGENT_SRC_DIR="${REPO_ROOT}/learning_agent"
 APPLIER_LOCAL_PATH="${REPO_ROOT}/scripts/apply_network_failures.py"
-CONFIG_DEFAULT="${REPO_ROOT}/config/pbft/smallbank.xml"
-FAILURE_SPEC_DEFAULT="${REPO_ROOT}/config/pbft/failure_spec.xml"
+CONFIG_DEFAULT="${REPO_ROOT}/config/smartbft/smallbank.xml"
+FAILURE_SPEC_DEFAULT="${REPO_ROOT}/config/smartbft/failure_spec.xml"
 LOCAL_TMP_DIR="${REPO_ROOT}/scripts/cloudlab/tmp"
 RUNS_ROOT="${LOCAL_TMP_DIR}/runs/smartbft"
 OUTPUT_DIR=""
@@ -35,7 +35,6 @@ AGENT_MODEL_SET=0
 BATCH_SIZE=256
 BATCH_TIMEOUT="50ms"
 REQUEST_TIMEOUT="30s"
-SUBMIT_MODE="broadcast"
 CREATE_WORKERS=""
 SERVER_PORT_BASE=19100
 AGENT_PORT=15501
@@ -123,13 +122,12 @@ Flags:
 
 SmartBFT options:
   --nodes <int>                     Override node count (default: 3f+1).
-  --config <path>                   SmallBank XML config (default: config/pbft/smallbank.xml).
+  --config <path>                   SmallBank XML config (default: config/smartbft/smallbank.xml).
   --failure-spec <path>             failure_spec.xml for proposal and network delay.
   --no-failure-spec                 Disable proposal delay and network delay appliers.
   --batch-size <int>                SmartBFT batch size (default: 200).
   --batch-timeout <duration>        SmartBFT batch timeout (default: 50ms).
   --request-timeout <duration>      Client request timeout (default: 30s).
-  --submit-mode <broadcast|leader>  Client submit mode (default: broadcast).
   --create-workers <int>            Account creation workers (default: first workload phase terminals).
   --client-start-delay <seconds>    Wait after servers are ready before launching client (default: 10).
   --start-offset <seconds>          Delay from client launch to benchmark/failure start (default: 20).
@@ -377,10 +375,6 @@ while [[ $# -gt 0 ]]; do
       REQUEST_TIMEOUT="${2:-}"
       shift 2
       ;;
-    --submit-mode)
-      SUBMIT_MODE="${2:-}"
-      shift 2
-      ;;
     --create-workers)
       CREATE_WORKERS="${2:-}"
       shift 2
@@ -479,10 +473,6 @@ if (( SERVER_PORT_BASE + NODES > 65535 )); then
   echo "Invalid --port-base ${SERVER_PORT_BASE} for ${NODES} nodes." >&2
   exit 2
 fi
-case "${SUBMIT_MODE}" in
-  broadcast|leader) ;;
-  *) echo "Invalid --submit-mode value: ${SUBMIT_MODE}. Expected broadcast or leader." >&2; exit 2 ;;
-esac
 case "${LEARNING_WINDOW_MODE}" in
   consensus|wall-clock) ;;
   *) echo "Invalid --learning-window-mode value: ${LEARNING_WINDOW_MODE}. Expected consensus or wall-clock." >&2; exit 2 ;;
@@ -594,7 +584,7 @@ if (( FAILURE_SPEC_ENABLED == 1 )); then
   cp "${FAILURE_SPEC_PATH}" "${ARTIFACT_DIR}/failure_spec.xml"
 fi
 if [[ "${MODE}" == "scheduled" ]]; then
-  cp "${REPO_ROOT}/learning_agent/config/schedule_pbft.csv" "${ARTIFACT_DIR}/schedule_pbft.csv"
+  cp "${REPO_ROOT}/learning_agent/config/schedule_smartbft.csv" "${ARTIFACT_DIR}/schedule_smartbft.csv"
 fi
 {
   printf 'protocol=%q\n' "smartbft"
@@ -607,7 +597,6 @@ fi
   printf 'batch_size=%q\n' "${BATCH_SIZE}"
   printf 'batch_timeout=%q\n' "${BATCH_TIMEOUT}"
   printf 'request_timeout=%q\n' "${REQUEST_TIMEOUT}"
-  printf 'submit_mode=%q\n' "${SUBMIT_MODE}"
   printf 'agent_model=%q\n' "${AGENT_MODEL_TYPE}"
   printf 'learning_window_mode=%q\n' "${LEARNING_WINDOW_MODE}"
   printf 'dataset_enabled=%q\n' "${DATASET_ENABLED}"
@@ -749,7 +738,6 @@ done
 
 echo "Selected mode: ${MODE}"
 echo "SmartBFT nodes: ${NODES} (f=${F}, replicas_per_server_machine=${replicas_per_server_machine})"
-echo "Submit mode: ${SUBMIT_MODE}"
 echo "Batch size: ${BATCH_SIZE}; batch timeout: ${BATCH_TIMEOUT}; request timeout: ${REQUEST_TIMEOUT}"
 echo "SmartBFT verbose server logs: ${VERBOSE_ENABLED}"
 echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (dataset=${DATASET_ENABLED}, log=${LOG_ENABLED})"
@@ -821,10 +809,10 @@ cp "${hosts_path}" "${run_root}/hosts.config"
 cp "${failure_hosts_path}" "${run_root}/hosts.failure.config"
 cp "${agent_hosts_path}" "${run_root}/agent_hosts.config"
 cp "${sharing_hosts_path}" "${run_root}/sharing_hosts.config"
-mkdir -p "${run_root}/config/pbft"
-cp "${config_path}" "${run_root}/config/pbft/smallbank.xml"
+mkdir -p "${run_root}/config/smartbft"
+cp "${config_path}" "${run_root}/config/smartbft/smallbank.xml"
 if [[ -n "${failure_spec_path}" ]]; then
-  cp "${failure_spec_path}" "${run_root}/config/pbft/failure_spec.xml"
+  cp "${failure_spec_path}" "${run_root}/config/smartbft/failure_spec.xml"
 fi
 chmod +x "${run_root}/scripts/apply_network_failures.py"
 rm -f "${tar_path}" "${hosts_path}" "${failure_hosts_path}" "${config_path}" "${agent_hosts_path}" "${sharing_hosts_path}"
@@ -963,6 +951,14 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   sudo -n ip netns exec "${ns_name}" ip addr replace "${ns_ip}/${overlay_mask}" dev "${ns_if}"
   sudo -n ip netns exec "${ns_name}" ip link set "${ns_if}" up
   sudo -n ip netns exec "${ns_name}" ip route replace default via "${bridge_ip}"
+  # net.ipv4.* is per network namespace, so the host setting does not reach the
+  # replicas. Consensus streams idle between view changes, and by default Linux
+  # collapses the TCP congestion window after an idle period, which makes each
+  # large view-change message pay slow start again over the injected delay.
+  # Keep the window across idle gaps and do not seed new connections from a
+  # cached low estimate left by an earlier delay phase.
+  sudo -n ip netns exec "${ns_name}" sysctl -q -w net.ipv4.tcp_slow_start_after_idle=0
+  sudo -n ip netns exec "${ns_name}" sysctl -q -w net.ipv4.tcp_no_metrics_save=1
 done
 
 for ((peer_idx = 0; peer_idx < server_machine_count; peer_idx++)); do
@@ -1079,7 +1075,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   session_name="smartbft_applier_${replica_id}"
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   tmux new-session -d -s "${session_name}" \
-    "cd \"${run_root}\" && python3 \"${run_root}/scripts/apply_network_failures.py\" --failure-spec \"${run_root}/config/pbft/failure_spec.xml\" --hosts-config \"${run_root}/hosts.failure.config\" --replica-id ${replica_id} --netns ${ns_name} --interface ${interface_name} --start-unix-ms ${start_unix_ms} > \"${run_root}/logs/applier_${replica_id}.log\" 2>&1"
+    "cd \"${run_root}\" && python3 \"${run_root}/scripts/apply_network_failures.py\" --failure-spec \"${run_root}/config/smartbft/failure_spec.xml\" --hosts-config \"${run_root}/hosts.failure.config\" --replica-id ${replica_id} --netns ${ns_name} --interface ${interface_name} --start-unix-ms ${start_unix_ms} > \"${run_root}/logs/applier_${replica_id}.log\" 2>&1"
 done
 REMOTE
     then
@@ -1142,7 +1138,7 @@ agent_model_args=""
 if [[ "${mode}" == "learning" || "${mode}" == "sharing" ]]; then
   agent_model_args="--model-type ${model_type}"
 elif [[ "${mode}" == "scheduled" ]]; then
-  agent_model_args="--model-type scheduled --schedule-file learning_agent/config/schedule_pbft.csv"
+  agent_model_args="--model-type scheduled --schedule-file learning_agent/config/schedule_smartbft.csv"
 fi
 
 for ((n = 0; n < replicas_per_machine; n++)); do
@@ -1163,7 +1159,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   fi
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   tmux new-session -d -s "${session_name}" \
-    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec \"${learning_agent_python}\" learning_agent/main.py --node-id ${replica_id} --protocol pbft ${bind_args} --signing false ${agent_model_args} ${dataset_args} --failure-spec \"${run_root}/config/pbft/failure_spec.xml\" --injection-start-unix-ms ${start_unix_ms}' > \"${agent_log}\" 2>&1"
+    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec \"${learning_agent_python}\" learning_agent/main.py --node-id ${replica_id} --protocol smartbft ${bind_args} --signing false ${agent_model_args} ${dataset_args} --failure-spec \"${run_root}/config/smartbft/failure_spec.xml\" --injection-start-unix-ms ${start_unix_ms}' > \"${agent_log}\" 2>&1"
 
   if [[ "${sharing_enabled}" == "1" ]]; then
     sharing_session="smartbft_sharing_${replica_id}"
@@ -1171,7 +1167,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
     rm -rf "${run_root}/sharing_wal_${replica_id}"
     tmux kill-session -t "${sharing_session}" >/dev/null 2>&1 || true
     tmux new-session -d -s "${sharing_session}" \
-      "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec ./bin/smartbft-sharing --role server --node-id $((replica_id + 1)) --protocol pbft --hosts-config \"${run_root}/sharing_hosts.config\" --data-dir \"${run_root}/sharing_wal_${replica_id}\" --keep-data' > \"${sharing_log}\" 2>&1"
+      "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec ./bin/smartbft-sharing --role server --node-id $((replica_id + 1)) --protocol smartbft --hosts-config \"${run_root}/sharing_hosts.config\" --data-dir \"${run_root}/sharing_wal_${replica_id}\" --keep-data' > \"${sharing_log}\" 2>&1"
   fi
 done
 
@@ -1279,7 +1275,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
     "--keep-data"
   )
 	  if [[ "${failure_enabled}" == "1" ]]; then
-	    args+=("--failure-spec" "${run_root}/config/pbft/failure_spec.xml" "--failure-start-unix-ms" "${start_unix_ms}")
+	    args+=("--failure-spec" "${run_root}/config/smartbft/failure_spec.xml" "--failure-start-unix-ms" "${start_unix_ms}")
 	  fi
 	  if [[ "${learning_enabled}" == "1" ]]; then
 	    args+=(
@@ -1345,17 +1341,15 @@ echo "Starting SmartBFT client on node0..."
 remote_create_workers="${CREATE_WORKERS:-__default__}"
 ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" "bash -s" -- \
   "${START_UNIX_MS}" \
-  "${SUBMIT_MODE}" \
   "${REQUEST_TIMEOUT}" \
   "${remote_create_workers}" \
   "${node0_advertise_ip}" <<'REMOTE'
 set -euo pipefail
 
 start_unix_ms="$1"
-submit_mode="$2"
-request_timeout="$3"
-create_workers="$4"
-reply_advertise="$5"
+request_timeout="$2"
+create_workers="$3"
+reply_advertise="$4"
 if [[ "${create_workers}" == "__default__" ]]; then
   create_workers=""
 fi
@@ -1364,9 +1358,8 @@ args=(
   "${run_root}/bin/smartbft-smallbank"
   "--role" "client"
   "--hosts-config" "${run_root}/hosts.config"
-  "--config" "${run_root}/config/pbft/smallbank.xml"
+  "--config" "${run_root}/config/smartbft/smallbank.xml"
   "--request-timeout" "${request_timeout}"
-  "--submit-mode" "${submit_mode}"
   "--client-reply-listen" "0.0.0.0:0"
   "--client-reply-advertise-host" "${reply_advertise}"
   "--create"

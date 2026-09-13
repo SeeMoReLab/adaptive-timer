@@ -58,6 +58,9 @@ PROTOCOL_NAME_TO_ENUM = {
     "pbft": agent_pb2.PROTOCOL_PBFT,
     "sbft": agent_pb2.PROTOCOL_SBFT,
     "tendermint": agent_pb2.PROTOCOL_TENDERMINT,
+    "hotstuff": agent_pb2.PROTOCOL_HOTSTUFF,
+    "autobahn": agent_pb2.PROTOCOL_AUTOBAHN,
+    "smartbft": agent_pb2.PROTOCOL_SMARTBFT,
 }
 
 MODEL_NAME_TO_TENSORMODEL = {
@@ -126,7 +129,7 @@ def set_seed(seed: int) -> None:
 def _parse_protocol(value: str) -> int:
     protocol = PROTOCOL_NAME_TO_ENUM.get(value.strip().lower().replace("-", "_"))
     if protocol is None:
-        valid = ", ".join(sorted({"pbft", "sbft", "tendermint"}))
+        valid = ", ".join(sorted(PROTOCOL_NAME_TO_ENUM))
         raise argparse.ArgumentTypeError(
             f"Unsupported protocol '{value}'. Valid options: {valid}"
         )
@@ -256,7 +259,7 @@ def _resolve_acceptable(
 
 def _default_acceptable(protocol: int) -> Optional[Dict[int, set]]:
     """Return the protocol-specific default phase scoring policy."""
-    if protocol != agent_pb2.PROTOCOL_PBFT:
+    if protocol not in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
         return None
     return {
         phase: set(timeouts)
@@ -350,7 +353,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--protocol",
         type=str,
         default='pbft',
-        help="Protocol: pbft | sbft | tendermint",
+        help="Protocol: pbft | smartbft | sbft | tendermint | hotstuff | autobahn",
     )
     parser.add_argument(
         "--model",
@@ -782,7 +785,7 @@ def main() -> None:
     )
     if args.phases is not None:
         phase_spec = args.phases
-    elif protocol_id == agent_pb2.PROTOCOL_PBFT:
+    elif protocol_id in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
         phase_spec = DEFAULT_PBFT_PHASES
     else:
         phase_spec = ";".join(

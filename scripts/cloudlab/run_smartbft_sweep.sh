@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 RUNNER="${SCRIPT_DIR}/run_smartbft.sh"
-FAILURE_SPEC="${REPO_ROOT}/config/pbft/failure_spec.xml"
-SCHEDULE="${REPO_ROOT}/learning_agent/config/schedule_pbft.csv"
+FAILURE_SPEC="${REPO_ROOT}/config/smartbft/failure_spec.xml"
+SCHEDULE="${REPO_ROOT}/learning_agent/config/schedule_smartbft.csv"
 TMP_ROOT="${SCRIPT_DIR}/tmp"
 
 MAX_TIMEOUT_MS=4294967295
@@ -216,7 +216,7 @@ for timeout_ms in "${timeouts[@]}"; do
   run_name="timeout_${timeout_ms}"
   run_dir="${results_root}/${run_name}"
   mkdir -p "${run_dir}"
-  cp "${SCHEDULE}" "${run_dir}/schedule_pbft.csv"
+  cp "${SCHEDULE}" "${run_dir}/schedule_smartbft.csv"
 
   echo
   echo "==> Sweep run ${run_number}/${total_runs}: timeout=${timeout_ms}ms"

@@ -8,7 +8,12 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 import agent_pb2
-from models import tendermint_timeouts_from_propose
+from models import (
+    AUTOBAHN_CAR_TIMEOUT_VALUES_MS,
+    AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS,
+    AUTOBAHN_TIMEOUT_DELAY_VALUES_MS,
+    tendermint_timeouts_from_propose,
+)
 from reward_utils import reward_from_report_row
 
 PBFT_LEGACY_FEATURE_ALIASES: Dict[str, Tuple[str, ...]] = {
@@ -249,7 +254,7 @@ def _lookup_feature_raw_value(
     if direct is not None and direct.strip() != "":
         return direct
 
-    if protocol == agent_pb2.PROTOCOL_PBFT:
+    if protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
         aliases = PBFT_LEGACY_FEATURE_ALIASES.get(field_name, ())
         for alias in aliases:
             aliased = row.get(f"feature_{alias}")
@@ -276,7 +281,7 @@ def _extract_action_index(
     timeout_values_ms: Sequence[int],
     row_number: int,
 ) -> int:
-    if protocol == agent_pb2.PROTOCOL_PBFT:
+    if protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
         election_timeout_ms = _parse_timeout_ms(
             row=row,
             candidates=(
@@ -361,6 +366,58 @@ def _extract_action_index(
         return _timeout_ms_to_index(
             propose_timeout_ms, timeout_values_ms, row_number
         )
+
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        timeout_delay_ms = _parse_timeout_ms(
+            row=row,
+            candidates=(
+                "timeout_delay_milliseconds_used",
+                "timeout_delay_milliseconds",
+            ),
+            row_number=row_number,
+        )
+        return _timeout_ms_to_index(timeout_delay_ms, timeout_values_ms, row_number)
+
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        # The three Autobahn knobs have distinct value sets, so the shared
+        # timeout_values_ms argument cannot cover them; the per-knob option
+        # tuples from models are used instead.
+        timeout_delay_ms = _parse_timeout_ms(
+            row=row,
+            candidates=(
+                "timeout_delay_milliseconds_used",
+                "timeout_delay_milliseconds",
+            ),
+            row_number=row_number,
+        )
+        car_timeout_ms = _parse_timeout_ms(
+            row=row,
+            candidates=(
+                "car_timeout_milliseconds_used",
+                "car_timeout_milliseconds",
+            ),
+            row_number=row_number,
+        )
+        fast_path_timeout_ms = _parse_timeout_ms(
+            row=row,
+            candidates=(
+                "fast_path_timeout_milliseconds_used",
+                "fast_path_timeout_milliseconds",
+            ),
+            row_number=row_number,
+        )
+        delay_idx = _timeout_ms_to_index(
+            timeout_delay_ms, AUTOBAHN_TIMEOUT_DELAY_VALUES_MS, row_number
+        )
+        car_idx = _timeout_ms_to_index(
+            car_timeout_ms, AUTOBAHN_CAR_TIMEOUT_VALUES_MS, row_number
+        )
+        fast_idx = _timeout_ms_to_index(
+            fast_path_timeout_ms, AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS, row_number
+        )
+        car_base = len(AUTOBAHN_CAR_TIMEOUT_VALUES_MS)
+        fast_base = len(AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS)
+        return (delay_idx * car_base * fast_base) + (car_idx * fast_base) + fast_idx
 
     raise ValueError(f"Unsupported protocol: {protocol}")
 

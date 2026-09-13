@@ -13,6 +13,9 @@ import io
 
 import agent_pb2
 from models import (
+    autobahn_car_timeout_index_to_ms,
+    autobahn_fast_path_timeout_index_to_ms,
+    autobahn_timeout_delay_ms_to_index,
     get_report_feature_field_names,
     get_timeout_values_ms,
     tendermint_timeouts_from_propose,
@@ -24,6 +27,9 @@ PROTOCOL_NAME_TO_ENUM = {
     "pbft": agent_pb2.PROTOCOL_PBFT,
     "sbft": agent_pb2.PROTOCOL_SBFT,
     "tendermint": agent_pb2.PROTOCOL_TENDERMINT,
+    "hotstuff": agent_pb2.PROTOCOL_HOTSTUFF,
+    "autobahn": agent_pb2.PROTOCOL_AUTOBAHN,
+    "smartbft": agent_pb2.PROTOCOL_SMARTBFT,
 }
 
 SIMULATED_REWARD_COLUMN = "simulated_reward"
@@ -118,6 +124,11 @@ class DataGenerator(BaseDataGenerator):
     def _primary_timeout_column(self) -> str:
         if self.protocol_id == agent_pb2.PROTOCOL_TENDERMINT:
             return "propose_timeout_milliseconds_used"
+        if self.protocol_id in (
+            agent_pb2.PROTOCOL_HOTSTUFF,
+            agent_pb2.PROTOCOL_AUTOBAHN,
+        ):
+            return "timeout_delay_milliseconds_used"
         return "election_timeout_milliseconds_used"
 
     def _derive_phase_options(self) -> Dict[int, int]:
@@ -234,13 +245,34 @@ class DataGenerator(BaseDataGenerator):
     def _set_timeout_columns(
         self, trial: pd.DataFrame, selected_timeouts: Sequence[int]
     ) -> None:
-        if self.protocol_id == agent_pb2.PROTOCOL_PBFT:
+        if self.protocol_id in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
             trial["election_timeout_milliseconds_used"] = selected_timeouts
             return
         if self.protocol_id == agent_pb2.PROTOCOL_SBFT:
             trial["election_timeout_milliseconds_used"] = selected_timeouts
             trial["slow_path_timeout_milliseconds_used"] = selected_timeouts
             trial["batch_timeout_milliseconds_used"] = selected_timeouts
+            return
+        if self.protocol_id == agent_pb2.PROTOCOL_HOTSTUFF:
+            trial["timeout_delay_milliseconds_used"] = selected_timeouts
+            return
+        if self.protocol_id == agent_pb2.PROTOCOL_AUTOBAHN:
+            # The knobs have distinct value sets, so the SBFT convention of
+            # copying the selected timeout into every column would produce
+            # invalid actions; car and fast-path instead follow the selected
+            # timeout delay at the same option index.
+            delay_indices = [
+                autobahn_timeout_delay_ms_to_index(int(timeout))
+                for timeout in selected_timeouts
+            ]
+            trial["timeout_delay_milliseconds_used"] = selected_timeouts
+            trial["car_timeout_milliseconds_used"] = [
+                autobahn_car_timeout_index_to_ms(index) for index in delay_indices
+            ]
+            trial["fast_path_timeout_milliseconds_used"] = [
+                autobahn_fast_path_timeout_index_to_ms(index)
+                for index in delay_indices
+            ]
             return
 
         timeout_triples = [

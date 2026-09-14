@@ -1,0 +1,15 @@
+{
+  "consensus": {
+    "timeout_delay": 5000,
+    "sync_retry_delay": 1000,
+    "max_payload_size": 32000,
+    "min_block_delay": 100
+  },
+  "mempool": {
+    "sync_retry_delay": 1000,
+    "max_payload_size": 500000,
+    "min_block_delay": 100,
+    "max_queued_transactions": 20000,
+    "max_queue_delay": 5000
+  }
+}

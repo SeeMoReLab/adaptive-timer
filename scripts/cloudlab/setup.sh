@@ -103,7 +103,7 @@ if (( has_peers == 1 )); then
   echo "Multi-node targets detected; skipping node0->peer SSH bootstrap."
 fi
 
-echo "Installing PBFT + Tendermint dependencies on all nodes in parallel..."
+echo "Installing SmartBFT, Tendermint, and Rust dependencies on all nodes in parallel..."
 pids=()
 nodes=()
 while read -r node host user; do
@@ -198,8 +198,8 @@ ensure_modern_go_toolchain() {
 
 ensure_modern_go_toolchain
 
-# Rust toolchain for the autobahn workspace (batched HotStuff/PBFT/SBFT and
-# Autobahn itself). rustup installs to ~/.cargo; the run scripts prepend
+# Rust toolchain for the autobahn workspace (batched HotStuff and Autobahn
+# itself). rustup installs to ~/.cargo; the run scripts prepend
 # ~/.cargo/bin to PATH on remote execution.
 ensure_rust_toolchain() {
   export PATH="${HOME}/.cargo/bin:${PATH}"

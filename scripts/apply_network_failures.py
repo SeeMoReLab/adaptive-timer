@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Apply phase-scheduled burst-delay faults using tc netem.
 
-This applier intentionally handles only the <network> section of
-config/pbft/failure_spec.xml and ignores PBFT/agent fault sections.
+This applier intentionally handles only the <network> section of a
+failure_spec.xml and ignores the protocol and agent fault sections.
 """
 
 from __future__ import annotations
@@ -1101,7 +1101,7 @@ def main() -> int:
     parser.add_argument(
         "--failure-spec",
         type=Path,
-        default=Path("config/pbft/failure_spec.xml"),
+        default=Path("config/smartbft/failure_spec.xml"),
         help="Path to failure spec XML.",
     )
     parser.add_argument(

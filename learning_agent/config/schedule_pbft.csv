@@ -1,6 +1,0 @@
-# time_s,timeout_ms
-# may be any integer from 1 through 4294967295
--10,300
-0,300
-890,800
-1490,1800

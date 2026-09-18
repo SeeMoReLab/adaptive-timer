@@ -22,8 +22,18 @@ import agent_pb2
 import agent_pb2_grpc
 from aggregator import BaseAggregator, MedianAggregator, WeightedMedianAggregator
 from continuous_bandit import (
+    DEFAULT_PROPORTIONAL_K,
     ContinuousThompsonSamplingModel,
+    ContinuousThresholdTimeoutModel,
     ContinuousTimeoutActionCodec,
+    NormalizedLatencyFloor,
+)
+from latency_floor import (
+    DEFAULT_LATENCY_FLOOR_K,
+    DEFAULT_LATENCY_FLOOR_QUANTILE,
+    LatencyFloor,
+    LatencyFloorPolicy,
+    latency_feature_indices,
 )
 from models import (
     ActionCodec,
@@ -33,7 +43,9 @@ from models import (
     LinearModel,
     PavlovTimeoutModel,
     StarvationFreeThompsonSamplingModel,
+    SurvivalGatedThompsonSamplingModel,
     ThompsonSamplingModel,
+    ThompsonSamplingModelV2,
     ProtocolReportFeatureExtractor,
     ProtocolTimeoutActionCodec,
     RandomTimeoutModel,
@@ -43,15 +55,19 @@ from models import (
     get_action_space_size,
     get_report_feature_dim,
     get_report_feature_field_names,
+    get_timeout_values_ms,
     report_to_feature_values,
 )
 from reward_utils import (
+    DEFAULT_REWARD_DESIGN,
+    REWARD_DESIGNS,
     calculate_autobahn_reward,
     calculate_hotstuff_reward,
     calculate_pbft_reward,
     calculate_sbft_reward,
     calculate_smartbft_reward,
     calculate_tendermint_reward,
+    set_reward_design,
 )
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -83,8 +99,30 @@ def _parse_bool(value: str) -> bool:
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
-def reward_engineering(protocol: int, report: object) -> float:
-    """Calculate a protocol-specific reward from a complete reward report."""
+def _tendermint_applied_timeouts(timeout_used: object) -> dict:
+    """The applied Tendermint timeout triple, as reward calculator kwargs.
+
+    Empty when no Timeout was supplied, which leaves the calculator's defaults
+    in place: reward_tps does not need them and reward_mixed says so itself.
+    """
+    if timeout_used is None:
+        return {}
+    return {
+        "propose_timeout_ms": int(timeout_used.propose_timeout_milliseconds),
+        "prevote_timeout_ms": int(timeout_used.prevote_timeout_milliseconds),
+        "precommit_timeout_ms": int(timeout_used.precommit_timeout_milliseconds),
+    }
+
+
+def reward_engineering(
+    protocol: int, report: object, timeout_used: object = None
+) -> float:
+    """Calculate a protocol-specific reward from a complete reward report.
+
+    ``timeout_used`` is the Timeout message the episode actually ran with. It
+    is only read for protocols whose report does not carry its own timeout
+    field - Tendermint - and is ignored everywhere else.
+    """
     if protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
         # SmartbftReport has the PbftReport field layout but its own reward.
         calculator = (
@@ -143,6 +181,7 @@ def reward_engineering(protocol: int, report: object) -> float:
             propose_latency_ms=float(report.propose_latency_ms),
             prevote_latency_ms=float(report.prevote_latency_ms),
             precommit_latency_ms=float(report.precommit_latency_ms),
+            **_tendermint_applied_timeouts(timeout_used),
         )
     if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
         return calculate_hotstuff_reward(
@@ -1767,7 +1806,9 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
 
         total_transactions = _report_total_transactions(reward_report)
         throughput_tps = _report_throughput_tps(reward_report)
-        engineered_reward = reward_engineering(self._protocol, reward_report)
+        engineered_reward = reward_engineering(
+            self._protocol, reward_report, timeout_used
+        )
         phase = self._phase_by_episode.get(reward_episode, -1)
         self._log_completed_episode_row_locked(
             phase=phase,
@@ -1887,6 +1928,9 @@ def serve(
     aggregate_function: str,
     aggregate_weight: int,
     schedule_file: Optional[Path],
+    threshold_multiplier: float,
+    latency_floor_k: float,
+    latency_floor_quantile: float,
     dataset_csv: Optional[Path],
     failure_spec: Optional[Path],
     injection_start_unix_ms: Optional[int],
@@ -1929,7 +1973,37 @@ def serve(
         )
         consensus_stub = agent_pb2_grpc.ConsensusStub(consensus_channel)
 
-    if model_type == "continuous":
+    # Domain constraint on the action space, shared by whichever model is
+    # built below: a timeout under the consensus latency the replicas are
+    # already achieving cannot be met, so it is not worth a decision. The
+    # field is the window mean, avg_consensus_latency_ms, matching what
+    # continuous_threshold reads below, so the constraint and the heuristic
+    # are compared on the same measurement.
+    latency_index, instances_index = latency_feature_indices(
+        get_report_feature_field_names(protocol)
+    )
+    latency_floor = (
+        None
+        if latency_floor_k <= 0.0
+        else LatencyFloor(
+            multiplier=latency_floor_k, quantile=latency_floor_quantile
+        )
+    )
+
+    if model_type == "continuous_threshold":
+        action_codec = ContinuousTimeoutActionCodec(protocol)
+        feature_fields = get_report_feature_field_names(protocol)
+        arms_ms = get_timeout_values_ms(protocol)
+        model = ContinuousThresholdTimeoutModel(
+            action_codec=action_codec,
+            n_features=get_report_feature_dim(protocol),
+            latency_index=feature_fields.index("avg_consensus_latency_ms"),
+            transactions_index=feature_fields.index("total_transactions"),
+            multiplier=threshold_multiplier,
+            clamp_ms=(min(arms_ms), max(arms_ms)),
+            initial_timeout_ms=sorted(arms_ms)[len(arms_ms) // 2],
+        )
+    elif model_type == "continuous":
         action_codec = ContinuousTimeoutActionCodec(protocol)
         discrete_action_count = get_action_space_size(protocol)
         model = ContinuousThompsonSamplingModel(
@@ -1939,6 +2013,17 @@ def serve(
             initial_design_size=discrete_action_count,
             memory_size=discrete_action_count * 32,
             seed=42,
+            latency_floor=(
+                None
+                if latency_floor is None
+                else NormalizedLatencyFloor(
+                    action_codec=action_codec,
+                    latency_index=latency_index,
+                    n_features=get_report_feature_dim(protocol),
+                    instances_index=instances_index,
+                    latency_floor=latency_floor,
+                )
+            ),
         )
     elif model_type == "random":
         # Seeded like the other models so that, in sharing mode, every node
@@ -1967,18 +2052,43 @@ def serve(
             n_features=get_report_feature_dim(protocol),
             seed=42,
         )
+    elif model_type == "cmab_v2":
+        # Earlier CMAB iteration, previously simulator-only. Kept reachable
+        # from the agent so a phase-change response can be compared against
+        # the current cmab on hardware rather than only on resampled data.
+        model = ThompsonSamplingModelV2(
+            action_dim=get_action_space_size(protocol),
+            n_features=get_report_feature_dim(protocol),
+            seed=42,
+        )
     elif model_type == "cmab_reset":
         model = CMAB(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
             seed=42,
         )
-    elif model_type == "claude_v2":
-        model = StarvationFreeThompsonSamplingModel(
+    elif model_type == "cmab_v4":
+        model = SurvivalGatedThompsonSamplingModel(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
             seed=42,
         )
+        print("[cmab_v4] survival-gated: liveness gate + reward ranking")
+    elif model_type == "claude_v2":
+        # bucket_size 32 rather than the class default of 8. The exploit branch
+        # is only contextual if its trees can split, and the inherited
+        # min_samples_leaf=6 needs two leaves of 6, so a window of 8 can never
+        # split: fitting the run's own rows gives a single leaf on 40 of 40
+        # draws at 8, versus 2.0 leaves at 16 and 3.5 at 32. At 8 the model
+        # falls back to a bootstrap mean of the window, which is the flat,
+        # context-free estimate it was written to replace.
+        model = StarvationFreeThompsonSamplingModel(
+            action_dim=get_action_space_size(protocol),
+            n_features=get_report_feature_dim(protocol),
+            bucket_size=32,
+            seed=42,
+        )
+        print("[claude_v2] bucket_size=32 (class default 8)")
     elif model_type == "codex_v1":
         model = DiscountedLinUCB(
             action_dim=get_action_space_size(protocol),
@@ -1996,10 +2106,37 @@ def serve(
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 
+    # continuous takes the floor through its own candidate sampler, above.
+    # continuous_threshold is already a multiple of the same latency, and
+    # scheduled is a fixed-baseline replay that must not be overridden.
+    #
+    # In sharing mode the floor stays identical on every replica for free: it
+    # is estimated from the consensus-agreed feature vector, which is the same
+    # on all of them, so constraining the action space does not break the
+    # lockstep the aggregated reward depends on.
+    floor_exempt = ("continuous_threshold", "scheduled")
+    if latency_floor is not None and model_type not in (
+        ("continuous",) + floor_exempt
+    ):
+        model = LatencyFloorPolicy(
+            model=model,
+            timeouts_ms=get_timeout_values_ms(protocol),
+            latency_index=latency_index,
+            n_features=get_report_feature_dim(protocol),
+            instances_index=instances_index,
+            latency_floor=latency_floor,
+        )
+    if latency_floor is not None:
+        applied = "not applied (latency rule already)" if model_type in floor_exempt else "applied"
+        print(
+            f"[latency_floor] k={latency_floor_k} "
+            f"quantile={latency_floor_quantile} {applied} to {model_type}"
+        )
+
     feature_extractor = ProtocolReportFeatureExtractor(protocol)
     if model_type == "scheduled":
         action_codec = ScheduledTimeoutActionCodec(protocol)
-    elif model_type != "continuous":
+    elif model_type not in ("continuous", "continuous_threshold"):
         action_codec = ProtocolTimeoutActionCodec(protocol)
     if aggregate_function == "median":
         aggregator: BaseAggregator = MedianAggregator(protocol=protocol)
@@ -2141,9 +2278,12 @@ def main():
             "linear",
             "cmab",
             "cmab_reset",
+            "cmab_v2",
+            "cmab_v4",
             "claude_v2",
             "codex_v1",
             "continuous",
+            "continuous_threshold",
             "scheduled",
             "thompson",
         ),
@@ -2156,12 +2296,21 @@ def main():
             "cmab_reset: blocked CMAB with replay-triggered resets "
             "(requires xgboost); "
             "claude_v2: cmab with the staleness bonus and contextual exploit "
-            "that stop an arm being starved after a bad phase; "
+            "that stop an arm being starved after a bad phase, with a 32-deep "
+            "per-arm window so those trees can actually split; "
             "codex_v1: discounted LinUCB, one ridge model per arm; "
+            "cmab_v2: the earlier CMAB iteration, one bootstrapped tree "
+            "ensemble over (context, arm) with per-head fitting; "
+            "cmab_v4: survival-gated - factorises reward into "
+            "P(alive | context, arm) times performance, gates on the first and "
+            "ranks on the second, so a timeout that stalls is ruled out from a "
+            "handful of samples instead of averaged into a conditional mean; "
             "continuous: bootstrapped continuous contextual bandit; "
+            "continuous_threshold: k * avg_consensus_latency_ms, clamped to "
+            "the arm range; no learning; "
             "thompson: deprecated alias for cmab; "
             "scheduled: timeout from a time-based schedule CSV. "
-            "The earlier CMAB iterations (v1-v3) are simulator-only; see "
+            "The remaining CMAB iterations (v1, v3) are simulator-only; see "
             "simulator.py --model."
         ),
     )
@@ -2179,6 +2328,64 @@ def main():
         type=int,
         default=3,
         help="Weight multiplier for local node when using weighted_median (default: 3).",
+    )
+
+    parser.add_argument(
+        "--threshold-multiplier",
+        type=float,
+        default=DEFAULT_PROPORTIONAL_K,
+        help=(
+            "Multiplier k for --model-type=continuous_threshold: "
+            "timeout_ms = clamp(k * avg_consensus_latency_ms, arm range). "
+            f"Fit it with learning_agent/fit_proportional.py (default: "
+            f"{DEFAULT_PROPORTIONAL_K})."
+        ),
+    )
+
+    parser.add_argument(
+        "--reward-design",
+        choices=REWARD_DESIGNS,
+        default=DEFAULT_REWARD_DESIGN,
+        help=(
+            "Reward shaping the agent learns from. reward_tps is throughput "
+            "alone, concave past a 1000 tps knee. reward_mixed additionally "
+            "discounts it by the share of the measurement window one fault "
+            "would cost - the applied timeout plus one consensus latency - so "
+            "a longer timer has to earn the detection delay it buys. Latency "
+            "enters reward_mixed only as an overhead relative to the window, "
+            "never as a level, because an absolute latency term ranks the "
+            "delay environment instead of the arm (default: "
+            f"{DEFAULT_REWARD_DESIGN})."
+        ),
+    )
+    parser.add_argument(
+        "--latency-floor-k",
+        type=float,
+        default=0.0,
+        help=(
+            "Domain constraint: never apply a timeout below k * the consensus "
+            "latency the replicas are already achieving, estimated as a low "
+            "quantile over recent committing windows. A timeout under that "
+            "latency cannot be met, so it buys view changes and stalls "
+            "throughput; excluding it costs the learner nothing it could have "
+            "won. 0 disables the constraint (default: 0; try "
+            f"{DEFAULT_LATENCY_FLOOR_K})."
+        ),
+    )
+    parser.add_argument(
+        "--latency-floor-quantile",
+        type=float,
+        default=DEFAULT_LATENCY_FLOOR_QUANTILE,
+        help=(
+            "Quantile of the recent-latency window taken as the round time to "
+            "bound against. Lower resists contamination - latency measured "
+            "under a badly chosen timeout is inflated by that choice - while "
+            "higher is needed when faults are intermittent, because a low "
+            "quantile then selects the windows that saw no fault and the floor "
+            "stops binding at all. See DEFAULT_LATENCY_FLOOR_QUANTILE in "
+            f"latency_floor.py for the measurements (default: "
+            f"{DEFAULT_LATENCY_FLOOR_QUANTILE})."
+        ),
     )
 
     parser.add_argument(
@@ -2232,6 +2439,10 @@ def main():
     if args.model_type == "thompson":
         args.model_type = "cmab"
 
+    # Process-wide, before any report is scored; see reward_utils.
+    set_reward_design(args.reward_design)
+    print(f"[reward] design={args.reward_design}")
+
     serve(
         protocol=args.protocol,
         node_id=args.node_id,
@@ -2248,6 +2459,9 @@ def main():
         aggregate_function=args.function,
         aggregate_weight=args.function_weight,
         schedule_file=args.schedule_file,
+        threshold_multiplier=args.threshold_multiplier,
+        latency_floor_k=args.latency_floor_k,
+        latency_floor_quantile=args.latency_floor_quantile,
         dataset_csv=args.dataset_csv,
         failure_spec=args.failure_spec,
         injection_start_unix_ms=args.injection_start_unix_ms,

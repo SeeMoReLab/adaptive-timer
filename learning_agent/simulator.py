@@ -19,7 +19,19 @@ from data_loader import (
     _extract_label, 
     _is_empty_row,
     )
-from reward_utils import calculate_reward_from_report_row
+from reward_utils import (
+    DEFAULT_REWARD_DESIGN,
+    REWARD_DESIGNS,
+    calculate_reward_from_report_row,
+    set_reward_design,
+)
+from latency_floor import (
+    DEFAULT_LATENCY_FLOOR_K,
+    DEFAULT_LATENCY_FLOOR_QUANTILE,
+    LatencyFloor,
+    LatencyFloorPolicy,
+    latency_feature_indices,
+)
 
 from models import (
     CMAB,
@@ -32,6 +44,7 @@ from models import (
     QuadraticRF,
     SingleRF,
     StarvationFreeThompsonSamplingModel,
+    SurvivalGatedThompsonSamplingModel,
     ThompsonSamplingModel,
     ThompsonSamplingModelV1,
     ThompsonSamplingModelV2,
@@ -83,6 +96,11 @@ MODEL_NAME_TO_TENSORMODEL = {
     # abandoned during a bad phase can be reconsidered, and an exploit branch
     # that scores the current context instead of the arm's flat window mean.
     "claude_v2": StarvationFreeThompsonSamplingModel,
+    # Factorises reward into liveness x performance: a gate on
+    # P(alive | context, arm) and a ranking over the arms that pass it. Named
+    # v4 because cmab_v3 is already ThompsonSamplingModelV3, one of the
+    # historical iterations above.
+    "cmab_v4": SurvivalGatedThompsonSamplingModel,
     # Win-stay/lose-shift heuristic. Context-free and non-learning, so it is a
     # floor to beat rather than an iteration of the bandits above.
     "pavlov": PavlovTimeoutModel,
@@ -106,6 +124,7 @@ SEEDED_MODELS = (
     SingleRF,
     NeighborhoodRobustBandit,
     StarvationFreeThompsonSamplingModel,
+    SurvivalGatedThompsonSamplingModel,
 )
 
 # Heuristics with no contextual model, so no n_features and no seed. The
@@ -369,6 +388,36 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Observation sample directory. Defaults to "
             "learning_agent/data/<protocol>."
+        ),
+    )
+    parser.add_argument(
+        "--reward-design",
+        choices=REWARD_DESIGNS,
+        default=DEFAULT_REWARD_DESIGN,
+        help=(
+            "Reward shaping to score the replayed reports with. reward_tps is "
+            "throughput alone; reward_mixed discounts it by the share of the "
+            "window one fault would cost (applied timeout + one consensus "
+            f"latency). Default: {DEFAULT_REWARD_DESIGN}."
+        ),
+    )
+    parser.add_argument(
+        "--latency-floor-k",
+        type=float,
+        default=0.0,
+        help=(
+            "Domain constraint: hide arms below k * the consensus latency the "
+            "replicas are already achieving. 0 disables it (default: 0; try "
+            f"{DEFAULT_LATENCY_FLOOR_K})."
+        ),
+    )
+    parser.add_argument(
+        "--latency-floor-quantile",
+        type=float,
+        default=DEFAULT_LATENCY_FLOOR_QUANTILE,
+        help=(
+            "Quantile of the recent-latency window used as the round time to "
+            f"bound against (default: {DEFAULT_LATENCY_FLOOR_QUANTILE})."
         ),
     )
     parser.add_argument(
@@ -774,6 +823,8 @@ def plot_prediction_phases(data_dict: Dict[Tuple[int, str], List[float]], save_p
 def main() -> None:
     args = _build_parser().parse_args()
     set_seed(args.seed)
+    set_reward_design(args.reward_design)
+    print(f"Reward design: {args.reward_design}")
     protocol_name = args.protocol.strip().lower().replace("-", "_")
     protocol_id = _parse_protocol(protocol_name)
     data_dir = args.data_dir or Path(__file__).resolve().parent / "data" / protocol_name
@@ -827,6 +878,26 @@ def main() -> None:
     if args.model in SEEDED_MODELS:
         model_kwargs["seed"] = args.seed
     model = args.model(**model_kwargs)
+
+    if args.latency_floor_k > 0.0:
+        latency_index, instances_index = latency_feature_indices(
+            get_report_feature_field_names(protocol_id)
+        )
+        model = LatencyFloorPolicy(
+            model=model,
+            timeouts_ms=get_timeout_values_ms(protocol_id),
+            latency_index=latency_index,
+            n_features=get_report_feature_dim(protocol_id),
+            instances_index=instances_index,
+            latency_floor=LatencyFloor(
+                multiplier=args.latency_floor_k,
+                quantile=args.latency_floor_quantile,
+            ),
+        )
+        print(
+            f"Latency floor: k={args.latency_floor_k} "
+            f"quantile={args.latency_floor_quantile}"
+        )
 
     os.makedirs(args.plot_dir, exist_ok=True)
     exp_path = os.path.join(args.plot_dir, args.experiment_name)
@@ -989,6 +1060,18 @@ def main() -> None:
         f"training={avg_train:.2f}ms (std={std_train:.2f}, med={med_train:.2f}, max={max_train:.2f})"
     )
     
+    print(f"\n[Accuracy per Phase:]")
+    for (i, p), phase_acc in result.items():
+        print(f"  Phase {p} ({i}/{len(phases)}): accuracy={phase_acc:.4f}")
+
+    if isinstance(model, LatencyFloorPolicy):
+        print(
+            f"\n[Latency Floor:]\tk={args.latency_floor_k}, "
+            f"quantile={args.latency_floor_quantile}, "
+            f"final_floor_ms={model.latency_floor.floor_ms:.0f}, "
+            f"decisions_overridden={model.override_count}"
+        )
+
     print(f"\n[Convergence Metrics per Phase:]")
     for (i, p), stats in convergence_stats.items():
         status = "Converged" if stats['converged'] else "Failed to Converge"

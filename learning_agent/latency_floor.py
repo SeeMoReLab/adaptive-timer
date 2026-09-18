@@ -1,65 +1,3 @@
-"""Consensus latency as a feasibility constraint rather than as a reward.
-
-The reward shapings in :mod:`reward_utils` that folded consensus latency into
-the objective (``design_1`` through ``design_3``) were retired because latency
-mostly reports the delay environment the run is currently in, not the quality
-of the timeout that was chosen: a phase with 150ms of injected network delay
-reads as high latency under every arm, so the learner ends up ranking phases
-instead of ranking arms.
-
-The same measurement is still worth having, one level down, as a domain
-constraint on the action space. If the last windows committed with their slow
-rounds taking N ms, then a timeout below N ms cannot be met by the protocol: the forward timer expires before the round can finish, the replicas
-raise a view change, and throughput collapses for reasons that have nothing to
-do with the fault being injected. Those actions are not a gamble worth taking -
-they are known-bad before they are played. So bound the action space below by
-the latency the protocol is already achieving and let the learner explore only
-above it, where the arms actually differ.
-
-The estimator is deliberately not a mean, because the measurement is
-contaminated by the arm at both ends. A too-short timeout raises latency
-through the view changes it causes; a too-long one raises it because a slow
-leader is left in place for most of the timer. Either way a mean-based floor
-ratchets upward - a bad window raises the floor, which hides the short arms,
-which keeps the floor high - and the ratchet would be driven by the agent's own
-last choice rather than by the environment. A low quantile over a sliding
-window estimates instead "how long a round takes when it is working", which is
-the quantity the constraint is about, and it comes back down as soon as enough
-healthy windows accumulate. See DEFAULT_LATENCY_FLOOR_QUANTILE for the measured
-reason the quantile has to be as low as it is. Windows that committed nothing
-are skipped entirely: they report a latency of 0, which is an absence of
-measurement, not evidence that consensus is fast.
-
-The default field is the window's mean, avg_consensus_latency_ms - see
-latency_feature_indices, which both main.py and simulator.py call without
-overriding it. That matches what ContinuousThresholdTimeoutModel and
-ProportionalThresholdExpert read, so the constraint and the heuristics are
-compared on the same measurement.
-
-An earlier revision of this comment claimed p95, on the argument that what a
-timeout has to cover is the slow round, not the average one - a bound set at
-the mean fires on about half the rounds by construction. The code never
-followed it, and it mostly did not matter: the two are identical while a window
-is homogeneous (measured: byte-identical floor behaviour on the continuous-delay
-hardware runs, 33/107 binds and 0 oracle-arm exclusions for avg, p50 and p95
-alike; on data/smartbft_wallclock at k=1.0, q=0.50 both fields bind 257/1260
-with per-arm median floors 37/349/638 for avg against 44/366/644 for p95). They
-diverge once a window mixes fast and slow rounds, where the mean reports the
-burst diluted by its duty cycle and the p95 reports its magnitude. Which is
-better is genuinely unsettled, because the tail has a detection threshold at
-the duty cycle: below about 5% duty a burst does not reach the 95th percentile
-at all, and there the mean is the more sensitive statistic. The fault phases
-run at 2.5-10% duty, straddling that. Pass latency_field="p95_consensus_latency_ms"
-to latency_feature_indices to measure the other side.
-
-One thing this constraint is not: a way to win an arm comparison. On the
-current SmartBFT arms it mostly does not bind - a 35ms round time puts the
-floor far below the 300ms arm - so it is worth turning on for the continuous
-models, whose action space reaches down to 100ms, and in phases where latency
-genuinely rises. It removes a known-bad region of the action space; it does not
-rank what is left.
-"""
-
 from collections import deque
 import inspect
 import math
@@ -79,17 +17,6 @@ DEFAULT_LATENCY_FLOOR_K = 1.0
 # cannot carry the quantile on its own, short enough to follow a regime change.
 DEFAULT_LATENCY_FLOOR_WINDOW = 16
 
-# Quantile of the window taken as the healthy round time. Measured on
-# data/smartbft_wallclock, where avg_consensus_latency_ms per arm is:
-#
-#     arm      p10    p25   median
-#     300ms     35     36       37
-#     800ms     35     36      348
-#    1800ms     37    347      638
-#
-# (p95_consensus_latency_ms has the same shape: 41/42/44, 42/43/365,
-# 44/363/644, so the argument below does not depend on which field is used.)
-#
 # Two pressures push this in opposite directions.
 #
 # Downward: the p10 column above is flat across the arms and the p25 column is

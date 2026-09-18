@@ -8,12 +8,12 @@ import time
 from pathlib import Path
 from typing import Dict, Generic, List, Optional, Tuple, TypeVar, Any
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.tree import  DecisionTreeRegressor
+from sklearn.tree import  DecisionTreeClassifier, DecisionTreeRegressor
 from collections import deque
 import numpy as np
 
 import agent_pb2
-from reward_utils import reward_from_throughput
+from reward_utils import reward_tps
 
 
 # def _load_xgb_regressor():
@@ -1007,7 +1007,7 @@ class QuadraticRewardScaler(RewardTransformer):
 
     @staticmethod
     def transform(throughput: float) -> float:
-        return reward_from_throughput(throughput)
+        return reward_tps(throughput)
 
 class LinearModel(TensorModel):
     """Linear policy over protocol-specific discrete timeout options.
@@ -1368,6 +1368,214 @@ class DiscountedLinUCB(TensorModel):
         )
         self._observation_counts = np.zeros(self._action_dim, dtype=np.int64)
 
+class ProportionalThresholdExpert(TensorModel):
+    """timeout = clamp(multiplier * observed latency), snapped to an arm.
+
+    The discrete face of continuous_bandit.ContinuousThresholdTimeoutModel, so
+    the same rule can sit inside :class:`Exp4ExpertBandit` alongside a learner.
+    Non-learning and context-free apart from that one attribute, and it holds
+    its current arm when the window committed nothing, because a stalled window
+    reports latency 0 and the formula would read that as "fast, shorten".
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        n_features: int,
+        timeouts_ms: Tuple[int, ...],
+        feature_index: int,
+        instances_index: Optional[int] = None,
+        multiplier: float = 1.0,
+    ) -> None:
+        if multiplier <= 0.0:
+            raise ValueError(f"multiplier must be > 0, got {multiplier}")
+        self._action_dim = int(action_dim)
+        self._n_features = int(n_features)
+        self._timeouts = tuple(int(t) for t in timeouts_ms)
+        self._feature_index = int(feature_index)
+        self._instances_index = instances_index
+        self._multiplier = float(multiplier)
+        self.reset_model()
+
+    def predict_action(self, features: np.ndarray) -> np.ndarray:
+        rows = np.asarray(features, dtype=np.float64)
+        if rows.ndim == 1:
+            rows = rows.reshape(1, -1)
+        out = np.zeros((len(rows), self._action_dim), dtype=np.float64)
+        for i, row in enumerate(rows):
+            alive = True
+            if self._instances_index is not None:
+                alive = float(row[self._instances_index]) > 0
+            if alive:
+                target = self._multiplier * float(row[self._feature_index])
+                target = min(max(target, self._timeouts[0]), self._timeouts[-1])
+                self._current = int(
+                    np.argmin([abs(t - target) for t in self._timeouts])
+                )
+            out[i, self._current] = 1.0
+        return out
+
+    def update_model(self, features, actions, rewards, backward: bool = True) -> float:
+        return 0.0
+
+    def reset_model(self) -> None:
+        self._current = 0
+
+class Exp4ExpertBandit(TensorModel):
+    """EXP4: a bandit over policies rather than over arms.
+
+    Auer, Cesa-Bianchi, Freund and Schapire, "The Nonstochastic Multiarmed
+    Bandit Problem" (SIAM J. Comput. 32(1), 2002), section 7; the high-
+    probability variant is EXP4.P (Beygelzimer, Langford, Li, Reyzin and
+    Schapire, AISTATS 2011). The related idea of letting the base algorithms
+    keep learning underneath the meta-algorithm is Corral (Agarwal, Luo,
+    Neyshabur and Schapire, COLT 2017).
+
+    Why this and not another value model. Measured on smartbft_r650_clemson-5,
+    every codex_v1 variant lands at 0.373-0.493 agreement with the oracle's
+    decision pattern while the hand-tuned continuous_threshold rule reaches
+    0.573, and five reward shapings did not close it. A learner that cannot
+    beat a fixed heuristic on its own can still be combined with it: EXP4's
+    regret is measured against the best expert in the set, so the ensemble
+    tracks whichever of them is right in the regime it is currently in, and
+    cannot end up far below the better one.
+
+    Each expert proposes one arm per decision. Their weights are exponential in
+    an importance-weighted reward estimate, so an expert is credited only for
+    decisions where the arm it advised was the one actually played, divided by
+    the probability of playing it. Learning experts are also updated with the
+    observed (context, arm, reward) regardless of which expert was followed:
+    the ridge fit underneath codex_v1 is off-policy in the sense that it
+    conditions on the arm played, not on who chose it.
+
+    Rewards are mapped into [0, 1] against a running maximum before the
+    exponential update, because the EXP4 bound assumes bounded gains and the
+    reward shapings in reward_utils span very different ranges.
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        n_features: int,
+        experts: Optional[List[TensorModel]] = None,
+        learning_rate: Optional[float] = None,
+        exploration_floor: float = 0.05,
+        seed: Optional[int] = None,
+    ) -> None:
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        if n_features <= 0:
+            raise ValueError(f"n_features must be > 0, got {n_features}")
+        if not 0.0 <= exploration_floor < 1.0:
+            raise ValueError(
+                f"exploration_floor must be in [0, 1), got {exploration_floor}"
+            )
+        self._action_dim = int(action_dim)
+        self._n_features = int(n_features)
+        self._experts = list(experts) if experts else []
+        if not self._experts:
+            raise ValueError("Exp4ExpertBandit needs at least one expert")
+        # sqrt(log K / (n_experts * T)) is the standard tuning; T is unknown
+        # online, so default to the horizon of one run (about 107 decisions).
+        self._learning_rate = float(
+            learning_rate
+            if learning_rate is not None
+            else math.sqrt(
+                math.log(max(len(self._experts), 2)) / (len(self._experts) * 107.0)
+            )
+        )
+        self._exploration_floor = float(exploration_floor)
+        self._seed = seed
+        self.reset_model()
+
+    @property
+    def expert_weights(self) -> np.ndarray:
+        return self._weights / float(np.sum(self._weights))
+
+    def _advice(self, features: np.ndarray) -> np.ndarray:
+        """One row per expert, a one-hot over arms."""
+        advice = np.zeros((len(self._experts), self._action_dim), dtype=np.float64)
+        for i, expert in enumerate(self._experts):
+            scores = np.asarray(expert.predict_action(features), dtype=np.float64)
+            arm = int(np.argmax(scores.reshape(-1)[: self._action_dim]))
+            advice[i, min(max(arm, 0), self._action_dim - 1)] = 1.0
+        return advice
+
+    def predict_action(self, features: np.ndarray) -> np.ndarray:
+        advice = self._advice(features)
+        w = self._weights / float(np.sum(self._weights))
+        probs = w @ advice
+        total = float(np.sum(probs))
+        probs = (
+            np.full(self._action_dim, 1.0 / self._action_dim)
+            if total <= 0.0
+            else probs / total
+        )
+        if self._exploration_floor > 0.0:
+            probs = (1.0 - self._exploration_floor) * probs + (
+                self._exploration_floor / self._action_dim
+            )
+        self._last_probs = probs
+        self._last_advice = advice
+        chosen = int(self._rng.choice(self._action_dim, p=probs))
+        # Scores are returned, not an index, so the codec's argmax picks the
+        # sampled arm while the probabilities stay visible for logging.
+        scores = probs.copy()
+        scores[chosen] = float(np.max(probs)) + 1.0
+        return scores.reshape(1, -1)
+
+    def update_model(
+        self,
+        features: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray | float,
+        backward: bool = True,
+    ) -> float:
+        if not backward:
+            return 0.0
+        arm = int(np.rint(np.asarray(actions, dtype=float).reshape(-1)[0]))
+        reward = float(np.asarray(rewards, dtype=float).reshape(-1)[0])
+        arm = min(max(arm, 0), self._action_dim - 1)
+
+        # Every learning expert sees the observed transition.
+        for expert in self._experts:
+            try:
+                expert.update_model(features, np.asarray(arm), reward)
+            except Exception:
+                pass
+
+        if self._last_probs is None or self._last_advice is None:
+            return 0.0
+        # Map into [0, 1] against the running range so the exponential update
+        # is scale free across the reward_utils shapings.
+        self._reward_hi = max(self._reward_hi, reward)
+        self._reward_lo = min(self._reward_lo, reward)
+        span = self._reward_hi - self._reward_lo
+        scaled = 0.5 if span <= 0 else (reward - self._reward_lo) / span
+
+        p = float(self._last_probs[arm])
+        estimate = scaled / p if p > 0 else 0.0
+        gains = self._last_advice[:, arm] * estimate
+        self._weights *= np.exp(self._learning_rate * gains)
+        # Renormalise to stop the weights drifting to inf or 0.
+        self._weights /= float(np.max(self._weights))
+        np.maximum(self._weights, 1e-12, out=self._weights)
+        self._last_probs = None
+        self._last_advice = None
+        return 0.0
+
+    def reset_model(self) -> None:
+        self._rng = np.random.default_rng(self._seed)
+        self._weights = np.ones(len(self._experts), dtype=np.float64)
+        self._last_probs = None
+        self._last_advice = None
+        self._reward_hi = 0.0
+        self._reward_lo = 0.0
+        for expert in self._experts:
+            try:
+                expert.reset_model()
+            except Exception:
+                pass
 
 class RandomTimeoutModel(TensorModel):
     """Selects a random timeout action index each prediction."""
@@ -1756,7 +1964,6 @@ class ThompsonSamplingModelV1(TensorModel):
             "rewards": deque(maxlen=self._max_bucket_size)
         }
 
-
 class ThompsonSamplingModelV2(TensorModel):
     def __init__(
         self,
@@ -1928,7 +2135,7 @@ class ThompsonSamplingModel(TensorModel):
         self._act_dim = int(action_dim)
         self._obs_dim = int(n_features)
         self._n_heads = int(n_heads)
-        self._max_bucket_size = 32
+        self._max_bucket_size = 16
         self._seed = seed
 
         self.reset_model()
@@ -4268,3 +4475,383 @@ class CMAB(TensorModel):
 
         for stale in self._block_policies[: -self._max_snapshots]:
             stale.model = None
+
+
+class SurvivalGatedThompsonSamplingModel(TensorModel):
+    """Contextual bandit that factorises reward into liveness x performance.
+
+    Every other model here estimates one quantity per (context, arm),
+    ``E[throughput | x, a]``, and picks the argmax. On this workload that is
+    the wrong quantity to estimate, because the outcome is not spread - it is
+    bimodal. Pooled over every CloudLab run, fault-phase throughput piles up
+    below 512 tps and again between 1024 and 1536, with a trough between, and
+    which mode a decision lands in is almost decided by the arm alone:
+
+        share of fault-phase pulls landing below 512 tps
+            phase   300ms   800ms   1800ms
+              p3      98%      0%       6%
+              p4     100%      1%       4%
+              p5      91%    100%      51%
+
+    So the conditional mean is a weighted average of "dead" and "fine" that
+    describes neither, and fitting it needs far more data than the ~5 samples
+    per (phase, arm) a 2160s run affords. This model estimates the two factors
+    it decomposes into instead:
+
+        E[reward | x, a] = P(alive | x, a) * E[reward | x, a, alive]
+
+    and uses them for different jobs - the first gates, the second ranks:
+
+        1. Liveness. One bootstrapped DecisionTreeClassifier ensemble per arm
+           over (context -> did this window commit at a usable rate). A
+           near-deterministic binary signal is cheap to learn: five failures
+           under a Beta(1, 1) prior already put the estimate at 1/7.
+        2. Performance. The usual per-arm regression ensemble, fit on the
+           surviving samples, deciding between the arms that passed the gate.
+           Ties go to the shorter timeout, because when two arms both survive
+           the shorter one recovers faster - measured in p3, 800ms returns a
+           median 1280 tps against 1800ms's 640.
+
+    This is the latency floor of latency_floor.py, learned instead of asserted.
+    The gate plays the same role as feasible_timeout_mask, but it is derived
+    from observed liveness rather than from a latency reading, and it is a
+    posterior rather than a rule - so a mistaken belief is revised by evidence,
+    where a mistaken floor is self-sealing (nothing can correct it, because the
+    evidence that would lives in the arm it forbids).
+
+    Two details keep it from strangling itself, both failure modes this
+    codebase has hit before:
+
+    - Laplace smoothing on the gate. A pure leaf reports probability exactly
+      0, which would condemn an arm permanently after a handful of bad pulls -
+      the starvation StarvationFreeThompsonSamplingModel exists to fix. The
+      raw ensemble probability is shrunk as (p*n + 1)/(n + 2), so an arm with
+      five straight failures scores 1/7 rather than 0 and stays reachable.
+    - The gate can never empty the action set. If no arm clears the threshold,
+      the most-alive arm is played. Phase 5 is exactly that case: 91%, 100%
+      and 51% dead across the three arms, so there is no live choice to make
+      and the model should fall through to "least bad" rather than stall.
+
+    The liveness label is relative, not absolute: a window counts as alive if
+    its reward reaches ``survival_fraction`` of the best reward seen in the
+    last ``reference_window`` decisions. An absolute bar calibrated on the
+    6200 tps base phases would mark every fault-phase decision dead.
+
+    The bar is a decayed maximum rather than a max over a window, and
+    ``_reference_reward`` records why: a windowed max is the slowest possible
+    statistic to adapt downward, so a bar set by the base phases stays in force
+    through the fault phase that follows.
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        n_features: int,
+        n_heads: int = 20,
+        bucket_size: int = 32,
+        survival_fraction: float = 0.25,
+        survival_threshold: float = 0.5,
+        reference_decay: float = 0.85,
+        exploration: float = 0.1,
+        stale_after: int = 8,
+        seed: Optional[int] = None,
+    ) -> None:
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        if n_features <= 0:
+            raise ValueError(f"n_features must be > 0, got {n_features}")
+        if n_heads <= 0:
+            raise ValueError(f"n_heads must be > 0, got {n_heads}")
+        if bucket_size <= 0:
+            raise ValueError(f"bucket_size must be > 0, got {bucket_size}")
+        if not 0.0 < survival_fraction <= 1.0:
+            raise ValueError(
+                f"survival_fraction must be in (0, 1], got {survival_fraction}"
+            )
+        if not 0.0 <= survival_threshold <= 1.0:
+            raise ValueError(
+                f"survival_threshold must be in [0, 1], got {survival_threshold}"
+            )
+        if not 0.0 < reference_decay < 1.0:
+            raise ValueError(
+                f"reference_decay must be in (0, 1), got {reference_decay}"
+            )
+        if not 0.0 <= exploration <= 1.0:
+            raise ValueError(f"exploration must be in [0, 1], got {exploration}")
+        if stale_after <= 0:
+            raise ValueError(f"stale_after must be > 0, got {stale_after}")
+
+        self._act_dim = int(action_dim)
+        self._obs_dim = int(n_features)
+        self._n_heads = int(n_heads)
+        self._bucket_size = int(bucket_size)
+        self._survival_fraction = float(survival_fraction)
+        self._survival_threshold = float(survival_threshold)
+        self._reference_decay = float(reference_decay)
+        self._exploration = float(exploration)
+        self._stale_after = int(stale_after)
+        self._seed = seed
+        self.reset_model()
+
+    # ------------------------------------------------------------------ gate
+
+    def _reference_reward(self) -> float:
+        """Best reward recently achievable, the bar liveness is measured against.
+
+        A decayed maximum, not a maximum over a window. A windowed max only
+        falls when the old maximum leaves the window, which takes a full window
+        - longer than a phase at this cadence, so the bar set by a 6200 tps
+        base phase would still be in force through the whole of the fault phase
+        that follows, marking every arm dead. Measured on a two-regime probe
+        with a 16-deep window, the bar was still 1.54 sixteen decisions after
+        the regime changed, against a best achievable reward of 1.31. A decayed
+        max falls geometrically instead and is re-anchored by any observation
+        above it, so it tracks what is currently achievable in a couple of
+        decisions.
+        """
+        return self._reference
+
+    def is_alive(self, reward: float) -> bool:
+        reference = self._reference_reward()
+        if reference <= 0.0:
+            return True
+        return float(reward) >= self._survival_fraction * reference
+
+    def _head_probability(self, head, row: np.ndarray) -> float:
+        classes = list(getattr(head, "classes_", []))
+        if len(classes) == 1:
+            return float(classes[0])
+        if not classes:
+            return 1.0
+        return float(head.predict_proba(row)[0][classes.index(1)])
+
+    def _survival_probability(
+        self, arm: int, row: np.ndarray, head_index: Optional[int] = None
+    ) -> float:
+        """Smoothed P(alive | context, arm), never exactly 0 or 1.
+
+        With ``head_index`` this is one bootstrap head - a posterior draw, the
+        same device the reward branch uses to explore. Without it, the ensemble
+        mean, which is the estimate to exploit.
+
+        Shrinking by the arm's own sample count is what keeps a run of bad
+        pulls from being read as certainty: at n=5 a pure-failure ensemble
+        reports (0*5 + 1)/(5 + 2) = 0.143, not 0.
+        """
+        count = len(self._memory[arm]["alive"])
+        if count == 0 or not self._alive_fitted[arm]:
+            return 1.0
+        heads = self._survival_models[arm]
+        if head_index is None:
+            raw = float(np.mean([self._head_probability(h, row) for h in heads]))
+        else:
+            raw = self._head_probability(heads[head_index % len(heads)], row)
+        return (raw * count + 1.0) / (count + 2.0)
+
+    # ------------------------------------------------------------- ranking
+
+    def _reward_estimate(self, arm: int, row: np.ndarray, explore: bool) -> float:
+        if not self._reward_fitted[arm]:
+            return 0.0
+        if explore:
+            head = self._reward_models[arm][
+                int(self._rng.integers(0, self._n_heads))
+            ]
+            return float(head.predict(row)[0])
+        return float(
+            np.mean([head.predict(row)[0] for head in self._reward_models[arm]])
+        )
+
+    def survival_probabilities(self, features: np.ndarray) -> np.ndarray:
+        """Per-arm P(alive) for one context. Exposed for tests and logging."""
+        row = np.asarray(features, dtype=float).reshape(1, -1)
+        return np.asarray(
+            [self._survival_probability(arm, row) for arm in range(self._act_dim)],
+            dtype=float,
+        )
+
+    def predict_action(self, features: np.ndarray) -> np.ndarray:
+        rows = np.asarray(features, dtype=float)
+        if rows.ndim == 1:
+            rows = rows.reshape(1, -1)
+        if rows.shape[1] != self._obs_dim:
+            raise ValueError(
+                f"Expected {self._obs_dim} features, got {rows.shape[1]}"
+            )
+
+        scores = np.zeros((len(rows), self._act_dim), dtype=float)
+        for index in range(len(rows)):
+            row = rows[index : index + 1]
+            untried = [a for a in range(self._act_dim) if not self._reward_fitted[a]]
+            if untried:
+                # Round-robin the arms nobody has measured yet, as the other
+                # models here do, so the gate is never asked about an arm it
+                # has no evidence on.
+                scores[index, untried] = 1e9
+                continue
+
+            alive = np.asarray(
+                [self._survival_probability(a, row) for a in range(self._act_dim)]
+            )
+            feasible = alive >= self._survival_threshold
+            # An arm the gate has turned off is never pulled, so its belief can
+            # never be revised - the self-sealing property that makes a hard
+            # floor risky, reintroduced by the back door. Measured on a
+            # two-regime probe, 2 of 8 seeds locked onto the wrong arm exactly
+            # this way. So a pull the gate has not seen in a while goes through
+            # regardless. This is the staleness escape from
+            # StarvationFreeThompsonSamplingModel, whose own ablation found the
+            # bonus, not the contextual branch, was what broke the ratchet.
+            stale = np.asarray(
+                [
+                    self._pulls - self._last_pull[a] >= self._stale_after
+                    for a in range(self._act_dim)
+                ]
+            )
+            feasible = feasible | stale
+            if not feasible.any():
+                # No arm is expected to hold. Play the least bad one rather
+                # than leaving the agent with nothing.
+                feasible = alive >= alive.max()
+
+            explore = bool(self._rng.random() < self._exploration)
+            for arm in range(self._act_dim):
+                if not feasible[arm]:
+                    scores[index, arm] = -np.inf
+                    continue
+                scores[index, arm] = self._reward_estimate(arm, row, explore)
+
+            _break_ties_in_place(scores[index : index + 1], self._rng)
+
+        return scores
+
+    # -------------------------------------------------------------- fitting
+
+    def _fit_arm(self, arm: int) -> None:
+        memory = self._memory[arm]
+        contexts = np.asarray(memory["features"], dtype=float)
+        rewards = np.asarray(memory["rewards"], dtype=float)
+        alive = np.asarray(memory["alive"], dtype=int)
+        if len(contexts) == 0:
+            return
+
+        # Liveness: every sample, including the dead ones - they are the label.
+        for index, head in enumerate(self._survival_models[arm]):
+            draw = self._rng.choice(len(contexts), size=len(contexts), replace=True)
+            if len(set(alive[draw].tolist())) == 0:
+                continue
+            head.fit(contexts[draw], alive[draw])
+        self._alive_fitted[arm] = True
+
+        # Performance: the surviving samples, which is the conditional this
+        # factor is defined on. With too few survivors to fit, fall back to the
+        # whole window rather than leave the arm unranked.
+        survivors = np.flatnonzero(alive == 1)
+        fit_contexts, fit_rewards = (
+            (contexts[survivors], rewards[survivors])
+            if len(survivors) >= 2
+            else (contexts, rewards)
+        )
+        for head in self._reward_models[arm]:
+            draw = self._rng.choice(
+                len(fit_contexts), size=len(fit_contexts), replace=True
+            )
+            head.fit(fit_contexts[draw], fit_rewards[draw])
+        self._reward_fitted[arm] = True
+
+    def update_model(
+        self,
+        features: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray | float,
+        backward: bool = True,
+    ) -> float:
+        if not backward:
+            return 0.0
+
+        rows = np.asarray(features, dtype=float)
+        if rows.ndim == 1:
+            rows = rows.reshape(1, -1)
+        action_values = np.asarray(actions, dtype=float).reshape(-1)
+        reward_values = np.asarray(rewards, dtype=float).reshape(-1)
+        if action_values.size == 1 and len(rows) > 1:
+            action_values = np.repeat(action_values, len(rows))
+        if reward_values.size == 1 and len(rows) > 1:
+            reward_values = np.repeat(reward_values, len(rows))
+        if action_values.size != len(rows):
+            raise ValueError(
+                f"actions batch size mismatch: expected {len(rows)}, "
+                f"got {action_values.size}"
+            )
+        if reward_values.size != len(rows):
+            raise ValueError(
+                f"rewards batch size mismatch: expected {len(rows)}, "
+                f"got {reward_values.size}"
+            )
+
+        touched = set()
+        for row, action, reward in zip(rows, action_values, reward_values):
+            arm = int(round(float(action)))
+            if not 0 <= arm < self._act_dim:
+                raise ValueError(
+                    f"actions must be between 0 and {self._act_dim - 1}, got {arm}"
+                )
+            # The bar is read before this reward joins the reference window, so
+            # a decision is judged against what came before it, not itself.
+            alive = self.is_alive(float(reward))
+            self._reference = max(
+                float(reward), self._reference * self._reference_decay
+            )
+            memory = self._memory[arm]
+            memory["features"].append(np.asarray(row, dtype=float).copy())
+            memory["rewards"].append(float(reward))
+            memory["alive"].append(int(alive))
+            self._pulls += 1
+            self._last_pull[arm] = self._pulls
+            touched.add(arm)
+
+        for arm in sorted(touched):
+            self._fit_arm(arm)
+        return 0.0
+
+    def reset_model(self) -> None:
+        self._rng = np.random.default_rng(self._seed)
+        self._memory: List[Dict[str, deque]] = [
+            {
+                "features": deque(maxlen=self._bucket_size),
+                "rewards": deque(maxlen=self._bucket_size),
+                "alive": deque(maxlen=self._bucket_size),
+            }
+            for _ in range(self._act_dim)
+        ]
+        self._reference = 0.0
+        self._survival_models = [
+            [
+                DecisionTreeClassifier(
+                    criterion="gini",
+                    max_depth=4,
+                    min_samples_leaf=4,
+                    random_state=arm * self._n_heads + head,
+                )
+                for head in range(self._n_heads)
+            ]
+            for arm in range(self._act_dim)
+        ]
+        self._reward_models = [
+            [
+                DecisionTreeRegressor(
+                    criterion="squared_error",
+                    max_depth=6,
+                    min_samples_leaf=6,
+                    min_impurity_decrease=0.01,
+                    random_state=arm * self._n_heads + head,
+                )
+                for head in range(self._n_heads)
+            ]
+            for arm in range(self._act_dim)
+        ]
+        self._alive_fitted = [False] * self._act_dim
+        self._reward_fitted = [False] * self._act_dim
+        # Pull clock for the staleness escape.
+        self._pulls = 0
+        self._last_pull = [0] * self._act_dim

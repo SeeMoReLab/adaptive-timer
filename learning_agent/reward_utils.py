@@ -18,13 +18,106 @@ REWARD_THROUGHPUT_KNEE_TPS = 1000.0
 REWARD_THROUGHPUT_ABOVE_KNEE_WEIGHT = 0.25
 
 
-def reward_from_throughput(throughput_tps: float) -> float:
+def reward_tps(throughput_tps: float) -> float:
     """Apply the reward shaping used by the online learning agent."""
     value = float(max(0.0, throughput_tps))
     if value <= REWARD_THROUGHPUT_KNEE_TPS:
         return value / REWARD_THROUGHPUT_KNEE_TPS
     excess = (value - REWARD_THROUGHPUT_KNEE_TPS) / REWARD_THROUGHPUT_KNEE_TPS
     return 1.0 + REWARD_THROUGHPUT_ABOVE_KNEE_WEIGHT * excess
+
+# Retired latency-shaped rewards, kept for reference. Consensus latency turned
+# out to describe the delay environment rather than the timeout that was
+# chosen - under 150ms of injected network delay every arm reads as slow - so
+# a reward built on it ranks phases instead of arms. The measurement is used as
+# a feasibility constraint on the action space instead; see latency_floor.py.
+def design_1(throughput_tps: int,p95_consensus_latency_ms: float) -> float:
+    if p95_consensus_latency_ms <= 0:
+        return -1
+    return (throughput_tps/p95_consensus_latency_ms)-1
+
+def design_2(throughput_tps: int,p95_consensus_latency_ms: float) -> float:
+    return (throughput_tps - p95_consensus_latency_ms) / 1000.0
+
+def design_3(throughput_tps: int,avg_consensus_latency_ms: float) -> float:
+    if avg_consensus_latency_ms <= 0:
+        return -1
+    return (throughput_tps/avg_consensus_latency_ms)-1
+
+def reward_mixed(
+    throughput_tps: float,
+    timeout_ms: int,
+    avg_consensus_latency_ms: float,
+    total_transactions: int,
+) -> float:
+    """Throughput, discounted by the share of the window one fault would cost.
+
+    A leader failure costs the timeout (to detect it) plus one consensus
+    latency (to re-commit under the new leader). Expressed as a fraction of
+    the measurement window, that is what a longer timer is actually buying
+    you, so no tuning constant is needed to say how much it is worth.
+
+    Latency enters only as an overhead relative to the window, never as a
+    level - an absolute latency term ranks the delay environment instead of
+    the arm, which is why it was taken out of this reward before.
+    """
+    if throughput_tps <= 0.0:
+        return 0.0
+    window_ms = 1000.0 * total_transactions / throughput_tps
+    overhead_ms = float(timeout_ms) + max(0.0, avg_consensus_latency_ms)
+    return reward_tps(throughput_tps) * window_ms / (window_ms + overhead_ms)
+
+# --- Reward design selection -------------------------------------------------
+#
+# Which of the two shapings above the calculate_*_reward functions apply. This
+# is one process-wide setting rather than a per-call argument because those
+# calculators are reached through signatures fixed by the protobuf report
+# layout (main.reward_engineering, simulator's CSV path, plotting scripts), and
+# threading a design parameter through all of them would touch every field
+# list. One agent process runs one design for its whole run, so a module-level
+# selection is the same thing with less plumbing. Set it once at startup, from
+# --reward-design.
+REWARD_DESIGNS: Tuple[str, ...] = ("reward_tps", "reward_mixed")
+DEFAULT_REWARD_DESIGN = "reward_tps"
+
+_active_reward_design = DEFAULT_REWARD_DESIGN
+
+
+def set_reward_design(name: str) -> str:
+    """Select the reward shaping for this process, returning the name set."""
+    global _active_reward_design
+    if name not in REWARD_DESIGNS:
+        raise ValueError(
+            f"Unknown reward design {name!r}. Expected one of "
+            f"{'|'.join(REWARD_DESIGNS)}."
+        )
+    _active_reward_design = name
+    return _active_reward_design
+
+
+def get_reward_design() -> str:
+    return _active_reward_design
+
+
+def _apply_reward_design(
+    *,
+    throughput_tps: float,
+    timeout_ms: Optional[int],
+    avg_consensus_latency_ms: float,
+    total_transactions: int,
+    protocol_name: str = "",
+) -> float:
+    if _active_reward_design == "reward_tps":
+        return reward_tps(throughput_tps)
+    if timeout_ms is None:
+        target = f" for {protocol_name}" if protocol_name else ""
+        raise ValueError(
+            f"reward_design=reward_mixed needs the applied timeout{target}, "
+            "but none was supplied with the report."
+        )
+    return reward_mixed(
+        throughput_tps, timeout_ms, avg_consensus_latency_ms, total_transactions
+    )
 
 
 def calculate_pbft_reward(
@@ -47,7 +140,12 @@ def calculate_pbft_reward(
     no_progress_view_change_count: int,
 ) -> float:
     """Calculate an online PBFT reward from a complete reward report."""
-    return reward_from_throughput(throughput_tps)
+    return _apply_reward_design(
+        throughput_tps=throughput_tps,
+        timeout_ms=timeout_ms,
+        avg_consensus_latency_ms=avg_consensus_latency_ms,
+        total_transactions=total_transactions,
+    )
 
 
 def calculate_smartbft_reward(
@@ -75,7 +173,13 @@ def calculate_smartbft_reward(
     arguments as calculate_pbft_reward but is tuned independently of the Rust
     PBFT baseline.
     """
-    return reward_from_throughput(throughput_tps)
+    return _apply_reward_design(
+        throughput_tps=throughput_tps,
+        timeout_ms=timeout_ms,
+        avg_consensus_latency_ms=avg_consensus_latency_ms,
+        total_transactions=total_transactions,
+    )
+
 
 
 def calculate_sbft_reward(
@@ -92,8 +196,18 @@ def calculate_sbft_reward(
     leader_change_count: int,
     regency_change_count: int,
 ) -> float:
-    """Calculate an online SBFT reward from a complete reward report."""
-    return reward_from_throughput(throughput_tps)
+    """Calculate an online SBFT reward from a complete reward report.
+
+    SbftReport carries no timeout field, so ``reward_mixed`` has no fault-cost
+    term to build and ``_apply_reward_design`` rejects it for this protocol.
+    """
+    return _apply_reward_design(
+        throughput_tps=throughput_tps,
+        timeout_ms=None,
+        avg_consensus_latency_ms=avg_consensus_latency_ms,
+        total_transactions=total_transactions,
+        protocol_name="sbft",
+    )
 
 
 def calculate_tendermint_reward(
@@ -113,8 +227,50 @@ def calculate_tendermint_reward(
     propose_latency_ms: float,
     prevote_latency_ms: float,
     precommit_latency_ms: float,
+    propose_timeout_ms: Optional[int] = None,
+    prevote_timeout_ms: Optional[int] = None,
+    precommit_timeout_ms: Optional[int] = None,
 ) -> float:
-    """Calculate an online Tendermint reward from a complete reward report."""
+    """Calculate an online Tendermint reward from a complete reward report.
+
+    TendermintReport carries no timeout field - the action is a triple, and
+    only the report's *_latency_ms measurements come back - so the three
+    timeouts that were applied are passed in alongside it by the caller
+    (main.reward_engineering from the Timeout message, the simulator from the
+    ``*_timeout_milliseconds_used`` CSV columns).
+
+    ``reward_mixed`` prices one fault as the round budget the protocol has to
+    burn before it can move on, which in Tendermint is all three phase timers,
+    not the propose timer alone: a silent proposer leaves prevote and precommit
+    to expire too. The three are locked together by
+    ``models.tendermint_timeouts_from_propose`` (prevote = precommit =
+    ceil(propose/3)), so the sum stays a fixed multiple of the arm and the
+    ranking over arms is unchanged - only the scale of the discount differs.
+    """
+    timeout_ms = None
+    if None not in (propose_timeout_ms, prevote_timeout_ms, precommit_timeout_ms):
+        timeout_ms = (
+            int(propose_timeout_ms)
+            + int(prevote_timeout_ms)
+            + int(precommit_timeout_ms)
+        )
+    return _apply_reward_design(
+        throughput_tps=throughput_tps,
+        timeout_ms=timeout_ms,
+        avg_consensus_latency_ms=avg_consensus_latency_ms,
+        total_transactions=total_transactions,
+        protocol_name="tendermint",
+    )
+
+
+def retired_tendermint_throughput_minus_latency(
+    throughput_tps: float, p90_consensus_latency_ms: float
+) -> float:
+    """The Tendermint reward before --reward-design existed, kept for reference.
+
+    Same objection as design_1..3 above: an absolute latency level reports the
+    delay environment the phase is in rather than the timeout that was chosen.
+    """
     return (throughput_tps - p90_consensus_latency_ms) / 4000.0
 
 
@@ -138,7 +294,12 @@ def calculate_hotstuff_reward(
     no_progress_view_change_count: int,
 ) -> float:
     """Calculate an online HotStuff reward from a complete reward report."""
-    return reward_from_throughput(throughput_tps)
+    return _apply_reward_design(
+        throughput_tps=throughput_tps,
+        timeout_ms=timeout_ms,
+        avg_consensus_latency_ms=avg_consensus_latency_ms,
+        total_transactions=total_transactions,
+    )
 
 
 def calculate_autobahn_reward(
@@ -161,7 +322,12 @@ def calculate_autobahn_reward(
     no_progress_view_change_count: int,
 ) -> float:
     """Calculate an online Autobahn reward from a complete reward report."""
-    return reward_from_throughput(throughput_tps)
+    return _apply_reward_design(
+        throughput_tps=throughput_tps,
+        timeout_ms=timeout_ms,
+        avg_consensus_latency_ms=avg_consensus_latency_ms,
+        total_transactions=total_transactions,
+    )
 
 
 def reward_from_report_row(
@@ -180,7 +346,7 @@ def reward_from_report_row(
             f"Invalid reward report value for '{REWARD_THROUGHPUT_FIELD}' "
             f"at CSV line {row_number}: {raw_value!r}"
         ) from exc
-    return reward_from_throughput(throughput_tps)
+    return reward_tps(throughput_tps)
 
 
 _REPORT_TYPES: Mapping[int, Type[object]] = {
@@ -257,5 +423,21 @@ def calculate_reward_from_report_row(
             values[field.name] = int(numeric_value)
         else:
             values[field.name] = numeric_value
+
+    # Tendermint's applied timeouts are not report fields, so they are not
+    # covered by the loop above; reward_mixed needs them and reward_tps does
+    # not, hence the tolerant lookup.
+    if int(protocol) == agent_pb2.PROTOCOL_TENDERMINT:
+        for name in ("propose", "prevote", "precommit"):
+            raw_value = row.get(f"{name}_timeout_milliseconds_used")
+            if raw_value is None or str(raw_value).strip() == "":
+                continue
+            try:
+                values[f"{name}_timeout_ms"] = int(float(raw_value))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid '{name}_timeout_milliseconds_used' at CSV line "
+                    f"{row_number}: {raw_value!r}"
+                ) from exc
 
     return float(calculator(**values))

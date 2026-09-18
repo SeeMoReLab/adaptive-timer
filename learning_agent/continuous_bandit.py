@@ -8,6 +8,7 @@ from scipy.stats import qmc
 from sklearn.tree import DecisionTreeRegressor
 
 import agent_pb2
+from latency_floor import LatencyFloor
 from models import (
     ActionCodec,
     TensorModel,
@@ -33,12 +34,14 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
 
         if self._protocol in (
             agent_pb2.PROTOCOL_PBFT,
+            agent_pb2.PROTOCOL_SMARTBFT,
             agent_pb2.PROTOCOL_TENDERMINT,
         ):
             self._action_dim = 1
         else:
             raise ValueError(
-                "Continuous timeout actions currently support only PBFT and Tendermint"
+                "Continuous timeout actions currently support only PBFT, "
+                "SmartBFT and Tendermint"
             )
 
         self._bounds_ms: Tuple[Tuple[int, int], ...] = tuple(
@@ -52,6 +55,10 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
     @property
     def bounds_ms(self) -> Tuple[Tuple[int, int], ...]:
         return self._bounds_ms
+
+    def normalize_ms(self, timeout_ms: int, dimension: int = 0) -> float:
+        """Public form of the log-space mapping that decode() inverts."""
+        return self._normalize_value(int(timeout_ms), dimension)
 
     def _normalize_value(self, timeout_ms: int, dimension: int) -> float:
         lower_ms, upper_ms = self._bounds_ms[dimension]
@@ -90,6 +97,12 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
                     election_timeout_milliseconds=timeout_values[0]
                 )
             )
+        if self._protocol == agent_pb2.PROTOCOL_SMARTBFT:
+            return agent_pb2.Timeout(
+                smartbft=agent_pb2.SmartbftTimeout(
+                    election_timeout_milliseconds=timeout_values[0]
+                )
+            )
         propose_timeout_ms, prevote_timeout_ms, precommit_timeout_ms = (
             tendermint_timeouts_from_propose(timeout_values[0])
         )
@@ -105,10 +118,15 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
         if isinstance(action, agent_pb2.Timeout):
             if self._protocol == agent_pb2.PROTOCOL_PBFT:
                 action = action.pbft
+            elif self._protocol == agent_pb2.PROTOCOL_SMARTBFT:
+                action = action.smartbft
             else:
                 action = action.tendermint
 
-        if self._protocol == agent_pb2.PROTOCOL_PBFT:
+        if self._protocol in (
+            agent_pb2.PROTOCOL_PBFT,
+            agent_pb2.PROTOCOL_SMARTBFT,
+        ):
             timeout_values = [
                 int(getattr(action, "election_timeout_milliseconds"))
             ]
@@ -148,6 +166,73 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
         return np.asarray(normalized, dtype=float)
 
 
+class NormalizedLatencyFloor:
+    """:class:`LatencyFloor` expressed in the codec's normalized action space.
+
+    The continuous models search in [0, 1] over log-spaced milliseconds, so the
+    constraint has to be mapped through the same transform before it can bound
+    a candidate set.
+    """
+
+    def __init__(
+        self,
+        action_codec: ContinuousTimeoutActionCodec,
+        latency_index: int,
+        n_features: int,
+        instances_index: Optional[int] = None,
+        latency_floor: Optional[LatencyFloor] = None,
+    ) -> None:
+        if not 0 <= int(latency_index) < int(n_features):
+            raise ValueError(
+                f"latency_index must be in [0, {n_features}), got {latency_index}"
+            )
+        if instances_index is not None and not 0 <= int(instances_index) < int(
+            n_features
+        ):
+            raise ValueError(
+                f"instances_index must be in [0, {n_features}), got {instances_index}"
+            )
+        self._action_codec = action_codec
+        self._latency_index = int(latency_index)
+        self._instances_index = (
+            None if instances_index is None else int(instances_index)
+        )
+        self._latency_floor = (
+            LatencyFloor() if latency_floor is None else latency_floor
+        )
+
+    @property
+    def latency_floor(self) -> LatencyFloor:
+        return self._latency_floor
+
+    @property
+    def floor_ms(self) -> float:
+        return self._latency_floor.floor_ms
+
+    def observe_features(self, row: np.ndarray) -> None:
+        alive = True
+        if self._instances_index is not None:
+            alive = float(row[self._instances_index]) > 0.0
+        self._latency_floor.observe(float(row[self._latency_index]), alive=alive)
+
+    def lower_bound(self) -> float:
+        """Smallest normalized action the constraint permits, in [0, 1)."""
+        floor_ms = self._latency_floor.floor_ms
+        if floor_ms <= 0.0:
+            return 0.0
+        lower_ms, upper_ms = self._action_codec.bounds_ms[0]
+        if floor_ms <= lower_ms:
+            return 0.0
+        # A floor above the whole range would leave nothing to play; keep the
+        # longest timeout available, as feasible_timeout_mask does.
+        if floor_ms >= upper_ms:
+            return 1.0
+        return self._action_codec.normalize_ms(int(math.ceil(floor_ms)))
+
+    def reset(self) -> None:
+        self._latency_floor.reset()
+
+
 class ContinuousThompsonSamplingModel(TensorModel):
     """Bootstrapped-tree contextual bandit over a continuous action domain."""
 
@@ -162,6 +247,7 @@ class ContinuousThompsonSamplingModel(TensorModel):
         candidate_count: int = 1024,
         exploration_probability: float = 0.5,
         seed: Optional[int] = None,
+        latency_floor: Optional["NormalizedLatencyFloor"] = None,
     ):
         if action_dim <= 0:
             raise ValueError(f"action_dim must be > 0, got {action_dim}")
@@ -200,6 +286,7 @@ class ContinuousThompsonSamplingModel(TensorModel):
         self._memory_size = int(memory_size)
         self._exploration_probability = float(exploration_probability)
         self._anchor_actions = np.asarray(anchors, dtype=float).astype(float)
+        self._latency_floor = latency_floor
         self._seed = (
             int(time.time_ns() & 0x7FFFFFFF) if seed is None else int(seed)
         )
@@ -215,20 +302,41 @@ class ContinuousThompsonSamplingModel(TensorModel):
             random_state=self._seed + head_index,
         )
 
-    def _candidate_actions(self) -> np.ndarray:
+    def _lower_bound(self) -> float:
+        """Normalized floor under which the action space is not searched."""
+        if self._latency_floor is None:
+            return 0.0
+        return float(self._latency_floor.lower_bound())
+
+    def _candidate_actions(self, lower_bound: float = 0.0) -> np.ndarray:
         sampled = self._candidate_engine.random(self._candidate_count)
         candidate_parts = [sampled, self._anchor_actions]
         if self.memory["actions"]:
             candidate_parts.append(np.asarray(self.memory["actions"], dtype=float))
         candidates = np.vstack(candidate_parts)
-        return np.unique(np.clip(candidates, 0.0, 1.0), axis=0)
+        candidates = np.unique(np.clip(candidates, 0.0, 1.0), axis=0)
+        if lower_bound <= 0.0:
+            return candidates
+        feasible = candidates[np.all(candidates >= lower_bound, axis=1)]
+        if len(feasible) == 0:
+            # Everything the sampler offered is below the floor; the bound
+            # itself is still a legal action, so play that rather than nothing.
+            return np.full((1, self._action_dim), lower_bound, dtype=float)
+        return feasible
 
     def _predict_one(self, features: np.ndarray) -> np.ndarray:
+        if self._latency_floor is not None:
+            self._latency_floor.observe_features(features)
+        lower_bound = self._lower_bound()
+
         if self._design_count < self._initial_design_size:
             self._design_count += 1
-            return self._design_engine.random(1)[0].astype(float)
+            design = self._design_engine.random(1)[0].astype(float)
+            # Rescale rather than clip, so the initial design still spreads
+            # over the feasible range instead of piling up on the bound.
+            return lower_bound + (1.0 - lower_bound) * design
 
-        candidates = self._candidate_actions()
+        candidates = self._candidate_actions(lower_bound)
         if not self.is_fitted:
             return candidates[int(self._rng.integers(0, len(candidates)))]
 
@@ -330,6 +438,8 @@ class ContinuousThompsonSamplingModel(TensorModel):
         return 0.0
 
     def reset_model(self) -> None:
+        if self._latency_floor is not None:
+            self._latency_floor.reset()
         self._rng = np.random.default_rng(self._seed)
         # Owen-scrambled Sobol, as torch.quasirandom.SobolEngine provided
         # before. Both use Joe-Kuo direction numbers, so the sequences are
@@ -350,3 +460,110 @@ class ContinuousThompsonSamplingModel(TensorModel):
             "actions": deque(maxlen=self._memory_size),
             "rewards": deque(maxlen=self._memory_size),
         }
+
+
+
+DEFAULT_PROPORTIONAL_K = 1.0
+class ContinuousThresholdTimeoutModel(TensorModel):
+    """Proportional rule over the reported consensus latency.
+        timeout_ms = clamp(k * avg_consensus_latency_ms, lower_ms, upper_ms)
+
+    The mean rather than the p95: the p95 of a window is dominated by the
+    rounds the current timer already mishandled, so it reports the arm's own
+    thrashing back to the rule that chose it. The mean moves with the delay
+    environment and is the field the latency floor reads, so the rule and the
+    constraint are driven by one measurement.
+    """
+
+    def __init__(
+        self,
+        action_codec: ContinuousTimeoutActionCodec,
+        n_features: int,
+        latency_index: int,
+        transactions_index: int,
+        multiplier: float = DEFAULT_PROPORTIONAL_K,
+        clamp_ms: Optional[Tuple[int, int]] = None,
+        initial_timeout_ms: Optional[int] = None,
+    ):
+        if n_features <= 0:
+            raise ValueError(f"n_features must be > 0, got {n_features}")
+        for name, index in (
+            ("latency_index", latency_index),
+            ("transactions_index", transactions_index),
+        ):
+            if not 0 <= index < n_features:
+                raise ValueError(
+                    f"{name} must be in [0, {n_features}), got {index}"
+                )
+        if not math.isfinite(multiplier) or multiplier <= 0.0:
+            raise ValueError(f"multiplier must be > 0, got {multiplier}")
+
+        codec_lower_ms, codec_upper_ms = action_codec.bounds_ms[0]
+        if clamp_ms is None:
+            clamp_ms = (codec_lower_ms, codec_upper_ms)
+        lower_ms, upper_ms = (int(clamp_ms[0]), int(clamp_ms[1]))
+        if upper_ms <= lower_ms:
+            raise ValueError(f"Invalid clamp bounds: {lower_ms}..{upper_ms}ms")
+        if lower_ms < codec_lower_ms or upper_ms > codec_upper_ms:
+            raise ValueError(
+                f"Clamp bounds {lower_ms}..{upper_ms}ms fall outside the codec "
+                f"bounds {codec_lower_ms}..{codec_upper_ms}ms"
+            )
+
+        if initial_timeout_ms is None:
+            initial_timeout_ms = int(round(math.sqrt(lower_ms * upper_ms)))
+        initial_timeout_ms = min(upper_ms, max(lower_ms, int(initial_timeout_ms)))
+
+        self._action_codec = action_codec
+        self._obs_dim = int(n_features)
+        self._latency_index = int(latency_index)
+        self._transactions_index = int(transactions_index)
+        self._multiplier = float(multiplier)
+        self._lower_ms = lower_ms
+        self._upper_ms = upper_ms
+        self._initial_timeout_ms = initial_timeout_ms
+
+        self.reset_model()
+
+    @property
+    def timeout_ms(self) -> int:
+        return self._held_timeout_ms
+
+    def _timeout_for(self, features: np.ndarray) -> int:
+        latency_ms = float(features[self._latency_index])
+        transactions = float(features[self._transactions_index])
+        if transactions <= 0.0 or not math.isfinite(latency_ms) or latency_ms <= 0.0:
+            return self._held_timeout_ms
+
+        timeout_ms = int(round(self._multiplier * latency_ms))
+        return min(self._upper_ms, max(self._lower_ms, timeout_ms))
+
+    def predict_action(self, features: np.ndarray) -> np.ndarray:
+        features_np = np.asarray(features, dtype=float)
+        single = features_np.ndim == 1
+        if single:
+            features_np = features_np.reshape(1, -1)
+        if features_np.shape[1] != self._obs_dim:
+            raise ValueError(
+                f"Expected {self._obs_dim} features, got {features_np.shape[1]}"
+            )
+
+        actions = []
+        for row in features_np:
+            self._held_timeout_ms = self._timeout_for(row)
+            actions.append([self._action_codec.normalize_ms(self._held_timeout_ms)])
+
+        result = np.asarray(actions, dtype=float)
+        return result[0] if single else result
+
+    def update_model(
+        self,
+        features: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray | float,
+        backward: bool = True,
+    ) -> float:
+        return 0.0
+
+    def reset_model(self) -> None:
+        self._held_timeout_ms = self._initial_timeout_ms

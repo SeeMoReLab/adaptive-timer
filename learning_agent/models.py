@@ -92,15 +92,25 @@ TIMEOUT_INDEX_TO_MS: Dict[int, int] = {
 
 
 class TendermintProposeTimeoutOption(IntEnum):
-    TIMEOUT_150_MS = 150
-    TIMEOUT_450_MS = 450
-    TIMEOUT_750_MS = 750
+    # One arm per measured optimum, from every CloudLab run pooled by the
+    # timeout actually applied:
+    #   300  - the shortest value clear of the spurious-timeout cliff. Below
+    #          ~275ms the propose step's tail overruns the timer and rounds
+    #          fail with no fault present at all (1.0 leader change per window
+    #          at <175ms, 0.8 at 175-224ms, 0.0 by 275ms). Also the omission
+    #          optimum, which is flat to ~500ms and falls off above it.
+    #   700  - the sustained-50ms-delay optimum, and clear of the collapse hole
+    #          around 350-500ms that sustained 150ms delay opens up.
+    #   1100 - the sustained-150ms-delay optimum (900-1200ms bin).
+    TIMEOUT_300_MS = 300
+    TIMEOUT_700_MS = 700
+    TIMEOUT_1100_MS = 1100
 
 
 TENDERMINT_PROPOSE_TIMEOUT_OPTIONS: Tuple[TendermintProposeTimeoutOption, ...] = (
-    TendermintProposeTimeoutOption.TIMEOUT_150_MS,
-    TendermintProposeTimeoutOption.TIMEOUT_450_MS,
-    TendermintProposeTimeoutOption.TIMEOUT_750_MS,
+    TendermintProposeTimeoutOption.TIMEOUT_300_MS,
+    TendermintProposeTimeoutOption.TIMEOUT_700_MS,
+    TendermintProposeTimeoutOption.TIMEOUT_1100_MS,
 )
 TENDERMINT_PROPOSE_TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(
     int(option) for option in TENDERMINT_PROPOSE_TIMEOUT_OPTIONS

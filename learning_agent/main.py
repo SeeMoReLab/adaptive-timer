@@ -24,7 +24,7 @@ from aggregator import BaseAggregator, MedianAggregator, WeightedMedianAggregato
 from continuous_bandit import (
     DEFAULT_PROPORTIONAL_K,
     ContinuousThompsonSamplingModel,
-    ContinuousThresholdTimeoutModel,
+    ContinuousHeuristicTimeoutModel,
     ContinuousTimeoutActionCodec,
     NormalizedLatencyFloor,
 )
@@ -1928,7 +1928,7 @@ def serve(
     aggregate_function: str,
     aggregate_weight: int,
     schedule_file: Optional[Path],
-    threshold_multiplier: float,
+    heuristic_multiplier: float,
     latency_floor_k: float,
     latency_floor_quantile: float,
     dataset_csv: Optional[Path],
@@ -1977,7 +1977,7 @@ def serve(
     # built below: a timeout under the consensus latency the replicas are
     # already achieving cannot be met, so it is not worth a decision. The
     # field is the window mean, avg_consensus_latency_ms, matching what
-    # continuous_threshold reads below, so the constraint and the heuristic
+    # continuous_heuristic reads below, so the constraint and the heuristic
     # are compared on the same measurement.
     latency_index, instances_index = latency_feature_indices(
         get_report_feature_field_names(protocol)
@@ -1990,16 +1990,16 @@ def serve(
         )
     )
 
-    if model_type == "continuous_threshold":
+    if model_type == "continuous_heuristic":
         action_codec = ContinuousTimeoutActionCodec(protocol)
         feature_fields = get_report_feature_field_names(protocol)
         arms_ms = get_timeout_values_ms(protocol)
-        model = ContinuousThresholdTimeoutModel(
+        model = ContinuousHeuristicTimeoutModel(
             action_codec=action_codec,
             n_features=get_report_feature_dim(protocol),
             latency_index=feature_fields.index("avg_consensus_latency_ms"),
             transactions_index=feature_fields.index("total_transactions"),
-            multiplier=threshold_multiplier,
+            multiplier=heuristic_multiplier,
             clamp_ms=(min(arms_ms), max(arms_ms)),
             initial_timeout_ms=sorted(arms_ms)[len(arms_ms) // 2],
         )
@@ -2107,14 +2107,14 @@ def serve(
         raise ValueError(f"Unsupported model type: {model_type}")
 
     # continuous takes the floor through its own candidate sampler, above.
-    # continuous_threshold is already a multiple of the same latency, and
+    # continuous_heuristic is already a multiple of the same latency, and
     # scheduled is a fixed-baseline replay that must not be overridden.
     #
     # In sharing mode the floor stays identical on every replica for free: it
     # is estimated from the consensus-agreed feature vector, which is the same
     # on all of them, so constraining the action space does not break the
     # lockstep the aggregated reward depends on.
-    floor_exempt = ("continuous_threshold", "scheduled")
+    floor_exempt = ("continuous_heuristic", "scheduled")
     if latency_floor is not None and model_type not in (
         ("continuous",) + floor_exempt
     ):
@@ -2136,7 +2136,7 @@ def serve(
     feature_extractor = ProtocolReportFeatureExtractor(protocol)
     if model_type == "scheduled":
         action_codec = ScheduledTimeoutActionCodec(protocol)
-    elif model_type not in ("continuous", "continuous_threshold"):
+    elif model_type not in ("continuous", "continuous_heuristic"):
         action_codec = ProtocolTimeoutActionCodec(protocol)
     if aggregate_function == "median":
         aggregator: BaseAggregator = MedianAggregator(protocol=protocol)
@@ -2283,7 +2283,7 @@ def main():
             "claude_v2",
             "codex_v1",
             "continuous",
-            "continuous_threshold",
+            "continuous_heuristic",
             "scheduled",
             "thompson",
         ),
@@ -2306,7 +2306,7 @@ def main():
             "ranks on the second, so a timeout that stalls is ruled out from a "
             "handful of samples instead of averaged into a conditional mean; "
             "continuous: bootstrapped continuous contextual bandit; "
-            "continuous_threshold: k * avg_consensus_latency_ms, clamped to "
+            "continuous_heuristic: k * avg_consensus_latency_ms, clamped to "
             "the arm range; no learning; "
             "thompson: deprecated alias for cmab; "
             "scheduled: timeout from a time-based schedule CSV. "
@@ -2331,11 +2331,11 @@ def main():
     )
 
     parser.add_argument(
-        "--threshold-multiplier",
+        "--heuristic-multiplier",
         type=float,
         default=DEFAULT_PROPORTIONAL_K,
         help=(
-            "Multiplier k for --model-type=continuous_threshold: "
+            "Multiplier k for --model-type=continuous_heuristic: "
             "timeout_ms = clamp(k * avg_consensus_latency_ms, arm range). "
             f"Fit it with learning_agent/fit_proportional.py (default: "
             f"{DEFAULT_PROPORTIONAL_K})."
@@ -2459,7 +2459,7 @@ def main():
         aggregate_function=args.function,
         aggregate_weight=args.function_weight,
         schedule_file=args.schedule_file,
-        threshold_multiplier=args.threshold_multiplier,
+        heuristic_multiplier=args.heuristic_multiplier,
         latency_floor_k=args.latency_floor_k,
         latency_floor_quantile=args.latency_floor_quantile,
         dataset_csv=args.dataset_csv,

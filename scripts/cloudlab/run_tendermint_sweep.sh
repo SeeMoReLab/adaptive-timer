@@ -27,7 +27,7 @@ Arguments:
 Flags:
   -d <seconds>      Experiment duration for each run.
   -t <timeouts>     Semicolon-separated propose timeout values in ms,
-                    e.g. '150;450;750'.
+                    e.g. '300;700;1100'.
 EOF
 }
 

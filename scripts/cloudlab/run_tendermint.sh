@@ -17,6 +17,11 @@ LOG_ENABLED=0
 DATASET_ENABLED=0
 AGENT_MODEL_TYPE="random"
 AGENT_MODEL_SET=0
+REWARD_DESIGN="reward_tps"
+# Domain constraint on the action space: never apply a timeout below k times
+# the consensus latency the replicas are already achieving. 0 disables it.
+LATENCY_FLOOR_K=0
+SCHEDULE_FILE="learning_agent/config/schedule_tendermint.csv"
 LOAD_CONNECTIONS=5
 LOAD_RATE=20
 LOAD_SEND_PERIOD_MS=100
@@ -70,7 +75,7 @@ trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -82,8 +87,19 @@ Flags:
   --log             Fetch remote Tendermint, ABCI, and client logs into the run artifact directory.
   --output-dir <path>
                     Store artifacts here instead of creating a timestamped run directory.
-  --model           Learning-agent model for learning/sharing modes: random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous (default: random).
+  --model           Learning-agent model for learning/sharing modes: random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic (default: random).
                     claude and codex select claude_v2 and codex_v1.
+  --reward-design   Reward the agent learns from: reward_tps|reward_mixed (default: reward_tps).
+                    reward_tps is throughput alone, concave past a 1000 tps knee. reward_mixed
+                    also discounts it by the share of the window one fault would cost.
+  --latency-floor-k <float>
+                    Never apply a timeout below k * the consensus latency the replicas are
+                    already achieving, estimated as a low quantile over recent committing
+                    windows. 0 disables it (default: 0).
+  --schedule-file <repo-rel-path>
+                    scheduled-mode oracle CSV, relative to the repo root
+                    (default: learning_agent/config/schedule_tendermint.csv). It must be inside
+                    the deployed payload to exist on the remote.
   -f <int>          Fault tolerance f. Number of nodes is derived as 3f+1 (default: 1).
   -t <int>          Load-generation duration in seconds (default: 60).
 EOF
@@ -104,7 +120,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|pavlov|linear|cmab|cmab_reset|continuous)
+    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_heuristic)
       printf '%s\n' "${model_lower}"
       ;;
     # Short names for the two newest bandits. main.py knows them by their
@@ -227,6 +243,33 @@ while [[ $# -gt 0 ]]; do
       OUTPUT_DIR="${2}"
       shift 2
       ;;
+    --reward-design)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --reward-design." >&2
+        usage >&2
+        exit 2
+      fi
+      REWARD_DESIGN="${2}"
+      shift 2
+      ;;
+    --latency-floor-k)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --latency-floor-k." >&2
+        usage >&2
+        exit 2
+      fi
+      LATENCY_FLOOR_K="${2}"
+      shift 2
+      ;;
+    --schedule-file)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --schedule-file." >&2
+        usage >&2
+        exit 2
+      fi
+      SCHEDULE_FILE="${2}"
+      shift 2
+      ;;
     --model)
       if [[ $# -lt 2 || -z "${2}" ]]; then
         echo "Missing value for --model." >&2
@@ -275,8 +318,16 @@ if ! mode_enables_learning_agent "${MODE}"; then
 else
   LEARNING_AGENT_ENABLED=1
 fi
+case "${REWARD_DESIGN}" in
+  reward_tps|reward_mixed) ;;
+  *) echo "Invalid --reward-design: ${REWARD_DESIGN}. Expected reward_tps|reward_mixed." >&2; exit 2 ;;
+esac
+if ! [[ "${LATENCY_FLOOR_K}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "Invalid --latency-floor-k: ${LATENCY_FLOOR_K}. Expected a non-negative number (0 disables the constraint)." >&2
+  exit 2
+fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -322,8 +373,8 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
   fi
 fi
 if [[ "${MODE}" == "scheduled" ]]; then
-  if [[ ! -f "${REPO_ROOT}/learning_agent/config/schedule_tendermint.csv" ]]; then
-    echo "Missing Tendermint schedule file: ${REPO_ROOT}/learning_agent/config/schedule_tendermint.csv" >&2
+  if [[ ! -f "${REPO_ROOT}/${SCHEDULE_FILE}" ]]; then
+    echo "Missing Tendermint schedule file: ${REPO_ROOT}/${SCHEDULE_FILE}" >&2
     exit 1
   fi
 fi
@@ -401,7 +452,7 @@ cp "${REPO_ROOT}/config/tendermint/config.toml" "${ARTIFACT_DIR}/config.toml"
 cp "${REPO_ROOT}/config/tendermint/failure_spec.xml" "${ARTIFACT_DIR}/failure_spec.xml"
 cp "${TARGETS_FILE}" "${ARTIFACT_DIR}/cloudlab_ssh_targets.txt"
 if [[ "${MODE}" == "scheduled" ]]; then
-  cp "${REPO_ROOT}/learning_agent/config/schedule_tendermint.csv" "${ARTIFACT_DIR}/schedule_tendermint.csv"
+  cp "${REPO_ROOT}/${SCHEDULE_FILE}" "${ARTIFACT_DIR}/schedule_tendermint.csv"
 fi
 {
   printf 'protocol=%q\n' "tendermint"
@@ -411,6 +462,9 @@ fi
   printf 'fault_tolerance=%q\n' "${F}"
   printf 'experiment_time_s=%q\n' "${EXPERIMENT_TIME_S}"
   printf 'agent_model=%q\n' "${AGENT_MODEL_TYPE}"
+  printf 'reward_design=%q\n' "${REWARD_DESIGN}"
+  printf 'latency_floor_k=%q\n' "${LATENCY_FLOOR_K}"
+  printf 'schedule_file=%q\n' "${SCHEDULE_FILE}"
   printf 'dataset_enabled=%q\n' "${DATASET_ENABLED}"
   printf 'log_enabled=%q\n' "${LOG_ENABLED}"
   printf 'targets_file=%q\n' "${TARGETS_FILE}"
@@ -461,7 +515,7 @@ rm -f "${LOCAL_PAYLOAD}"
 
 echo "Running remote CometBFT experiment on ${remote_host} (mode=${MODE}, f=${F}, t=${EXPERIMENT_TIME_S}s)..."
 remote_failed=0
-if ! ssh "${SSH_OPTS[@]}" "${remote_user}@${remote_host}" "bash -s" -- "${REMOTE_PAYLOAD}" "${REMOTE_APPLIER}" "${F}" "${EXPERIMENT_TIME_S}" "${MODE}" "${LOG_ENABLED}" "${DATASET_ENABLED}" "${LOAD_CONNECTIONS}" "${LOAD_RATE}" "${LOAD_SEND_PERIOD_MS}" "${AGENT_MODEL_TYPE}" <<'REMOTE'
+if ! ssh "${SSH_OPTS[@]}" "${remote_user}@${remote_host}" "bash -s" -- "${REMOTE_PAYLOAD}" "${REMOTE_APPLIER}" "${F}" "${EXPERIMENT_TIME_S}" "${MODE}" "${LOG_ENABLED}" "${DATASET_ENABLED}" "${LOAD_CONNECTIONS}" "${LOAD_RATE}" "${LOAD_SEND_PERIOD_MS}" "${AGENT_MODEL_TYPE}" "${REWARD_DESIGN}" "${LATENCY_FLOOR_K}" "${SCHEDULE_FILE}" <<'REMOTE'
 set -euo pipefail
 
 payload_path="$1"
@@ -475,6 +529,9 @@ load_connections="$8"
 load_rate="$9"
 load_send_period_ms="${10}"
 agent_model_type="${11}"
+reward_design="${12}"
+latency_floor_k="${13}"
+schedule_file_rel="${14}"
 
 if [[ "${mode}" != "normal" && "${mode}" != "learning" && "${mode}" != "sharing" && "${mode}" != "scheduled" ]]; then
   echo "Unsupported mode on remote: ${mode} (supported: normal, learning, sharing, scheduled)" >&2
@@ -504,10 +561,14 @@ if ! [[ "${load_send_period_ms}" =~ ^[0-9]+$ ]] || (( load_send_period_ms < 1 ))
   echo "Invalid load_send_period_ms: ${load_send_period_ms}" >&2
   exit 2
 fi
+# Post-normalization names, so this list is normalize_agent_model_type's
+# output alphabet (claude/codex already translated), not its input. Keep the
+# two in sync: the heredoc is quoted, so the local list cannot be interpolated
+# here and a name added there is silently rejected on the remote.
 case "${agent_model_type}" in
-  random|pavlov|linear|cmab|cmab_reset|claude_v2|codex_v1|continuous) ;;
+  random|pavlov|linear|cmab|cmab_reset|claude_v2|codex_v1|continuous|continuous_heuristic) ;;
   *)
-    echo "Invalid agent_model_type: ${agent_model_type}. Use random|pavlov|linear|cmab|cmab_reset|claude_v2|codex_v1|continuous." >&2
+    echo "Invalid agent_model_type: ${agent_model_type}. Use random|pavlov|linear|cmab|cmab_reset|claude_v2|codex_v1|continuous|continuous_heuristic." >&2
     exit 2
     ;;
 esac
@@ -539,7 +600,7 @@ agent_hosts_config="${run_root}/agent_hosts.config"
 sharing_hosts_config="${run_root}/sharing_hosts.config"
 sharing_src_dir="${run_root}/SmartBFT"
 sharing_bin="${run_root}/bin/smartbft-sharing"
-schedule_file="${learning_agent_dir}/config/schedule_tendermint.csv"
+schedule_file="${run_root}/${schedule_file_rel}"
 applier_hosts_config="${run_root}/applier_hosts.config"
 applier_script="${run_root}/apply_network_failures.py"
 
@@ -1026,6 +1087,16 @@ if (( learning_agent_enabled == 1 )); then
     agent_mode_args="--model-type ${agent_model_type}"
   elif [[ "${mode}" == "scheduled" ]]; then
     agent_mode_args="--model-type scheduled --schedule-file \"${schedule_file}\""
+  fi
+  # The reward shaping applies to every agent mode that trains, including the
+  # scheduled replay, whose CSV records the reward each fixed timeout earned.
+  if [[ "${agent_mode_args}" != "" ]]; then
+    agent_mode_args="${agent_mode_args} --reward-design ${reward_design}"
+  fi
+  # The floor is a constraint on the action space, so it only means anything
+  # where the agent is choosing the timeout at all.
+  if [[ "${agent_mode_args}" != "" && "${latency_floor_k}" != "0" ]]; then
+    agent_mode_args="${agent_mode_args} --latency-floor-k ${latency_floor_k}"
   fi
   for ((i = 0; i < num_nodes; i++)); do
     agent_session="tm_tendermint_agent_${i}"

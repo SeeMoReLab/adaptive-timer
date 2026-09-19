@@ -6,7 +6,7 @@ CSVs) and renders a grid: rows = agents, cols = timers. Each subplot shows the
 chosen timeout over episodes, with the injection phase shaded in the background.
 
 The CSV schema is auto-detected:
-  * tendermint  -> propose levels 150/450/750, phase levels 50/150/250
+  * tendermint  -> propose levels 300/700/1100, phase levels 50/150/250
   * SmartBFT    -> one timer   (election),                       levels 300/800/1800
 
 Usage:
@@ -46,7 +46,7 @@ LINE_COLOR = "#1f3b73"
 
 # --- Schemas ------------------------------------------------------------
 TENDERMINT_TIMERS = [
-    ("propose_timeout_milliseconds_used", "propose", [150, 450, 750]),
+    ("propose_timeout_milliseconds_used", "propose", [300, 700, 1100]),
     ("prevote_timeout_milliseconds_used", "prevote", [50, 150, 250]),
     ("precommit_timeout_milliseconds_used", "precommit", [50, 150, 250]),
 ]

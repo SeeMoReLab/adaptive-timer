@@ -464,7 +464,7 @@ class ContinuousThompsonSamplingModel(TensorModel):
 
 
 DEFAULT_PROPORTIONAL_K = 1.0
-class ContinuousThresholdTimeoutModel(TensorModel):
+class ContinuousHeuristicTimeoutModel(TensorModel):
     """Proportional rule over the reported consensus latency.
         timeout_ms = clamp(k * avg_consensus_latency_ms, lower_ms, upper_ms)
 

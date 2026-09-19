@@ -31,6 +31,11 @@ LOG_ENABLED=0
 VERBOSE_ENABLED=0
 AGENT_MODEL_TYPE="random"
 AGENT_MODEL_SET=0
+REWARD_DESIGN="reward_tps"
+# Domain constraint on the action space: never apply a timeout below k times
+# the consensus latency the replicas are already achieving. 0 disables it.
+LATENCY_FLOOR_K=0
+SCHEDULE_FILE="learning_agent/config/schedule_smartbft.csv"
 
 BATCH_SIZE=256
 BATCH_TIMEOUT="50ms"
@@ -102,7 +107,7 @@ trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -114,9 +119,22 @@ Flags:
   --log                             Download client, server, applier, and agent logs.
   --output-dir <path>               Store artifacts here instead of creating a timestamped run directory.
   --verbose                         Enable SmartBFT debug logs on server replicas.
-  --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous>
+  --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic>
                                      Learning-agent model for learning mode (default: random).
                                      claude and codex select claude_v2 and codex_v1.
+  --reward-design <reward_tps|reward_mixed>
+                                     Reward the agent learns from (default: reward_tps).
+                                     reward_tps is throughput alone, concave past a 1000 tps knee.
+                                     reward_mixed also discounts it by the share of the window one
+                                     fault would cost (applied timeout + one consensus latency),
+                                     so a longer timer has to earn the detection delay it buys.
+  --latency-floor-k <float>          Never apply a timeout below k * the consensus latency the
+                                     replicas are already achieving, estimated as a low quantile
+                                     over recent committing windows. Such a timeout cannot be met,
+                                     so it only buys view changes. 0 disables it (default: 0).
+  --schedule-file <repo-rel-path>    scheduled-mode oracle CSV, relative to the repo root
+                                     (default: learning_agent/config/schedule_smartbft.csv).
+                                     It must be inside the deployed payload to exist on the remote.
   -f <int>                          Fault tolerance f; nodes defaults to 3f+1 (default: 1).
   -t <int>                          Seconds to run after benchmark start (default: 300).
 
@@ -159,7 +177,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|pavlov|linear|cmab|cmab_reset|continuous) printf '%s\n' "${model_lower}" ;;
+    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_heuristic) printf '%s\n' "${model_lower}" ;;
     # Short names for the two newest bandits. main.py knows them by their
     # versioned names, so translate here and let everything downstream - the
     # remote validation included - carry the name main.py accepts.
@@ -345,6 +363,18 @@ while [[ $# -gt 0 ]]; do
       AGENT_MODEL_SET=1
       shift 2
       ;;
+    --reward-design)
+      REWARD_DESIGN="${2:-}"
+      shift 2
+      ;;
+    --latency-floor-k)
+      LATENCY_FLOOR_K="${2:-}"
+      shift 2
+      ;;
+    --schedule-file)
+      SCHEDULE_FILE="${2:-}"
+      shift 2
+      ;;
     --nodes)
       NODES="${2:-}"
       NODES_SET=1
@@ -481,8 +511,16 @@ if [[ -n "${CREATE_WORKERS}" ]] && (! [[ "${CREATE_WORKERS}" =~ ^[0-9]+$ ]] || (
   echo "Invalid --create-workers value: ${CREATE_WORKERS}." >&2
   exit 2
 fi
+case "${REWARD_DESIGN}" in
+  reward_tps|reward_mixed) ;;
+  *) echo "Invalid --reward-design: ${REWARD_DESIGN}. Expected reward_tps|reward_mixed." >&2; exit 2 ;;
+esac
+if ! [[ "${LATENCY_FLOOR_K}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "Invalid --latency-floor-k: ${LATENCY_FLOOR_K}. Expected a non-negative number (0 disables the constraint)." >&2
+  exit 2
+fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -584,7 +622,11 @@ if (( FAILURE_SPEC_ENABLED == 1 )); then
   cp "${FAILURE_SPEC_PATH}" "${ARTIFACT_DIR}/failure_spec.xml"
 fi
 if [[ "${MODE}" == "scheduled" ]]; then
-  cp "${REPO_ROOT}/learning_agent/config/schedule_smartbft.csv" "${ARTIFACT_DIR}/schedule_smartbft.csv"
+  if [[ ! -f "${REPO_ROOT}/${SCHEDULE_FILE}" ]]; then
+    echo "Schedule file not found: ${REPO_ROOT}/${SCHEDULE_FILE}" >&2
+    exit 1
+  fi
+  cp "${REPO_ROOT}/${SCHEDULE_FILE}" "${ARTIFACT_DIR}/schedule_smartbft.csv"
 fi
 {
   printf 'protocol=%q\n' "smartbft"
@@ -598,6 +640,9 @@ fi
   printf 'batch_timeout=%q\n' "${BATCH_TIMEOUT}"
   printf 'request_timeout=%q\n' "${REQUEST_TIMEOUT}"
   printf 'agent_model=%q\n' "${AGENT_MODEL_TYPE}"
+  printf 'reward_design=%q\n' "${REWARD_DESIGN}"
+  printf 'latency_floor_k=%q\n' "${LATENCY_FLOOR_K}"
+  printf 'schedule_file=%q\n' "${SCHEDULE_FILE}"
   printf 'learning_window_mode=%q\n' "${LEARNING_WINDOW_MODE}"
   printf 'dataset_enabled=%q\n' "${DATASET_ENABLED}"
   printf 'log_enabled=%q\n' "${LOG_ENABLED}"
@@ -1113,7 +1158,10 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
         "${AGENT_MODEL_TYPE}" \
         "${AGENT_PORT}" \
         "${SHARING_ENABLED}" \
-        "${SHARING_COLLECT_WAIT_MS}" <<'REMOTE'
+        "${SHARING_COLLECT_WAIT_MS}" \
+        "${LATENCY_FLOOR_K}" \
+        "${REWARD_DESIGN}" \
+        "${SCHEDULE_FILE}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
@@ -1125,6 +1173,9 @@ model_type="$6"
 agent_port="$7"
 sharing_enabled="$8"
 sharing_collect_wait_ms="$9"
+latency_floor_k="${10}"
+reward_design="${11}"
+schedule_file="${12}"
 run_root="$HOME/smartbft_cloudlab"
 learning_agent_python="${HOME}/.venvs/adaptive-timer-learning-agent/bin/python"
 
@@ -1138,7 +1189,17 @@ agent_model_args=""
 if [[ "${mode}" == "learning" || "${mode}" == "sharing" ]]; then
   agent_model_args="--model-type ${model_type}"
 elif [[ "${mode}" == "scheduled" ]]; then
-  agent_model_args="--model-type scheduled --schedule-file learning_agent/config/schedule_smartbft.csv"
+  agent_model_args="--model-type scheduled --schedule-file \"${schedule_file}\""
+fi
+# The floor is a constraint on the action space, so it only means anything
+# where the agent is choosing the timeout at all.
+if [[ "${agent_model_args}" != "" && "${latency_floor_k}" != "0" ]]; then
+  agent_model_args="${agent_model_args} --latency-floor-k ${latency_floor_k}"
+fi
+# The reward shaping applies to every agent mode that trains, including the
+# scheduled replay, whose CSV records the reward each fixed timeout earned.
+if [[ "${agent_model_args}" != "" ]]; then
+  agent_model_args="${agent_model_args} --reward-design ${reward_design}"
 fi
 
 for ((n = 0; n < replicas_per_machine; n++)); do

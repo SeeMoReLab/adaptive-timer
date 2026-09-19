@@ -120,7 +120,22 @@
             </agent>
         </phase>
 
-        <!-- Proposal omission -->
+        <!--
+          Phase 1: short-arm regime.
+          The delay sits between the 300ms and 700ms arms. A replica whose
+          timeout_propose is 300ms leaves RoundStepPropose before the proposal
+          is released, so the maverick's proposal is dropped by
+          delayedSendPreparedProposal and the height completes in round 1 for
+          ~500ms (300 propose + 100 prevote + 100 precommit). A replica on
+          700ms or 1100ms is still in the propose step when the proposal lands,
+          so it commits in round 0 but pays the full 600ms. Escaping is cheaper
+          than waiting, so 300ms is optimal here.
+          Two bounds on this value, both tight to 100ms:
+            - above 500ms (= 300 + 2*100), or escaping costs more than waiting
+              and the short arm stops winning;
+            - below 700ms, or the middle arm escapes too and the regime
+              collapses into phase 2.
+        -->
         <phase>
             <atTime>300</atTime>
             <network>
@@ -136,12 +151,23 @@
 
             <tendermint>
                 <proposalDelay>
-                    <delayMs>10000</delayMs>
+                    <delayMs>600</delayMs>
                 </proposalDelay>
             </tendermint>
         </phase>
 
-        <!-- Small network delay -->
+        <!--
+          Phase 2: mid-arm regime.
+          The delay is above every arm, so the proposal is always dropped and
+          every arm escapes by timing out. The cost of escaping is
+          arm + 2*(arm/3), so it scales with the arm: 750ms pays the most.
+          The shortest arm escapes cheapest, so this phase is only a
+          middle-arm regime while the long arms' escape cost dominates: measured
+          -19.0% for the longest arm against the middle one. Verify the winner
+          here after the arm change - with 300ms clear of the spurious-timeout
+          cliff the short arm may now take this phase too, which would collapse
+          it into phase 1.
+        -->
         <phase>
             <atTime>600</atTime>
             <network>
@@ -149,36 +175,32 @@
                 <precedence>global,source,edge</precedence>
 
                 <global>
-                    <delayMs>50</delayMs>
-                    <burstDurationMs>10000</burstDurationMs>
-                    <burstIntervalMs>10000</burstIntervalMs>
-                </global>
-            </network>
-        </phase>
-
-        <phase>
-            <atTime>900</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>50</delayMs>
-                    <burstDurationMs>10000</burstDurationMs>
-                    <burstIntervalMs>10000</burstIntervalMs>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
                 </global>
             </network>
 
             <tendermint>
                 <proposalDelay>
-                    <delayMs>10000</delayMs>
+                    <delayMs>20000</delayMs>
                 </proposalDelay>
             </tendermint>
         </phase>
 
-        <!-- Large network delay -->
+        <!--
+          Phase 3: long-arm regime.
+          Sustained delay on every edge (burstDuration == burstInterval, so the
+          network is continuously slow). The delay is not escapable - changing
+          round does not help, because the next proposer is just as slow - so
+          the only working answer is a timeout long enough to ride it out.
+          Measured at +197% for 750ms over 450ms under the old arm set, the
+          widest margin in the spec. Note the collapse hole this regime opens
+          between roughly 350ms and 500ms (806 tps, worse than either side);
+          700ms and 1100ms both sit clear of it.
+        -->
         <phase>
-            <atTime>1200</atTime>
+            <atTime>900</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -189,6 +211,32 @@
                     <burstIntervalMs>10000</burstIntervalMs>
                 </global>
             </network>
+        </phase>
+
+        <!--
+          Phase 4: back to the short-arm regime.
+          Same fault as phase 1. It is placed after the long-arm phase so the
+          run ends on the hardest transition in the spec, 1100ms straight back
+          down to 300ms.
+        -->
+        <phase>
+            <atTime>1200</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
+            </network>
+
+            <tendermint>
+                <proposalDelay>
+                    <delayMs>600</delayMs>
+                </proposalDelay>
+            </tendermint>
         </phase>
     </phases>
 </failureSpec>

@@ -1,7 +1,24 @@
 # time_s,propose_timeout_ms
 # propose_timeout_ms may be any integer from 1 through 4294967295
 # prevote_timeout_ms and precommit_timeout_ms are derived as propose_timeout_ms / 3
--10,150
-0,150
-590,450
-1190,750
+#
+# Hindsight-optimal arm per phase of config/tendermint/failure_spec.xml.
+# Arms are {300, 700, 1100} (learning_agent/models.py).
+#
+# Timing: the agent, the network applier and the CometBFT propose-delay
+# controller all anchor on the same --start-unix-ms, and both appliers fire a
+# phase at warmUpTime + atTime. ScheduledTimeoutModel shifts the whole schedule
+# so its first row lands at elapsed 0, so with a leading -10 row (warmUpTime=10)
+# a switch written at T fires at warmUpTime + T. Writing the atTime value here
+# therefore lands the switch exactly on the phase boundary.
+#
+#   p0 @0    no fault              300  control; arm-independent, no switch needed
+#   p1 @300  proposalDelay 600ms   300  short arm escapes, long arms wait it out
+#   p2 @600  proposalDelay 20s     700  every arm escapes; cost scales with arm
+#   p3 @900  net 150ms sustained  1100  not escapable, ride it out
+#   p4 @1200 proposalDelay 600ms   300  back down to the short arm
+-10,300
+0,300
+600,700
+900,1100
+1200,300

@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "learning_agent"))
-from reward_utils import reward_from_throughput
+from reward_utils import reward_tps
 
 # phase index (0..18) -> regime, from config/smartbft/failure_spec.xml
 REGIMES = [
@@ -48,7 +48,7 @@ def add_derived_reward(df):
         )
     df = df.copy()
     df['reward'] = df['reward_throughput_tps'].astype(float).map(
-        reward_from_throughput
+        reward_tps
     )
     return df
 

@@ -2,15 +2,25 @@ import unittest
 
 import agent_pb2
 from reward_utils import (
+    DEFAULT_REWARD_DESIGN,
     calculate_pbft_reward,
     calculate_reward_from_report_row,
     calculate_sbft_reward,
     calculate_tendermint_reward,
+    get_reward_design,
     reward_from_report_row,
+    set_reward_design,
 )
 
 
 class RewardExtractionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # The design is process-wide, so a test that changes it has to put it
+        # back or it leaks into whatever runs next.
+        previous = get_reward_design()
+        self.addCleanup(set_reward_design, previous)
+        set_reward_design(DEFAULT_REWARD_DESIGN)
+
     def test_gives_full_credit_to_throughput_below_the_knee(self) -> None:
         row = {
             "reward_throughput_tps": "500",
@@ -85,11 +95,13 @@ class RewardExtractionTest(unittest.TestCase):
             precommit_latency_ms=5.0,
         )
 
+        # Under the default design every protocol scores throughput alone, so
+        # the three agree; Tendermint's old (tps - p90)/4000 is retired.
         self.assertEqual(pbft_reward, 0.5)
-        # SBFT discounts the throughput reward by p95 consensus latency: the
-        # timers move the tail, not the median.
-        self.assertAlmostEqual(sbft_reward, 0.5 * (300.0 / 330.0))
-        self.assertAlmostEqual(tendermint_reward, 0.4944)
+        # Every protocol uses the reward_tps design by default, so the
+        # reward is the throughput term alone with no latency discount.
+        self.assertEqual(sbft_reward, 0.5)
+        self.assertEqual(tendermint_reward, 0.5)
 
     def test_tendermint_csv_reward_uses_complete_reward_report(self) -> None:
         row = {
@@ -114,7 +126,69 @@ class RewardExtractionTest(unittest.TestCase):
             agent_pb2.PROTOCOL_TENDERMINT, row, row_number=2
         )
 
-        self.assertEqual(reward, 3.9)
+        # 4000 tps: 1.0 for the first 1000, then 0.25 * 3 for the excess.
+        self.assertEqual(reward, 1.75)
+
+    def test_reward_mixed_discounts_throughput_by_the_fault_cost(self) -> None:
+        row = {
+            "reward_total_transactions": "100",
+            "reward_total_consensus_instances": "10",
+            "reward_avg_consensus_latency_ms": "20",
+            "reward_p50_consensus_latency_ms": "18",
+            "reward_p90_consensus_latency_ms": "500",
+            "reward_throughput_tps": "4000",
+            "reward_timeout_violation_rate": "0.1",
+            "reward_avg_batch_size": "10",
+            "reward_p50_batch_size": "9",
+            "reward_p90_batch_size": "14",
+            "reward_leader_change_count": "1",
+            "reward_regency_change_count": "1",
+            "reward_propose_latency_ms": "10",
+            "reward_prevote_latency_ms": "5",
+            "reward_precommit_latency_ms": "5",
+            "propose_timeout_milliseconds_used": "450",
+            "prevote_timeout_milliseconds_used": "150",
+            "precommit_timeout_milliseconds_used": "150",
+        }
+        set_reward_design("reward_mixed")
+
+        reward = calculate_reward_from_report_row(
+            agent_pb2.PROTOCOL_TENDERMINT, row, row_number=2
+        )
+
+        # window = 1000 * 100 / 4000 = 25ms; overhead = (450+150+150) + 20.
+        self.assertAlmostEqual(reward, 1.75 * 25.0 / (25.0 + 770.0))
+
+    def test_reward_mixed_rejects_a_tendermint_row_without_its_timeouts(
+        self,
+    ) -> None:
+        row = {
+            "reward_total_transactions": "100",
+            "reward_total_consensus_instances": "10",
+            "reward_avg_consensus_latency_ms": "20",
+            "reward_p50_consensus_latency_ms": "18",
+            "reward_p90_consensus_latency_ms": "500",
+            "reward_throughput_tps": "4000",
+            "reward_timeout_violation_rate": "0.1",
+            "reward_avg_batch_size": "10",
+            "reward_p50_batch_size": "9",
+            "reward_p90_batch_size": "14",
+            "reward_leader_change_count": "1",
+            "reward_regency_change_count": "1",
+            "reward_propose_latency_ms": "10",
+            "reward_prevote_latency_ms": "5",
+            "reward_precommit_latency_ms": "5",
+        }
+        set_reward_design("reward_mixed")
+
+        with self.assertRaisesRegex(ValueError, "applied timeout for tendermint"):
+            calculate_reward_from_report_row(
+                agent_pb2.PROTOCOL_TENDERMINT, row, row_number=2
+            )
+
+    def test_unknown_reward_design_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unknown reward design"):
+            set_reward_design("latency_capped")
 
 
 if __name__ == "__main__":

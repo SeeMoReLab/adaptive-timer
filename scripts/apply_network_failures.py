@@ -41,6 +41,8 @@ class BurstDelay:
     delay_ms: float
     burst_duration_ms: float
     burst_interval_ms: float
+    baseline_delay_ms: float = 0.0
+    burst_start_offset_ms: Optional[float] = None
 
 
 # iptables chain (filter table) that holds the <silence> rules. It is jumped
@@ -142,6 +144,14 @@ def _parse_burst_delay(node: ET.Element) -> BurstDelay:
     if delay_ms < 0:
         raise ValueError("delayMs must be >= 0")
 
+    baseline_delay_ms = _parse_optional_float(node, "baselineDelayMs") or 0.0
+    if baseline_delay_ms < 0:
+        raise ValueError("baselineDelayMs must be >= 0")
+
+    burst_start_offset_ms = _parse_optional_float(node, "burstStartOffsetMs")
+    if burst_start_offset_ms is not None and burst_start_offset_ms < 0:
+        raise ValueError("burstStartOffsetMs must be >= 0")
+
     burst_duration_ms = _parse_optional_float(node, "burstDurationMs")
     burst_interval_ms = _parse_optional_float(node, "burstIntervalMs")
     if burst_duration_ms is None and burst_interval_ms is None:
@@ -174,11 +184,22 @@ def _parse_burst_delay(node: ET.Element) -> BurstDelay:
         raise ValueError("burstIntervalMs must be >= 0")
     if burst_duration_ms > 0 and burst_interval_ms <= 0:
         raise ValueError("burstIntervalMs must be > 0 when burstDurationMs is > 0")
+    if burst_start_offset_ms is not None:
+        latest_start_ms = burst_interval_ms - burst_duration_ms
+        if burst_start_offset_ms > latest_start_ms:
+            raise ValueError(
+                "burstStartOffsetMs must leave room for the burst inside its "
+                f"interval: {burst_start_offset_ms:g} > {latest_start_ms:g} "
+                f"(burstIntervalMs {burst_interval_ms:g} - burstDurationMs "
+                f"{burst_duration_ms:g})"
+            )
 
     return BurstDelay(
         delay_ms=delay_ms,
         burst_duration_ms=burst_duration_ms,
         burst_interval_ms=burst_interval_ms,
+        baseline_delay_ms=baseline_delay_ms,
+        burst_start_offset_ms=burst_start_offset_ms,
     )
 
 
@@ -605,9 +626,13 @@ def _log_phase_rule_plan(
             f"Phase #{phase_index} rule: src={src_replica_id} "
             f"dst_replicas={list(rule.dst_replicas)} dst_ip={rule.dst_ip} "
             f"base_delay_ms={base_delay_ms:g} "
+            f"baseline_delay_ms={fault.baseline_delay_ms:g} "
+            f"quiet_total_delay_ms={_quiet_delay_ms(base_delay_ms, fault):g} "
             f"burst_delay_ms={fault.delay_ms:g} "
             f"burst_duration_ms={fault.burst_duration_ms:g} "
             f"burst_interval_ms={fault.burst_interval_ms:g} "
+            f"burst_start_offset_ms="
+            f"{'random' if fault.burst_start_offset_ms is None else format(fault.burst_start_offset_ms, 'g')} "
             f"burst_total_delay_ms={base_delay_ms + fault.delay_ms:g}"
         )
 
@@ -668,10 +693,15 @@ def _stable_fraction(*parts: object) -> float:
     return value / float(2**64 - 1)
 
 
+def _quiet_delay_ms(base_delay_ms: float, fault: BurstDelay) -> float:
+    """Delay held between bursts: the experiment base plus the phase baseline."""
+    return base_delay_ms + fault.baseline_delay_ms
+
+
 def _initial_delay_ms(base_delay_ms: float, fault: BurstDelay) -> float:
     if _burst_continuous(fault):
         return base_delay_ms + fault.delay_ms
-    return base_delay_ms
+    return _quiet_delay_ms(base_delay_ms, fault)
 
 
 def _netem_qdisc_cmd(
@@ -951,15 +981,22 @@ def _burst_event_pair(
     interval_s = fault.burst_interval_ms / 1000.0
     duration_s = fault.burst_duration_ms / 1000.0
     latest_start_offset_s = interval_s - duration_s
-    fraction = _stable_fraction(
-        burst_seed,
-        phase_index,
-        src_replica_id,
-        ",".join(str(replica) for replica in rule.dst_replicas),
-        rule.dst_ip,
-        interval_index,
-    )
-    start_s = interval_index * interval_s + fraction * latest_start_offset_s
+    if fault.burst_start_offset_ms is not None:
+        # Every edge bursts at the same point in every interval, so the whole
+        # network changes state together and the phase can be aligned to
+        # something outside it.
+        offset_s = fault.burst_start_offset_ms / 1000.0
+    else:
+        fraction = _stable_fraction(
+            burst_seed,
+            phase_index,
+            src_replica_id,
+            ",".join(str(replica) for replica in rule.dst_replicas),
+            rule.dst_ip,
+            interval_index,
+        )
+        offset_s = fraction * latest_start_offset_s
+    start_s = interval_index * interval_s + offset_s
     end_s = start_s + duration_s
     return (
         BurstEvent(at_s=start_s, rule=rule, active=True),
@@ -981,7 +1018,11 @@ def _apply_burst_event(
     dry_run: bool,
     netns: str | None,
 ) -> None:
-    delay_ms = base_delay_ms + event.rule.fault.delay_ms if event.active else base_delay_ms
+    delay_ms = (
+        base_delay_ms + event.rule.fault.delay_ms
+        if event.active
+        else _quiet_delay_ms(base_delay_ms, event.rule.fault)
+    )
     _log(
         f"Phase #{phase_index} burst {'start' if event.active else 'end'}: "
         f"src={src_replica_id} dst_replicas={list(event.rule.dst_replicas)} "

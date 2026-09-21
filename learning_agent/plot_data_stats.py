@@ -21,7 +21,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from reward_utils import reward_from_throughput
+from reward_utils import reward_tps
 
 # PhaseMapping-intended timeout per phase (annotation only; edit if your labels differ).
 INTENDED = {0: 300, 1: 300, 2: 300, 3: 800, 4: 800, 5: 1800}
@@ -34,7 +34,7 @@ def add_derived_reward(df):
         )
     df = df.copy()
     df['reward'] = df['reward_throughput_tps'].astype(float).map(
-        reward_from_throughput
+        reward_tps
     )
     return df
 

@@ -1,0 +1,217 @@
+<?xml version="1.0"?>
+<failureSpec>
+
+    <!--
+      Time-based, phase-driven fault specification for CppBedrock PBFT.
+
+      Calibrated on CloudLab at 20,000 requests/s, four replicas on one
+      32-core host, with the consensus window at 16 batches in flight. See
+      CppBedrock/adaptive_timers.MD for the measurements.
+      learning_agent/config/schedule_pbft.csv holds the best timeout per phase.
+
+      Election timeout ladder: 250 (low), 600 (medium), 1200 (high).
+
+      Two mechanisms, kept separate.
+
+      The network delay sets the healthy latency tail: p50 is 168 ms at the
+      base 5 ms link, 335 ms at 5+50 and 630 ms at 5+150. A rung at or below
+      its level's tail fires on ordinary latency and storms, with no fault
+      injected at all. That is what removes 250 at 5+50, and both 250 and 600
+      at 5+150. Latency is near-deterministic - p95 runs about 20 ms above p50
+      at every level - so a rung only has to clear that spread to be removed
+      by a tail, which is why 600 storms at 5+150 on 30 ms of margin.
+
+      The leader proposal delay D decides which of the surviving rungs fires.
+      A rung below the delayed leader's latency escapes to a clean leader once
+      per interval tick and keeps the healthy tail; a rung above it never
+      reaches its deadline and pays the delay on every request instead.
+
+      The delayed latency is not tail + D, and it is not linear in D either.
+      Measured on the rung that sleeps through the delay, at base:
+
+        D          120    150    200    400
+        p50        293    321    513    721-860
+        p95        318    349    685    -
+        cost/D     1.04   1.02   1.73   1.38-1.73
+
+      There is a knee between 150 and 200, and the p95 column says what it is:
+      below the knee the delay only defers a proposal, while above it the held
+      proposal occupies its consensus-window slot long enough to throttle the
+      pipeline, so the cost grows faster than D and the spread widens with it.
+      At 5+50 the cost is about 1.0*D throughout, because there the delay
+      overlaps work already in flight.
+
+      Each delay sits mid-window between the rung that must escape it and the
+      rung that must sleep through it:
+
+        phase           must escape     must sleep      window      D
+        base + small    250             600             100-150    120
+        base + big      600             1200            254-607    400
+        5+50 + small    600             1200            265-865    500
+
+      The small delay's upper bound is set by the transient, not by the median
+      cost. pinLeaderWindow re-pins its victim once per interval tick and the
+      pipeline drains and refloods around that move; the spike grows with D,
+      and one crossing per tick is enough for a rung to escape, since the
+      window will not re-pin afterwards. Measured against the 600 rung: at
+      D=120 the spike never reaches it (0 view changes, delayed p50 293), at
+      150 about once per two ticks (1, reproduced twice, p50 320), at 170 once
+      per tick (2, and p50 reads back as the healthy 150 - it escaped), and at
+      200 the steady state has degraded as well (p50 513, p95 685).
+
+      Raising D brings the next rung up into play; it does not push the winner
+      higher. So 5+150 carries no delay - its tail alone leaves only 1200.
+
+      netem jitter reorders packets and TCP treats reordering as loss, which
+      at this rate costs more than half the throughput, so jitterRatio is 0.
+    -->
+
+    <schemaVersion>4</schemaVersion>
+    <replicaIdType>global</replicaIdType>
+    <warmUpTime>10</warmUpTime>
+
+    <globalNetworkDelay>
+        <delayMs>5</delayMs>
+        <jitterRatio>0</jitterRatio>
+    </globalNetworkDelay>
+
+    <phases>
+        <phase>
+            <atTime>0</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
+            </network>
+            <pbft>
+                <proposalDelay>
+                    <replicas/>
+                </proposalDelay>
+            </pbft>
+        </phase>
+        <phase>
+            <atTime>300</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
+            </network>
+            <pbft>
+                <proposalDelay>
+                    <interval>60</interval>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>120</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+        <phase>
+            <atTime>600</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
+            </network>
+            <pbft>
+                <proposalDelay>
+                    <interval>60</interval>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>400</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+        <phase>
+            <atTime>900</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>50</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+            </network>
+            <pbft>
+                <proposalDelay>
+                    <replicas/>
+                </proposalDelay>
+            </pbft>
+        </phase>
+        <phase>
+            <atTime>1200</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>50</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+            </network>
+            <pbft>
+                <proposalDelay>
+                    <interval>60</interval>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>500</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+        <phase>
+            <atTime>1500</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>150</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+            </network>
+            <pbft>
+                <proposalDelay>
+                    <replicas/>
+                </proposalDelay>
+            </pbft>
+        </phase>
+        <phase>
+            <atTime>1800</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
+            </network>
+            <pbft>
+                <proposalDelay>
+                    <replicas/>
+                </proposalDelay>
+            </pbft>
+        </phase>
+    </phases>
+</failureSpec>

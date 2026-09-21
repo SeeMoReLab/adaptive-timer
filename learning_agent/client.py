@@ -14,7 +14,6 @@ SBFT_TIMEOUT_OPTIONS_MS = (150, 400, 900)
 TENDERMINT_PROPOSE_TIMEOUT_OPTIONS_MS = (150, 450, 750)
 HOTSTUFF_TIMEOUT_DELAY_OPTIONS_MS = (800, 2000, 5000)
 AUTOBAHN_TIMEOUT_DELAY_OPTIONS_MS = (800, 2000, 5000)
-AUTOBAHN_CAR_TIMEOUT_OPTIONS_MS = (500, 1500, 5000)
 AUTOBAHN_FAST_PATH_TIMEOUT_OPTIONS_MS = (500, 1500, 5000)
 PROTOCOL_NAME_TO_ENUM = {
     "pbft": agent_pb2.PROTOCOL_PBFT,
@@ -172,40 +171,16 @@ def _random_pbft_report(
 
 
 def _random_sbft_report(rng: random.Random) -> agent_pb2.SbftReport:
-    total_transactions = rng.randint(500, 20000)
-    avg_batch_size = rng.uniform(1.0, 200.0)
-    total_consensus_instances = max(
-        1, int(round(total_transactions / max(avg_batch_size, 1.0)))
-    )
-    avg_consensus_latency_ms = rng.uniform(1.0, 250.0)
-    p95_consensus_latency_ms = rng.uniform(
-        avg_consensus_latency_ms,
-        max(avg_consensus_latency_ms, avg_consensus_latency_ms * 2.0),
-    )
-    p99_consensus_latency_ms = rng.uniform(
-        p95_consensus_latency_ms,
-        max(p95_consensus_latency_ms, p95_consensus_latency_ms * 1.5),
-    )
-    throughput_tps = total_transactions / rng.uniform(0.5, 5.0)
-    timeout_violation_rate = rng.uniform(0.0, 0.2)
-    p95_batch_size = rng.uniform(
-        avg_batch_size, max(avg_batch_size, avg_batch_size * 1.5)
-    )
-    leader_change_count = rng.randint(0, 8)
-    regency_change_count = rng.randint(0, 8)
-    return agent_pb2.SbftReport(
-        total_transactions=total_transactions,
-        total_consensus_instances=total_consensus_instances,
-        avg_consensus_latency_ms=avg_consensus_latency_ms,
-        p95_consensus_latency_ms=p95_consensus_latency_ms,
-        p99_consensus_latency_ms=p99_consensus_latency_ms,
-        throughput_tps=throughput_tps,
-        timeout_violation_rate=timeout_violation_rate,
-        avg_batch_size=avg_batch_size,
-        p95_batch_size=p95_batch_size,
-        leader_change_count=leader_change_count,
-        regency_change_count=regency_change_count,
-    )
+    """Random SbftReport: the shared PBFT layout plus the SBFT extras."""
+    report = _random_pbft_report(rng, agent_pb2.SbftReport)
+    report.pre_prepare_latency_ms = rng.uniform(1.0, 50.0)
+    report.prepare_latency_ms = rng.uniform(1.0, 50.0)
+    report.commit_latency_ms = rng.uniform(1.0, 50.0)
+    report.slow_path_timeout_ms = rng.choice(SBFT_TIMEOUT_OPTIONS_MS)
+    total = int(report.total_consensus_instances)
+    report.fast_path_count = rng.randint(0, total)
+    report.slow_path_count = total - int(report.fast_path_count)
+    return report
 
 
 def _random_hotstuff_report(rng: random.Random) -> agent_pb2.HotstuffReport:
@@ -322,11 +297,9 @@ def _random_timeout_used(protocol: int, rng: random.Random) -> object:
     if protocol == agent_pb2.PROTOCOL_SBFT:
         election_timeout_ms = rng.choice(SBFT_TIMEOUT_OPTIONS_MS)
         slow_path_timeout_ms = rng.choice(SBFT_TIMEOUT_OPTIONS_MS)
-        batch_timeout_ms = rng.choice(SBFT_TIMEOUT_OPTIONS_MS)
         return agent_pb2.SbftTimeout(
             election_timeout_milliseconds=election_timeout_ms,
             slow_path_timeout_milliseconds=slow_path_timeout_ms,
-            batch_timeout_milliseconds=batch_timeout_ms,
         )
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
         propose_timeout_ms = rng.choice(TENDERMINT_PROPOSE_TIMEOUT_OPTIONS_MS)
@@ -342,11 +315,9 @@ def _random_timeout_used(protocol: int, rng: random.Random) -> object:
         )
     if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
         timeout_delay_ms = rng.choice(AUTOBAHN_TIMEOUT_DELAY_OPTIONS_MS)
-        car_timeout_ms = rng.choice(AUTOBAHN_CAR_TIMEOUT_OPTIONS_MS)
         fast_path_timeout_ms = rng.choice(AUTOBAHN_FAST_PATH_TIMEOUT_OPTIONS_MS)
         return agent_pb2.AutobahnTimeout(
             timeout_delay_milliseconds=timeout_delay_ms,
-            car_timeout_milliseconds=car_timeout_ms,
             fast_path_timeout_milliseconds=fast_path_timeout_ms,
         )
     raise ValueError(f"Unsupported protocol: {protocol}")
@@ -376,7 +347,8 @@ def _print_sent_payload(
             f"protocol={agent_pb2.Protocol.Name(protocol)}",
             f"total_transactions={int(report.total_transactions)}",
             f"throughput_tps={float(report.throughput_tps):.2f}",
-            f"timeout_violation_rate={float(report.timeout_violation_rate):.3f}",
+            f"fast_path_count={int(report.fast_path_count)}",
+            f"slow_path_count={int(report.slow_path_count)}",
         )
     elif protocol in (agent_pb2.PROTOCOL_HOTSTUFF, agent_pb2.PROTOCOL_AUTOBAHN):
         print(
@@ -414,12 +386,10 @@ def _print_sent_payload(
     elif reward.HasField("sbft"):
         election_timeout_ms = reward.sbft.timeout_used.election_timeout_milliseconds
         slow_path_timeout_ms = reward.sbft.timeout_used.slow_path_timeout_milliseconds
-        batch_timeout_ms = reward.sbft.timeout_used.batch_timeout_milliseconds
         reward_episode = reward.sbft.episode
         timeout_desc = (
             f"reward.election_timeout_ms={election_timeout_ms} "
-            f"reward.slow_path_timeout_ms={slow_path_timeout_ms} "
-            f"reward.batch_timeout_ms={batch_timeout_ms}"
+            f"reward.slow_path_timeout_ms={slow_path_timeout_ms}"
         )
     elif reward.HasField("tendermint"):
         propose_timeout_ms = reward.tendermint.timeout_used.propose_timeout_milliseconds
@@ -437,12 +407,10 @@ def _print_sent_payload(
         timeout_desc = f"reward.timeout_delay_ms={timeout_delay_ms}"
     elif reward.HasField("autobahn"):
         timeout_delay_ms = reward.autobahn.timeout_used.timeout_delay_milliseconds
-        car_timeout_ms = reward.autobahn.timeout_used.car_timeout_milliseconds
         fast_path_timeout_ms = reward.autobahn.timeout_used.fast_path_timeout_milliseconds
         reward_episode = reward.autobahn.episode
         timeout_desc = (
             f"reward.timeout_delay_ms={timeout_delay_ms} "
-            f"reward.car_timeout_ms={car_timeout_ms} "
             f"reward.fast_path_timeout_ms={fast_path_timeout_ms}"
         )
     else:
@@ -486,8 +454,6 @@ def _print_timeout_status(status: agent_pb2.TimeoutStatus) -> None:
             f"{status.timeout.sbft.election_timeout_milliseconds}",
             "slow_path_timeout_ms="
             f"{status.timeout.sbft.slow_path_timeout_milliseconds}",
-            "batch_timeout_ms="
-            f"{status.timeout.sbft.batch_timeout_milliseconds}",
             window_desc,
         )
         return
@@ -516,8 +482,6 @@ def _print_timeout_status(status: agent_pb2.TimeoutStatus) -> None:
             "Timeout ready:",
             "timeout_delay_ms="
             f"{status.timeout.autobahn.timeout_delay_milliseconds}",
-            "car_timeout_ms="
-            f"{status.timeout.autobahn.car_timeout_milliseconds}",
             "fast_path_timeout_ms="
             f"{status.timeout.autobahn.fast_path_timeout_milliseconds}",
             window_desc,

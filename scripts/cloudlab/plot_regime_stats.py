@@ -1,7 +1,7 @@
 """Faceted bar plot of a metric's mean by (timeout, regime) for a cloudlab run.
 
 Reads completed episode rows from agent*.csv (each = one node), folds the 19
-experiment phases into the named regimes from config/pbft/failure_spec.xml, and
+experiment phases into the named regimes from config/smartbft/failure_spec.xml, and
 plots one panel per regime: bars = election timeout (light->dark = short->long).
 The "best" bar per regime is outlined (highest for reward-like metrics, lowest for
 cost metrics such as feature_leader_change_count.
@@ -29,7 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "learning_agent"))
 from reward_utils import reward_from_throughput
 
-# phase index (0..18) -> regime, from config/pbft/failure_spec.xml
+# phase index (0..18) -> regime, from config/smartbft/failure_spec.xml
 REGIMES = [
     ("Base (clean)",              [0]),
     ("Leader proposal +300ms",    [1, 2, 3, 4, 5]),

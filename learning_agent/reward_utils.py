@@ -18,6 +18,37 @@ REWARD_THROUGHPUT_KNEE_TPS = 1000.0
 REWARD_THROUGHPUT_ABOVE_KNEE_WEIGHT = 0.25
 
 
+# Latency at which the throughput reward is halved, applied to the p95 of
+# consensus latency rather than the p50.
+#
+# The SBFT timers are latency knobs, and both of them are invisible in
+# throughput once the pipeline is deep enough to keep the committed rate at
+# the offered rate. The slow-path timeout trades two message delays against
+# the prepare spread. The election timeout decides how long the committee
+# tolerates a leader that delays every proposal it makes, and electing away
+# from that leader is the only thing that ends the window - so the cost is
+# borne by the proposals made inside it.
+#
+# That cost lands in the tail, not the median: in a 60 s window most traffic
+# is clean and the p50 barely moves (74 ms against 107 ms across a factor of
+# eight in election timeout) while the p95 separates cleanly (99 ms against
+# 271 ms) and the worst episode spans 328 ms against 4,730 ms. The knee sits
+# near the healthy p95 so the term discriminates at the scale the timers
+# actually move, instead of saturating.
+REWARD_LATENCY_HALF_MS = 300.0
+
+
+def discount_from_latency(p95_consensus_latency_ms: float) -> float:
+    """Latency discount in (0, 1] applied to a throughput reward.
+
+    Multiplicative rather than subtractive: the reward stays non-negative,
+    which the policy models rely on, and latency decides between actions that
+    reach the same throughput without ever outweighing a real collapse.
+    """
+    value = float(max(0.0, p95_consensus_latency_ms))
+    return REWARD_LATENCY_HALF_MS / (REWARD_LATENCY_HALF_MS + value)
+
+
 def reward_from_throughput(throughput_tps: float) -> float:
     """Apply the reward shaping used by the online learning agent."""
     value = float(max(0.0, throughput_tps))
@@ -83,17 +114,38 @@ def calculate_sbft_reward(
     total_transactions: int,
     total_consensus_instances: int,
     avg_consensus_latency_ms: float,
+    p50_consensus_latency_ms: float,
     p95_consensus_latency_ms: float,
-    p99_consensus_latency_ms: float,
     throughput_tps: float,
-    timeout_violation_rate: float,
     avg_batch_size: float,
     p95_batch_size: float,
     leader_change_count: int,
     regency_change_count: int,
+    timeout_ms: int,
+    avg_inter_commit_gap_ms: float,
+    p50_inter_commit_gap_ms: float,
+    p95_inter_commit_gap_ms: float,
+    view_change_count: int,
+    no_progress_view_change_count: int,
+    pre_prepare_latency_ms: float,
+    prepare_latency_ms: float,
+    commit_latency_ms: float,
+    slow_path_timeout_ms: int,
+    fast_path_count: int,
+    slow_path_count: int,
 ) -> float:
-    """Calculate an online SBFT reward from a complete reward report."""
-    return reward_from_throughput(throughput_tps)
+    """Calculate an online SBFT reward from a complete reward report.
+
+    SbftReport shares PbftReport's base fields and adds the SBFT phase and
+    fast/slow-path context, all of which are available here for tuning.
+
+    SBFT is the one protocol here with two timers, and the slow-path timeout
+    only shows up in latency, so the throughput reward carries a latency
+    discount. The other protocols keep the throughput-only reward.
+    """
+    return reward_from_throughput(throughput_tps) * discount_from_latency(
+        p95_consensus_latency_ms
+    )
 
 
 def calculate_tendermint_reward(

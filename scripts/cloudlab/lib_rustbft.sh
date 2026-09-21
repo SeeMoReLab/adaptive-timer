@@ -73,7 +73,7 @@ VERBOSE_ENABLED=0
 AGENT_MODEL_TYPE="random"
 AGENT_MODEL_SET=0
 
-TX_RATE=40000
+TX_RATE=60000
 TX_SIZE=512
 REQUEST_TIMEOUT_MS=10000
 CLIENT_RETRY_TIMEOUT_MS=1000
@@ -94,6 +94,7 @@ MEMPOOL_PORT=9100
 CONSENSUS_PORT=9200
 AGENT_PORT=15501
 INITIAL_TIMEOUT_MS=""
+SCHEDULE_FILE_ARG=""
 LEARNING_WINDOW_MODE="wall-clock"
 LEARNING_FEATURE_DURATION_MS=10000
 LEARNING_REPLY_WAIT_MS=2000
@@ -194,6 +195,7 @@ ${PROTOCOL_NAME} options:
 Learning-agent options:
   --agent-port <port>               Learning-agent port inside each replica namespace (default: 15501).
   --initial-timeout <ms>            Override the initial consensus timeout_delay (default: from config/${PROTOCOL_NAME}/parameters.json).
+  --schedule <path>                 Schedule CSV for scheduled mode, inside the repo (default: ${SCHEDULE_FILE_REL}).
   --learning-window-mode <mode>     wall-clock only for Rust protocols (default: wall-clock).
   --learning-feature-duration <ms>  Feature window (default: 10000).
   --learning-reply-wait <ms>        Recommendation wait (default: 2000).
@@ -394,6 +396,7 @@ rustbft_main() {
       --front-port) FRONT_PORT="${2:-}"; shift 2 ;;
       --agent-port) AGENT_PORT="${2:-}"; shift 2 ;;
       --initial-timeout) INITIAL_TIMEOUT_MS="${2:-}"; shift 2 ;;
+      --schedule) SCHEDULE_FILE_ARG="${2:-}"; shift 2 ;;
       --learning-window-mode) LEARNING_WINDOW_MODE="${2:-}"; shift 2 ;;
       --learning-feature-duration) LEARNING_FEATURE_DURATION_MS="${2:-}"; shift 2 ;;
       --learning-reply-wait) LEARNING_REPLY_WAIT_MS="${2:-}"; shift 2 ;;
@@ -423,6 +426,24 @@ rustbft_main() {
   if ! mode_is_supported "${MODE}"; then
     echo "Mode '${MODE}' is not supported by run_${PROTOCOL_NAME}.sh yet (supported: ${SUPPORTED_MODES})." >&2
     exit 2
+  fi
+  if [[ -n "${SCHEDULE_FILE_ARG}" ]]; then
+    if [[ "${MODE}" != "scheduled" ]]; then
+      echo "--schedule is only meaningful in scheduled mode (mode is '${MODE}')." >&2
+      exit 2
+    fi
+    # The schedule ships to the node inside the repo tarball, so it must live
+    # under the repo root; store it relative to REPO_ROOT like the default.
+    schedule_abs="$(cd "$(dirname "${SCHEDULE_FILE_ARG}")" 2>/dev/null && pwd)/$(basename "${SCHEDULE_FILE_ARG}")"
+    if [[ ! -f "${schedule_abs}" ]]; then
+      echo "Schedule file not found: ${SCHEDULE_FILE_ARG}" >&2
+      exit 2
+    fi
+    if [[ "${schedule_abs}" != "${REPO_ROOT}/"* ]]; then
+      echo "Schedule file must be inside the repo (${REPO_ROOT}): ${schedule_abs}" >&2
+      exit 2
+    fi
+    SCHEDULE_FILE_REL="${schedule_abs#${REPO_ROOT}/}"
   fi
   if ! [[ "${F}" =~ ^[0-9]+$ ]] || (( F < 1 )); then
     echo "Invalid -f value: ${F}. It must be an integer >= 1." >&2
@@ -1028,6 +1049,16 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   sudo -n ip netns exec "${ns_name}" ip addr replace "${ns_ip}/${overlay_mask}" dev "${ns_if}"
   sudo -n ip netns exec "${ns_name}" ip link set "${ns_if}" up
   sudo -n ip netns exec "${ns_name}" ip route replace default via "${bridge_ip}"
+  # TCP tuning inside the replica namespace (namespace-scoped, host untouched).
+  # With netem delays of 100-200 ms one-way, the default 4 MB send buffer caps
+  # a single stream near 80 Mbit/s, below what batch dissemination needs;
+  # 64 MB buffers and no slow start after idle lift that to several hundred
+  # Mbit/s. Measured on amd121 (d6515) with iperf3 at 200 ms one-way:
+  # 76 Mbit/s default vs 739 Mbit/s tuned.
+  sudo -n ip netns exec "${ns_name}" sysctl -q -w \
+    net.ipv4.tcp_rmem="4096 131072 67108864" \
+    net.ipv4.tcp_wmem="4096 16384 67108864" \
+    net.ipv4.tcp_slow_start_after_idle=0
 done
 
 for ((peer_idx = 0; peer_idx < server_machine_count; peer_idx++)); do

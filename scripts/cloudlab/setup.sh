@@ -103,7 +103,7 @@ if (( has_peers == 1 )); then
   echo "Multi-node targets detected; skipping node0->peer SSH bootstrap."
 fi
 
-echo "Installing SmartBFT, Tendermint, and Rust dependencies on all nodes in parallel..."
+echo "Installing SmartBFT, Tendermint, Rust, and CppBedrock dependencies on all nodes in parallel..."
 pids=()
 nodes=()
 while read -r node host user; do
@@ -122,6 +122,14 @@ if command -v apt-get >/dev/null 2>&1; then
     build-essential \
     clang \
     protobuf-compiler \
+    protobuf-compiler-grpc \
+    libprotobuf-dev \
+    libgrpc++-dev \
+    libyaml-cpp-dev \
+    libxml2-dev \
+    nlohmann-json3-dev \
+    libssl-dev \
+    cmake \
     pkg-config \
     curl \
     tar
@@ -229,6 +237,10 @@ go version
 cargo --version
 protoc --version >/dev/null 2>&1
 clang --version >/dev/null 2>&1
+cmake --version >/dev/null 2>&1
+# CppBedrock links gRPC through pkg-config on Ubuntu (no gRPCConfig.cmake there).
+pkg-config --exists grpc++ yaml-cpp libxml-2.0
+command -v grpc_cpp_plugin >/dev/null 2>&1
 make --version >/dev/null 2>&1
 curl --version >/dev/null 2>&1
 tar --version >/dev/null 2>&1

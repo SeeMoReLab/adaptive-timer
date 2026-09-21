@@ -13,7 +13,6 @@
   "use_fast_path": true,
   "fast_path_timeout": 500,
   "use_ride_share": false,
-  "car_timeout": 2000,
   "simulate_asynchrony": false,
   "asynchrony_start": 20000,
   "asynchrony_duration": 10000

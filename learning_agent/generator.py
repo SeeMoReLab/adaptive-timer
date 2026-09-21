@@ -13,7 +13,6 @@ import io
 
 import agent_pb2
 from models import (
-    autobahn_car_timeout_index_to_ms,
     autobahn_fast_path_timeout_index_to_ms,
     autobahn_timeout_delay_ms_to_index,
     get_report_feature_field_names,
@@ -251,7 +250,6 @@ class DataGenerator(BaseDataGenerator):
         if self.protocol_id == agent_pb2.PROTOCOL_SBFT:
             trial["election_timeout_milliseconds_used"] = selected_timeouts
             trial["slow_path_timeout_milliseconds_used"] = selected_timeouts
-            trial["batch_timeout_milliseconds_used"] = selected_timeouts
             return
         if self.protocol_id == agent_pb2.PROTOCOL_HOTSTUFF:
             trial["timeout_delay_milliseconds_used"] = selected_timeouts
@@ -259,16 +257,13 @@ class DataGenerator(BaseDataGenerator):
         if self.protocol_id == agent_pb2.PROTOCOL_AUTOBAHN:
             # The knobs have distinct value sets, so the SBFT convention of
             # copying the selected timeout into every column would produce
-            # invalid actions; car and fast-path instead follow the selected
-            # timeout delay at the same option index.
+            # invalid actions; fast-path instead follows the selected timeout
+            # delay at the same option index.
             delay_indices = [
                 autobahn_timeout_delay_ms_to_index(int(timeout))
                 for timeout in selected_timeouts
             ]
             trial["timeout_delay_milliseconds_used"] = selected_timeouts
-            trial["car_timeout_milliseconds_used"] = [
-                autobahn_car_timeout_index_to_ms(index) for index in delay_indices
-            ]
             trial["fast_path_timeout_milliseconds_used"] = [
                 autobahn_fast_path_timeout_index_to_ms(index)
                 for index in delay_indices

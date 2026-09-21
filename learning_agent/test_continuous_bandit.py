@@ -101,16 +101,15 @@ class ScheduledTimeoutActionCodecTest(unittest.TestCase):
         self.assertEqual(decoded.tendermint.precommit_timeout_milliseconds, 146)
         self.assertEqual(encoded.tolist(), [437.0])
 
-    def test_sbft_accepts_three_non_discrete_timeouts(self) -> None:
+    def test_sbft_accepts_two_non_discrete_timeouts(self) -> None:
         codec = ScheduledTimeoutActionCodec(agent_pb2.PROTOCOL_SBFT)
 
-        decoded = codec.decode(np.asarray([437.0, 521.0, 89.0]))
+        decoded = codec.decode(np.asarray([437.0, 521.0]))
         encoded = codec.encode(decoded)
 
         self.assertEqual(decoded.sbft.election_timeout_milliseconds, 437)
         self.assertEqual(decoded.sbft.slow_path_timeout_milliseconds, 521)
-        self.assertEqual(decoded.sbft.batch_timeout_milliseconds, 89)
-        self.assertEqual(encoded.tolist(), [437.0, 521.0, 89.0])
+        self.assertEqual(encoded.tolist(), [437.0, 521.0])
 
     def test_rejects_values_outside_uint32_range(self) -> None:
         codec = ScheduledTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT)

@@ -57,10 +57,21 @@ class RewardExtractionTest(unittest.TestCase):
         )
         sbft_reward = calculate_sbft_reward(
             **common,
+            p50_consensus_latency_ms=18.0,
             p95_consensus_latency_ms=30.0,
-            p99_consensus_latency_ms=35.0,
-            timeout_violation_rate=0.1,
             p95_batch_size=15.0,
+            timeout_ms=300,
+            avg_inter_commit_gap_ms=25.0,
+            p50_inter_commit_gap_ms=22.0,
+            p95_inter_commit_gap_ms=40.0,
+            view_change_count=1,
+            no_progress_view_change_count=1,
+            pre_prepare_latency_ms=5.0,
+            prepare_latency_ms=6.0,
+            commit_latency_ms=7.0,
+            slow_path_timeout_ms=150,
+            fast_path_count=90,
+            slow_path_count=10,
         )
         tendermint_reward = calculate_tendermint_reward(
             **common,
@@ -75,7 +86,9 @@ class RewardExtractionTest(unittest.TestCase):
         )
 
         self.assertEqual(pbft_reward, 0.5)
-        self.assertEqual(sbft_reward, 0.5)
+        # SBFT discounts the throughput reward by p95 consensus latency: the
+        # timers move the tail, not the median.
+        self.assertAlmostEqual(sbft_reward, 0.5 * (300.0 / 330.0))
         self.assertAlmostEqual(tendermint_reward, 0.4944)
 
     def test_tendermint_csv_reward_uses_complete_reward_report(self) -> None:

@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
-"""Apply phase-scheduled burst-delay faults using tc netem.
+"""Apply phase-scheduled network faults using tc netem.
 
 This applier intentionally handles only the <network> section of a
-failure_spec.xml and ignores the protocol and agent fault sections.
+failure_spec.xml and ignores the protocol and agent fault sections. Two fault
+kinds are supported per phase:
+
+- burst delays on the global / per-source / per-edge rules (delayMs plus the
+  burst schedule), applied as netem delay with jitter at <globalNetworkDelay>/<jitterRatio> (default 20 percent);
+- <silence>, a list of replica ids that go dark for the phase. Every applier
+  cuts a silenced replica off like a crash: iptables REJECT (icmp-port-unreachable)
+  in both directions so new connects fail instantly, plus `ss -K` to destroy the
+  established connections (black-holed packets would leave them hanging),
+  so the replica neither sends nor receives: the fail-silent crash fault of
+  the BFT model, without any process lifecycle management.
 """
 
 from __future__ import annotations
@@ -18,9 +28,12 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, FrozenSet, List, Tuple
 
-NETWORK_DELAY_JITTER_RATIO = 0.20
+# Default netem jitter as a fraction of the delay, when the spec does not set
+# <globalNetworkDelay>/<jitterRatio>. netem jitter reorders packets, which TCP
+# treats as loss, so high-throughput protocols should set it to 0 explicitly.
+DEFAULT_NETWORK_DELAY_JITTER_RATIO = 0.20
 
 
 @dataclass(frozen=True)
@@ -30,6 +43,12 @@ class BurstDelay:
     burst_interval_ms: float
 
 
+# iptables chain (filter table) that holds the <silence> rules. It is jumped
+# to from INPUT and OUTPUT, flushed on every phase change and deleted at
+# teardown, so the rest of the namespace's firewall is never touched.
+SILENCE_CHAIN = "ADAPTIVE_SILENCE"
+
+
 @dataclass
 class PhaseNetworkSpec:
     at_time_s: float
@@ -37,6 +56,8 @@ class PhaseNetworkSpec:
     global_fault: BurstDelay
     source_faults: Dict[int, BurstDelay]
     edge_faults: Dict[Tuple[int, int], BurstDelay]
+    # Replicas that are fail-silent for this phase: no traffic in or out.
+    silenced: FrozenSet[int]
 
 
 @dataclass(frozen=True)
@@ -176,6 +197,21 @@ def _parse_global_network_delay_ms(root: ET.Element) -> float:
     return delay_ms
 
 
+def _parse_jitter_ratio(root: ET.Element) -> float:
+    node = root.find("./globalNetworkDelay/jitterRatio")
+    if node is None or node.text is None:
+        return DEFAULT_NETWORK_DELAY_JITTER_RATIO
+    try:
+        ratio = float(node.text.strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid float in <globalNetworkDelay>/<jitterRatio>: {node.text!r}"
+        ) from exc
+    if ratio < 0 or ratio >= 1:
+        raise ValueError("globalNetworkDelay jitterRatio must be in [0, 1)")
+    return ratio
+
+
 def _parse_warmup_seconds(root: ET.Element) -> float:
     warmup_ms = _parse_optional_int(root, "warmUpTimeMs")
     if warmup_ms is not None:
@@ -187,10 +223,11 @@ def _parse_warmup_seconds(root: ET.Element) -> float:
     return max(0.0, warmup_s)
 
 
-def _parse_phases(spec_path: Path) -> Tuple[float, float, List[PhaseNetworkSpec]]:
+def _parse_phases(spec_path: Path) -> Tuple[float, float, float, List[PhaseNetworkSpec]]:
     root = ET.parse(spec_path).getroot()
     warmup_s = _parse_warmup_seconds(root)
     base_delay_ms = _parse_global_network_delay_ms(root)
+    jitter_ratio = _parse_jitter_ratio(root)
     phase_nodes = root.findall("./phases/phase")
     if not phase_nodes:
         raise ValueError("No <phase> entries found under <phases>")
@@ -230,6 +267,7 @@ def _parse_phases(spec_path: Path) -> Tuple[float, float, List[PhaseNetworkSpec]
                     ),
                     source_faults={},
                     edge_faults={},
+                    silenced=frozenset(),
                 )
             )
             continue
@@ -254,6 +292,8 @@ def _parse_phases(spec_path: Path) -> Tuple[float, float, List[PhaseNetworkSpec]
             dst = _parse_required_int(edge_node, "dst")
             edge_faults[(src, dst)] = _parse_burst_delay(edge_node)
 
+        silenced = _parse_silenced(network)
+
         phases.append(
             PhaseNetworkSpec(
                 at_time_s=at_time_s,
@@ -261,6 +301,7 @@ def _parse_phases(spec_path: Path) -> Tuple[float, float, List[PhaseNetworkSpec]
                 global_fault=global_fault,
                 source_faults=source_faults,
                 edge_faults=edge_faults,
+                silenced=silenced,
             )
         )
 
@@ -270,7 +311,7 @@ def _parse_phases(spec_path: Path) -> Tuple[float, float, List[PhaseNetworkSpec]
     if not has_at_time:
         _log("No <atTime> found; treating <time> as phase duration (legacy behavior).")
 
-    return warmup_s, base_delay_ms, phases
+    return warmup_s, base_delay_ms, jitter_ratio, phases
 
 
 def _load_hosts(hosts_config: Path) -> Dict[int, HostEntry]:
@@ -384,7 +425,130 @@ def _clear_tc(
     )
 
 
+def _silence_peer_ips(
+    phase: PhaseNetworkSpec, src_replica_id: int, hosts: Dict[int, HostEntry]
+) -> List[str]:
+    """Replica IPs whose established TCP connections this replica must drop.
+
+    A silenced replica drops every peer; a healthy replica drops every
+    silenced peer. Both sides act, so no packet has to cross the wire.
+    """
+    ips: List[str] = []
+    for replica_id, entry in sorted(hosts.items()):
+        if replica_id == src_replica_id:
+            continue
+        if src_replica_id in phase.silenced or replica_id in phase.silenced:
+            if entry.ip not in ips:
+                ips.append(entry.ip)
+    return ips
+
+
+def _ensure_silence_chain(
+    *, iptables_bin: str, use_sudo: bool, dry_run: bool, netns: str | None
+) -> None:
+    common = dict(use_sudo=use_sudo, dry_run=dry_run, netns=netns)
+    _run_command([iptables_bin, "-N", SILENCE_CHAIN], check=False, **common)
+    _run_command([iptables_bin, "-F", SILENCE_CHAIN], **common)
+    for hook in ("INPUT", "OUTPUT"):
+        present = _run_command(
+            [iptables_bin, "-C", hook, "-j", SILENCE_CHAIN], check=False, **common
+        )
+        if dry_run or present.returncode != 0:
+            _run_command([iptables_bin, "-I", hook, "-j", SILENCE_CHAIN], **common)
+
+
+def _apply_silence(
+    *,
+    phase: PhaseNetworkSpec,
+    src_replica_id: int,
+    hosts: Dict[int, HostEntry],
+    iptables_bin: str,
+    ss_bin: str,
+    use_sudo: bool,
+    dry_run: bool,
+    netns: str | None,
+) -> None:
+    """Install the phase's <silence> rules (flushing the previous phase's)."""
+    common = dict(use_sudo=use_sudo, dry_run=dry_run, netns=netns)
+    _ensure_silence_chain(iptables_bin=iptables_bin, **common)
+    peer_ips = _silence_peer_ips(phase, src_replica_id, hosts)
+    if not peer_ips:
+        return
+    self_ip = hosts[src_replica_id].ip
+    silenced_here = src_replica_id in phase.silenced
+    _log(
+        f"Silence: replica {src_replica_id} "
+        + ("cut off from everything but itself" if silenced_here else f"cut off from {peer_ips}")
+        + f" (silenced={sorted(phase.silenced)})"
+    )
+    # Measured on the CloudLab kernel (6.8): REJECT --reject-with tcp-reset in
+    # OUTPUT does NOT fail a local connect() (it times out like a drop), while
+    # icmp-port-unreachable fails it instantly with ECONNREFUSED from either
+    # side. No catch-all DROP: it would swallow the ICMP error itself. The
+    # protocols are TCP-only.
+    reject = ["-p", "tcp", "-j", "REJECT", "--reject-with", "icmp-port-unreachable"]
+    if silenced_here:
+        # Everything except loopback (learning agent) and the replica's own
+        # address (primary <-> worker) is rejected, so the client's lanes to
+        # this replica stall as well: a crashed replica ingests nothing. The
+        # client's established connections keep retransmitting and resume by
+        # themselves once the rules are lifted.
+        for direction in ("-d", "-s"):
+            _run_command(
+                [iptables_bin, "-A", SILENCE_CHAIN, direction, "127.0.0.0/8", "-j", "RETURN"],
+                **common,
+            )
+        for direction in ("-d", "-s"):
+            _run_command(
+                [iptables_bin, "-A", SILENCE_CHAIN, "!", direction, self_ip] + reject,
+                **common,
+            )
+    else:
+        for ip in peer_ips:
+            for direction in ("-d", "-s"):
+                _run_command(
+                    [iptables_bin, "-A", SILENCE_CHAIN, direction, ip] + reject,
+                    **common,
+                )
+    # Established connections are not affected by the rules (TCP treats the
+    # ICMP error as soft and keeps retransmitting), so destroy the replica to
+    # replica ones: the local side gets ECONNABORTED and the peer ECONNRESET
+    # on its next write, as a crashed process's kernel would have produced.
+    for ip in peer_ips:
+        _run_command([ss_bin, "-K", "dst", ip], check=False, **common)
+
+
+def _clear_silence(
+    *, iptables_bin: str, use_sudo: bool, dry_run: bool, netns: str | None
+) -> None:
+    common = dict(use_sudo=use_sudo, dry_run=dry_run, netns=netns, check=False)
+    for hook in ("INPUT", "OUTPUT"):
+        _run_command([iptables_bin, "-D", hook, "-j", SILENCE_CHAIN], **common)
+    _run_command([iptables_bin, "-F", SILENCE_CHAIN], **common)
+    _run_command([iptables_bin, "-X", SILENCE_CHAIN], **common)
+
+
+def _parse_silenced(network: ET.Element) -> FrozenSet[int]:
+    """The <silence> block: replica ids that are fail-silent for the phase."""
+    silence = network.find("silence")
+    if silence is None:
+        return frozenset()
+    ids = set()
+    for replica_node in silence.findall("replica"):
+        if replica_node.text is None or not replica_node.text.strip():
+            raise ValueError("<silence><replica> must contain a replica id")
+        try:
+            ids.add(int(replica_node.text.strip()))
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid replica id in <silence>: {replica_node.text!r}"
+            ) from exc
+    return frozenset(ids)
+
+
 def _choose_fault(phase: PhaseNetworkSpec, src: int, dst: int) -> BurstDelay:
+    # <silence> is enforced with iptables (see _apply_silence), not netem, so
+    # the delay rules below stay in place for a silenced replica's edges.
     fault = phase.global_fault
     if src in phase.source_faults:
         fault = phase.source_faults[src]
@@ -518,6 +682,7 @@ def _netem_qdisc_cmd(
     *,
     verb: str,
     netem_limit: int,
+    jitter_ratio: float,
 ) -> List[str]:
     command = [
         tc_bin,
@@ -535,8 +700,8 @@ def _netem_qdisc_cmd(
         "delay",
         f"{delay_ms:g}ms",
     ]
-    if delay_ms > 0:
-        jitter_ms = delay_ms * NETWORK_DELAY_JITTER_RATIO
+    if delay_ms > 0 and jitter_ratio > 0:
+        jitter_ms = delay_ms * jitter_ratio
         command.append(f"{jitter_ms:g}ms")
     return command
 
@@ -548,6 +713,7 @@ def _set_rule_delay(
     interface: str,
     tc_bin: str,
     netem_limit: int,
+    jitter_ratio: float,
     use_sudo: bool,
     dry_run: bool,
     netns: str | None,
@@ -560,6 +726,7 @@ def _set_rule_delay(
             delay_ms,
             verb="change",
             netem_limit=netem_limit,
+            jitter_ratio=jitter_ratio,
         ),
         use_sudo=use_sudo,
         dry_run=dry_run,
@@ -576,6 +743,7 @@ def _configure_phase_tc(
     tc_bin: str,
     link_rate: str,
     netem_limit: int,
+    jitter_ratio: float,
     use_sudo: bool,
     dry_run: bool,
     netns: str | None,
@@ -663,6 +831,7 @@ def _configure_phase_tc(
                     _initial_delay_ms(base_delay_ms, rule.fault),
                     verb="replace",
                     netem_limit=netem_limit,
+                    jitter_ratio=jitter_ratio,
                 ),
                 use_sudo=use_sudo,
                 dry_run=dry_run,
@@ -677,6 +846,7 @@ def _configure_phase_tc(
                     _initial_delay_ms(base_delay_ms, rule.fault),
                     verb="change",
                     netem_limit=netem_limit,
+                    jitter_ratio=jitter_ratio,
                 ),
                 use_sudo=use_sudo,
                 dry_run=dry_run,
@@ -696,6 +866,7 @@ def _configure_phase_tc(
                         _initial_delay_ms(base_delay_ms, rule.fault),
                         verb="replace",
                         netem_limit=netem_limit,
+                        jitter_ratio=jitter_ratio,
                     ),
                     use_sudo=use_sudo,
                     dry_run=dry_run,
@@ -805,6 +976,7 @@ def _apply_burst_event(
     interface: str,
     tc_bin: str,
     netem_limit: int,
+    jitter_ratio: float,
     use_sudo: bool,
     dry_run: bool,
     netns: str | None,
@@ -821,6 +993,7 @@ def _apply_burst_event(
         interface=interface,
         tc_bin=tc_bin,
         netem_limit=netem_limit,
+        jitter_ratio=jitter_ratio,
         use_sudo=use_sudo,
         dry_run=dry_run,
         netns=netns,
@@ -863,6 +1036,7 @@ def _run_open_ended_bursts(
     interface: str,
     tc_bin: str,
     netem_limit: int,
+    jitter_ratio: float,
     burst_seed: int,
     use_sudo: bool,
     dry_run: bool,
@@ -914,6 +1088,7 @@ def _run_open_ended_bursts(
             interface=interface,
             tc_bin=tc_bin,
             netem_limit=netem_limit,
+            jitter_ratio=jitter_ratio,
             use_sudo=use_sudo,
             dry_run=dry_run,
             netns=netns,
@@ -949,6 +1124,9 @@ def _run_phase(
     tc_bin: str,
     link_rate: str,
     netem_limit: int,
+    jitter_ratio: float,
+    iptables_bin: str,
+    ss_bin: str,
     burst_seed: int,
     use_sudo: bool,
     dry_run: bool,
@@ -979,6 +1157,7 @@ def _run_phase(
         tc_bin=tc_bin,
         link_rate=link_rate,
         netem_limit=netem_limit,
+        jitter_ratio=jitter_ratio,
         use_sudo=use_sudo,
         dry_run=dry_run,
         netns=netns,
@@ -987,6 +1166,17 @@ def _run_phase(
     _log_tc_state(
         interface=interface,
         tc_bin=tc_bin,
+        use_sudo=use_sudo,
+        dry_run=dry_run,
+        netns=netns,
+    )
+
+    _apply_silence(
+        phase=phase,
+        src_replica_id=src_replica_id,
+        hosts=hosts,
+        iptables_bin=iptables_bin,
+        ss_bin=ss_bin,
         use_sudo=use_sudo,
         dry_run=dry_run,
         netns=netns,
@@ -1002,6 +1192,7 @@ def _run_phase(
             interface=interface,
             tc_bin=tc_bin,
             netem_limit=netem_limit,
+            jitter_ratio=jitter_ratio,
             burst_seed=burst_seed,
             use_sudo=use_sudo,
             dry_run=dry_run,
@@ -1029,6 +1220,7 @@ def _run_phase(
             interface=interface,
             tc_bin=tc_bin,
             netem_limit=netem_limit,
+            jitter_ratio=jitter_ratio,
             use_sudo=use_sudo,
             dry_run=dry_run,
             netns=netns,
@@ -1105,6 +1297,18 @@ def main() -> int:
         help="Path/binary name for tc.",
     )
     parser.add_argument(
+        "--iptables-bin",
+        type=str,
+        default="iptables",
+        help="Path/binary name for iptables (used by the <silence> fault).",
+    )
+    parser.add_argument(
+        "--ss-bin",
+        type=str,
+        default="ss",
+        help="Path/binary name for ss (its -K destroys the silenced replica's TCP connections).",
+    )
+    parser.add_argument(
         "--link-rate",
         type=str,
         default="10000mbit",
@@ -1136,7 +1340,7 @@ def main() -> int:
     if args.netem_limit <= 0:
         raise ValueError("--netem-limit must be greater than zero")
 
-    warmup_s, base_delay_ms, phases = _parse_phases(args.failure_spec)
+    warmup_s, base_delay_ms, jitter_ratio, phases = _parse_phases(args.failure_spec)
     hosts = _load_hosts(args.hosts_config)
     if args.replica_id not in hosts:
         raise ValueError(
@@ -1160,7 +1364,7 @@ def main() -> int:
         "Starting network applier "
         f"(replica_id={args.replica_id}, netns={args.netns or 'host'}, "
         f"interface={interface}, warmup_s={warmup_s:.3f}, "
-        f"base_delay_ms={base_delay_ms:g}, phases={len(phases)})"
+        f"base_delay_ms={base_delay_ms:g}, jitter_ratio={jitter_ratio:g}, phases={len(phases)})"
     )
 
     tc_initialized = False
@@ -1183,6 +1387,9 @@ def main() -> int:
             tc_bin=args.tc_bin,
             link_rate=args.link_rate,
             netem_limit=args.netem_limit,
+            jitter_ratio=jitter_ratio,
+            iptables_bin=args.iptables_bin,
+            ss_bin=args.ss_bin,
             burst_seed=args.burst_seed,
             use_sudo=use_sudo,
             dry_run=args.dry_run,
@@ -1190,10 +1397,16 @@ def main() -> int:
         )
 
     if args.teardown_at_end:
-        _log("Tearing down tc rules at end.")
+        _log("Tearing down tc and silence rules at end.")
         _clear_tc(
             interface,
             tc_bin=args.tc_bin,
+            use_sudo=use_sudo,
+            dry_run=args.dry_run,
+            netns=args.netns,
+        )
+        _clear_silence(
+            iptables_bin=args.iptables_bin,
             use_sudo=use_sudo,
             dry_run=args.dry_run,
             netns=args.netns,

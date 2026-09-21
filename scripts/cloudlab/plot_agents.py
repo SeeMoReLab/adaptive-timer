@@ -68,7 +68,7 @@ TENDERMINT_PHASE_META = {
     5: ("large net delay", "#6baed6"),
 }
 
-# SmartBFT (config/pbft/failure_spec.xml). Colors group phases by fault regime
+# SmartBFT (config/smartbft/failure_spec.xml). Colors group phases by fault regime
 # so contiguous same-regime blocks read as one band; the legend dedupes by label.
 _SB = {"base": "#c7e9c0", "p3": "#fdd0a2", "p9": "#e6805a",
        "n5": "#c6dbef", "n5p3": "#b3a2d4", "n15": "#6b8fd6"}

@@ -9,7 +9,6 @@ import numpy as np
 
 import agent_pb2
 from models import (
-    AUTOBAHN_CAR_TIMEOUT_VALUES_MS,
     AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS,
     AUTOBAHN_TIMEOUT_DELAY_VALUES_MS,
     tendermint_timeouts_from_propose,
@@ -310,21 +309,12 @@ def _extract_action_index(
             ),
             row_number=row_number,
         )
-        batch_timeout_ms = _parse_timeout_ms(
-            row=row,
-            candidates=(
-                "batch_timeout_milliseconds_used",
-                "batch_timeout_milliseconds",
-            ),
-            row_number=row_number,
-        )
         election_idx = _timeout_ms_to_index(
             election_timeout_ms, timeout_values_ms, row_number
         )
         slow_idx = _timeout_ms_to_index(slow_timeout_ms, timeout_values_ms, row_number)
-        batch_idx = _timeout_ms_to_index(batch_timeout_ms, timeout_values_ms, row_number)
         base = len(timeout_values_ms)
-        return (election_idx * base * base) + (slow_idx * base) + batch_idx
+        return (election_idx * base) + slow_idx
 
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
         propose_timeout_ms = _parse_timeout_ms(
@@ -379,7 +369,7 @@ def _extract_action_index(
         return _timeout_ms_to_index(timeout_delay_ms, timeout_values_ms, row_number)
 
     if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
-        # The three Autobahn knobs have distinct value sets, so the shared
+        # The two Autobahn knobs have distinct value sets, so the shared
         # timeout_values_ms argument cannot cover them; the per-knob option
         # tuples from models are used instead.
         timeout_delay_ms = _parse_timeout_ms(
@@ -387,14 +377,6 @@ def _extract_action_index(
             candidates=(
                 "timeout_delay_milliseconds_used",
                 "timeout_delay_milliseconds",
-            ),
-            row_number=row_number,
-        )
-        car_timeout_ms = _parse_timeout_ms(
-            row=row,
-            candidates=(
-                "car_timeout_milliseconds_used",
-                "car_timeout_milliseconds",
             ),
             row_number=row_number,
         )
@@ -409,15 +391,11 @@ def _extract_action_index(
         delay_idx = _timeout_ms_to_index(
             timeout_delay_ms, AUTOBAHN_TIMEOUT_DELAY_VALUES_MS, row_number
         )
-        car_idx = _timeout_ms_to_index(
-            car_timeout_ms, AUTOBAHN_CAR_TIMEOUT_VALUES_MS, row_number
-        )
         fast_idx = _timeout_ms_to_index(
             fast_path_timeout_ms, AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS, row_number
         )
-        car_base = len(AUTOBAHN_CAR_TIMEOUT_VALUES_MS)
         fast_base = len(AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS)
-        return (delay_idx * car_base * fast_base) + (car_idx * fast_base) + fast_idx
+        return (delay_idx * fast_base) + fast_idx
 
     raise ValueError(f"Unsupported protocol: {protocol}")
 

@@ -8,6 +8,9 @@
       Network precedence per phase: edge > source > global.
       Network delay semantics:
         - <globalNetworkDelay>/<delayMs> is a constant base one-way packet delay.
+        - <globalNetworkDelay>/<jitterRatio> (optional, default 0.20) scales the
+          netem jitter applied to every delay. netem jitter reorders packets and
+          TCP treats that as loss, so set it to 0 for high-throughput runs.
         - Per-phase network <delayMs> is an extra delay during slow bursts.
         - <burstDurationMs> and <burstIntervalMs> define burst scheduling:
           one slow burst is placed at a deterministic-random start time within
@@ -16,12 +19,24 @@
           Outside bursts: delay = globalNetworkDelay.
         - Set both burst fields to 0 to disable phase network bursts.
           If burstDurationMs >= burstIntervalMs, the edge is continuously slow.
-      Protocol precedence per phase: replica override > global default.
-      Proposal delay:
-        - <interval> repeats the proposal-delay phase every N seconds until the
-          next phase starts. <intervalMs> can be used for millisecond precision.
-        - For <id>leader</id>, the leader is resolved independently at each
-          interval tick.
+      Silence:
+        - <network><silence><replica>N</replica></silence> makes every
+          applier drop all traffic to and from replica N for the phase
+          (iptables REJECT icmp-port-unreachable in both directions plus
+          `ss -K` on the replica-to-replica connections, so connections fail
+          fast as after a crash): the fail-silent crash fault.
+      Protocol faults (per protocol section, keyed by fixed global replica id;
+      <id>1</id> is rejected because both HotStuff and Autobahn rotate
+        - <proposalDelay>: the replica holds the consensus proposals it
+          leads. Autobahn only: <messages>prepare,confirm,commit</messages>
+          selects which leader-originated phases are held (default prepare),
+          and <forceSlowPath>true</forceSlowPath> makes the leader ignore a
+          unanimous Prepare QC after its own fast-path wait.
+        - <voteDelay> (Autobahn only): the replica holds its consensus votes
+          and nothing else, defeating unanimity without being a slow leader.
+        - Each rule or replica takes <delayMs> (fixed) or
+          <delayRelativeToTimeoutMs> (live view-change timeout plus a signed
+          offset, clamped at zero).
 
       Phase timing:
         - Preferred: <atTime> means "activate this phase at t seconds from start".
@@ -84,16 +99,15 @@
             <hotstuff>
                 <!--
                   Proposal-delay behavior:
-                    enabled for listed replica IDs.
-                    Special ID "leader" means:
-                    snapshot the active phase or interval-tick leader and target
-                    leader + next (f-1) replicas in current view order.
+                    enabled for listed global replica IDs; the replica holds
+                    the consensus proposals it leads by <delayMs>.
+                    <id>1</id> is not supported (leaders rotate).
                 -->
                 <proposalDelay>
                     <replicas>
                         <!--
                         <replica>
-                            <id>leader</id>
+                            <id>1</id>
                             <delayMs>300</delayMs>
                         </replica>
                         -->
@@ -145,10 +159,9 @@
 
             <hotstuff>
                 <proposalDelay>
-                    <interval>60</interval>
                     <replicas>
                         <replica>
-                            <id>leader</id>
+                            <id>1</id>
                             <delayMs>300</delayMs>
                         </replica>
                     </replicas>
@@ -171,10 +184,9 @@
 
             <hotstuff>
                 <proposalDelay>
-                    <interval>60</interval>
                     <replicas>
                         <replica>
-                            <id>leader</id>
+                            <id>1</id>
                             <delayMs>600</delayMs>
                         </replica>
                     </replicas>
@@ -212,10 +224,9 @@
 
             <hotstuff>
                 <proposalDelay>
-                    <interval>60</interval>
                     <replicas>
                         <replica>
-                            <id>leader</id>
+                            <id>1</id>
                             <delayMs>3000</delayMs>
                         </replica>
                     </replicas>
@@ -239,10 +250,9 @@
 
             <hotstuff>
                 <proposalDelay>
-                    <interval>60</interval>
                     <replicas>
                         <replica>
-                            <id>leader</id>
+                            <id>1</id>
                             <delayMs>5000</delayMs>
                         </replica>
                     </replicas>

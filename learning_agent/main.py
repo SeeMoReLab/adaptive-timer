@@ -117,14 +117,27 @@ def reward_engineering(protocol: int, report: object) -> float:
             total_transactions=int(report.total_transactions),
             total_consensus_instances=int(report.total_consensus_instances),
             avg_consensus_latency_ms=float(report.avg_consensus_latency_ms),
+            p50_consensus_latency_ms=float(report.p50_consensus_latency_ms),
             p95_consensus_latency_ms=float(report.p95_consensus_latency_ms),
-            p99_consensus_latency_ms=float(report.p99_consensus_latency_ms),
             throughput_tps=float(report.throughput_tps),
-            timeout_violation_rate=float(report.timeout_violation_rate),
             avg_batch_size=float(report.avg_batch_size),
             p95_batch_size=float(report.p95_batch_size),
             leader_change_count=int(report.leader_change_count),
             regency_change_count=int(report.regency_change_count),
+            timeout_ms=int(report.timeout_ms),
+            avg_inter_commit_gap_ms=float(report.avg_inter_commit_gap_ms),
+            p50_inter_commit_gap_ms=float(report.p50_inter_commit_gap_ms),
+            p95_inter_commit_gap_ms=float(report.p95_inter_commit_gap_ms),
+            view_change_count=int(report.view_change_count),
+            no_progress_view_change_count=int(
+                report.no_progress_view_change_count
+            ),
+            pre_prepare_latency_ms=float(report.pre_prepare_latency_ms),
+            prepare_latency_ms=float(report.prepare_latency_ms),
+            commit_latency_ms=float(report.commit_latency_ms),
+            slow_path_timeout_ms=int(report.slow_path_timeout_ms),
+            fast_path_count=int(report.fast_path_count),
+            slow_path_count=int(report.slow_path_count),
         )
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
         return calculate_tendermint_reward(
@@ -229,7 +242,6 @@ def _dataset_timeout_field_names(protocol: int) -> Tuple[str, ...]:
         return (
             "election_timeout_milliseconds_used",
             "slow_path_timeout_milliseconds_used",
-            "batch_timeout_milliseconds_used",
         )
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
         return (
@@ -242,7 +254,6 @@ def _dataset_timeout_field_names(protocol: int) -> Tuple[str, ...]:
     if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
         return (
             "timeout_delay_milliseconds_used",
-            "car_timeout_milliseconds_used",
             "fast_path_timeout_milliseconds_used",
         )
     raise ValueError(f"Unsupported protocol: {protocol}")
@@ -255,7 +266,6 @@ def _dataset_timeout_values(protocol: int, timeout_used: object) -> Tuple[object
         return (
             getattr(timeout_used, "election_timeout_milliseconds", ""),
             getattr(timeout_used, "slow_path_timeout_milliseconds", ""),
-            getattr(timeout_used, "batch_timeout_milliseconds", ""),
         )
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
         return (
@@ -268,7 +278,6 @@ def _dataset_timeout_values(protocol: int, timeout_used: object) -> Tuple[object
     if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
         return (
             getattr(timeout_used, "timeout_delay_milliseconds", ""),
-            getattr(timeout_used, "car_timeout_milliseconds", ""),
             getattr(timeout_used, "fast_path_timeout_milliseconds", ""),
         )
     raise ValueError(f"Unsupported protocol: {protocol}")
@@ -921,47 +930,25 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         return dirty_report
 
     def _dirty_sbft_state(self, state: agent_pb2.SbftReport) -> agent_pb2.SbftReport:
-        baseline_total_tx = max(int(state.total_transactions), 1)
-        baseline_total_cons = max(int(state.total_consensus_instances), 1)
-        dirty_report = agent_pb2.SbftReport()
-        dirty_report.CopyFrom(state)
-        dirty_report.total_transactions = self._rng.randint(0, baseline_total_tx * 3)
-        dirty_report.total_consensus_instances = self._rng.randint(0, baseline_total_cons * 3)
-        dirty_report.avg_consensus_latency_ms = float(
-            max(0.0, float(state.avg_consensus_latency_ms) * self._rng.uniform(0.4, 2.0))
+        """Dirty an SbftReport: the shared PBFT layout plus the SBFT extras."""
+        dirty_report = self._dirty_pbft_state(state)
+        dirty_report.pre_prepare_latency_ms = float(
+            max(0.0, float(state.pre_prepare_latency_ms) * self._rng.uniform(0.4, 2.0))
         )
-        dirty_report.p95_consensus_latency_ms = float(
-            max(
-                dirty_report.avg_consensus_latency_ms,
-                float(state.p95_consensus_latency_ms) * self._rng.uniform(0.4, 2.2),
-            )
+        dirty_report.prepare_latency_ms = float(
+            max(0.0, float(state.prepare_latency_ms) * self._rng.uniform(0.4, 2.0))
         )
-        dirty_report.p99_consensus_latency_ms = float(
-            max(
-                dirty_report.p95_consensus_latency_ms,
-                float(state.p99_consensus_latency_ms) * self._rng.uniform(0.4, 2.4),
-            )
+        dirty_report.commit_latency_ms = float(
+            max(0.0, float(state.commit_latency_ms) * self._rng.uniform(0.4, 2.0))
         )
-        dirty_report.throughput_tps = float(
-            max(0.0, float(state.throughput_tps) * self._rng.uniform(0.4, 1.8))
+        dirty_report.slow_path_timeout_ms = max(
+            0, int(round(float(state.slow_path_timeout_ms) * self._rng.uniform(0.8, 1.2)))
         )
-        dirty_report.timeout_violation_rate = float(
-            min(1.0, max(0.0, float(state.timeout_violation_rate) + self._rng.uniform(-0.1, 0.2)))
+        dirty_report.fast_path_count = self._rng.randint(
+            0, max(int(state.fast_path_count), 1) * 3
         )
-        dirty_report.avg_batch_size = float(
-            max(0.0, float(state.avg_batch_size) * self._rng.uniform(0.4, 1.6))
-        )
-        dirty_report.p95_batch_size = float(
-            max(
-                float(dirty_report.avg_batch_size),
-                float(state.p95_batch_size) * self._rng.uniform(0.4, 1.8),
-            )
-        )
-        dirty_report.leader_change_count = self._rng.randint(
-            0, max(int(state.leader_change_count), 1) * 3
-        )
-        dirty_report.regency_change_count = self._rng.randint(
-            0, max(int(state.regency_change_count), 1) * 3
+        dirty_report.slow_path_count = self._rng.randint(
+            0, max(int(state.slow_path_count), 1) * 3
         )
         return dirty_report
 
@@ -1355,7 +1342,8 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                     f"throughput={local.throughput_tps:.6f} "
                     f"avg_latency_ms={local.avg_consensus_latency_ms:.6f} "
                     f"p95_latency_ms={local.p95_consensus_latency_ms:.6f} "
-                    f"timeout_violation_rate={local.timeout_violation_rate:.6f}"
+                    f"fast_path={local.fast_path_count} "
+                    f"slow_path={local.slow_path_count}"
                 )
             elif self._protocol in (
                 agent_pb2.PROTOCOL_HOTSTUFF,
@@ -1782,15 +1770,13 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         elif self._protocol == agent_pb2.PROTOCOL_SBFT:
             reward_timeout = (
                 f"{timeout_used.election_timeout_milliseconds}/"
-                f"{timeout_used.slow_path_timeout_milliseconds}/"
-                f"{timeout_used.batch_timeout_milliseconds}"
+                f"{timeout_used.slow_path_timeout_milliseconds}"
             )
         elif self._protocol == agent_pb2.PROTOCOL_HOTSTUFF:
             reward_timeout = f"{timeout_used.timeout_delay_milliseconds}"
         elif self._protocol == agent_pb2.PROTOCOL_AUTOBAHN:
             reward_timeout = (
                 f"{timeout_used.timeout_delay_milliseconds}/"
-                f"{timeout_used.car_timeout_milliseconds}/"
                 f"{timeout_used.fast_path_timeout_milliseconds}"
             )
         else:
@@ -2187,11 +2173,11 @@ def main():
         default=None,
         help=(
             "Path to schedule CSV. PBFT and SmartBFT format: time_s,election_timeout_ms. "
-            "SBFT format: time_s,election_timeout_ms,slow_path_timeout_ms,batch_timeout_ms. "
+            "SBFT format: time_s,election_timeout_ms,slow_path_timeout_ms. "
             "Tendermint format: time_s,propose_timeout_ms; prevote and "
             "precommit are derived as one-third of propose. "
             "HotStuff format: time_s,timeout_ms. "
-            "Autobahn format: time_s,timeout_delay_ms,car_timeout_ms,fast_path_timeout_ms. "
+            "Autobahn format: time_s,timeout_delay_ms,fast_path_timeout_ms. "
             "Negative time_s values are allowed for pre-start offsets; schedule "
             "activations are shifted so the earliest entry begins at time 0. "
             "Required when --model-type=scheduled."

@@ -2,266 +2,338 @@
 <failureSpec>
 
     <!--
-      Time-based, phase-driven fault specification.
-      Replica IDs are global IDs (0..N-1).
+      Autobahn timeout-demonstration spec.
 
-      Network precedence per phase: edge > source > global.
-      Network delay semantics:
-        - <globalNetworkDelay>/<delayMs> is a constant base one-way packet delay.
-        - Per-phase network <delayMs> is an extra delay during slow bursts.
-        - <burstDurationMs> and <burstIntervalMs> define burst scheduling:
-          one slow burst is placed at a deterministic-random start time within
-          each interval fully contained in the phase.
-        - During a burst: delay = globalNetworkDelay + phase delayMs.
-          Outside bursts: delay = globalNetworkDelay.
-        - Set both burst fields to 0 to disable phase network bursts.
-          If burstDurationMs >= burstIntervalMs, the edge is continuously slow.
-      Protocol precedence per phase: replica override > global default.
-      Proposal delay:
-        - <interval> repeats the proposal-delay phase every N seconds until the
-          next phase starts. <intervalMs> can be used for millisecond precision.
-        - For <id>leader</id>, the leader is resolved independently at each
-          interval tick.
+      Purpose: produce regimes where a HIGH timeout clearly wins and regimes
+      where a LOW timeout clearly wins, for both live adaptive knobs
+      (timeout_delay and fast_path_timeout), each with a fault that gives a
+      reason to move the knob in each direction.
 
-      Phase timing:
-        - Preferred: <atTime> means "activate this phase at t seconds from start".
-        - Legacy: <time> is interpreted as phase duration by the network applier.
+      Sizing assumptions for n=4 (f=1), k=4, use_fast_path=true,
+      use_ride_share=false (so consensus messages travel directly and never
+      ride on cars):
+        - one consensus stage  ~ one round trip (2 x one-way delay) + processing
+        - slot commit          ~ 2 stages (fast path) or 3 stages (slow path)
+        - fast path needs all 4 votes; slow path needs 3
+        - the fast-path wait starts at the 3rd vote and ends at the 4th, so
+          what it races is the SPREAD between those two, not the delay level
+        - this spec sets <jitterRatio>0</jitterRatio>: netem jitter reorders
+          packets, TCP treats that as loss, and batch dissemination collapses
+          at Autobahn's rates. With a uniform delay the 3rd-to-4th vote spread
+          is therefore only processing noise, and it is the per-source delay
+          (phase 2) and the silent replica (phase 4) that exercise the fast-path
+          timer
+        - the per-slot view-change timer covers the whole slot: a leader may
+          spend (T - honest slot time) on any of its phases before followers
+          depose it, whatever the injected delay d is
+
+      Pair this with the three schedules in learning_agent/config/:
+        schedule_autobahn_low.csv     constant low  (400 / 50)
+        schedule_autobahn_high.csv    constant high (5000 / 500)
+        schedule_autobahn_oracle.csv  per-phase best
+      Schedule time_s values line up 1:1 with <atTime> below, because the
+      first schedule row sits at -warmUpTime.
+
+      Replica IDs are global IDs from replica_map.json. Leader assignment in
+      Autobahn sorts by public key, so replica 3 leads about a quarter of
+      slots, not a predictable quarter.
     -->
 
     <schemaVersion>4</schemaVersion>
     <replicaIdType>global</replicaIdType>
-    <!-- Warm-up period in seconds: no failure behavior is active during this time. -->
     <warmUpTime>10</warmUpTime>
 
-    <!-- Constant one-way packet delay applied for the whole experiment. -->
     <globalNetworkDelay>
         <delayMs>5</delayMs>
+        <!-- No netem jitter: jitter reorders packets and TCP treats that as
+             loss, which collapses batch dissemination at Autobahn's rates. -->
+        <jitterRatio>0</jitterRatio>
     </globalNetworkDelay>
 
     <phases>
-        <!-- Base case -->
+
+        <!-- ================================================================
+             PHASE 0 @ t=0 .. 120   BASELINE / CONTROL
+             One-way delay 5ms. Stage ~15ms, slot ~40ms.
+             Fast path succeeds; vote spread is ~1ms.
+             Expectation: both knobs nearly indifferent. Low is free.
+             ================================================================ -->
         <phase>
-            <!-- Activate this phase at t=0 seconds from experiment start -->
             <atTime>0</atTime>
-
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
-
-                <!-- Extra burst delay applied to all directed edges unless overridden -->
                 <global>
                     <delayMs>0</delayMs>
                     <burstDurationMs>0</burstDurationMs>
                     <burstIntervalMs>0</burstIntervalMs>
                 </global>
+                <sources></sources>
+                <edges></edges>
+            </network>
+            <autobahn>
+                <proposalDelay>
+                    <replicas></replicas>
+                </proposalDelay>
+            </autobahn>
+        </phase>
 
-                <!-- Extra burst delay applied to all outgoing edges from src unless overridden by edge -->
+        <!-- ================================================================
+             PHASE 1 @ t=120 .. 240   UNIFORM SLOW NETWORK
+             +195ms on every directed edge, continuously (duration >= interval)
+             so one-way delay is 200ms. A follower arms the timer for slot
+             s+1 when the Prepare of slot s arrives and cancels it on the
+             Commit of s+1, so the timed span is Prepare(s+1) out, votes back,
+             Commit out: ~600ms on the fast path, ~1000ms on the slow path.
+             All four replicas stay healthy, so the fast path still completes
+             and, without jitter, the 3rd-to-4th vote spread is only processing
+             noise, so any fast_path_timeout works here.
+
+             Expectation: timeout_delay HIGH is required. A 400ms timer sits
+             below the ~600ms slot time, so healthy slots time out every
+             period and, with no backoff, never recover. fast_path_timeout is
+             only mildly engaged here, which is the point: this phase isolates
+             timeout_delay.
+
+             Note the first ~25s after the delay switches on are a TCP
+             transient (RTT jumps from 10ms to 400ms, cwnd collapses and
+             re-grows) that hits every arm equally.
+             ================================================================ -->
+        <phase>
+            <atTime>120</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>195</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+                <sources></sources>
+                <edges></edges>
+            </network>
+            <autobahn>
+                <proposalDelay>
+                    <replicas></replicas>
+                </proposalDelay>
+            </autobahn>
+        </phase>
+
+        <!-- ================================================================
+             PHASE 2 @ t=240 .. 360   SLOW NETWORK + ONE LAGGING REPLICA
+             Uniform +195ms as above, plus another +150ms on replica 3's
+             outgoing edges (source rule replaces the global rule, so its
+             delayMs is 195 + 150 = 345 on top of the 5ms base). Replica 3
+             still answers, just last and late.
+
+             Vote spread (3rd -> 4th) ~150ms. Stage ~400ms, so the prize for
+             completing the fast path is a whole skipped phase, ~400ms,
+             against a 150ms wait.
+
+             Expectation: fast_path_timeout HIGH wins. 500ms catches the 4th
+             vote and pays 150ms; 50ms gives up and pays a full extra phase.
+             timeout_delay must stay high to cover the inflated slot time.
+             ================================================================ -->
+        <phase>
+            <atTime>240</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>195</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
                 <sources>
-                    <!--
                     <source>
-                        <src>0</src>
-                        <delayMs>0</delayMs>
-                        <burstDurationMs>0</burstDurationMs>
-                        <burstIntervalMs>0</burstIntervalMs>
+                        <src>3</src>
+                        <delayMs>345</delayMs>
+                        <burstDurationMs>10000</burstDurationMs>
+                        <burstIntervalMs>10000</burstIntervalMs>
                     </source>
-                    -->
                 </sources>
-
-                <!-- Extra burst delay applied to one directed edge (src -> dst) -->
-                <edges>
-                    <!--
-                    <edge>
-                        <src>0</src>
-                        <dst>1</dst>
-                        <delayMs>0</delayMs>
-                        <burstDurationMs>0</burstDurationMs>
-                        <burstIntervalMs>0</burstIntervalMs>
-                    </edge>
-                    -->
-                </edges>
+                <edges></edges>
             </network>
-
             <autobahn>
-                <!--
-                  Proposal-delay behavior:
-                    enabled for listed replica IDs.
-                    Special ID "leader" means:
-                    snapshot the active phase or interval-tick leader and target
-                    leader + next (f-1) replicas in current view order.
-                -->
                 <proposalDelay>
-                    <replicas>
-                        <!--
-                        <replica>
-                            <id>leader</id>
-                            <delayMs>300</delayMs>
-                        </replica>
-                        -->
-                    </replicas>
+                    <replicas></replicas>
                 </proposalDelay>
             </autobahn>
-
-            <agent>
-                <!--
-                  Dirty report behavior:
-                    random dirty report is enabled only for listed replica IDs.
-                    If a replica ID is not listed, dirty report is disabled.
-                -->
-                <dirtyReport>
-                    <replicas>
-                        <!--
-                        <id>2</id>
-                        -->
-                    </replicas>
-                </dirtyReport>
-
-                <!--
-                  Ignore-report behavior:
-                    submit exactly 2f+1 reports even if more were collected.
-                    Enabled only for listed replica IDs.
-                -->
-                <ignoreReport>
-                    <replicas>
-                        <!--
-                        <id>3</id>
-                        -->
-                    </replicas>
-                </ignoreReport>
-            </agent>
         </phase>
 
-        <!-- <phase>
-            <atTime>300</atTime>
+        <!-- ================================================================
+             PHASE 3 @ t=360 .. 480   ONE SLOW LEADER
+             Network clean, all replicas alive and voting. Replica 3 holds
+             every Prepare it leads for 3000ms (its votes and its cars are on
+             time, so the fast path still completes in other leaders' slots).
+
+             The delay sits between the 400 and 5000 arms on purpose:
+               - T = 400  deposes replica 3 after 400ms; each of its turns
+                          costs about 400ms + a TC + a fresh slot under the
+                          next leader
+               - T = 5000 tolerates it; each of its turns costs the full
+                          3000ms, and because the Prepare of slot s is the
+                          ticket for slot s+1, the whole pipeline waits with it
+
+             Expectation: timeout_delay LOW wins; fast_path_timeout is not
+             engaged. This is the fault that gives the view-change timer a
+             reason to be low, the same way a proposal delay does in PBFT.
+             It runs before the silence phase on purpose: a replica coming
+             back from 120s of silence has to resync, and that recovery
+             should land in the final control phase, not here.
+             ================================================================ -->
+        <phase>
+            <atTime>360</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
-
                 <global>
                     <delayMs>0</delayMs>
                     <burstDurationMs>0</burstDurationMs>
                     <burstIntervalMs>0</burstIntervalMs>
                 </global>
+                <sources></sources>
+                <edges></edges>
             </network>
-
             <autobahn>
                 <proposalDelay>
-                    <interval>60</interval>
+                    <!-- prepare is the default; add confirm,commit for a
+                         leader that is slow in every phase, or
+                         <forceSlowPath>true</forceSlowPath> for one that
+                         waits for unanimity and then ignores it. -->
+                    <messages>prepare</messages>
                     <replicas>
                         <replica>
-                            <id>leader</id>
-                            <delayMs>300</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </autobahn>
-        </phase>
-
-        <phase>
-            <atTime>600</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>0</delayMs>
-                    <burstDurationMs>0</burstDurationMs>
-                    <burstIntervalMs>0</burstIntervalMs>
-                </global>
-            </network>
-
-            <autobahn>
-                <proposalDelay>
-                    <interval>60</interval>
-                    <replicas>
-                        <replica>
-                            <id>leader</id>
-                            <delayMs>600</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </autobahn>
-        </phase> -->
-
-        <!-- Small network delay -->
-        <phase>
-            <atTime>60</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>50</delayMs>
-                    <burstDurationMs>10000</burstDurationMs>
-                    <burstIntervalMs>10000</burstIntervalMs>
-                </global>
-            </network>
-        </phase>
-
-        <!-- <phase>
-            <atTime>60</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>50</delayMs>
-                    <burstDurationMs>10000</burstDurationMs>
-                    <burstIntervalMs>10000</burstIntervalMs>
-                </global>
-            </network>
-
-            <autobahn>
-                <proposalDelay>
-                    <interval>60</interval>
-                    <replicas>
-                        <replica>
-                            <id>leader</id>
+                            <id>3</id>
                             <delayMs>3000</delayMs>
                         </replica>
                     </replicas>
                 </proposalDelay>
             </autobahn>
-        </phase> -->
+        </phase>
 
-        <!-- Large network delay -->
-        <!-- <phase>
-            <atTime>60</atTime>
+        <!-- ================================================================
+             PHASE 4 @ t=480 .. 600   ONE REPLICA SILENT (crash fault)
+             Network otherwise clean (5ms). <silence> makes every applier
+             cut replica 3 off like a crash: iptables REJECT with
+             icmp-port-unreachable in both directions (new connects fail
+             instantly) plus `ss -K` on the replica-to-replica connections
+             (established ones fail instantly). No process management.
+             Fast failure matters: black-holing packets (netem loss) or a
+             hanging connect leaves the network layer's bounded per-peer
+             channel (1000 messages) full behind a send that never completes,
+             and every healthy primary's and worker's main loop blocks on
+             its next send to replica 3. In the first CloudLab runs that
+             froze all three healthy replicas for 75s to 3min, spanning into
+             the recovery phase. With fast failures the senders take their
+             reconnect path instead (the reliable sender buffers off-loop and
+             retries with backoff up to 60s).
+
+             Two effects, both pushing the same way:
+               - unanimity is impossible, so every Prepare burns the full
+                 fast-path wait before falling back to the 3-vote QC
+               - replica 3 leads roughly a quarter of slots and never
+                 proposes, so those slots need a view change
+
+             Expectation: BOTH knobs LOW. With 50ms / 400ms a slot commits in
+             about 100ms and a dead-leader slot recovers in 400ms. With
+             500ms / 5000ms the same slot takes about 550ms and a dead-leader
+             slot blocks the pipeline for 5s.
+
+             This phase also demonstrates the coupling: a 400ms view-change
+             timer is only safe while the fast-path wait is small. Pair a low
+             timeout_delay with a high fast_path_timeout and the ~550ms slot
+             time overruns the 400ms timer on every slot.
+
+             Caveat for reading the numbers: the silenced replica rejects the
+             client too (a crashed replica ingests nothing), so the quarter of
+             the client's load addressed to replica 3 stalls in its TCP lanes
+             and is counted as errors by the client. That load is lost for
+             every arm equally during this phase; it lowers the contrast
+             between arms but does not bias it. The lanes resume on their own
+             once the rules are lifted, after TCP's retransmit backoff.
+
+             Recovery in phase 5 is bounded by the reliable sender's reconnect
+             backoff (doubles from 200ms, capped at 60s), so expect up to a
+             minute before replica 3 is fully back in every peer's view.
+
+             RECOVERY STATUS (CloudLab, 2026-09-16 evening). Four fixes went
+             into the Autobahn fork: header-waiter -> core channels are
+             unbounded (no more core freeze), the committer skips ahead over
+             a gap it can never receive (adopting the certified lane heights
+             of the oldest Commit it holds, tips stored without payload or
+             parents when the lane gap exceeds gc_depth), the client paces
+             on executed ticks (no catch-up burst after a stalled lane), and
+             the reliable sender's reconnect backoff is capped at 5s. With
+             these, the healthy replicas run through the silence and the
+             recovery at the full 45k without any stall, and the returning
+             replica catches up ~20s after reconnecting and commits every
+             other lane again (probe run 20260916_201617).
+
+             STILL OPEN: the returning replica's OWN lane does not rejoin.
+             Its lane height is far behind the others, and the peers reject
+             its new cars as too old against a global gc round derived from
+             the highest committed height (HeaderTooOld, debug level); the
+             pending-sync cleanup in the header waiter and the worker
+             synchronizer uses the same round. Until gc becomes per lane,
+             the quarter of the client load addressed to that replica stays
+             unacked in phase 5 for every arm (15k err/s), and its client
+             lanes only resume ~90s after the rules lift (TCP retransmit
+             backoff). Compare arms in phase 5 on the other three lanes.
+
+             Phase 4 with the HIGH arm (T=5000, F=500) used to freeze the
+             healthy primaries entirely (bounded channel cycle between core
+             and header waiter under 5s-parked slots); the unbounded
+             channels remove that, but it has not been re-run yet.
+             ================================================================ -->
+        <phase>
+            <atTime>480</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>150</delayMs>
-                    <burstDurationMs>10000</burstDurationMs>
-                    <burstIntervalMs>10000</burstIntervalMs>
-                </global>
-            </network>
-
-            <autobahn>
-                <proposalDelay>
-                    <interval>60</interval>
-                    <replicas>
-                        <replica>
-                            <id>leader</id>
-                            <delayMs>5000</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </autobahn>
-        </phase> -->
-
-        <!-- <phase>
-            <atTime>1800</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
                 <global>
                     <delayMs>0</delayMs>
                     <burstDurationMs>0</burstDurationMs>
                     <burstIntervalMs>0</burstIntervalMs>
                 </global>
+                <sources></sources>
+                <edges></edges>
+                <silence>
+                    <replica>3</replica>
+                </silence>
             </network>
-        </phase> -->
+            <autobahn>
+                <proposalDelay>
+                    <replicas></replicas>
+                </proposalDelay>
+            </autobahn>
+        </phase>
+
+        <!-- ================================================================
+             PHASE 5 @ t=600 .. end   RECOVERY / CONTROL
+             Back to clean. Confirms the system returns to baseline and gives
+             the constant-high schedule a stretch where it is not penalised,
+             so the comparison is not front-loaded.
+             ================================================================ -->
+        <phase>
+            <atTime>600</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
+                <sources></sources>
+                <edges></edges>
+            </network>
+            <autobahn>
+                <proposalDelay>
+                    <replicas></replicas>
+                </proposalDelay>
+            </autobahn>
+        </phase>
+
     </phases>
 </failureSpec>

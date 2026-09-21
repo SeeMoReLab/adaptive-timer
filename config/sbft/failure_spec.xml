@@ -1,0 +1,219 @@
+<?xml version="1.0"?>
+<failureSpec>
+    <!-- Time-based, phase-driven fault specification for CppBedrock SBFT.
+
+         Calibrated at 15,000 requests/s, four replicas in namespaces on one
+         48-core CloudLab host, with the consensus window at 64 batches in
+         flight. Run it at that rate; the runner defaults to it.
+
+         Election timeouts: 250 (low), 600 (medium), 1200 (high) ms.
+
+         The two knobs are independent and are varied independently.
+
+         Network delay sets the healthy p95 latency tail - 167 ms at base,
+         319 at 5+50, 624 at 5+150 - and a timeout at or below its level's
+         tail fires on ordinary latency and storms however healthy the leader
+         is. That is what takes rungs off the table as the delay rises, and it
+         is what fixes the three values: low must fail at 5+50 and so sits
+         under 319, medium must fail at 5+150 and so sits under 624 while
+         staying clear of 319, and high must survive 5+150 and so sits above
+         624. Nothing else about the ladder is free.
+
+         The medium rung is set at 600, near the top of its band, to leave the
+         widest gap above the low rung - that gap is what the two base phases
+         have to fit their delays into. It is also the one value here with a
+         thin margin: it has to storm at 5+150 against a 624 ms tail, and
+         700 ms survives there with only 20 view changes, so the boundary is
+         not far below it. If 600 turns out to survive at 5+150, the rung
+         comes down rather than the tail moving - anything above 319 works.
+
+         Leader proposal delay decides which of the surviving rungs is best,
+         by deciding which of them fire at all. A timeout above D + tail never
+         reaches its deadline, so it never elects and pays D on every request;
+         one below it elects about once per 60 s tick and escapes to a leader
+         carrying no delay. Raising D therefore brings the next rung up into
+         play rather than pushing the winner higher.
+
+         Each phase admits a set of acceptable timeouts, and it is the
+         intersection across the run that identifies the three values:
+
+           base                    all three work
+           base + low delay        low only        - only 250 fires
+           base + high delay       low or medium   - 600 now fires too, 1200 does not
+           5+50                    medium or high  - 250 is under this level's tail
+           5+50 + low delay        medium only     - 600 fires, 1200 does not
+           5+150                   high only       - 250 and 600 are under the tail
+
+         The delays are sized to put D + tail between two rungs, never to
+         match the network delay. At base the tail is 167, so 230 ms of delay
+         lands at 397 - above the low rung, below the medium - and 700 ms
+         lands at 867, above the medium and below the high. At 5+50 the tail
+         is 319, so 500 ms of delay lands at 819, above the medium and below
+         the high. The base delay is not lowered further than 230: at 180 ms
+         the low rung's deadline is crossed only sometimes, so it elects
+         without the escape resolving anything - 225 view changes against 17.
+         5+150 carries no delay at all: its tail alone leaves only
+         the high rung standing, and adding a delay there would confound the
+         two mechanisms rather than separate them.
+
+         The slow-path timeout is 500 ms throughout. No phase here actuates
+         that axis: without a straggler all four prepares arrive together, so
+         20 and 500 ms both catch the fast path and tie. Exercising it needs a
+         phase with one replica far slower than the rest.
+
+         No phase crashes a replica. A replica restored after a crash rejoins
+         its view and executes, but the committee never regains the fast path,
+         which would leave every later phase measured on a degraded committee.
+
+         netem jitter reorders packets and TCP treats reordering as loss, which
+         costs more than half the throughput at this rate, so jitterRatio is 0. -->
+    <schemaVersion>4</schemaVersion>
+    <replicaIdType>global</replicaIdType>
+    <warmUpTime>10</warmUpTime>
+    <globalNetworkDelay>
+        <delayMs>5</delayMs>
+        <jitterRatio>0</jitterRatio>
+    </globalNetworkDelay>
+    <phases>
+        <!-- base: all three work. No fault and every rung is clear of the
+             167 ms tail, so none of them elects and none pays anything. -->
+        <phase>
+            <atTime>0</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
+            </network>
+            <sbft>
+                <proposalDelay>
+                    <replicas/>
+                </proposalDelay>
+            </sbft>
+        </phase>
+        <!-- base + low delay: low only. D + tail = 397 ms, which is above the
+             low rung and below the medium, so 250 elects once a tick and
+             escapes to a clean leader while 600 and 1200 never fire and carry
+             the 230 ms on every request. -->
+        <phase>
+            <atTime>300</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
+            </network>
+            <sbft>
+                <proposalDelay>
+                    <interval>60</interval>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>230</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </sbft>
+        </phase>
+        <!-- base + high delay: low or medium. D + tail = 867 ms now reaches
+             past the medium rung, so 600 fires and escapes as well and the two
+             are equally good; 1200 is still above it, never fires, and pays
+             the 700 ms. -->
+        <phase>
+            <atTime>600</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
+            </network>
+            <sbft>
+                <proposalDelay>
+                    <interval>60</interval>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>700</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </sbft>
+        </phase>
+        <!-- 5+50: medium or high. No fault, but the tail is now 319 ms and the
+             low rung sits under it, so 250 elects on ordinary latency and
+             storms. 600 and 1200 are both clear of it and neither fires. -->
+        <phase>
+            <atTime>900</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>50</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+            </network>
+            <sbft>
+                <proposalDelay>
+                    <replicas/>
+                </proposalDelay>
+            </sbft>
+        </phase>
+        <!-- 5+50 + low delay: medium only. The low rung is still under the
+             tail, and D + tail = 819 ms is above the medium rung and below the
+             high, so 600 escapes while 1200 never fires and pays the 500 ms. -->
+        <phase>
+            <atTime>1200</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>50</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+            </network>
+            <sbft>
+                <proposalDelay>
+                    <interval>60</interval>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>500</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </sbft>
+        </phase>
+        <!-- 5+150: high only. No fault and no delay: the tail is 624 ms, which
+             is above both the low and the medium rung, so each of them elects
+             on ordinary latency and storms. Only 1200 is clear of it. This is
+             the phase the medium rung has least margin in. -->
+        <phase>
+            <atTime>1500</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>150</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+            </network>
+            <sbft>
+                <proposalDelay>
+                    <replicas/>
+                </proposalDelay>
+            </sbft>
+        </phase>
+    </phases>
+</failureSpec>

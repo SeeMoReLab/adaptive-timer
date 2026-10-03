@@ -2,7 +2,6 @@ import unittest
 
 import agent_pb2
 from reward_utils import (
-    DEFAULT_REWARD_DESIGN,
     calculate_pbft_reward,
     calculate_reward_from_report_row,
     calculate_sbft_reward,
@@ -16,10 +15,11 @@ from reward_utils import (
 class RewardExtractionTest(unittest.TestCase):
     def setUp(self) -> None:
         # The design is process-wide, so a test that changes it has to put it
-        # back or it leaks into whatever runs next.
+        # back or it leaks into whatever runs next. These tests pin the
+        # throughput formula, so they run under reward_tps, not the default.
         previous = get_reward_design()
         self.addCleanup(set_reward_design, previous)
-        set_reward_design(DEFAULT_REWARD_DESIGN)
+        set_reward_design("reward_tps")
 
     def test_gives_full_credit_to_throughput_below_the_knee(self) -> None:
         row = {
@@ -95,11 +95,11 @@ class RewardExtractionTest(unittest.TestCase):
             precommit_latency_ms=5.0,
         )
 
-        # Under the default design every protocol scores throughput alone, so
-        # the three agree; Tendermint's old (tps - p90)/4000 is retired.
+        # Under reward_tps every protocol scores throughput alone, so the
+        # three agree; Tendermint's old (tps - p90)/4000 is retired.
         self.assertEqual(pbft_reward, 0.5)
-        # Every protocol uses the reward_tps design by default, so the
-        # reward is the throughput term alone with no latency discount.
+        # Under reward_tps the reward is the throughput term alone with no
+        # latency discount.
         self.assertEqual(sbft_reward, 0.5)
         self.assertEqual(tendermint_reward, 0.5)
 

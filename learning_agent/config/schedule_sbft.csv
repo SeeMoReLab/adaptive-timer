@@ -1,45 +1,26 @@
 # time_s,election_timeout_ms,slow_path_timeout_ms
-# CppBedrock SBFT: election (view-change) timeout and slow-path (fast-path wait) timeout.
-# Best pair per phase of config/sbft/failure_spec.xml, switched 10 s ahead of each
-# boundary so the change lands before the regime does. Calibrated at 15,000
-# requests/s on CloudLab with the consensus window at 64 batches in flight, ranked
-# on the agent's own reward averaged over episodes; see CppBedrock/adaptive_timers.MD.
+# CppBedrock SBFT oracle for config/sbft/failure_spec.xml: the best pair per phase,
+# switched 10 s before each boundary. Calibrated in runs/2026-09-27-sbft-pairs at
+# 15,000 req/s, 3 draws per pair per phase; throughput ties everywhere, so pairs are
+# ranked on p50 consensus latency with a 50 ms threshold.
 #
-# Election timeouts: 250 (low), 600 (medium), 1200 (high).
+# Election chooses from 250 / 525 / 1100 (models.py TIMEOUT_VALUES_MS): each rung is
+# just under the fast-path floor of the next link level, so it survives its own
+# level and storms one level up. Slow-path wait chooses from 50 / 150
+# (SBFT_SLOW_PATH_VALUES_MS): 50 gives up at once when the 4th prepare cannot be
+# caught, 150 waits out a lag of up to ~130 ms. (250, 150) has no phase: at base the
+# extra round is only 39 ms, so W=150 can never beat W=50 by the threshold.
 #
-#   phase                          acceptable        labelled   why
-#   t=0    base                    all three         250        nothing elects; low is no worse
-#   t=300  base + delay 230        low               250        D+tail=397: only 250 fires
-#   t=600  base + delay 700        low or medium     250        D+tail=867: 600 fires too; 1200 pays
-#   t=900  5+50                    medium or high    600        250 is under the 319 ms tail
-#   t=1200 5+50 + delay 500        medium            600        D+tail=819: 600 fires, 1200 pays
-#   t=1500 5+150                   high              1200       250 and 600 are under the 624 ms tail
+#   phase                            election  slow  p50 vs runner-up
+#   t=0     base + crash + D=150       250      50   191 vs 286
+#   t=300   5+50 + S=80 + D=350        525     150   362 vs 425
+#   t=600   5+50 + S=300 + D=350       525      50   417 vs 527
+#   t=900   5+150 + S=100             1100     150   759 vs 941
+#   t=1200  5+150 + S=300             1100      50   927 vs 1050
 #
-# Two mechanisms, kept separate. The network delay sets the healthy latency tail
-# and a rung at or below its level's tail storms on ordinary latency - that is
-# what removes the low rung at 5+50 and both lower rungs at 5+150, with no fault
-# injected at all. The leader proposal delay decides which of the surviving rungs
-# fires: above D + tail a timeout never reaches its deadline and pays the delay on
-# every request, below it the timeout escapes to a clean leader once per 60 s tick.
-# Raising the delay brings the next rung up into play; it does not push the winner
-# higher. So 5+150 carries no delay - its tail alone leaves only the high rung.
-#
-# Where a phase accepts more than one value, the lower is labelled: it is no worse
-# in that phase and it keeps the trajectory's changes tied to the regime changes.
-#
-# The medium rung sits near the top of its band (319 < 600 < 624) to leave the
-# widest gap above the low rung, since the two base phases have to fit their
-# delays into it. That makes 5+150 the phase it has least margin in: 700 ms
-# survives there with only 20 view changes, so if 600 also survives, the rung
-# comes down rather than the delay changing - anything above 319 works.
-#
-# The slow-path timeout is constant here. No phase in this spec actuates it:
-# without a straggler all four prepares arrive together and 20 ms catches the fast
-# path as well as 500 ms does. It needs a phase with one replica far slower.
--10,250,500
-0,250,500
-290,250,500
-590,250,500
-890,600,500
-1190,600,500
-1490,1200,500
+-10,250,50
+0,250,50
+290,525,150
+590,525,50
+890,1100,150
+1190,1100,50

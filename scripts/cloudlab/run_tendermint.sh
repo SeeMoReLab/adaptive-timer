@@ -89,7 +89,7 @@ Flags:
                     Store artifacts here instead of creating a timestamped run directory.
   --model           Learning-agent model for learning/sharing modes: random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic (default: random).
                     claude and codex select claude_v2 and codex_v1.
-  --reward-design   Reward the agent learns from: reward_tps|reward_mixed (default: reward_tps).
+  --reward-design   Reward the agent learns from: reward_tps|reward_mixed|reward_tps_latency (default: reward_tps).
                     reward_tps is throughput alone, concave past a 1000 tps knee. reward_mixed
                     also discounts it by the share of the window one fault would cost.
   --latency-floor-k <float>
@@ -319,8 +319,8 @@ else
   LEARNING_AGENT_ENABLED=1
 fi
 case "${REWARD_DESIGN}" in
-  reward_tps|reward_mixed) ;;
-  *) echo "Invalid --reward-design: ${REWARD_DESIGN}. Expected reward_tps|reward_mixed." >&2; exit 2 ;;
+  reward_tps|reward_mixed|reward_tps_latency) ;;
+  *) echo "Invalid --reward-design: ${REWARD_DESIGN}. Expected reward_tps|reward_mixed|reward_tps_latency." >&2; exit 2 ;;
 esac
 if ! [[ "${LATENCY_FLOOR_K}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   echo "Invalid --latency-floor-k: ${LATENCY_FLOOR_K}. Expected a non-negative number (0 disables the constraint)." >&2

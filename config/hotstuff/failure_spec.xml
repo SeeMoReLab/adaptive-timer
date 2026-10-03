@@ -26,7 +26,8 @@
           `ss -K` on the replica-to-replica connections, so connections fail
           fast as after a crash): the fail-silent crash fault.
       Protocol faults (per protocol section, keyed by fixed global replica id;
-      <id>1</id> is rejected because both HotStuff and Autobahn rotate
+      <id>leader</id> is rejected because both HotStuff and Autobahn rotate
+      leaders):
         - <proposalDelay>: the replica holds the consensus proposals it
           leads. Autobahn only: <messages>prepare,confirm,commit</messages>
           selects which leader-originated phases are held (default prepare),
@@ -48,230 +49,106 @@
     <!-- Warm-up period in seconds: no failure behavior is active during this time. -->
     <warmUpTime>10</warmUpTime>
 
-    <!-- Constant one-way packet delay applied for the whole experiment. -->
+    <!--
+      Calibrated 2026-10-02 (scripts/cloudlab/tmp/cal/hs, 10,000 tx/s, 180 s
+      per cell, one draw each, autobahn 77b3eff). One phase per HotStuff
+      timeout (models.py HOTSTUFF_TIMEOUT_VALUES_MS 160 / 460 / 760), each
+      best in its phase on reward_tps_latency (tps/10000 - p50 s) measured at
+      the client. 160 and 460 sit just under what the next link level needs
+      (5+50: 170 locks into 3-hop rounds, 180 runs clean; 5+150: about 470),
+      and 760 keeps the 300 ms gap.
+
+      The attack is one slow leader, there to punish timeouts higher than the
+      link needs, so it weakens as the delay grows and is gone at 5+150,
+      where no rung is too high and the link alone punishes the low ones:
+      replica 3 holds each proposal it leads until X ms before its live
+      timeout, so each of its turns (one round in four) stretches by T - X
+      and it is never deposed. X is the phase's own rung minus 60 (100 at
+      base, 400 at 5+50), so the right rung loses 60 ms per attacker turn
+      and every larger rung loses more. jitterRatio 0.
+    -->
     <globalNetworkDelay>
         <delayMs>5</delayMs>
+        <jitterRatio>0</jitterRatio>
     </globalNetworkDelay>
 
     <phases>
-        <!-- Base case -->
+        <!-- t=0: best 160. base + slow leader X=100.
+             Reward 160 +0.74 / 460 +0.33 / 760 -0.10 (p50 264 / 666 / 1104 ms). -->
         <phase>
-            <!-- Activate this phase at t=0 seconds from experiment start -->
             <atTime>0</atTime>
-
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
-
-                <!-- Extra burst delay applied to all directed edges unless overridden -->
                 <global>
                     <delayMs>0</delayMs>
                     <burstDurationMs>0</burstDurationMs>
                     <burstIntervalMs>0</burstIntervalMs>
                 </global>
-
-                <!-- Extra burst delay applied to all outgoing edges from src unless overridden by edge -->
-                <sources>
-                    <!--
-                    <source>
-                        <src>0</src>
-                        <delayMs>0</delayMs>
-                        <burstDurationMs>0</burstDurationMs>
-                        <burstIntervalMs>0</burstIntervalMs>
-                    </source>
-                    -->
-                </sources>
-
-                <!-- Extra burst delay applied to one directed edge (src -> dst) -->
-                <edges>
-                    <!--
-                    <edge>
-                        <src>0</src>
-                        <dst>1</dst>
-                        <delayMs>0</delayMs>
-                        <burstDurationMs>0</burstDurationMs>
-                        <burstIntervalMs>0</burstIntervalMs>
-                    </edge>
-                    -->
-                </edges>
+                <sources></sources>
+                <edges></edges>
             </network>
-
             <hotstuff>
-                <!--
-                  Proposal-delay behavior:
-                    enabled for listed global replica IDs; the replica holds
-                    the consensus proposals it leads by <delayMs>.
-                    <id>1</id> is not supported (leaders rotate).
-                -->
                 <proposalDelay>
                     <replicas>
-                        <!--
                         <replica>
-                            <id>1</id>
-                            <delayMs>300</delayMs>
+                            <id>3</id>
+                            <delayRelativeToTimeoutMs>-100</delayRelativeToTimeoutMs>
                         </replica>
-                        -->
                     </replicas>
                 </proposalDelay>
             </hotstuff>
-
-            <agent>
-                <!--
-                  Dirty report behavior:
-                    random dirty report is enabled only for listed replica IDs.
-                    If a replica ID is not listed, dirty report is disabled.
-                -->
-                <dirtyReport>
-                    <replicas>
-                        <!--
-                        <id>2</id>
-                        -->
-                    </replicas>
-                </dirtyReport>
-
-                <!--
-                  Ignore-report behavior:
-                    submit exactly 2f+1 reports even if more were collected.
-                    Enabled only for listed replica IDs.
-                -->
-                <ignoreReport>
-                    <replicas>
-                        <!--
-                        <id>3</id>
-                        -->
-                    </replicas>
-                </ignoreReport>
-            </agent>
         </phase>
 
-        <!-- <phase>
+        <!-- t=300: best 460. 5+50 + slow leader X=400.
+             Reward 160 -0.11 (9.1k tps, every replica times out every round) /
+             460 +0.40 / 760 +0.04 (p50 1017 / 603 / 961 ms). -->
+        <phase>
             <atTime>300</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
-
                 <global>
-                    <delayMs>0</delayMs>
-                    <burstDurationMs>0</burstDurationMs>
-                    <burstIntervalMs>0</burstIntervalMs>
+                    <delayMs>50</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
                 </global>
+                <sources></sources>
+                <edges></edges>
             </network>
-
             <hotstuff>
                 <proposalDelay>
                     <replicas>
                         <replica>
-                            <id>1</id>
-                            <delayMs>300</delayMs>
+                            <id>3</id>
+                            <delayRelativeToTimeoutMs>-400</delayRelativeToTimeoutMs>
                         </replica>
                     </replicas>
                 </proposalDelay>
             </hotstuff>
         </phase>
 
+        <!-- t=600: best 760. 5+150, no slow leader.
+             Reward 460 -2.01 (4.7k tps, every replica times out every round) /
+             760 -0.41 (p50 2479 / 1414 ms); 160 commits nothing here. -->
         <phase>
             <atTime>600</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>0</delayMs>
-                    <burstDurationMs>0</burstDurationMs>
-                    <burstIntervalMs>0</burstIntervalMs>
-                </global>
-            </network>
-
-            <hotstuff>
-                <proposalDelay>
-                    <replicas>
-                        <replica>
-                            <id>1</id>
-                            <delayMs>600</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </hotstuff>
-        </phase> -->
-
-        <!-- Small network delay -->
-        <phase>
-            <atTime>60</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>50</delayMs>
-                    <burstDurationMs>10000</burstDurationMs>
-                    <burstIntervalMs>10000</burstIntervalMs>
-                </global>
-            </network>
-        </phase>
-
-        <!-- <phase>
-            <atTime>60</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>50</delayMs>
-                    <burstDurationMs>10000</burstDurationMs>
-                    <burstIntervalMs>10000</burstIntervalMs>
-                </global>
-            </network>
-
-            <hotstuff>
-                <proposalDelay>
-                    <replicas>
-                        <replica>
-                            <id>1</id>
-                            <delayMs>3000</delayMs>
-                        </replica>
-                    </replicas>
-                </proposalDelay>
-            </hotstuff>
-        </phase> -->
-
-        <!-- Large network delay -->
-        <!-- <phase>
-            <atTime>60</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
                 <global>
                     <delayMs>150</delayMs>
                     <burstDurationMs>10000</burstDurationMs>
                     <burstIntervalMs>10000</burstIntervalMs>
                 </global>
+                <sources></sources>
+                <edges></edges>
             </network>
-
             <hotstuff>
                 <proposalDelay>
-                    <replicas>
-                        <replica>
-                            <id>1</id>
-                            <delayMs>5000</delayMs>
-                        </replica>
-                    </replicas>
+                    <replicas></replicas>
                 </proposalDelay>
             </hotstuff>
-        </phase> -->
-
-        <!-- <phase>
-            <atTime>1800</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>0</delayMs>
-                    <burstDurationMs>0</burstDurationMs>
-                    <burstIntervalMs>0</burstIntervalMs>
-                </global>
-            </network>
-        </phase> -->
+        </phase>
     </phases>
 </failureSpec>

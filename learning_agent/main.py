@@ -17,16 +17,19 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import grpc
 from google.protobuf import empty_pb2
+from threadpoolctl import threadpool_limits
 
 import agent_pb2
 import agent_pb2_grpc
 from aggregator import BaseAggregator, MedianAggregator, WeightedMedianAggregator
 from continuous_bandit import (
     DEFAULT_PROPORTIONAL_K,
-    ContinuousThompsonSamplingModel,
     ContinuousHeuristicTimeoutModel,
     ContinuousTimeoutActionCodec,
-    NormalizedLatencyFloor,
+    SimPriorGPModel,
+    SimReturnGPModel,
+    context_spec,
+    return_prior_path,
 )
 from latency_floor import (
     DEFAULT_LATENCY_FLOOR_K,
@@ -67,6 +70,7 @@ from reward_utils import (
     calculate_sbft_reward,
     calculate_smartbft_reward,
     calculate_tendermint_reward,
+    get_reward_design,
     set_reward_design,
 )
 
@@ -254,6 +258,7 @@ PROTOCOL_NAME_TO_ENUM = {
 # consensus ticks: window_consensus_count == 0 marks a wall-clock window.
 WALL_CLOCK_PROTOCOLS = (
     agent_pb2.PROTOCOL_PBFT,
+    agent_pb2.PROTOCOL_SBFT,
     agent_pb2.PROTOCOL_HOTSTUFF,
     agent_pb2.PROTOCOL_AUTOBAHN,
     agent_pb2.PROTOCOL_SMARTBFT,
@@ -288,13 +293,8 @@ def _dataset_timeout_field_names(protocol: int) -> Tuple[str, ...]:
             "prevote_timeout_milliseconds_used",
             "precommit_timeout_milliseconds_used",
         )
-    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+    if protocol in (agent_pb2.PROTOCOL_HOTSTUFF, agent_pb2.PROTOCOL_AUTOBAHN):
         return ("timeout_delay_milliseconds_used",)
-    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
-        return (
-            "timeout_delay_milliseconds_used",
-            "fast_path_timeout_milliseconds_used",
-        )
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -312,13 +312,8 @@ def _dataset_timeout_values(protocol: int, timeout_used: object) -> Tuple[object
             getattr(timeout_used, "prevote_timeout_milliseconds", ""),
             getattr(timeout_used, "precommit_timeout_milliseconds", ""),
         )
-    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+    if protocol in (agent_pb2.PROTOCOL_HOTSTUFF, agent_pb2.PROTOCOL_AUTOBAHN):
         return (getattr(timeout_used, "timeout_delay_milliseconds", ""),)
-    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
-        return (
-            getattr(timeout_used, "timeout_delay_milliseconds", ""),
-            getattr(timeout_used, "fast_path_timeout_milliseconds", ""),
-        )
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
@@ -376,6 +371,31 @@ def _copy_state(state: object) -> object:
     cloned = state.__class__()
     cloned.CopyFrom(state)
     return cloned
+
+
+# Protocols whose agents give an empty report window its own length as latency.
+EMPTY_WINDOW_PROTOCOLS = (agent_pb2.PROTOCOL_SBFT, agent_pb2.PROTOCOL_HOTSTUFF)
+
+
+def _fill_empty_window_latency(state: object, window_ms: int) -> bool:
+    """Give a window in which no batch executed its own length as its latency.
+
+    CppBedrock reports 0 for a window without a latency sample (AgentClient.h),
+    so reward_tps_latency scored a full stall at 0, above every storm. The
+    oldest request still pending has waited at least the window whenever one
+    was pending at its start. SBFT (Kevin, 2026-10-01) and HotStuff, whose
+    report also gives 0 for an empty window (Kevin, 2026-10-02). Applied to the
+    report the model reads - the 2f+1 median in sharing mode - so it marks a
+    stall of the cluster; a lone replica that executed nothing while the
+    others served keeps its 0 in the median. Returns whether the window was
+    empty.
+    """
+    if int(state.total_consensus_instances) != 0:
+        return False
+    state.avg_consensus_latency_ms = float(window_ms)
+    state.p50_consensus_latency_ms = float(window_ms)
+    state.p95_consensus_latency_ms = float(window_ms)
+    return True
 
 
 def _extract_reward_payload(protocol: int, reward: agent_pb2.Reward) -> Optional[Tuple[int, object, object]]:
@@ -701,9 +721,18 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         agent_injection_schedule: Optional[List[AgentInjectionPhase]],
         injection_start_mono: float,
         injection_warmup_s: float,
+        empty_window_latency_ms: Optional[Tuple[int, int]],
     ):
         self._protocol = int(protocol)
         self.node_id = node_id
+        # (feature window, reward window) lengths: an empty window's latency.
+        if (self._protocol in EMPTY_WINDOW_PROTOCOLS) != (
+            empty_window_latency_ms is not None
+        ):
+            raise ValueError(
+                "empty_window_latency_ms is required for SBFT and HotStuff and only for them"
+            )
+        self._empty_window_latency_ms = empty_window_latency_ms
         self._collect_wait_s = collect_wait_s
         self._sharing = sharing
         self._model = model
@@ -1792,6 +1821,16 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._pending_rewards_by_episode.pop(reward_episode, None)
             return
 
+        if self._empty_window_latency_ms is not None:
+            reward_report = _copy_state(reward_report)
+            if _fill_empty_window_latency(
+                reward_report, self._empty_window_latency_ms[1]
+            ):
+                print(
+                    f"[report] reward episode {reward_episode}: no batch executed "
+                    f"in the reward window; latency set to "
+                    f"{self._empty_window_latency_ms[1]} ms"
+                )
         total_transactions = _report_total_transactions(reward_report)
         throughput_tps = _report_throughput_tps(reward_report)
         engineered_reward = reward_engineering(
@@ -1813,13 +1852,11 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 f"{timeout_used.election_timeout_milliseconds}/"
                 f"{timeout_used.slow_path_timeout_milliseconds}"
             )
-        elif self._protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        elif self._protocol in (
+            agent_pb2.PROTOCOL_HOTSTUFF,
+            agent_pb2.PROTOCOL_AUTOBAHN,
+        ):
             reward_timeout = f"{timeout_used.timeout_delay_milliseconds}"
-        elif self._protocol == agent_pb2.PROTOCOL_AUTOBAHN:
-            reward_timeout = (
-                f"{timeout_used.timeout_delay_milliseconds}/"
-                f"{timeout_used.fast_path_timeout_milliseconds}"
-            )
         else:
             reward_timeout = (
                 f"{timeout_used.propose_timeout_milliseconds}/"
@@ -1878,10 +1915,17 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 f"Invalid report window for timeout prediction: start={start_tick}, seq={report_seq}"
             )
         cached_report = _copy_state(report)
+        if self._empty_window_latency_ms is not None and _fill_empty_window_latency(
+            cached_report, self._empty_window_latency_ms[0]
+        ):
+            print(
+                f"[report] episode {episode}: no batch executed in the feature "
+                f"window; latency set to {self._empty_window_latency_ms[0]} ms"
+            )
         self._state_by_episode[episode] = cached_report
         self._phase_by_episode[episode] = self._dataset_phase_for_episode_locked()
 
-        features = self._feature_extractor.featurize(report)
+        features = self._feature_extractor.featurize(cached_report)
         action = self._model.predict_action(features)
         timeout = self._action_codec.decode(action)
 
@@ -1920,6 +1964,7 @@ def serve(
     dataset_csv: Optional[Path],
     failure_spec: Optional[Path],
     injection_start_unix_ms: Optional[int],
+    empty_window_latency_ms: Optional[Tuple[int, int]],
 ):
     use_explicit_bind = host is not None and port is not None
     if use_explicit_bind:
@@ -1990,27 +2035,32 @@ def serve(
             initial_timeout_ms=sorted(arms_ms)[len(arms_ms) // 2],
         )
     elif model_type == "continuous":
-        action_codec = ContinuousTimeoutActionCodec(protocol)
-        discrete_action_count = get_action_space_size(protocol)
-        model = ContinuousThompsonSamplingModel(
-            action_dim=action_codec.action_dim,
-            n_features=get_report_feature_dim(protocol),
-            anchor_actions=action_codec.anchor_actions(),
-            initial_design_size=discrete_action_count,
-            memory_size=discrete_action_count * 32,
-            seed=42,
-            latency_floor=(
-                None
-                if latency_floor is None
-                else NormalizedLatencyFloor(
-                    action_codec=action_codec,
-                    latency_index=latency_index,
-                    n_features=get_report_feature_dim(protocol),
-                    instances_index=instances_index,
-                    latency_floor=latency_floor,
-                )
-            ),
+        # Fully learned: the floor is a guard on the action, so it is refused
+        # rather than silently dropped.
+        if latency_floor is not None:
+            raise ValueError(
+                "--model-type=continuous is fully learned and takes no "
+                "--latency-floor-k; pass 0"
+            )
+        # Refuses a protocol without a context spec or without its return
+        # prior; wait_bounds_ms is SBFT's fast-path wait (None elsewhere).
+        # SimPriorGPModel (H18, spec.prior_path) stays in the code, unwired.
+        spec = context_spec(protocol)
+        action_codec = ContinuousTimeoutActionCodec(
+            protocol, bounds_ms=spec.bounds_ms, wait_bounds_ms=spec.wait_bounds_ms
         )
+        model = SimReturnGPModel(
+            action_codec=action_codec,
+            field_names=get_report_feature_field_names(protocol),
+            prior_path=return_prior_path(protocol),
+            reward_design=get_reward_design(),
+        )
+        # A decision is small dense linear algebra (on SBFT the GP over 1,024 grid
+        # points). OpenBLAS starts one thread per core; on the 64-core CloudLab host,
+        # with four agents beside the replicas, those threads oversubscribe: an SBFT
+        # decision took 114 ms there and 17 ms on one thread (Tendermint 37 and 6).
+        # The limit holds for the rest of the process.
+        threadpool_limits(limits=1, user_api="blas")
     elif model_type == "random":
         # Seeded like the other models so that, in sharing mode, every node
         # draws the same action from the same agreed features. Reward
@@ -2092,7 +2142,7 @@ def serve(
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 
-    # continuous takes the floor through its own candidate sampler, above.
+    # continuous refuses the floor outright, above.
     # continuous_heuristic is already a multiple of the same latency, and
     # scheduled is a fixed-baseline replay that must not be overridden.
     #
@@ -2163,6 +2213,7 @@ def serve(
         agent_injection_schedule=agent_injection_schedule,
         injection_start_mono=start_mono,
         injection_warmup_s=injection_warmup_s,
+        empty_window_latency_ms=empty_window_latency_ms,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -2291,7 +2342,13 @@ def main():
             "P(alive | context, arm) times performance, gates on the first and "
             "ranks on the second, so a timeout that stalls is ruled out from a "
             "handful of samples instead of averaged into a conditional mean; "
-            "continuous: bootstrapped continuous contextual bandit; "
+            "continuous: the election timeout (PBFT 100-3000 ms, SmartBFT "
+            "100-4000 ms), SBFT's election timeout (100-3000 ms) and fast-path "
+            "wait (10-500 ms), or Tendermint propose timeout (100-3000 ms) from a "
+            "simulator-pretrained reward prior plus an online Gaussian-process "
+            "residual, lower-confidence-bound choice (no floor); needs "
+            "pretrained_models/continuous_<protocol>_prior.npz, trained by "
+            "that protocol's *_sim.py on the agent's --reward-design; "
             "continuous_heuristic: k * avg_consensus_latency_ms, clamped to "
             "the arm range; no learning; "
             "thompson: deprecated alias for cmab; "
@@ -2375,6 +2432,27 @@ def main():
     )
 
     parser.add_argument(
+        "--feature-window-ms",
+        type=int,
+        default=None,
+        help=(
+            "Length of the replicas' feature window in ms (CppBedrock "
+            "--learning-feature-duration). Required for --protocol sbft, "
+            "where a window in which no batch executed takes its length as "
+            "its consensus latency; refused for other protocols."
+        ),
+    )
+    parser.add_argument(
+        "--reward-window-ms",
+        type=int,
+        default=None,
+        help=(
+            "Length of the replicas' reward window in ms (CppBedrock "
+            "--learning-reward-duration); see --feature-window-ms."
+        ),
+    )
+
+    parser.add_argument(
         "--schedule-file",
         type=Path,
         default=None,
@@ -2384,7 +2462,7 @@ def main():
             "Tendermint format: time_s,propose_timeout_ms; prevote and "
             "precommit are derived as one-third of propose. "
             "HotStuff format: time_s,timeout_ms. "
-            "Autobahn format: time_s,timeout_delay_ms,fast_path_timeout_ms. "
+            "Autobahn format: time_s,timeout_delay_ms. "
             "Negative time_s values are allowed for pre-start offsets; schedule "
             "activations are shifted so the earliest entry begins at time 0. "
             "Required when --model-type=scheduled."
@@ -2424,6 +2502,21 @@ def main():
     args = parser.parse_args()
     if args.model_type == "thompson":
         args.model_type = "cmab"
+    windows = (args.feature_window_ms, args.reward_window_ms)
+    if args.protocol in EMPTY_WINDOW_PROTOCOLS:
+        if None in windows or min(windows) <= 0:
+            parser.error(
+                "--protocol sbft and hotstuff require positive --feature-window-ms "
+                "and --reward-window-ms"
+            )
+        empty_window_latency_ms = windows
+    else:
+        if windows != (None, None):
+            parser.error(
+                "--feature-window-ms/--reward-window-ms apply to --protocol "
+                "sbft and hotstuff only"
+            )
+        empty_window_latency_ms = None
 
     # Process-wide, before any report is scored; see reward_utils.
     set_reward_design(args.reward_design)
@@ -2451,6 +2544,7 @@ def main():
         dataset_csv=args.dataset_csv,
         failure_spec=args.failure_spec,
         injection_start_unix_ms=args.injection_start_unix_ms,
+        empty_window_latency_ms=empty_window_latency_ms,
     )
 
 

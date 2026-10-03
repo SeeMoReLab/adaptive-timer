@@ -13,8 +13,6 @@ import io
 
 import agent_pb2
 from models import (
-    autobahn_fast_path_timeout_index_to_ms,
-    autobahn_timeout_delay_ms_to_index,
     get_report_feature_field_names,
     get_timeout_values_ms,
     tendermint_timeouts_from_propose,
@@ -251,23 +249,11 @@ class DataGenerator(BaseDataGenerator):
             trial["election_timeout_milliseconds_used"] = selected_timeouts
             trial["slow_path_timeout_milliseconds_used"] = selected_timeouts
             return
-        if self.protocol_id == agent_pb2.PROTOCOL_HOTSTUFF:
+        if self.protocol_id in (
+            agent_pb2.PROTOCOL_HOTSTUFF,
+            agent_pb2.PROTOCOL_AUTOBAHN,
+        ):
             trial["timeout_delay_milliseconds_used"] = selected_timeouts
-            return
-        if self.protocol_id == agent_pb2.PROTOCOL_AUTOBAHN:
-            # The knobs have distinct value sets, so the SBFT convention of
-            # copying the selected timeout into every column would produce
-            # invalid actions; fast-path instead follows the selected timeout
-            # delay at the same option index.
-            delay_indices = [
-                autobahn_timeout_delay_ms_to_index(int(timeout))
-                for timeout in selected_timeouts
-            ]
-            trial["timeout_delay_milliseconds_used"] = selected_timeouts
-            trial["fast_path_timeout_milliseconds_used"] = [
-                autobahn_fast_path_timeout_index_to_ms(index)
-                for index in delay_indices
-            ]
             return
 
         timeout_triples = [

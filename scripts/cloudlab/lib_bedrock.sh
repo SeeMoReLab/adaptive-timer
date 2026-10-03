@@ -15,7 +15,7 @@
 # Required variables from the sourcing script:
 #   PROTOCOL_NAME               e.g. pbft (artifact/session naming, agent protocol default)
 #   BEDROCK_PROTOCOL_CONFIG_REL CppBedrock protocol YAML, relative to repo root
-#   SUPPORTED_MODES             space-separated subset of: normal learning scheduled
+#   SUPPORTED_MODES             space-separated subset of: normal learning sharing scheduled
 #   AGENT_PROTOCOL              --protocol value for learning_agent/main.py
 #   SCHEDULE_FILE_REL           schedule CSV for scheduled mode, relative to repo root
 #   FAILURE_SPEC_DEFAULT_REL    default failure spec, relative to repo root
@@ -65,6 +65,8 @@ LOG_ENABLED=0
 VERBOSE_ENABLED=0
 AGENT_MODEL_TYPE="random"
 AGENT_MODEL_SET=0
+REWARD_DESIGN="reward_tps"
+LATENCY_FLOOR_K="0"
 
 TX_RATE="${TX_RATE:-40000}"
 REQUEST_TIMEOUT_MS=10000
@@ -87,6 +89,12 @@ MAX_PENDING_BYTES=16777216
 MONITOR_INTERVAL_MS=1000
 REPLICA_PORT=15000
 AGENT_PORT=15501
+# Sharing mode: each replica namespace also runs a SmartBFT report-chain node,
+# which orders the agents' report batches so every agent decides from the
+# same data (as in run_smartbft.sh and run_tendermint.sh).
+SHARING_REPORT_PORT=15601
+SHARING_CONSENSUS_PORT=15701
+SHARING_COLLECT_WAIT_MS=100
 INITIAL_TIMEOUT_MS=""
 INITIAL_SLOW_PATH_TIMEOUT_MS=""
 LEARNING_WINDOW_MODE="wall-clock"
@@ -173,8 +181,12 @@ Flags:
   --log                             Download client, server, applier, and agent logs.
   --output-dir <path>               Store artifacts here instead of a timestamped run directory.
   --verbose                         Enable per-message debug logs on server replicas.
-  --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous>
+  --reward-design <reward_tps|reward_mixed|reward_tps_latency>
+                                    Reward the agent learns from (default: reward_tps).
+  --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic>
                                      Learning-agent model for learning mode (default: random).
+  --latency-floor-k <float>          Never apply a timeout below k x the recent consensus latency
+                                     (LatencyFloorPolicy; 0 disables it; default: 0).
   -f <int>                          Fault tolerance f; nodes defaults to 3f+1 (default: 1).
   -t <int>                          Seconds to run after benchmark start (default: 300).
 
@@ -218,7 +230,7 @@ EOF
 
 mode_enables_learning_agent() {
   case "$1" in
-    learning|scheduled) return 0 ;;
+    learning|sharing|scheduled) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -236,7 +248,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|pavlov|linear|cmab|cmab_reset|continuous) printf '%s\n' "${model_lower}" ;;
+    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_heuristic) printf '%s\n' "${model_lower}" ;;
     claude) printf '%s\n' "claude_v2" ;;
     codex) printf '%s\n' "codex_v1" ;;
     *) return 1 ;;
@@ -392,6 +404,8 @@ bedrock_main() {
         ;;
       --verbose) VERBOSE_ENABLED=1; shift ;;
       --model) AGENT_MODEL_TYPE="${2:-}"; AGENT_MODEL_SET=1; shift 2 ;;
+      --reward-design) REWARD_DESIGN="${2:-}"; shift 2 ;;
+      --latency-floor-k) LATENCY_FLOOR_K="${2:-}"; shift 2 ;;
       --nodes) NODES="${2:-}"; NODES_SET=1; shift 2 ;;
       --failure-spec) FAILURE_SPEC_PATH="${2:-}"; FAILURE_SPEC_ENABLED=1; shift 2 ;;
       --no-failure-spec) FAILURE_SPEC_ENABLED=0; shift ;;
@@ -418,7 +432,7 @@ bedrock_main() {
       --learning-reply-wait) LEARNING_REPLY_WAIT_MS="${2:-}"; shift 2 ;;
       --learning-warmup-duration) LEARNING_WARMUP_DURATION_MS="${2:-}"; shift 2 ;;
       --learning-reward-duration) LEARNING_REWARD_DURATION_MS="${2:-}"; shift 2 ;;
-      normal|heuristic|learning|sharing|scheduled)
+      normal|learning|sharing|scheduled)
         MODE="$1"
         shift
         ;;
@@ -504,11 +518,19 @@ bedrock_main() {
     exit 2
   fi
   if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-    echo "Invalid --model value. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous." >&2
+    echo "Invalid --model value. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic." >&2
     exit 2
   fi
-  if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" ]]; then
-    echo "--model is only supported with learning mode." >&2
+  if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
+    echo "--model is only supported with learning or sharing mode." >&2
+    exit 2
+  fi
+  case "${REWARD_DESIGN}" in
+    reward_tps|reward_mixed|reward_tps_latency) ;;
+    *) echo "Invalid --reward-design: ${REWARD_DESIGN}. Expected reward_tps|reward_mixed|reward_tps_latency." >&2; exit 2 ;;
+  esac
+  if ! [[ "${LATENCY_FLOOR_K}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "Invalid --latency-floor-k: ${LATENCY_FLOOR_K}. Expected a non-negative number (0 disables the constraint)." >&2
     exit 2
   fi
   if ! mode_enables_learning_agent "${MODE}"; then
@@ -633,6 +655,8 @@ bedrock_main() {
     printf 'initial_timeout_ms=%q\n' "${INITIAL_TIMEOUT_MS:-from-config}"
     printf 'initial_slow_path_timeout_ms=%q\n' "${INITIAL_SLOW_PATH_TIMEOUT_MS:-from-config}"
     printf 'agent_model=%q\n' "${AGENT_MODEL_TYPE}"
+    printf 'reward_design=%q\n' "${REWARD_DESIGN}"
+    printf 'latency_floor_k=%q\n' "${LATENCY_FLOOR_K}"
     printf 'learning_window_mode=%q\n' "${LEARNING_WINDOW_MODE}"
     printf 'learning_feature_duration_ms=%q\n' "${LEARNING_FEATURE_DURATION_MS}"
     printf 'learning_reply_wait_ms=%q\n' "${LEARNING_REPLY_WAIT_MS}"
@@ -738,10 +762,14 @@ bedrock_main() {
   # the client-endpoint readiness list.
   FAILURE_HOSTS_CONFIG_LOCAL="${ARTIFACT_DIR}/${PROTOCOL_NAME}_hosts.failure.config"
   AGENT_HOSTS_CONFIG_LOCAL="${ARTIFACT_DIR}/${PROTOCOL_NAME}_agent_hosts.config"
+  SHARING_HOSTS_CONFIG_LOCAL="${ARTIFACT_DIR}/${PROTOCOL_NAME}_sharing_hosts.config"
   CLIENT_TARGETS_LOCAL="${ARTIFACT_DIR}/client_targets.txt"
   : > "${FAILURE_HOSTS_CONFIG_LOCAL}"
   : > "${AGENT_HOSTS_CONFIG_LOCAL}"
+  : > "${SHARING_HOSTS_CONFIG_LOCAL}"
   : > "${CLIENT_TARGETS_LOCAL}"
+  sharing_consensus_port=0
+  [[ "${MODE}" == "sharing" ]] && sharing_consensus_port="${SHARING_CONSENSUS_PORT}"
   replica_ips=()
   for ((replica_id = 0; replica_id < NODES; replica_id++)); do
     machine_idx=$((replica_id / replicas_per_server_machine))
@@ -749,7 +777,9 @@ bedrock_main() {
     ip="${OVERLAY_OCTET_A}.${OVERLAY_OCTET_B}.$((machine_idx + 1)).$((OVERLAY_HOST_OFFSET + slot))"
     replica_ips+=("${ip}")
     printf '%d %s %d\n' "${replica_id}" "${ip}" "${REPLICA_PORT}" >> "${FAILURE_HOSTS_CONFIG_LOCAL}"
-    printf '%d %s 0 0 %d 0\n' "${replica_id}" "${ip}" "${AGENT_PORT}" >> "${AGENT_HOSTS_CONFIG_LOCAL}"
+    printf '%d %s 0 0 %d %d\n' "${replica_id}" "${ip}" "${AGENT_PORT}" "${sharing_consensus_port}" >> "${AGENT_HOSTS_CONFIG_LOCAL}"
+    # Report-chain node ids are 1-based: node_id host report_port agent_port consensus_port.
+    printf '%d %s %d %d %d\n' "$((replica_id + 1))" "${ip}" "${SHARING_REPORT_PORT}" "${AGENT_PORT}" "${SHARING_CONSENSUS_PORT}" >> "${SHARING_HOSTS_CONFIG_LOCAL}"
     printf '%s:%d\n' "${ip}" "${REPLICA_PORT}" >> "${CLIENT_TARGETS_LOCAL}"
   done
   replica_ips_csv="$(IFS=,; printf '%s' "${replica_ips[*]}")"
@@ -761,12 +791,18 @@ bedrock_main() {
 
   echo "Creating ${PROTOCOL_NAME} CloudLab payload tarball..."
   rm -f "${LOCAL_TAR}"
+  sharing_payload=""
+  # The report chain is a SmartBFT binary built on the remote node.
+  [[ "${MODE}" == "sharing" ]] && sharing_payload="SmartBFT"
   COPYFILE_DISABLE=1 COPY_EXTENDED_ATTRIBUTES_DISABLE=1 tar -czf "${LOCAL_TAR}" \
+    --exclude='SmartBFT/.git' \
+    --exclude='SmartBFT/build' \
     --exclude='CppBedrock/.git' \
     --exclude='CppBedrock/build' \
     --exclude='CppBedrock/web' \
     --exclude='CppBedrock/keys/*.pem' \
-    -C "${REPO_ROOT}" CppBedrock config learning_agent proto scripts/apply_network_failures.py scripts/cloudlab/gen_committee.py
+    -C "${REPO_ROOT}" CppBedrock config learning_agent proto scripts/apply_network_failures.py scripts/cloudlab/gen_committee.py \
+    ${sharing_payload}
 
   echo "Copying payload to CloudLab nodes and building CppBedrock..."
   pids=()
@@ -781,6 +817,7 @@ bedrock_main() {
       scp "${SSH_OPTS[@]}" "${LOCAL_TAR}" "${user}@${host}:${remote_tar}"
       scp "${SSH_OPTS[@]}" "${FAILURE_HOSTS_CONFIG_LOCAL}" "${user}@${host}:/tmp/${PROTOCOL_NAME}_hosts_failure_$$.config"
       scp "${SSH_OPTS[@]}" "${AGENT_HOSTS_CONFIG_LOCAL}" "${user}@${host}:/tmp/${PROTOCOL_NAME}_agent_hosts_$$.config"
+      scp "${SSH_OPTS[@]}" "${SHARING_HOSTS_CONFIG_LOCAL}" "${user}@${host}:/tmp/${PROTOCOL_NAME}_sharing_hosts_$$.config"
       if (( FAILURE_SPEC_ENABLED == 1 )); then
         remote_failure_spec="/tmp/${PROTOCOL_NAME}_failure_spec_$$.xml"
         scp "${SSH_OPTS[@]}" "${FAILURE_SPEC_PATH}" "${user}@${host}:${remote_failure_spec}"
@@ -790,7 +827,9 @@ bedrock_main() {
         "/tmp/${PROTOCOL_NAME}_hosts_failure_$$.config" \
         "${remote_failure_spec}" \
         "/tmp/${PROTOCOL_NAME}_agent_hosts_$$.config" \
-        "${RUN_ROOT_REMOTE_NAME}" <<'REMOTE'
+        "${RUN_ROOT_REMOTE_NAME}" \
+        "/tmp/${PROTOCOL_NAME}_sharing_hosts_$$.config" \
+        "${MODE}" <<'REMOTE'
 set -euo pipefail
 
 tar_path="$1"
@@ -798,6 +837,8 @@ failure_hosts_path="$2"
 failure_spec_path="$3"
 agent_hosts_path="$4"
 run_root_name="$5"
+sharing_hosts_path="$6"
+mode="$7"
 run_root="$HOME/${run_root_name}"
 
 remove_path_with_sudo_fallback() {
@@ -817,7 +858,7 @@ remove_path_with_sudo_fallback() {
 }
 
 # Keep the cmake build dir across runs to avoid full rebuilds.
-for stale in "${run_root}/CppBedrock" "${run_root}/config" "${run_root}/learning_agent" "${run_root}/proto" "${run_root}/scripts" "${run_root}/logs" "${run_root}/netcfg"; do
+for stale in "${run_root}/CppBedrock" "${run_root}/SmartBFT" "${run_root}/config" "${run_root}/learning_agent" "${run_root}/proto" "${run_root}/scripts" "${run_root}/logs" "${run_root}/netcfg"; do
   remove_path_with_sudo_fallback "${stale}"
 done
 mkdir -p "${run_root}"
@@ -825,11 +866,12 @@ tar --warning=no-unknown-keyword -xzf "${tar_path}" -C "${run_root}"
 mkdir -p "${run_root}/bin" "${run_root}/logs" "${run_root}/netcfg" "${run_root}/build"
 cp "${failure_hosts_path}" "${run_root}/hosts.failure.config"
 cp "${agent_hosts_path}" "${run_root}/agent_hosts.config"
+cp "${sharing_hosts_path}" "${run_root}/sharing_hosts.config"
 if [[ -n "${failure_spec_path}" ]]; then
   cp "${failure_spec_path}" "${run_root}/failure_spec.xml"
 fi
 chmod +x "${run_root}/scripts/apply_network_failures.py" "${run_root}/scripts/cloudlab/gen_committee.py"
-rm -f "${tar_path}" "${failure_hosts_path}" "${agent_hosts_path}"
+rm -f "${tar_path}" "${failure_hosts_path}" "${agent_hosts_path}" "${sharing_hosts_path}"
 if [[ -n "${failure_spec_path}" ]]; then
   rm -f "${failure_spec_path}"
 fi
@@ -849,6 +891,14 @@ cmake --build "${run_root}/build" -j "$(nproc)" --target CppBedrock bedrock_clie
   || { tail -n 60 "${run_root}/logs/cmake_build.log" >&2; exit 1; }
 cp "${run_root}/build/CppBedrock" "${run_root}/bin/CppBedrock"
 cp "${run_root}/build/bedrock_client" "${run_root}/bin/bedrock_client"
+
+if [[ "${mode}" == "sharing" ]]; then
+  export PATH="$HOME/go/bin:${PATH}"
+  command -v go >/dev/null 2>&1 || { echo "go not found on $(hostname); run scripts/cloudlab/setup.sh first." >&2; exit 1; }
+  echo "Building report-chain (sharing) binary with $(go version)"
+  (cd "${run_root}/SmartBFT" && GOCACHE="${run_root}/gocache" go build -o "${run_root}/bin/smartbft-sharing" ./examples/sharing) \
+    > "${run_root}/logs/sharing_build.log" 2>&1 || { tail -n 40 "${run_root}/logs/sharing_build.log" >&2; exit 1; }
+fi
 REMOTE
     ) &
     pids+=("$!")
@@ -1192,7 +1242,12 @@ REMOTE
           "${PROTOCOL_NAME}" \
           "${AGENT_PROTOCOL}" \
           "${SCHEDULE_FILE_REL}" \
-          "${FAILURE_SPEC_ENABLED}" <<'REMOTE'
+          "${FAILURE_SPEC_ENABLED}" \
+          "${SHARING_COLLECT_WAIT_MS}" \
+          "${REWARD_DESIGN}" \
+          "${LATENCY_FLOOR_K}" \
+          "${LEARNING_FEATURE_DURATION_MS}" \
+          "${LEARNING_REWARD_DURATION_MS}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
@@ -1208,6 +1263,11 @@ protocol="${10}"
 agent_protocol="${11}"
 schedule_file_rel="${12}"
 failure_spec_enabled="${13}"
+sharing_collect_wait_ms="${14}"
+reward_design="${15}"
+latency_floor_k="${16}"
+feature_window_ms="${17}"
+reward_window_ms="${18}"
 learning_agent_python="${HOME}/.venvs/adaptive-timer-learning-agent/bin/python"
 
 if [[ ! -x "${learning_agent_python}" ]]; then
@@ -1217,10 +1277,30 @@ if [[ ! -x "${learning_agent_python}" ]]; then
 fi
 
 agent_model_args=""
+# Sharing agents talk to each other and to their report-chain node, so they bind
+# every interface and read their peers from the hosts config.
+bind_args="--host 127.0.0.1 --port ${agent_port}"
 if [[ "${mode}" == "learning" ]]; then
   agent_model_args="--model-type ${model_type}"
+elif [[ "${mode}" == "sharing" ]]; then
+  agent_model_args="--model-type ${model_type}"
+  bind_args="--host 0.0.0.0 --sharing true --hosts-config ${run_root}/agent_hosts.config --collect-wait-ms ${sharing_collect_wait_ms}"
 elif [[ "${mode}" == "scheduled" ]]; then
   agent_model_args="--model-type scheduled --schedule-file ${schedule_file_rel}"
+fi
+
+agent_model_args="${agent_model_args} --reward-design ${reward_design}"
+# The floor is a constraint on the action space, so it only means anything where the
+# agent is choosing the timeout at all (learning or sharing), as in run_smartbft.sh.
+if [[ "${mode}" == "learning" || "${mode}" == "sharing" ]] && [[ "${latency_floor_k}" != "0" ]]; then
+  agent_model_args="${agent_model_args} --latency-floor-k ${latency_floor_k}"
+fi
+
+# SBFT agents give a window in which no batch executed its own length as its
+# latency, so they need the windows the replicas measure (main.py refuses
+# these flags for other protocols).
+if [[ "${agent_protocol}" == "sbft" ]]; then
+  agent_model_args="${agent_model_args} --feature-window-ms ${feature_window_ms} --reward-window-ms ${reward_window_ms}"
 fi
 
 failure_args=""
@@ -1240,7 +1320,15 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   fi
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   tmux new-session -d -s "${session_name}" \
-    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec \"${learning_agent_python}\" learning_agent/main.py --node-id ${replica_id} --protocol ${agent_protocol} --host 127.0.0.1 --port ${agent_port} --signing false ${agent_model_args} ${dataset_args} ${failure_args}' > \"${agent_log}\" 2>&1"
+    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec \"${learning_agent_python}\" learning_agent/main.py --node-id ${replica_id} --protocol ${agent_protocol} ${bind_args} --signing false ${agent_model_args} ${dataset_args} ${failure_args}' > \"${agent_log}\" 2>&1"
+  if [[ "${mode}" == "sharing" ]]; then
+    sharing_session="${protocol}_sharing_${replica_id}"
+    # The node runs as the login user (not root) so its WAL stays removable here.
+    rm -rf "${run_root}/sharing_wal_${replica_id}"
+    tmux kill-session -t "${sharing_session}" >/dev/null 2>&1 || true
+    tmux new-session -d -s "${sharing_session}" \
+      "sudo -n ip netns exec ${ns_name} sudo -n -u $(id -un) env HOME=${HOME} bash -lc 'cd \"${run_root}\" && exec ./bin/smartbft-sharing --role server --node-id $((replica_id + 1)) --protocol ${agent_protocol} --hosts-config \"${run_root}/sharing_hosts.config\" --data-dir \"${run_root}/sharing_wal_${replica_id}\" --keep-data' > \"${run_root}/logs/sharing_${replica_id}.log\" 2>&1"
+  fi
 done
 
 sleep 2
@@ -1251,6 +1339,11 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   if ! tmux has-session -t "${session_name}" 2>/dev/null; then
     echo "Learning-agent session exited early: ${session_name}" >&2
     tail -n 80 "${agent_log}" >&2 || true
+    exit 1
+  fi
+  if [[ "${mode}" == "sharing" ]] && ! tmux has-session -t "${protocol}_sharing_${replica_id}" 2>/dev/null; then
+    echo "Report-chain session exited early: ${protocol}_sharing_${replica_id}" >&2
+    tail -n 80 "${run_root}/logs/sharing_${replica_id}.log" >&2 || true
     exit 1
   fi
 done
@@ -1501,7 +1594,7 @@ sleep 3
 printf '%s\n' "${sessions}" | while read -r session_name; do
   [[ -z "${session_name}" ]] && continue
   case "${session_name}" in
-    "${protocol}_server_"*|"${protocol}_applier_"*|"${protocol}_agent_"*)
+    "${protocol}_server_"*|"${protocol}_applier_"*|"${protocol}_agent_"*|"${protocol}_sharing_"*)
       tmux send-keys -t "${session_name}" C-c >/dev/null 2>&1 || true
       ;;
   esac
@@ -1510,7 +1603,7 @@ sleep 3
 printf '%s\n' "${sessions}" | while read -r session_name; do
   [[ -z "${session_name}" ]] && continue
   case "${session_name}" in
-    "${protocol}_server_"*|"${protocol}_applier_"*|"${protocol}_agent_"*|"${protocol}_client")
+    "${protocol}_server_"*|"${protocol}_applier_"*|"${protocol}_agent_"*|"${protocol}_sharing_"*|"${protocol}_client")
       tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
       ;;
   esac
@@ -1603,6 +1696,7 @@ REMOTE
     LOGS_LOCAL_DIR="${ARTIFACT_DIR}/logs"
     rm -rf "${LOGS_LOCAL_DIR}"
     mkdir -p "${LOGS_LOCAL_DIR}/servers" "${LOGS_LOCAL_DIR}/appliers" "${LOGS_LOCAL_DIR}/agents"
+    [[ "${MODE}" == "sharing" ]] && mkdir -p "${LOGS_LOCAL_DIR}/sharing"
     for i in "${!server_nodes[@]}"; do
       node="${server_nodes[$i]}"
       host="${server_hosts[$i]}"
@@ -1628,6 +1722,14 @@ REMOTE
             "${RUN_ROOT_REMOTE_NAME}/logs/agent_${replica_id}.log" \
             "${LOGS_LOCAL_DIR}/agents/agent_${replica_id}.log" \
             "agent_${replica_id}.log" \
+            "log" \
+            1
+        fi
+        if [[ "${MODE}" == "sharing" ]]; then
+          queue_artifact_download "${node}" "${host}" "${user}" \
+            "${RUN_ROOT_REMOTE_NAME}/logs/sharing_${replica_id}.log" \
+            "${LOGS_LOCAL_DIR}/sharing/sharing_${replica_id}.log" \
+            "sharing_${replica_id}.log" \
             "log" \
             1
         fi

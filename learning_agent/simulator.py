@@ -40,6 +40,7 @@ from models import (
     MultiRF,
     NeighborhoodRobustBandit,
     PBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE,
+    SMARTBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE,
     PavlovTimeoutModel,
     QuadraticRF,
     SingleRF,
@@ -278,12 +279,13 @@ def _resolve_acceptable(
 
 def _default_acceptable(protocol: int) -> Optional[Dict[int, set]]:
     """Return the protocol-specific default phase scoring policy."""
-    if protocol not in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
+    if protocol == agent_pb2.PROTOCOL_PBFT:
+        table = PBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE
+    elif protocol == agent_pb2.PROTOCOL_SMARTBFT:
+        table = SMARTBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE
+    else:
         return None
-    return {
-        phase: set(timeouts)
-        for phase, timeouts in PBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE.items()
-    }
+    return {phase: set(timeouts) for phase, timeouts in table.items()}
 
 
 def _parse_data(

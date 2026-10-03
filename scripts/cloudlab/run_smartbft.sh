@@ -107,11 +107,11 @@ trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
-  mode              Optional; one of normal|heuristic|learning|sharing|scheduled (default: normal).
+  mode              Optional; one of normal|learning|sharing|scheduled (default: normal).
   targets_file      Optional path to cloudlab SSH targets file.
 
 Flags:
@@ -168,7 +168,7 @@ EOF
 
 mode_enables_learning_agent() {
   case "$1" in
-    heuristic|learning|sharing|scheduled) return 0 ;;
+    learning|sharing|scheduled) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -453,7 +453,7 @@ while [[ $# -gt 0 ]]; do
       LEARNING_REWARD_DURATION="${2:-}"
       shift 2
       ;;
-    normal|heuristic|learning|sharing|scheduled)
+    normal|learning|sharing|scheduled)
       MODE="$1"
       shift
       ;;
@@ -533,7 +533,7 @@ else
   LEARNING_AGENT_ENABLED=1
 fi
 if (( DATASET_ENABLED == 1 )) && (( LEARNING_AGENT_ENABLED == 0 )); then
-  echo "--dataset requires heuristic|learning|sharing|scheduled mode." >&2
+  echo "--dataset requires learning|sharing|scheduled mode." >&2
   exit 2
 fi
 if (( LEARNING_AGENT_ENABLED == 1 )); then

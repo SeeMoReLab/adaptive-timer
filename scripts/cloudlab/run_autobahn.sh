@@ -4,7 +4,7 @@
 # only pins the protocol knobs.
 
 PROTOCOL_NAME="autobahn"
-SUPPORTED_MODES="normal learning scheduled"
+SUPPORTED_MODES="normal learning sharing scheduled"
 AGENT_PROTOCOL="autobahn"
 SCHEDULE_FILE_REL="learning_agent/config/schedule_autobahn.csv"
 FAILURE_SPEC_DEFAULT_REL="config/autobahn/failure_spec.xml"

@@ -2,7 +2,11 @@
 <failureSpec>
     <!-- Proposed by runs/2026-09-27-sbft-pairs (2026-09-28). One phase per SBFT timeout pair; each pair is best in its phase by
          steady throughput then p50 (>= 50 ms), 3 draws each, 15,000 req/s, on CppBedrock 3fb8d58. (250, 150) is unreachable:
-         see the run log. Straggler 5000 ms (t=0) is a crash in effect (above the 5 s gRPC keepalive). jitterRatio 0. -->
+         see the run log. Straggler 5000 ms (t=300) is a crash in effect (above the 5 s gRPC keepalive). jitterRatio 0.
+         2026-10-03: no-fault phases added at base (t=0), 5+50 (t=600) and back at base (t=2100), the layout of the
+         Tendermint spec; the calibrated phases moved to t=300 / 900 / 1200 / 1500 / 1800 unchanged. The no-fault
+         phases are not yet calibrated: their expected pairs follow from the floors (election ties above them; with
+         no straggler the fast path always completes, so W ties). -->
     <schemaVersion>4</schemaVersion>
     <replicaIdType>global</replicaIdType>
     <warmUpTime>10</warmUpTime>
@@ -11,9 +15,27 @@
         <jitterRatio>0</jitterRatio>
     </globalNetworkDelay>
     <phases>
-        <!-- t=0: best (250, 50). base + crash + D=150: 250 elects away from the delayed leader, both waits miss, W=50 cheapest -->
+        <!-- t=0: expected (250, 50), uncalibrated. base, no straggler, no proposal delay: every election rung clears the base floor and ties, and with all n prepares on time W never engages, so both waits tie -->
         <phase>
             <atTime>0</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
+            </network>
+            <sbft>
+                <proposalDelay>
+                    <replicas/>
+                </proposalDelay>
+            </sbft>
+        </phase>
+        <!-- t=300: best (250, 50). base + crash + D=150: 250 elects away from the delayed leader, both waits miss, W=50 cheapest -->
+        <phase>
+            <atTime>300</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -43,9 +65,27 @@
                 </proposalDelay>
             </sbft>
         </phase>
-        <!-- t=300: best (525, 150). 5+50 + S=80 + D=350: 250 storms (floor 275), 525 escapes D, W=150 catches the 80 ms lag -->
+        <!-- t=600: expected (525, 50), uncalibrated. 5+50, no straggler, no proposal delay: 250 storms (floor 275), 525 and 1100 tie, W never engages -->
         <phase>
-            <atTime>300</atTime>
+            <atTime>600</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>50</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+            </network>
+            <sbft>
+                <proposalDelay>
+                    <replicas/>
+                </proposalDelay>
+            </sbft>
+        </phase>
+        <!-- t=900: best (525, 150). 5+50 + S=80 + D=350: 250 storms (floor 275), 525 escapes D, W=150 catches the 80 ms lag -->
+        <phase>
+            <atTime>900</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -75,9 +115,9 @@
                 </proposalDelay>
             </sbft>
         </phase>
-        <!-- t=600: best (525, 50). 5+50 + S=300 + D=350: both waits miss, W=50 cheapest; 1100 sleeps through D -->
+        <!-- t=1200: best (525, 50). 5+50 + S=300 + D=350: both waits miss, W=50 cheapest; 1100 sleeps through D -->
         <phase>
-            <atTime>600</atTime>
+            <atTime>1200</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -107,9 +147,9 @@
                 </proposalDelay>
             </sbft>
         </phase>
-        <!-- t=900: best (1100, 150). 5+150 + S=100: 250 and 525 storm (floor 600), W=150 catches -->
+        <!-- t=1500: best (1100, 150). 5+150 + S=100: 250 and 525 storm (floor 600), W=150 catches -->
         <phase>
-            <atTime>900</atTime>
+            <atTime>1500</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -133,9 +173,9 @@
                 </proposalDelay>
             </sbft>
         </phase>
-        <!-- t=1200: best (1100, 50). 5+150 + S=300: 250 and 525 storm (floor 600), both waits miss, W=50 cheapest. A crash (S=5000) here stalls the low rungs on a still-open view-change split; see the run log. -->
+        <!-- t=1800: best (1100, 50). 5+150 + S=300: 250 and 525 storm (floor 600), both waits miss, W=50 cheapest. A crash (S=5000) here stalls the low rungs on a still-open view-change split; see the run log. -->
         <phase>
-            <atTime>1200</atTime>
+            <atTime>1800</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -152,6 +192,24 @@
                         <burstIntervalMs>10000</burstIntervalMs>
                     </source>
                 </sources>
+            </network>
+            <sbft>
+                <proposalDelay>
+                    <replicas/>
+                </proposalDelay>
+            </sbft>
+        </phase>
+        <!-- t=2100: expected (250, 50), uncalibrated. Back to base, no faults, as t=0 -->
+        <phase>
+            <atTime>2100</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
             </network>
             <sbft>
                 <proposalDelay>

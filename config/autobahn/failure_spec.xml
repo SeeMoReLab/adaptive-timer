@@ -50,29 +50,35 @@
     <warmUpTime>10</warmUpTime>
 
     <!--
-      Calibrated 2026-10-02 (scripts/cloudlab/tmp/cal/ab, 10,000 tx/s, 180 s
-      per cell, autobahn 77b3eff plus the one-knob agent hooks, fast-path wait
-      fixed at 50 ms). One phase per Autobahn timeout (models.py
-      AUTOBAHN_TIMEOUT_DELAY_VALUES_MS 250 / 750 / 1250), each best in its
-      phase on reward_tps_latency (tps/10000 - p50 s) measured at the client.
+      Calibrated 2026-10-02 (scripts/cloudlab/tmp/cal/ab, cloudlab_1, 10,000
+      tx/s, 180 s per cell, autobahn 77b3eff plus the one-knob agent hooks,
+      fast-path wait fixed at 50 ms), on reward_tps_latency (tps/10000 - p50
+      s) measured at the client. Autobahn timeouts are models.py
+      AUTOBAHN_TIMEOUT_DELAY_VALUES_MS 250 / 750 / 1250.
+
+      Same layout as the Tendermint spec: at each link level a phase with no
+      attack, then (base and 5+50 only) the same link with the attack, and
+      finally back to base. In a no-attack phase every rung that clears the
+      level's floor ties or the lowest of them wins, so the oracle takes it.
 
       Replica 3 is faulty in two ways:
         - in every phase it holds every consensus vote 10 s, so every quorum
           needs all three honest replicas, unanimity (the fast path) never
           forms, and a view change that fires before a slot can finish
-          starves the slot. This is what turns link delay into a floor:
-          healthy Autobahn has none, since a timed-out slot still commits in
-          view 1 on any 3 votes. It costs nothing at base. The floors are
-          soft (about 400 at 5+50, about 1000 at 5+150), so 250 and 750 sit
-          as far under them as it takes to lose clearly one level up, and
-          1250 keeps the 500 ms gap;
+          starves the slot. This is what turns link delay into a floor, so
+          it stays on in the no-attack phases: healthy Autobahn has none,
+          since a timed-out slot still commits in view 1 on any 3 votes, and
+          250 would then win at every link level. It costs nothing at base.
+          The floors are soft (about 400 at 5+50, about 1000 at 5+150), so
+          250 and 750 sit as far under them as it takes to lose clearly one
+          level up, and 1250 keeps the 500 ms gap;
         - the attack proper, a slow leader that punishes timeouts higher than
-          the link needs, so it weakens as the delay grows and is gone at
+          the link needs, so it weakens as the delay grows and is absent at
           5+150, where no rung is too high: replica 3 holds each Prepare it
           leads until X ms before its live timeout, stretching each of its
-          slots by about T - X. X is the phase's own rung minus 60 (190 at
-          base, 690 at 5+50), so the right rung loses 60 ms per attacker slot
-          and every larger rung loses more.
+          slots by about T - X. X is the level's rung minus 60 (190 at base,
+          690 at 5+50), so the right rung loses 60 ms per attacker slot and
+          every larger rung loses more.
       jitterRatio 0.
     -->
     <globalNetworkDelay>
@@ -81,10 +87,39 @@
     </globalNetworkDelay>
 
     <phases>
-        <!-- t=0: best 250. base + slow leader X=190.
-             Reward 250 +0.78 / 750 +0.58 / 1250 +0.31 (p50 222 / 428 / 683 ms). -->
+        <!-- t=0: best 250 (tie). base, no attack (votes still withheld).
+             Flat: T=100 +0.78, T=1000 +0.79 (p50 225 / 212 ms). -->
         <phase>
             <atTime>0</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
+                <sources></sources>
+                <edges></edges>
+            </network>
+            <autobahn>
+                <proposalDelay>
+                    <replicas></replicas>
+                </proposalDelay>
+                <voteDelay>
+                    <replicas>
+                        <replica>
+                            <id>3</id>
+                            <delayMs>10000</delayMs>
+                        </replica>
+                    </replicas>
+                </voteDelay>
+            </autobahn>
+        </phase>
+        <!-- t=300: best 250. base + slow leader X=190.
+             Reward 250 +0.78 / 750 +0.58 / 1250 +0.31 (p50 222 / 428 / 683 ms). -->
+        <phase>
+            <atTime>300</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -116,11 +151,43 @@
                 </voteDelay>
             </autobahn>
         </phase>
-        <!-- t=300: best 750. 5+50 + slow leader X=690.
+        <!-- t=600: best 750. 5+50, no attack (votes still withheld).
+             T=200 -0.35 / 300 +0.11 / 400 +0.26 / 500 +0.24 / 1000 +0.16
+             (p50 1356 / 895 / 744 / 763 / 841 ms): 250 is under the floor and
+             1250 pays for the slope above it. The rungs themselves were not
+             run in this phase. -->
+        <phase>
+            <atTime>600</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>50</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+                <sources></sources>
+                <edges></edges>
+            </network>
+            <autobahn>
+                <proposalDelay>
+                    <replicas></replicas>
+                </proposalDelay>
+                <voteDelay>
+                    <replicas>
+                        <replica>
+                            <id>3</id>
+                            <delayMs>10000</delayMs>
+                        </replica>
+                    </replicas>
+                </voteDelay>
+            </autobahn>
+        </phase>
+        <!-- t=900: best 750. 5+50 + slow leader X=690.
              Reward 250 -0.13 and -0.18 (two draws) / 750 +0.16 / 1250 -0.07
              (p50 1136 / 839 / 1073 ms). -->
         <phase>
-            <atTime>300</atTime>
+            <atTime>900</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -152,13 +219,12 @@
                 </voteDelay>
             </autobahn>
         </phase>
-        <!-- t=600: best 1250. 5+150, no slow leader (votes still withheld).
+        <!-- t=1200: best 1250. 5+150, no attack (votes still withheld).
              Reward 750 -1.16 (11 stall seconds in 120) / 1250 -0.84
              (p50 2146 / 1836 ms); 500 already scores -2.11, so 250 was not
-             run. With all four replicas healthy 750 would win here (p50
-             1433 at 700 vs 1483 at 900 and 1600 at 2000). -->
+             run. -->
         <phase>
-            <atTime>600</atTime>
+            <atTime>1200</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -166,6 +232,34 @@
                     <delayMs>150</delayMs>
                     <burstDurationMs>10000</burstDurationMs>
                     <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+                <sources></sources>
+                <edges></edges>
+            </network>
+            <autobahn>
+                <proposalDelay>
+                    <replicas></replicas>
+                </proposalDelay>
+                <voteDelay>
+                    <replicas>
+                        <replica>
+                            <id>3</id>
+                            <delayMs>10000</delayMs>
+                        </replica>
+                    </replicas>
+                </voteDelay>
+            </autobahn>
+        </phase>
+        <!-- t=1500: best 250 (tie). Back to base, no attack, as t=0. -->
+        <phase>
+            <atTime>1500</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
                 </global>
                 <sources></sources>
                 <edges></edges>

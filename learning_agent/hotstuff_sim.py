@@ -324,15 +324,21 @@ def sample_schedule(rng: np.random.Generator, total_s: float) -> List[Phase]:
     return phases
 
 
-# config/hotstuff/failure_spec.xml: warm-up 10 s, then (one-way, hold offset)
-# per phase, None for no slow leader. Used only to evaluate policies in
-# simulation, never to train.
+# config/hotstuff/failure_spec.xml: warm-up 10 s, then (atTime, one-way, hold
+# offset) per 300 s phase, None for no slow leader, and the oracle's timeout
+# per phase (learning_agent/config/schedule_hotstuff.csv). Used only to
+# evaluate policies in simulation, never to train.
 SPEC_PHASES: Tuple[Tuple[float, float, Optional[float]], ...] = (
-    (0.0, 5.0, 100.0),
-    (300.0, 55.0, 400.0),
-    (600.0, 155.0, None),
+    (0.0, 5.0, None),
+    (300.0, 5.0, 100.0),
+    (600.0, 55.0, None),
+    (900.0, 55.0, 400.0),
+    (1200.0, 155.0, None),
+    (1500.0, 5.0, None),
 )
+SPEC_ORACLE_MS: Tuple[float, ...] = (160.0, 160.0, 460.0, 460.0, 760.0, 160.0)
 SPEC_WARMUP_S = 10.0
+SPEC_EPISODES = int((SPEC_WARMUP_S + SPEC_PHASES[-1][0] + 300.0 + 10.0) // EPISODE_S)
 
 
 def spec_schedule() -> List[Phase]:
@@ -556,7 +562,7 @@ def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH):
     raise ValueError(kind)
 
 
-def evaluate_spec(kind: str, constants: SimConstants, seed: int, rungs=None, **kwargs) -> np.ndarray:
+def evaluate_spec(kind: str, constants: SimConstants, seed: int, **kwargs) -> np.ndarray:
     """Per-phase (mean reward after the switch episode, mean p50, median timeout,
     mean reward over the whole phase including its switch episode) of one policy
     on the spec."""
@@ -564,11 +570,11 @@ def evaluate_spec(kind: str, constants: SimConstants, seed: int, rungs=None, **k
     if kind == "oracle":
         def predict(x: np.ndarray) -> float:
             idx, _ = sim.phase_at(sim.episode_start_s + FEATURE_S + REPLY_S)
-            return float(rungs[max(0, idx - 1)])
+            return SPEC_ORACLE_MS[max(0, idx - 1)]
         update = None
     else:
         predict, update = make_policy(kind, **kwargs)
-    rows = run_agent(sim, 46, predict, update)
+    rows = run_agent(sim, SPEC_EPISODES, predict, update)
     out = np.zeros((len(SPEC_PHASES), 4))
     for ph in range(len(SPEC_PHASES)):
         whole = [r for r in rows if r[0] == ph]
@@ -597,7 +603,7 @@ def main() -> None:
     e = sub.add_parser("eval", help="compare policies on the spec schedule in simulation")
     e.add_argument("--seeds", type=int, default=10)
     e.add_argument("--prior", default=DEFAULT_PRIOR_PATH)
-    e.add_argument("--rungs", default="160,460,760", help="the oracle's rung per spec phase")
+    e.add_argument("--rungs", default="160,460,760", help="the fixed timeouts to compare")
     e.add_argument("--randomize", action="store_true", help="random constants per seed")
     e.add_argument("--reward-design", default="reward_tps_latency")
     args = parser.parse_args()
@@ -619,7 +625,7 @@ def main() -> None:
         constants = sample_constants(rng) if args.randomize else SimConstants()
         if args.randomize:
             constants.load_tps = 10000.0
-        res = {k: evaluate_spec(k, constants, s, rungs=rungs) for k in ("oracle",)}
+        res = {"oracle": evaluate_spec("oracle", constants, s)}
         for r in rungs:
             res[f"fixed:{r:g}"] = evaluate_spec(f"fixed:{r:g}", constants, s)
         res["candidate"] = evaluate_spec("candidate", constants, s, prior_path=args.prior)

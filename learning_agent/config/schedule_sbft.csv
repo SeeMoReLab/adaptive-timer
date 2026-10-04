@@ -11,16 +11,26 @@
 # caught, 150 waits out a lag of up to ~130 ms. (250, 150) has no phase: at base the
 # extra round is only 39 ms, so W=150 can never beat W=50 by the threshold.
 #
+# The no-fault phases (t=0, 600, 2100; added 2026-10-03, not yet calibrated) take
+# the lowest election rung that clears the link's floor, and W=50: with no straggler
+# the fast path always completes, so the wait never engages.
+#
 #   phase                            election  slow  p50 vs runner-up
-#   t=0     base + crash + D=150       250      50   191 vs 286
-#   t=300   5+50 + S=80 + D=350        525     150   362 vs 425
-#   t=600   5+50 + S=300 + D=350       525      50   417 vs 527
-#   t=900   5+150 + S=100             1100     150   759 vs 941
-#   t=1200  5+150 + S=300             1100      50   927 vs 1050
+#   t=0     base, no faults            250      50   (uncalibrated)
+#   t=300   base + crash + D=150       250      50   191 vs 286
+#   t=600   5+50, no faults            525      50   (uncalibrated)
+#   t=900   5+50 + S=80 + D=350        525     150   362 vs 425
+#   t=1200  5+50 + S=300 + D=350       525      50   417 vs 527
+#   t=1500  5+150 + S=100             1100     150   759 vs 941
+#   t=1800  5+150 + S=300             1100      50   927 vs 1050
+#   t=2100  base, no faults            250      50   (uncalibrated)
 #
 -10,250,50
 0,250,50
-290,525,150
+290,250,50
 590,525,50
-890,1100,150
-1190,1100,50
+890,525,150
+1190,525,50
+1490,1100,150
+1790,1100,50
+2090,250,50

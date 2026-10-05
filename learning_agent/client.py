@@ -9,13 +9,12 @@ from google.protobuf import empty_pb2
 import agent_pb2
 import agent_pb2_grpc
 
-PBFT_TIMEOUT_OPTIONS_MS = (250, 550, 1200)
-SMARTBFT_TIMEOUT_OPTIONS_MS = (300, 800, 1800)
-SBFT_TIMEOUT_OPTIONS_MS = (150, 400, 900)
+PBFT_TIMEOUT_OPTIONS_MS = (300, 800, 1800)
+SBFT_TIMEOUT_OPTIONS_MS = (250, 525, 1100)
+SBFT_SLOW_PATH_OPTIONS_MS = (50, 150)
 TENDERMINT_PROPOSE_TIMEOUT_OPTIONS_MS = (300, 700, 1100)
-HOTSTUFF_TIMEOUT_DELAY_OPTIONS_MS = (800, 2000, 5000)
-AUTOBAHN_TIMEOUT_DELAY_OPTIONS_MS = (800, 2000, 5000)
-AUTOBAHN_FAST_PATH_TIMEOUT_OPTIONS_MS = (500, 1500, 5000)
+HOTSTUFF_TIMEOUT_DELAY_OPTIONS_MS = (160, 460, 760)
+AUTOBAHN_TIMEOUT_DELAY_OPTIONS_MS = (250, 750, 1250)
 PROTOCOL_NAME_TO_ENUM = {
     "pbft": agent_pb2.PROTOCOL_PBFT,
     "sbft": agent_pb2.PROTOCOL_SBFT,
@@ -125,15 +124,6 @@ def _load_hosts_config(path: Path) -> Dict[int, str]:
     return entries
 
 
-# The three protocols share the PbftReport layout but not the timeout ladder,
-# so the report's timeout_ms has to come from the caller's own arms.
-_REPORT_CLS_TIMEOUT_OPTIONS_MS = {
-    agent_pb2.PbftReport: PBFT_TIMEOUT_OPTIONS_MS,
-    agent_pb2.SmartbftReport: SMARTBFT_TIMEOUT_OPTIONS_MS,
-    agent_pb2.SbftReport: SBFT_TIMEOUT_OPTIONS_MS,
-}
-
-
 def _random_pbft_report(
     rng: random.Random, report_cls: type = agent_pb2.PbftReport
 ) -> object:
@@ -152,9 +142,7 @@ def _random_pbft_report(
     p95_batch_size = rng.uniform(avg_batch_size, max(avg_batch_size, avg_batch_size * 1.5))
     leader_change_count = rng.randint(0, 8)
     regency_change_count = rng.randint(0, 8)
-    timeout_ms = rng.choice(
-        _REPORT_CLS_TIMEOUT_OPTIONS_MS.get(report_cls, PBFT_TIMEOUT_OPTIONS_MS)
-    )
+    timeout_ms = rng.choice([300, 800, 1800])
     avg_inter_commit_gap_ms = rng.uniform(1.0, 250.0)
     p50_inter_commit_gap_ms = rng.uniform(1.0, avg_inter_commit_gap_ms)
     p95_inter_commit_gap_ms = rng.uniform(
@@ -188,7 +176,7 @@ def _random_sbft_report(rng: random.Random) -> agent_pb2.SbftReport:
     report.pre_prepare_latency_ms = rng.uniform(1.0, 50.0)
     report.prepare_latency_ms = rng.uniform(1.0, 50.0)
     report.commit_latency_ms = rng.uniform(1.0, 50.0)
-    report.slow_path_timeout_ms = rng.choice(SBFT_TIMEOUT_OPTIONS_MS)
+    report.slow_path_timeout_ms = rng.choice(SBFT_SLOW_PATH_OPTIONS_MS)
     total = int(report.total_consensus_instances)
     report.fast_path_count = rng.randint(0, total)
     report.slow_path_count = total - int(report.fast_path_count)
@@ -304,11 +292,11 @@ def _random_timeout_used(protocol: int, rng: random.Random) -> object:
         )
     if protocol == agent_pb2.PROTOCOL_SMARTBFT:
         return agent_pb2.SmartbftTimeout(
-            election_timeout_milliseconds=rng.choice(SMARTBFT_TIMEOUT_OPTIONS_MS)
+            election_timeout_milliseconds=rng.choice(PBFT_TIMEOUT_OPTIONS_MS)
         )
     if protocol == agent_pb2.PROTOCOL_SBFT:
         election_timeout_ms = rng.choice(SBFT_TIMEOUT_OPTIONS_MS)
-        slow_path_timeout_ms = rng.choice(SBFT_TIMEOUT_OPTIONS_MS)
+        slow_path_timeout_ms = rng.choice(SBFT_SLOW_PATH_OPTIONS_MS)
         return agent_pb2.SbftTimeout(
             election_timeout_milliseconds=election_timeout_ms,
             slow_path_timeout_milliseconds=slow_path_timeout_ms,
@@ -326,11 +314,8 @@ def _random_timeout_used(protocol: int, rng: random.Random) -> object:
             timeout_delay_milliseconds=rng.choice(HOTSTUFF_TIMEOUT_DELAY_OPTIONS_MS)
         )
     if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
-        timeout_delay_ms = rng.choice(AUTOBAHN_TIMEOUT_DELAY_OPTIONS_MS)
-        fast_path_timeout_ms = rng.choice(AUTOBAHN_FAST_PATH_TIMEOUT_OPTIONS_MS)
         return agent_pb2.AutobahnTimeout(
-            timeout_delay_milliseconds=timeout_delay_ms,
-            fast_path_timeout_milliseconds=fast_path_timeout_ms,
+            timeout_delay_milliseconds=rng.choice(AUTOBAHN_TIMEOUT_DELAY_OPTIONS_MS)
         )
     raise ValueError(f"Unsupported protocol: {protocol}")
 
@@ -419,12 +404,8 @@ def _print_sent_payload(
         timeout_desc = f"reward.timeout_delay_ms={timeout_delay_ms}"
     elif reward.HasField("autobahn"):
         timeout_delay_ms = reward.autobahn.timeout_used.timeout_delay_milliseconds
-        fast_path_timeout_ms = reward.autobahn.timeout_used.fast_path_timeout_milliseconds
         reward_episode = reward.autobahn.episode
-        timeout_desc = (
-            f"reward.timeout_delay_ms={timeout_delay_ms} "
-            f"reward.fast_path_timeout_ms={fast_path_timeout_ms}"
-        )
+        timeout_desc = f"reward.timeout_delay_ms={timeout_delay_ms}"
     else:
         reward_episode = -1
         timeout_desc = "reward.timeout=unknown"
@@ -494,8 +475,6 @@ def _print_timeout_status(status: agent_pb2.TimeoutStatus) -> None:
             "Timeout ready:",
             "timeout_delay_ms="
             f"{status.timeout.autobahn.timeout_delay_milliseconds}",
-            "fast_path_timeout_ms="
-            f"{status.timeout.autobahn.fast_path_timeout_milliseconds}",
             window_desc,
         )
         return

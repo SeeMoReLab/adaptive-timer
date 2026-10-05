@@ -120,25 +120,6 @@
             </agent>
         </phase>
 
-        <!--
-          Phase 1: long-arm regime by inversion (was 600ms, a short-arm one).
-          The delay now equals the shortest arm. The delay timer starts when
-          the proposal is signed, which is after block assembly, so it always
-          fires after the 300ms replica's own timeout_propose: the maverick has
-          left RoundStepPropose, delayedSendPreparedProposal drops the send,
-          and that replica completes in round 1 for ~500ms (300 propose + 100
-          prevote + 100 precommit). Deterministic, not a race.
-          The 700ms and 1100ms replicas do receive it. Measured on
-          codex_tps phase 1 (n=166 maverick heights), release -> complete block
-          costs G = 140ms median, 252ms p90, 349ms max, so they see the block
-          at 300+G <= 649ms and commit in round 0 for ~300ms.
-          That inverts the phase: waiting costs ~300ms and escaping ~500ms, so
-          the two longer arms are optimal here and 300ms is the worst. The
-          600ms version rewarded the short arm instead, and also left the
-          700ms arm straddling - 68% of maverick heights ran past its deadline.
-          Note the oracle schedule (schedule_tendermint.csv) still plays 300ms
-          across this phase and is no longer the best answer to it.
-        -->
         <phase>
             <atTime>300</atTime>
             <network>
@@ -154,44 +135,11 @@
 
             <tendermint>
                 <proposalDelay>
-                    <delayMs>300</delayMs>
+                    <delayMs>10000</delayMs>
                 </proposalDelay>
             </tendermint>
         </phase>
 
-        <!--
-          Phase 2: mid-arm regime.
-          Sustained network delay, like phase 3 but milder, sized so the
-          middle arm is the answer rather than the longest one.
-
-          This was a proposal delay of 20000ms, which made every arm escape by
-          timing out at a cost of arm + 2*(arm/3). That cost scales with the
-          arm, so the shortest one escapes cheapest and the phase was only a
-          middle-arm regime while the long arms' escape cost dominated - a
-          margin measured at -19.0% under the old arm set, and one the old
-          comment already flagged as likely to collapse into phase 1 once 300ms
-          cleared the spurious-timeout cliff. A network delay removes that
-          failure mode outright: it is not escapable, because changing round
-          does not help when the next proposer is just as slow, so no arm can
-          win this phase by being short.
-
-          50ms. What an arm has to clear under sustained delay is its own
-          prevote and precommit sub-timeout, arm/3, measured against the
-          delay. Under the old arm set at 50ms the 150ms arm sat at 1.0x and
-          died (1519 tps) while the 450ms arm sat at 3.0x and took the phase
-          at full throughput (4009 tps, against 3942 for 750ms). The new arms
-          land at:
-            - 300ms  -> arm/3 = 2.0x the delay.
-            - 700ms  -> 4.7x. Clears it well past where 450ms held before.
-            - 1100ms -> 7.3x. Clears it, and pays for headroom it cannot use.
-
-          The 300ms arm is the whole phase. At 2.0x it sits exactly between
-          the only two margins ever measured - 1.0x died, 3.0x was untouched -
-          so nothing here says which side it falls on, and the arm change
-          moved it there. If it dies this is the mid-arm regime it is meant to
-          be; if it rides the delay out it wins on speed and the phase
-          collapses into phase 1. That is the first thing to check on hardware.
-        -->
         <phase>
             <atTime>600</atTime>
             <network>
@@ -206,66 +154,8 @@
             </network>
         </phase>
 
-        <!--
-          Phase 3: long-arm regime.
-          Sustained delay on every edge (burstDuration == burstInterval, so the
-          network is continuously slow). The delay is not escapable - changing
-          round does not help, because the next proposer is just as slow - so
-          the only working answer is a timeout long enough to ride it out.
-          Measured at +197% for 750ms over 450ms under the old arm set, the
-          widest margin in the spec. Note the collapse hole this regime opens
-          between roughly 350ms and 500ms (806 tps, worse than either side);
-          700ms and 1100ms both sit clear of it.
-          Phase 2 is now the same kind of fault at 50ms, and phase 4 is that
-          same 50ms with a proposal delay on top, so the spec holds three
-          sustained-delay regimes where it used to hold one. This phase is the
-          long-arm one only if 1100ms beats 700ms at 150ms while 700ms takes
-          50ms; check the three together, not one at a time.
-        -->
         <phase>
             <atTime>900</atTime>
-            <network>
-                <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
-
-                <global>
-                    <delayMs>150</delayMs>
-                    <burstDurationMs>10000</burstDurationMs>
-                    <burstIntervalMs>10000</burstIntervalMs>
-                </global>
-            </network>
-        </phase>
-
-        <!--
-          Phase 4: the two faults together.
-          Phase 2's 50ms sustained delay with phase 1's 600ms proposal delay
-          on top, which is what removes the escape that phase 1 rewards. In
-          phase 1 the 300ms arm wins by leaving RoundStepPropose before the
-          maverick's proposal is released and completing in round 1 for ~500ms,
-          cheaper than the 600ms the longer arms wait. Here the sustained
-          delay takes that escape away: the round-1 path costs 300 + 2*(300/3)
-          with every step having to clear the delay, and 300/3 is only 2.0x
-          it - the same untested margin phase 2 turns on.
-
-          That leaves 700ms against 1100ms, and they are not separated by
-          round-0 cost: both are still in the propose step when the proposal
-          lands, so both commit in round 0 and both pay the same wait. They
-          are separated by whether 700ms clears the proposal at all. The
-          proposal is released at 600ms and then has to propagate under the
-          delay, so 700ms has 100ms of margin for that hop and 1100ms has
-          500ms. A whole round at 50ms measured ~420ms against ~66ms clean, so
-          one hop of it plausibly costs anywhere from 50 to 150ms: 700ms
-          straddles the line and 1100ms does not.
-
-          The oracle schedule therefore says 1100 here, as the arm that is
-          never worse: if the proposal lands inside 700ms the two tie on
-          throughput and only the shorter arm's secondary advantages separate
-          them, and if it lands outside, 700ms escapes at a cost of
-          700 + 2*(700/3) and loses outright. One measurement settles it -
-          fixed-arm baselines at 700 and 1100, compared over this phase alone.
-        -->
-        <phase>
-            <atTime>1200</atTime>
             <network>
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
@@ -279,9 +169,37 @@
 
             <tendermint>
                 <proposalDelay>
-                    <delayMs>600</delayMs>
+                    <delayMs>10000</delayMs>
                 </proposalDelay>
             </tendermint>
+        </phase>
+
+        <phase>
+            <atTime>1200</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>150</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+            </network>
+        </phase>
+
+        <phase>
+            <atTime>1500</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <precedence>global,source,edge</precedence>
+
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
+            </network>
         </phase>
     </phases>
 </failureSpec>

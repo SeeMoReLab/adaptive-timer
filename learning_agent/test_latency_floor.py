@@ -5,6 +5,10 @@ import numpy as np
 import agent_pb2
 from continuous_bandit import (
     ContinuousLinUCB,
+    SimReturnGPModel,
+    context_spec,
+    resolve_prior_path,
+    return_prior_path,
     _refined_ladder_ms,
     ContinuousThompsonSamplingModel,
     ContinuousTimeoutActionCodec,
@@ -510,6 +514,12 @@ class ProtocolWiringTest(unittest.TestCase):
         self.assertEqual(list(arms), sorted(arms))
 
 
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
 class ContinuousLinUCBTest(unittest.TestCase):
     """codex_v1's estimator over a continuous timeout, and the floor on top."""
 
@@ -766,5 +776,76 @@ class ContinuousLinUCBTest(unittest.TestCase):
             )
 
 
-if __name__ == "__main__":
-    unittest.main()
+class PretrainingAblationTest(unittest.TestCase):
+    """The three --prior-path settings the Full RL blocks run."""
+
+    def test_empty_selects_the_protocols_shipped_return_prior(self) -> None:
+        for protocol in (
+            agent_pb2.PROTOCOL_PBFT,
+            agent_pb2.PROTOCOL_SMARTBFT,
+            agent_pb2.PROTOCOL_TENDERMINT,
+            agent_pb2.PROTOCOL_SBFT,
+        ):
+            with self.subTest(protocol=protocol):
+                self.assertEqual(
+                    resolve_prior_path(protocol, ""),
+                    return_prior_path(protocol),
+                )
+
+    def test_none_is_untrained(self) -> None:
+        self.assertIsNone(resolve_prior_path(agent_pb2.PROTOCOL_PBFT, "none"))
+
+    def test_a_path_is_taken_as_the_ablation_prior(self) -> None:
+        self.assertEqual(
+            resolve_prior_path(agent_pb2.PROTOCOL_PBFT, "a/blind_prior.npz"),
+            "a/blind_prior.npz",
+        )
+
+    def test_untrained_model_opens_mid_range_and_learns_online(self) -> None:
+        protocol = agent_pb2.PROTOCOL_PBFT
+        spec = context_spec(protocol)
+        codec = ContinuousTimeoutActionCodec(
+            protocol, bounds_ms=spec.bounds_ms, wait_bounds_ms=spec.wait_bounds_ms
+        )
+        model = SimReturnGPModel(
+            action_codec=codec,
+            field_names=get_report_feature_field_names(protocol),
+            prior_path=None,
+            reward_design="reward_tps_latency",
+        )
+        features = np.zeros(get_report_feature_dim(protocol))
+        features[0], features[1], features[2], features[5] = 200000, 100, 80.0, 40000
+        opening = codec.denormalize_ms(float(np.atleast_1d(model.predict_action(features))[0]))
+        lower_ms, upper_ms = spec.bounds_ms
+        # Nothing in a zero prior prefers an end of the range, so it must not
+        # open at one: argmax over a flat grid would otherwise pick index 0.
+        self.assertGreater(opening, lower_ms)
+        self.assertLess(opening, upper_ms)
+        # And the GP still takes an online update, fitting the reward itself.
+        action = model.predict_action(features)
+        model.update_model(features, action, 5.0)
+        self.assertIsNotNone(model.predict_action(features))
+
+    def test_untrained_sbft_opens_inside_both_dimensions(self) -> None:
+        protocol = agent_pb2.PROTOCOL_SBFT
+        spec = context_spec(protocol)
+        codec = ContinuousTimeoutActionCodec(
+            protocol, bounds_ms=spec.bounds_ms, wait_bounds_ms=spec.wait_bounds_ms
+        )
+        model = SimReturnGPModel(
+            action_codec=codec,
+            field_names=get_report_feature_field_names(protocol),
+            prior_path=None,
+            reward_design="reward_tps_latency",
+        )
+        features = np.zeros(get_report_feature_dim(protocol))
+        features[0], features[1], features[2], features[5] = 200000, 100, 80.0, 40000
+        action = np.atleast_1d(model.predict_action(features))
+        self.assertEqual(action.size, 2)
+        for dimension, (lower_ms, upper_ms) in enumerate(
+            (spec.bounds_ms, spec.wait_bounds_ms)
+        ):
+            value = codec.denormalize_ms(float(action[dimension]), dimension)
+            with self.subTest(dimension=dimension):
+                self.assertGreater(value, lower_ms)
+                self.assertLess(value, upper_ms)

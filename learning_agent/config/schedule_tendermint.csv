@@ -12,24 +12,13 @@
 # a switch written at T fires at warmUpTime + T. Writing the atTime value here
 # therefore lands the switch exactly on the phase boundary.
 #
-#   p0 @0    no fault                     300  control; arm-independent
-#   p1 @300  proposalDelay 600ms          300  short arm escapes, long arms wait
-#   p2 @600  net 50ms sustained           700  not escapable; 300 should die at
-#                                              arm/3 = 2.0x the delay
-#   p3 @900  net 150ms sustained         1100  not escapable, ride it out
-#   p4 @1200 net 50ms + proposalDelay600 1100  delay removes the escape 300 wins
-#                                              on in p1; 700 has only 100ms of
-#                                              margin for the proposal hop
-#
-# Two of these five labels are asserted, not measured, and both turn on the
-# same untested margin - whether a 300ms arm survives arm/3 = 2.0x a sustained
-# delay. p2 is the mid-arm regime only if it does not, and p4's 1100 assumes
-# the same. p4 is additionally a max-min choice between 700 and 1100: they tie
-# on round-0 cost if the proposal lands inside 700ms, and 700 loses outright if
-# it does not. Fixed-arm baselines over p2 and p4 settle both; see the phase
-# comments in the spec.
+#   p0 @0    no fault              300  control; arm-independent, no switch needed
+#   p1 @300  proposalDelay 600ms   300  short arm escapes, long arms wait it out
+#   p2 @600  proposalDelay 20s     700  every arm escapes; cost scales with arm
+#   p3 @900  net 150ms sustained  1100  not escapable, ride it out
+#   p4 @1200 proposalDelay 600ms   300  back down to the short arm
 -10,300
 0,300
-580,700
-880,1100
-1180,1100
+590,700
+1190,1100
+1490,300

@@ -13,7 +13,7 @@
 #
 # Required variables from the sourcing script:
 #   PROTOCOL_NAME         e.g. hotstuff
-#   SUPPORTED_MODES       space-separated subset of: normal heuristic learning sharing scheduled
+#   SUPPORTED_MODES       space-separated subset of: normal learning sharing scheduled
 #   AGENT_PROTOCOL        --protocol value for learning_agent/main.py (when agent modes are supported)
 #   SCHEDULE_FILE_REL     schedule CSV for scheduled mode, relative to repo root
 #   FAILURE_SPEC_DEFAULT_REL  default failure spec, relative to repo root
@@ -93,6 +93,12 @@ FRONT_PORT=9000
 MEMPOOL_PORT=9100
 CONSENSUS_PORT=9200
 AGENT_PORT=15501
+# Sharing mode: each replica namespace also runs a SmartBFT report-chain node,
+# which orders the agents' report batches so every agent decides from the
+# same data (as in lib_bedrock.sh, run_smartbft.sh and run_tendermint.sh).
+SHARING_REPORT_PORT=15601
+SHARING_CONSENSUS_PORT=15701
+SHARING_COLLECT_WAIT_MS=100
 INITIAL_TIMEOUT_MS=""
 SCHEDULE_FILE_ARG=""
 LEARNING_WINDOW_MODE="wall-clock"
@@ -206,7 +212,7 @@ EOF
 
 mode_enables_learning_agent() {
   case "$1" in
-    heuristic|learning|sharing|scheduled) return 0 ;;
+    learning|sharing|scheduled) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -402,7 +408,7 @@ rustbft_main() {
       --learning-reply-wait) LEARNING_REPLY_WAIT_MS="${2:-}"; shift 2 ;;
       --learning-warmup-duration) LEARNING_WARMUP_DURATION_MS="${2:-}"; shift 2 ;;
       --learning-reward-duration) LEARNING_REWARD_DURATION_MS="${2:-}"; shift 2 ;;
-      normal|heuristic|learning|sharing|scheduled)
+      normal|learning|sharing|scheduled)
         MODE="$1"
         shift
         ;;
@@ -526,10 +532,6 @@ rustbft_main() {
   fi
   if (( LEARNING_AGENT_ENABLED == 1 )); then
     DATASET_ENABLED=1
-  fi
-  if [[ "${MODE}" == "sharing" ]]; then
-    echo "Sharing mode is not implemented for Rust protocols yet." >&2
-    exit 2
   fi
 
   LOCAL_SSH_KEY_PATH="${LOCAL_SSH_KEY_PATH/#\~/$HOME}"
@@ -733,10 +735,14 @@ rustbft_main() {
   # the client-endpoint readiness list.
   FAILURE_HOSTS_CONFIG_LOCAL="${ARTIFACT_DIR}/${PROTOCOL_NAME}_hosts.failure.config"
   AGENT_HOSTS_CONFIG_LOCAL="${ARTIFACT_DIR}/${PROTOCOL_NAME}_agent_hosts.config"
+  SHARING_HOSTS_CONFIG_LOCAL="${ARTIFACT_DIR}/${PROTOCOL_NAME}_sharing_hosts.config"
   CLIENT_TARGETS_LOCAL="${ARTIFACT_DIR}/client_targets.txt"
   : > "${FAILURE_HOSTS_CONFIG_LOCAL}"
   : > "${AGENT_HOSTS_CONFIG_LOCAL}"
+  : > "${SHARING_HOSTS_CONFIG_LOCAL}"
   : > "${CLIENT_TARGETS_LOCAL}"
+  sharing_consensus_port=0
+  [[ "${MODE}" == "sharing" ]] && sharing_consensus_port="${SHARING_CONSENSUS_PORT}"
   replica_ips=()
   for ((replica_id = 0; replica_id < NODES; replica_id++)); do
     machine_idx=$((replica_id / replicas_per_server_machine))
@@ -744,7 +750,9 @@ rustbft_main() {
     ip="${OVERLAY_OCTET_A}.${OVERLAY_OCTET_B}.$((machine_idx + 1)).$((OVERLAY_HOST_OFFSET + slot))"
     replica_ips+=("${ip}")
     printf '%d %s %d\n' "${replica_id}" "${ip}" "${FRONT_PORT}" >> "${FAILURE_HOSTS_CONFIG_LOCAL}"
-    printf '%d %s 0 0 %d 0\n' "${replica_id}" "${ip}" "${AGENT_PORT}" >> "${AGENT_HOSTS_CONFIG_LOCAL}"
+    printf '%d %s 0 0 %d %d\n' "${replica_id}" "${ip}" "${AGENT_PORT}" "${sharing_consensus_port}" >> "${AGENT_HOSTS_CONFIG_LOCAL}"
+    # Report-chain node ids are 1-based: node_id host report_port agent_port consensus_port.
+    printf '%d %s %d %d %d\n' "$((replica_id + 1))" "${ip}" "${SHARING_REPORT_PORT}" "${AGENT_PORT}" "${SHARING_CONSENSUS_PORT}" >> "${SHARING_HOSTS_CONFIG_LOCAL}"
     printf '%s:%d\n' "${ip}" "${FRONT_PORT}" >> "${CLIENT_TARGETS_LOCAL}"
   done
   replica_ips_csv="$(IFS=,; printf '%s' "${replica_ips[*]}")"
@@ -757,11 +765,17 @@ rustbft_main() {
 
   echo "Creating ${PROTOCOL_NAME} CloudLab payload tarball..."
   rm -f "${LOCAL_TAR}"
+  sharing_payload=""
+  # The report chain is a SmartBFT binary built on the remote node.
+  [[ "${MODE}" == "sharing" ]] && sharing_payload="SmartBFT"
   COPYFILE_DISABLE=1 COPY_EXTENDED_ATTRIBUTES_DISABLE=1 tar -czf "${LOCAL_TAR}" \
     --exclude='autobahn/.git' \
     --exclude='autobahn/target' \
     --exclude='autobahn/baselines/target' \
-    -C "${REPO_ROOT}" autobahn config learning_agent proto scripts/apply_network_failures.py scripts/cloudlab/gen_committee.py
+    --exclude='SmartBFT/.git' \
+    --exclude='SmartBFT/build' \
+    -C "${REPO_ROOT}" autobahn config learning_agent proto scripts/apply_network_failures.py scripts/cloudlab/gen_committee.py \
+    ${sharing_payload}
 
   echo "Copying payload to CloudLab nodes and building the Rust workspace..."
   pids=()
@@ -776,6 +790,7 @@ rustbft_main() {
       scp "${SSH_OPTS[@]}" "${LOCAL_TAR}" "${user}@${host}:${remote_tar}"
       scp "${SSH_OPTS[@]}" "${FAILURE_HOSTS_CONFIG_LOCAL}" "${user}@${host}:/tmp/${PROTOCOL_NAME}_hosts_failure_$$.config"
       scp "${SSH_OPTS[@]}" "${AGENT_HOSTS_CONFIG_LOCAL}" "${user}@${host}:/tmp/${PROTOCOL_NAME}_agent_hosts_$$.config"
+      scp "${SSH_OPTS[@]}" "${SHARING_HOSTS_CONFIG_LOCAL}" "${user}@${host}:/tmp/${PROTOCOL_NAME}_sharing_hosts_$$.config"
       if (( FAILURE_SPEC_ENABLED == 1 )); then
         remote_failure_spec="/tmp/${PROTOCOL_NAME}_failure_spec_$$.xml"
         scp "${SSH_OPTS[@]}" "${FAILURE_SPEC_PATH}" "${user}@${host}:${remote_failure_spec}"
@@ -787,7 +802,9 @@ rustbft_main() {
         "/tmp/${PROTOCOL_NAME}_agent_hosts_$$.config" \
         "${RUN_ROOT_REMOTE_NAME}" \
         "${WORKSPACE_REL}" \
-        "${CLIENT_BIN_SRC}" <<'REMOTE'
+        "${CLIENT_BIN_SRC}" \
+        "/tmp/${PROTOCOL_NAME}_sharing_hosts_$$.config" \
+        "${MODE}" <<'REMOTE'
 set -euo pipefail
 
 tar_path="$1"
@@ -797,6 +814,8 @@ agent_hosts_path="$4"
 run_root_name="$5"
 workspace_rel="$6"
 client_bin_src="$7"
+sharing_hosts_path="$8"
+mode="$9"
 run_root="$HOME/${run_root_name}"
 
 remove_path_with_sudo_fallback() {
@@ -816,7 +835,7 @@ remove_path_with_sudo_fallback() {
 }
 
 # Keep the cargo target dir across runs to avoid full rebuilds.
-for stale in "${run_root}/autobahn" "${run_root}/config" "${run_root}/learning_agent" "${run_root}/proto" "${run_root}/scripts" "${run_root}/logs" "${run_root}/db" "${run_root}/netcfg"; do
+for stale in "${run_root}/autobahn" "${run_root}/SmartBFT" "${run_root}/config" "${run_root}/learning_agent" "${run_root}/proto" "${run_root}/scripts" "${run_root}/logs" "${run_root}/db" "${run_root}/netcfg"; do
   remove_path_with_sudo_fallback "${stale}"
 done
 mkdir -p "${run_root}"
@@ -824,11 +843,12 @@ tar --warning=no-unknown-keyword -xzf "${tar_path}" -C "${run_root}"
 mkdir -p "${run_root}/bin" "${run_root}/logs" "${run_root}/db" "${run_root}/netcfg"
 cp "${failure_hosts_path}" "${run_root}/hosts.failure.config"
 cp "${agent_hosts_path}" "${run_root}/agent_hosts.config"
+cp "${sharing_hosts_path}" "${run_root}/sharing_hosts.config"
 if [[ -n "${failure_spec_path}" ]]; then
   cp "${failure_spec_path}" "${run_root}/failure_spec.xml"
 fi
 chmod +x "${run_root}/scripts/apply_network_failures.py" "${run_root}/scripts/cloudlab/gen_committee.py"
-rm -f "${tar_path}" "${failure_hosts_path}" "${agent_hosts_path}"
+rm -f "${tar_path}" "${failure_hosts_path}" "${agent_hosts_path}" "${sharing_hosts_path}"
 if [[ -n "${failure_spec_path}" ]]; then
   rm -f "${failure_spec_path}"
 fi
@@ -856,6 +876,14 @@ cd "${run_root}/${workspace_rel}"
 CARGO_TARGET_DIR="${run_root}/target" cargo build --release --features node/benchmark --bin node --bin "${client_bin_src}"
 cp "${run_root}/target/release/node" "${run_root}/bin/node"
 cp "${run_root}/target/release/${client_bin_src}" "${run_root}/bin/client"
+
+if [[ "${mode}" == "sharing" ]]; then
+  export PATH="$HOME/go/bin:/usr/local/go/bin:${PATH}"
+  command -v go >/dev/null 2>&1 || { echo "go not found on $(hostname); run scripts/cloudlab/setup.sh first." >&2; exit 1; }
+  echo "Building report-chain (sharing) binary with $(go version)"
+  (cd "${run_root}/SmartBFT" && GOCACHE="${run_root}/gocache" go build -o "${run_root}/bin/smartbft-sharing" ./examples/sharing) \
+    > "${run_root}/logs/sharing_build.log" 2>&1 || { tail -n 40 "${run_root}/logs/sharing_build.log" >&2; exit 1; }
+fi
 REMOTE
     ) &
     pids+=("$!")
@@ -1222,7 +1250,10 @@ REMOTE
           "${PROTOCOL_NAME}" \
           "${AGENT_PROTOCOL}" \
           "${SCHEDULE_FILE_REL}" \
-          "${FAILURE_SPEC_ENABLED}" <<'REMOTE'
+          "${FAILURE_SPEC_ENABLED}" \
+          "${LEARNING_FEATURE_DURATION_MS}" \
+          "${LEARNING_REWARD_DURATION_MS}" \
+          "${SHARING_COLLECT_WAIT_MS}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
@@ -1238,6 +1269,9 @@ protocol="${10}"
 agent_protocol="${11}"
 schedule_file_rel="${12}"
 failure_spec_enabled="${13}"
+feature_window_ms="${14}"
+reward_window_ms="${15}"
+sharing_collect_wait_ms="${16}"
 learning_agent_python="${HOME}/.venvs/adaptive-timer-learning-agent/bin/python"
 
 if [[ ! -x "${learning_agent_python}" ]]; then
@@ -1247,10 +1281,23 @@ if [[ ! -x "${learning_agent_python}" ]]; then
 fi
 
 agent_model_args=""
+# Sharing agents talk to each other and to their report-chain node, so they bind
+# every interface and read their peers from the hosts config.
+bind_args="--host 127.0.0.1 --port ${agent_port}"
 if [[ "${mode}" == "learning" ]]; then
   agent_model_args="--model-type ${model_type}"
+elif [[ "${mode}" == "sharing" ]]; then
+  agent_model_args="--model-type ${model_type}"
+  bind_args="--host 0.0.0.0 --sharing true --hosts-config ${run_root}/agent_hosts.config --collect-wait-ms ${sharing_collect_wait_ms}"
 elif [[ "${mode}" == "scheduled" ]]; then
   agent_model_args="--model-type scheduled --schedule-file ${schedule_file_rel}"
+fi
+
+# HotStuff agents give a window in which nothing committed its own length as
+# its latency, so they need the windows the replicas measure (main.py refuses
+# these flags for protocols that do not).
+if [[ "${agent_protocol}" == "hotstuff" ]]; then
+  agent_model_args="${agent_model_args} --feature-window-ms ${feature_window_ms} --reward-window-ms ${reward_window_ms}"
 fi
 
 failure_args=""
@@ -1270,7 +1317,15 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   fi
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   tmux new-session -d -s "${session_name}" \
-    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec \"${learning_agent_python}\" learning_agent/main.py --node-id ${replica_id} --protocol ${agent_protocol} --host 127.0.0.1 --port ${agent_port} --signing false ${agent_model_args} ${dataset_args} ${failure_args}' > \"${agent_log}\" 2>&1"
+    "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec \"${learning_agent_python}\" learning_agent/main.py --node-id ${replica_id} --protocol ${agent_protocol} ${bind_args} --signing false ${agent_model_args} ${dataset_args} ${failure_args}' > \"${agent_log}\" 2>&1"
+  if [[ "${mode}" == "sharing" ]]; then
+    sharing_session="${protocol}_sharing_${replica_id}"
+    # The node runs as the login user (not root) so its WAL stays removable here.
+    rm -rf "${run_root}/sharing_wal_${replica_id}"
+    tmux kill-session -t "${sharing_session}" >/dev/null 2>&1 || true
+    tmux new-session -d -s "${sharing_session}" \
+      "sudo -n ip netns exec ${ns_name} sudo -n -u $(id -un) env HOME=${HOME} bash -lc 'cd \"${run_root}\" && exec ./bin/smartbft-sharing --role server --node-id $((replica_id + 1)) --protocol ${agent_protocol} --hosts-config \"${run_root}/sharing_hosts.config\" --data-dir \"${run_root}/sharing_wal_${replica_id}\" --keep-data' > \"${run_root}/logs/sharing_${replica_id}.log\" 2>&1"
+  fi
 done
 
 sleep 2
@@ -1281,6 +1336,11 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   if ! tmux has-session -t "${session_name}" 2>/dev/null; then
     echo "Learning-agent session exited early: ${session_name}" >&2
     tail -n 80 "${agent_log}" >&2 || true
+    exit 1
+  fi
+  if [[ "${mode}" == "sharing" ]] && ! tmux has-session -t "${protocol}_sharing_${replica_id}" 2>/dev/null; then
+    echo "Report-chain session exited early: ${protocol}_sharing_${replica_id}" >&2
+    tail -n 80 "${run_root}/logs/sharing_${replica_id}.log" >&2 || true
     exit 1
   fi
 done
@@ -1533,7 +1593,7 @@ sessions="$(tmux ls -F '#S' 2>/dev/null || true)"
 printf '%s\n' "${sessions}" | while read -r session_name; do
   [[ -z "${session_name}" ]] && continue
   case "${session_name}" in
-    "${protocol}_server_"*|"${protocol}_worker_"*|"${protocol}_applier_"*|"${protocol}_agent_"*|"${protocol}_client")
+    "${protocol}_server_"*|"${protocol}_worker_"*|"${protocol}_applier_"*|"${protocol}_agent_"*|"${protocol}_sharing_"*|"${protocol}_client")
       tmux send-keys -t "${session_name}" C-c >/dev/null 2>&1 || true
       ;;
   esac
@@ -1542,7 +1602,7 @@ sleep 3
 printf '%s\n' "${sessions}" | while read -r session_name; do
   [[ -z "${session_name}" ]] && continue
   case "${session_name}" in
-    "${protocol}_server_"*|"${protocol}_worker_"*|"${protocol}_applier_"*|"${protocol}_agent_"*|"${protocol}_client")
+    "${protocol}_server_"*|"${protocol}_worker_"*|"${protocol}_applier_"*|"${protocol}_agent_"*|"${protocol}_sharing_"*|"${protocol}_client")
       tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
       ;;
   esac
@@ -1635,6 +1695,7 @@ REMOTE
     LOGS_LOCAL_DIR="${ARTIFACT_DIR}/logs"
     rm -rf "${LOGS_LOCAL_DIR}"
     mkdir -p "${LOGS_LOCAL_DIR}/servers" "${LOGS_LOCAL_DIR}/appliers" "${LOGS_LOCAL_DIR}/agents"
+    [[ "${MODE}" == "sharing" ]] && mkdir -p "${LOGS_LOCAL_DIR}/sharing"
     for i in "${!server_nodes[@]}"; do
       node="${server_nodes[$i]}"
       host="${server_hosts[$i]}"
@@ -1668,6 +1729,14 @@ REMOTE
             "${RUN_ROOT_REMOTE_NAME}/logs/agent_${replica_id}.log" \
             "${LOGS_LOCAL_DIR}/agents/agent_${replica_id}.log" \
             "agent_${replica_id}.log" \
+            "log" \
+            1
+        fi
+        if [[ "${MODE}" == "sharing" ]]; then
+          queue_artifact_download "${node}" "${host}" "${user}" \
+            "${RUN_ROOT_REMOTE_NAME}/logs/sharing_${replica_id}.log" \
+            "${LOGS_LOCAL_DIR}/sharing/sharing_${replica_id}.log" \
+            "sharing_${replica_id}.log" \
             "log" \
             1
         fi

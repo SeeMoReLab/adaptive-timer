@@ -4,7 +4,7 @@
 
 PROTOCOL_NAME="sbft"
 BEDROCK_PROTOCOL_CONFIG_REL="CppBedrock/config/config.sbft.yaml"
-SUPPORTED_MODES="normal learning scheduled"
+SUPPORTED_MODES="normal learning sharing scheduled"
 AGENT_PROTOCOL="sbft"
 SCHEDULE_FILE_REL="${SCHEDULE_FILE_REL:-learning_agent/config/schedule_sbft.csv}"
 FAILURE_SPEC_DEFAULT_REL="config/sbft/failure_spec.xml"

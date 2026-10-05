@@ -11,7 +11,7 @@
   "use_parallel_proposals": true,
   "k": 4,
   "use_fast_path": true,
-  "fast_path_timeout": 500,
+  "fast_path_timeout": 50,
   "use_ride_share": false,
   "simulate_asynchrony": false,
   "asynchrony_start": 20000,

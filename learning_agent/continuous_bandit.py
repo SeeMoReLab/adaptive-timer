@@ -1,9 +1,12 @@
 from collections import deque
+from dataclasses import dataclass
 import math
+import os
 import time
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
+from scipy.linalg import solve_triangular
 from scipy.special import betaln, digamma, polygamma
 from scipy.stats import qmc
 from sklearn.tree import DecisionTreeRegressor
@@ -22,13 +25,17 @@ from models import (
 class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
     """Maps normalized continuous actions to protocol timeout messages."""
 
-    def __init__(self, protocol: int):
+    def __init__(
+        self,
+        protocol: int,
+        bounds_ms: Tuple[int, int] = (100, 10000),
+        wait_bounds_ms: Optional[Tuple[int, int]] = None,
+    ):
         self._protocol = int(protocol)
         # timeout_values = get_timeout_values_ms(self._protocol)
         # lower_ms = min(timeout_values)
         # upper_ms = max(timeout_values)
-        lower_ms = 100
-        upper_ms = 10000
+        lower_ms, upper_ms = int(bounds_ms[0]), int(bounds_ms[1])
         if lower_ms <= 0 or upper_ms <= lower_ms:
             raise ValueError(
                 f"Invalid continuous timeout bounds: {lower_ms}..{upper_ms}ms"
@@ -38,21 +45,39 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
             agent_pb2.PROTOCOL_PBFT,
             agent_pb2.PROTOCOL_SMARTBFT,
             agent_pb2.PROTOCOL_TENDERMINT,
+            agent_pb2.PROTOCOL_HOTSTUFF,
         ):
+            if wait_bounds_ms is not None:
+                raise ValueError(
+                    "wait_bounds_ms is SBFT's fast-path wait; "
+                    f"{agent_pb2.Protocol.Name(self._protocol)} has one timeout dimension"
+                )
             self._action_dim = 1
+            self._bounds_ms: Tuple[Tuple[int, int], ...] = ((lower_ms, upper_ms),)
+        elif self._protocol == agent_pb2.PROTOCOL_SBFT:
+            # Dimension 0 the election timeout T, dimension 1 the fast-path wait W.
+            if wait_bounds_ms is None:
+                raise ValueError("SBFT continuous actions need wait_bounds_ms")
+            wait_lower_ms, wait_upper_ms = int(wait_bounds_ms[0]), int(wait_bounds_ms[1])
+            if wait_lower_ms <= 0 or wait_upper_ms <= wait_lower_ms:
+                raise ValueError(
+                    f"Invalid continuous wait bounds: {wait_lower_ms}..{wait_upper_ms}ms"
+                )
+            self._action_dim = 2
+            self._bounds_ms = ((lower_ms, upper_ms), (wait_lower_ms, wait_upper_ms))
         else:
             raise ValueError(
                 "Continuous timeout actions currently support only PBFT, "
-                "SmartBFT and Tendermint"
+                "SmartBFT, SBFT, Tendermint and HotStuff"
             )
-
-        self._bounds_ms: Tuple[Tuple[int, int], ...] = tuple(
-            (lower_ms, upper_ms) for _ in range(self._action_dim)
-        )
 
     @property
     def action_dim(self) -> int:
         return self._action_dim
+
+    @property
+    def protocol(self) -> int:
+        return self._protocol
 
     @property
     def bounds_ms(self) -> Tuple[Tuple[int, int], ...]:
@@ -120,6 +145,19 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
                     election_timeout_milliseconds=timeout_values[0]
                 )
             )
+        if self._protocol == agent_pb2.PROTOCOL_SBFT:
+            return agent_pb2.Timeout(
+                sbft=agent_pb2.SbftTimeout(
+                    election_timeout_milliseconds=timeout_values[0],
+                    slow_path_timeout_milliseconds=timeout_values[1],
+                )
+            )
+        if self._protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+            return agent_pb2.Timeout(
+                hotstuff=agent_pb2.HotstuffTimeout(
+                    timeout_delay_milliseconds=timeout_values[0]
+                )
+            )
         propose_timeout_ms, prevote_timeout_ms, precommit_timeout_ms = (
             tendermint_timeouts_from_propose(timeout_values[0])
         )
@@ -137,6 +175,10 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
                 action = action.pbft
             elif self._protocol == agent_pb2.PROTOCOL_SMARTBFT:
                 action = action.smartbft
+            elif self._protocol == agent_pb2.PROTOCOL_SBFT:
+                action = action.sbft
+            elif self._protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+                action = action.hotstuff
             else:
                 action = action.tendermint
 
@@ -147,6 +189,13 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
             timeout_values = [
                 int(getattr(action, "election_timeout_milliseconds"))
             ]
+        elif self._protocol == agent_pb2.PROTOCOL_SBFT:
+            timeout_values = [
+                int(getattr(action, "election_timeout_milliseconds")),
+                int(getattr(action, "slow_path_timeout_milliseconds")),
+            ]
+        elif self._protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+            timeout_values = [int(getattr(action, "timeout_delay_milliseconds"))]
         else:
             propose_timeout_ms = int(
                 getattr(action, "propose_timeout_milliseconds")
@@ -586,6 +635,723 @@ class ContinuousHeuristicTimeoutModel(TensorModel):
         self._held_timeout_ms = self._initial_timeout_ms
 
 
+# --- Simulator-pretrained Gaussian-process bandit -----------------------------
+
+_PRIOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pretrained_models")
+
+# Action range of --model-type=continuous on Tendermint, and where its prior ships.
+CONTINUOUS_TENDERMINT_BOUNDS_MS: Tuple[int, int] = (100, 3000)
+DEFAULT_TENDERMINT_PRIOR_PATH = os.path.join(_PRIOR_DIR, "continuous_tendermint_prior.npz")
+
+
+@dataclass(frozen=True)
+class ContextSpec:
+    """What --model-type=continuous reads and plays on one protocol.
+
+    The context vector is log1p of ``log_fields`` followed by ``raw_fields``
+    verbatim, in that order; ``length_scales`` has one GP length scale per
+    context dimension (inf drops the field from the kernel; the prior still
+    reads it). ``bounds_ms`` is the codec's action range (SBFT's election
+    timeout), ``wait_bounds_ms`` SBFT's fast-path wait range (None on the
+    one-dimensional protocols), ``prior_path`` where the simulator-trained
+    prior ships (input_dim = context_dim + action_dim, trained on the agent's
+    reward design) and ``simulator`` the script that trains it.
+    """
+
+    log_fields: Tuple[str, ...]
+    raw_fields: Tuple[str, ...]
+    length_scales: Tuple[float, ...]
+    bounds_ms: Tuple[int, int]
+    prior_path: str
+    simulator: str
+    wait_bounds_ms: Optional[Tuple[int, int]] = None
+
+    def __post_init__(self) -> None:
+        if len(self.length_scales) != len(self.log_fields) + len(self.raw_fields):
+            raise ValueError(
+                f"{len(self.length_scales)} length scales for "
+                f"{len(self.log_fields) + len(self.raw_fields)} context fields"
+            )
+
+    @property
+    def context_dim(self) -> int:
+        return len(self.length_scales)
+
+
+# Log-scaled report fields the model reads, in TENDERMINT_REPORT_FEATURE_FIELD_NAMES
+# terms, plus the violation rate.
+_TENDERMINT_CONTEXT_LOG_FIELDS: Tuple[str, ...] = (
+    "avg_consensus_latency_ms",
+    "p50_consensus_latency_ms",
+    "p90_consensus_latency_ms",
+    "propose_latency_ms",
+    "prevote_latency_ms",
+    "precommit_latency_ms",
+    "throughput_tps",
+    "avg_batch_size",
+)
+# GP length scales per context dimension: 0.3 in log units is a factor of 1.35.
+# The GP tells contexts apart only by p50 latency, throughput and violation
+# rate. The other fields swing from one 8 s window to the next within a phase
+# (p3 prevote latency 77-143 ms), which made every window a new context and
+# kept the GP from pooling a phase's evidence. inf drops a field from the
+# kernel; the prior still reads every field.
+_TENDERMINT_CONTEXT_LENGTH_SCALES: Tuple[float, ...] = (
+    math.inf,  # avg_consensus_latency_ms
+    0.3,  # p50_consensus_latency_ms
+    math.inf, math.inf, math.inf, math.inf,  # p90, propose, prevote, precommit
+    0.2,  # throughput_tps
+    math.inf,  # avg_batch_size
+    0.15,  # timeout_violation_rate
+)
+
+# PBFT and SmartBFT share the 16-field report (PBFT_REPORT_FEATURE_FIELD_NAMES).
+# view_change_count stands in for Tendermint's violation rate. timeout_ms, the
+# applied election timeout, is left out on purpose: the model's own last pick
+# in the context drove a two-cycle (H15).
+_PBFT_CONTEXT_LOG_FIELDS: Tuple[str, ...] = (
+    "avg_consensus_latency_ms",
+    "p50_consensus_latency_ms",
+    "p95_consensus_latency_ms",
+    "throughput_tps",
+    "avg_batch_size",
+    "p50_inter_commit_gap_ms",
+    "view_change_count",
+)
+# Same reading as the Tendermint scales; 0.7 on the log1p count is a factor
+# of 2 in view changes (quiet windows report 0, a PBFT storm 3-5 per 10 s
+# window, a SmartBFT storm about 18).
+_PBFT_CONTEXT_LENGTH_SCALES: Tuple[float, ...] = (
+    math.inf,  # avg_consensus_latency_ms
+    0.3,  # p50_consensus_latency_ms
+    math.inf,  # p95_consensus_latency_ms
+    0.2,  # throughput_tps
+    math.inf, math.inf,  # avg_batch_size, p50_inter_commit_gap_ms
+    0.7,  # view_change_count
+)
+
+# SBFT's report is PBFT's plus the phase latencies and path counts
+# (SBFT_REPORT_FEATURE_FIELD_NAMES); the fast and slow path counts join
+# view_change_count in the kernel. pre_prepare_latency_ms (pre-prepare to
+# certificate) carries the model's own W on a miss, so the prior reads it but
+# the kernel does not. The (T, W) applied while the context was measured is not
+# part of it: the prior's 3-episode return already handles a T that escapes a
+# delayed leader, and with the applied pair as an input the policy cycled
+# through its own last pick (runs/2026-10-01-sbft-continuous, 22:55: three of
+# five fits good without it, one or two with it). The leader's n-th prepare
+# gap and its seen/unseen counts tell a miss the wait could catch (a gap under
+# the slow path) from one it cannot (unseen by execution, as with a crashed
+# replica); the prior reads them, the kernel does not.
+_SBFT_CONTEXT_LOG_FIELDS: Tuple[str, ...] = (
+    "avg_consensus_latency_ms",
+    "p50_consensus_latency_ms",
+    "p95_consensus_latency_ms",
+    "throughput_tps",
+    "avg_batch_size",
+    "p50_inter_commit_gap_ms",
+    "view_change_count",
+    "pre_prepare_latency_ms",
+    "prepare_latency_ms",
+    "fast_path_count",
+    "slow_path_count",
+    "nth_prepare_gap_ms",
+    "nth_prepare_seen_count",
+    "nth_prepare_unseen_count",
+)
+_SBFT_CONTEXT_LENGTH_SCALES: Tuple[float, ...] = (
+    math.inf,  # avg_consensus_latency_ms
+    0.3,  # p50_consensus_latency_ms
+    math.inf,  # p95_consensus_latency_ms
+    0.2,  # throughput_tps
+    math.inf, math.inf,  # avg_batch_size, p50_inter_commit_gap_ms
+    0.7,  # view_change_count
+    math.inf, math.inf,  # pre_prepare_latency_ms, prepare_latency_ms
+    0.7,  # fast_path_count
+    0.7,  # slow_path_count
+    math.inf, math.inf, math.inf,  # nth_prepare_gap_ms, _seen_count, _unseen_count
+)
+
+CONTEXT_SPECS: Dict[int, ContextSpec] = {
+    agent_pb2.PROTOCOL_TENDERMINT: ContextSpec(
+        log_fields=_TENDERMINT_CONTEXT_LOG_FIELDS,
+        raw_fields=("timeout_violation_rate",),
+        length_scales=_TENDERMINT_CONTEXT_LENGTH_SCALES,
+        bounds_ms=CONTINUOUS_TENDERMINT_BOUNDS_MS,
+        prior_path=DEFAULT_TENDERMINT_PRIOR_PATH,
+        simulator="tendermint_sim.py",
+    ),
+    # Top rung 1200; base p50 94-168 across hosts, so 100 sits under the floor.
+    agent_pb2.PROTOCOL_PBFT: ContextSpec(
+        log_fields=_PBFT_CONTEXT_LOG_FIELDS,
+        raw_fields=(),
+        length_scales=_PBFT_CONTEXT_LENGTH_SCALES,
+        bounds_ms=(100, 3000),
+        prior_path=os.path.join(_PRIOR_DIR, "continuous_pbft_prior.npz"),
+        simulator="pbft_sim.py",
+    ),
+    # 1800 is the only rung that survives 5+150 and 800 still storms there.
+    agent_pb2.PROTOCOL_SMARTBFT: ContextSpec(
+        log_fields=_PBFT_CONTEXT_LOG_FIELDS,
+        raw_fields=(),
+        length_scales=_PBFT_CONTEXT_LENGTH_SCALES,
+        bounds_ms=(100, 4000),
+        prior_path=os.path.join(_PRIOR_DIR, "continuous_smartbft_prior.npz"),
+        simulator="smartbft_sim.py",
+    ),
+    # Two-dimensional action: election timeout T in bounds_ms, fast-path wait
+    # W in wait_bounds_ms.
+    agent_pb2.PROTOCOL_SBFT: ContextSpec(
+        log_fields=_SBFT_CONTEXT_LOG_FIELDS,
+        raw_fields=(),
+        length_scales=_SBFT_CONTEXT_LENGTH_SCALES,
+        bounds_ms=(100, 3000),
+        prior_path=os.path.join(_PRIOR_DIR, "continuous_sbft_prior.npz"),
+        simulator="sbft_sim.py",
+        wait_bounds_ms=(10, 500),
+    ),
+    # HotStuff's report is PBFT's field for field (models.py). A healthy round
+    # is 2h, so the 100 ms lower bound sits at the block-delay floor of a 5 ms
+    # link; 2000 is three times what 5+150 needs.
+    agent_pb2.PROTOCOL_HOTSTUFF: ContextSpec(
+        log_fields=_PBFT_CONTEXT_LOG_FIELDS,
+        raw_fields=(),
+        length_scales=_PBFT_CONTEXT_LENGTH_SCALES,
+        bounds_ms=(100, 2000),
+        prior_path=os.path.join(_PRIOR_DIR, "continuous_hotstuff_prior.npz"),
+        simulator="hotstuff_sim.py",
+    ),
+}
+
+
+def context_spec(protocol: int) -> ContextSpec:
+    spec = CONTEXT_SPECS.get(int(protocol))
+    if spec is None:
+        raise ValueError(
+            "--model-type=continuous has no context spec for "
+            f"{agent_pb2.Protocol.Name(int(protocol))}; it runs on PBFT, SmartBFT, "
+            "SBFT, Tendermint and HotStuff"
+        )
+    return spec
+
+
+def report_context(
+    spec: ContextSpec, field_names: Tuple[str, ...], features: np.ndarray
+) -> np.ndarray:
+    """Context vector for one report: log1p of spec.log_fields, then spec.raw_fields.
+
+    The model's own previous timeout is deliberately not part of it: with it,
+    each replica's last pick fed back into its next one and drove a two-cycle
+    between low and high timeouts in p3.
+    """
+    row = np.asarray(features, dtype=float).reshape(-1)
+    values = [
+        math.log1p(max(0.0, float(row[field_names.index(name)])))
+        for name in spec.log_fields
+    ]
+    values.extend(float(row[field_names.index(name)]) for name in spec.raw_fields)
+    return np.asarray(values, dtype=float)
+
+
+def tendermint_context(field_names: Tuple[str, ...], features: np.ndarray) -> np.ndarray:
+    return report_context(CONTEXT_SPECS[agent_pb2.PROTOCOL_TENDERMINT], field_names, features)
+
+
+class NumpyMLP:
+    """ReLU MLP regressor evaluated in numpy, loaded from an .npz of weights."""
+
+    def __init__(self, path: str):
+        data = np.load(path)
+        count = int(data["n_layers"])
+        self._weights = [data[f"W{i}"] for i in range(count)]
+        self._biases = [data[f"b{i}"] for i in range(count)]
+        self._x_mean = data["x_mean"]
+        self._x_std = data["x_std"]
+        self._y_mean = float(data["y_mean"])
+        self._y_std = float(data["y_std"])
+        self.reward_design = str(data["reward_design"])
+        # A prior fit on log(reward) (smartbft_sim.train_prior) says so; its outputs are
+        # exponentiated back to reward units so the GP residual stays in those units.
+        self.target_log = bool(int(data["target_log"])) if "target_log" in data else False
+        # Episodes the action was held for in training (tendermint_sim train
+        # --hold-episodes); the target was the mean reward over the hold. 1 = one
+        # episode's reward, the SimPriorGPModel prior.
+        self.hold_episodes = int(data["hold_episodes"]) if "hold_episodes" in data else 1
+        # Rewards below this were fit as this value (tendermint_sim train
+        # --target-floor); -inf when the prior was fit to the raw reward.
+        self.target_floor = float(data["target_floor"]) if "target_floor" in data else -math.inf
+
+    @property
+    def input_dim(self) -> int:
+        return int(self._x_mean.size)
+
+    @property
+    def y_std(self) -> float:
+        """Standard deviation of the training target, the reward's natural scale."""
+        return self._y_std
+
+    def predict(self, inputs: np.ndarray) -> np.ndarray:
+        h = (np.asarray(inputs, dtype=float) - self._x_mean) / self._x_std
+        for i, (w, b) in enumerate(zip(self._weights, self._biases)):
+            h = h @ w + b
+            if i < len(self._weights) - 1:
+                h = np.maximum(h, 0.0)
+        out = h.reshape(-1) * self._y_std + self._y_mean
+        return np.exp(out) if self.target_log else out
+
+
+# Default floor for an untrained prior. SimReturnGPModel needs a finite one -
+# it applies the same floor to the online reward so the residual compares like
+# with like - and -2 is the value the simulators' --target-floor help quotes.
+DEFAULT_UNTRAINED_TARGET_FLOOR = -2.0
+
+
+class ZeroPrior:
+    """NumpyMLP's surface with no simulator knowledge: it predicts 0 everywhere.
+
+    The "untrained" arm of the pretraining ablation. The GP machinery is
+    unchanged - same grid, same kernel, same confidence bound - but the
+    residual it fits is the reward itself rather than the reward's distance
+    from a simulator's guess, so everything the model knows it learned online.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        reward_design: str,
+        target_floor: float = DEFAULT_UNTRAINED_TARGET_FLOOR,
+    ):
+        self._input_dim = int(input_dim)
+        self.reward_design = str(reward_design)
+        self.target_log = False
+        self.hold_episodes = 1
+        self.target_floor = float(target_floor)
+
+    @property
+    def input_dim(self) -> int:
+        return self._input_dim
+
+    @property
+    def y_std(self) -> float:
+        """1.0: with no fitted target there is no scale to carry, so the GP's
+        constants act on the reward in its own units."""
+        return 1.0
+
+    def predict(self, inputs: np.ndarray) -> np.ndarray:
+        return np.zeros(len(np.atleast_2d(np.asarray(inputs, dtype=float))))
+
+
+class SimPriorGPModel(TensorModel):
+    """Continuous contextual bandit: simulator prior plus online GP residual.
+
+    The reward of timeout ``a`` in context ``z`` is modelled as
+    ``prior(z, a) + f(z, a)``. ``prior`` is an MLP trained offline on the
+    protocol's simulator (``ContextSpec.simulator``; randomized environments,
+    never the failure spec);
+    ``f`` is a Gaussian process fitted online to what the prior got wrong on
+    this deployment. ``f`` has a level shared by every timeout in a context
+    (``level_std``) plus a part local in the timeout, so a context-wide miss
+    of the prior (as in p3, where it is optimistic at every timeout) lowers
+    untried timeouts too instead of only the one played. Each decision plays,
+    over a log-spaced grid of timeouts,
+    the argmax of the lower confidence bound ``prior + mean - confidence * sd``
+    of the posterior: a timeout nobody has tried in this context is discounted
+    by its uncertainty, so after a failure the model moves toward timeouts it
+    has evidence for rather than toward an untried one the prior is optimistic
+    about, and a context it has not seen at all falls back on the prior.
+
+    The action is the normalized log timeout of ``action_codec``; on SBFT it
+    is the pair (election timeout, fast-path wait), searched over the product
+    grid ``grid_size`` x ``wait_grid_size`` with a product RBF kernel over the
+    two. The context, scales, and prior come from
+    ``CONTEXT_SPECS[action_codec.protocol]``.
+    There is no floor, clamp, or rule other than the codec's range.
+    """
+
+    def __init__(
+        self,
+        action_codec: ContinuousTimeoutActionCodec,
+        field_names: Tuple[str, ...],
+        prior_path: Optional[str],
+        reward_design: str,
+        grid_size: int = 64,
+        signal_std: float = 0.08,
+        noise_std: float = 0.04,
+        action_length_scale: float = 0.1,
+        memory_size: int = 256,
+        confidence: float = 1.0,
+        level_std: float = 0.2,
+        wait_grid_size: int = 16,
+    ):
+        action_dim = int(action_codec.action_dim)
+        if action_dim not in (1, 2):
+            raise ValueError(
+                f"SimPriorGPModel supports one or two timeout dimensions, got {action_dim}"
+            )
+        for name, value in (
+            ("grid_size", grid_size),
+            ("wait_grid_size", wait_grid_size),
+            ("memory_size", memory_size),
+        ):
+            if int(value) <= 1:
+                raise ValueError(f"{name} must be > 1, got {value}")
+        for name, value in (
+            ("signal_std", signal_std),
+            ("noise_std", noise_std),
+            ("action_length_scale", action_length_scale),
+            ("confidence", confidence),
+            ("level_std", level_std),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be > 0, got {value}")
+
+        self._codec = action_codec
+        self._action_dim = action_dim
+        self._spec = context_spec(action_codec.protocol)
+        self._field_names = tuple(field_names)
+        self._obs_dim = len(self._field_names)
+        for name in self._spec.log_fields + self._spec.raw_fields:
+            if name not in self._field_names:
+                raise ValueError(
+                    f"Context field {name} is not in the report fields given"
+                )
+        context_dim_for_prior = self._spec.context_dim
+        if prior_path is None:
+            # Untrained: no simulator pretraining, the GP fits the reward itself.
+            self._prior = ZeroPrior(
+                input_dim=context_dim_for_prior + action_dim,
+                reward_design=reward_design,
+            )
+        elif not os.path.isfile(prior_path):
+            raise FileNotFoundError(
+                f"Prior {prior_path} does not exist; train it with "
+                f"{self._spec.simulator} train --reward-design {reward_design}"
+            )
+        else:
+            self._prior = NumpyMLP(prior_path)
+        if self._prior.reward_design != reward_design:
+            raise ValueError(
+                f"Prior {prior_path} was trained on {self._prior.reward_design}, "
+                f"but the agent runs {reward_design}; retrain it with "
+                f"{self._spec.simulator} train --reward-design {reward_design}"
+            )
+        context_dim = self._spec.context_dim
+        if self._prior.input_dim != context_dim + action_dim:
+            raise ValueError(
+                f"Prior {prior_path} takes {self._prior.input_dim} inputs, "
+                f"expected {context_dim + action_dim} (context + action)"
+            )
+        if action_dim == 1:
+            self._grid = np.linspace(0.0, 1.0, int(grid_size))
+            self._mid_index = int(grid_size) // 2
+        else:
+            # One (T, W) row per pair, T major.
+            timeouts = np.linspace(0.0, 1.0, int(grid_size))
+            waits = np.linspace(0.0, 1.0, int(wait_grid_size))
+            self._grid = np.column_stack(
+                (np.repeat(timeouts, waits.size), np.tile(waits, timeouts.size))
+            )
+            # T major, W minor: the middle of both axes, not of the flat index.
+            self._mid_index = (int(grid_size) // 2) * int(wait_grid_size) + int(
+                wait_grid_size
+            ) // 2
+            self._grid_axes = (timeouts, waits)
+        self._signal_var = float(signal_std) ** 2
+        self._noise_var = float(noise_std) ** 2
+        self._scales = np.asarray(
+            self._spec.length_scales + (float(action_length_scale),) * action_dim,
+            dtype=float,
+        )
+        self._memory_size = int(memory_size)
+        self._confidence = float(confidence)
+        # Shared by every timeout in a context: how far the prior's level can
+        # be off there as a whole (the Tendermint prior's simulator holdout
+        # RMSE, 0.204; another protocol's prior passes its own).
+        self._level_var = float(level_std) ** 2
+        self.reset_model()
+
+    def _kernel(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        d = self._action_dim
+        diff = (a[:, None, :] - b[None, :, :]) / self._scales
+        sq = diff * diff
+        context = np.exp(-0.5 * np.sum(sq[:, :, :-d], axis=2))
+        # Product RBF over the action dimensions; at d = 1 the sum is the one term.
+        action = np.exp(-0.5 * np.sum(sq[:, :, -d:], axis=2))
+        return context * (self._level_var + self._signal_var * action)
+
+    def _kernel_grid(self, a: np.ndarray, context: np.ndarray) -> np.ndarray:
+        """``_kernel(a, _inputs(context, _grid))`` for d = 2, with the context factor
+        computed once per row of ``a`` instead of once per (row, grid point), since
+        every grid row carries the same context. Equal to ``_kernel`` up to rounding."""
+        d = self._action_dim
+        dc = (a[:, :-d] - context.reshape(1, -1)) / self._scales[:-d]
+        context_factor = np.exp(-0.5 * np.sum(dc * dc, axis=1))
+        # The grid is the product of its T and W axes (T major) and the action kernel a
+        # product of per-axis RBFs, so it factors into a (rows, T) and a (rows, W) table.
+        timeouts, waits = self._grid_axes
+        dt = (a[:, -2, None] - timeouts[None, :]) / self._scales[-2]
+        dw = (a[:, -1, None] - waits[None, :]) / self._scales[-1]
+        action = (
+            np.exp(-0.5 * dt * dt)[:, :, None] * np.exp(-0.5 * dw * dw)[:, None, :]
+        ).reshape(len(a), -1)
+        return context_factor[:, None] * (self._level_var + self._signal_var * action)
+
+    def _inputs(self, context: np.ndarray, actions: np.ndarray) -> np.ndarray:
+        return np.hstack(
+            (
+                np.repeat(context.reshape(1, -1), len(actions), axis=0),
+                actions.reshape(-1, self._action_dim),
+            )
+        )
+
+    def _choose(self, context: np.ndarray) -> np.ndarray | float:
+        """The chosen grid row: a float at d = 1, a (T, W) pair at d = 2."""
+        grid_inputs = self._inputs(context, self._grid)
+        prior = self._prior.predict(grid_inputs)
+        if not self._residuals:
+            # A flat prior (ZeroPrior, before anything is learned) makes argmax
+            # pick index 0, the shortest timeout, on every protocol. Nothing in
+            # the model prefers it, so open in the middle of the range instead.
+            if float(np.ptp(prior)) == 0.0:
+                return self._grid[self._mid_index]
+            return self._grid[int(np.argmax(prior))]
+
+        x = np.asarray(self._inputs_seen, dtype=float)
+        y = np.asarray(self._residuals, dtype=float)
+        k_xx = self._kernel(x, x) + self._noise_var * np.eye(len(x))
+        k_xg = (
+            self._kernel(x, grid_inputs)
+            if self._action_dim == 1
+            else self._kernel_grid(x, context)
+        )
+        chol = np.linalg.cholesky(k_xx)
+        alpha = np.linalg.solve(chol.T, np.linalg.solve(chol, y))
+        v = (
+            np.linalg.solve(chol, k_xg)
+            if self._action_dim == 1
+            else solve_triangular(chol, k_xg, lower=True)
+        )
+        mean = k_xg.T @ alpha
+        prior_var = self._level_var + self._signal_var
+        sd = np.sqrt(np.clip(prior_var - np.sum(v * v, axis=0), 0.0, None))
+        return self._grid[int(np.argmax(prior + mean - self._confidence * sd))]
+
+    def predict_action(self, features: np.ndarray) -> np.ndarray:
+        row = np.asarray(features, dtype=float).reshape(-1)
+        if row.size != self._obs_dim:
+            raise ValueError(f"Expected {self._obs_dim} features, got {row.size}")
+        action = self._choose(report_context(self._spec, self._field_names, row))
+        # A copy, never a view of the grid.
+        return np.array(action, dtype=float).reshape(-1)
+
+    def update_model(
+        self,
+        features: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray | float,
+        backward: bool = True,
+    ) -> float:
+        row = np.asarray(features, dtype=float).reshape(-1)
+        if row.size != self._obs_dim:
+            raise ValueError(f"Expected {self._obs_dim} features, got {row.size}")
+        action = np.asarray(actions, dtype=float).reshape(-1)
+        if action.size != self._action_dim:
+            raise ValueError(
+                f"Expected {self._action_dim} action values, got {action.size}"
+            )
+        reward = float(np.asarray(rewards, dtype=float).reshape(-1)[0])
+        inputs = np.append(report_context(self._spec, self._field_names, row), action)
+        residual = reward - float(self._prior.predict(inputs.reshape(1, -1))[0])
+        self._inputs_seen.append(inputs)
+        self._residuals.append(residual)
+        return residual
+
+    def reset_model(self) -> None:
+        self._inputs_seen: deque[np.ndarray] = deque(maxlen=self._memory_size)
+        self._residuals: deque[float] = deque(maxlen=self._memory_size)
+
+
+def return_prior_path(protocol: int) -> str:
+    """Prior file of SimReturnGPModel for ``protocol``: the protocol's prior path
+    with ``_return`` before the extension (continuous_tendermint_return_prior.npz)."""
+    base, ext = os.path.splitext(context_spec(protocol).prior_path)
+    if not base.endswith("_prior"):
+        raise ValueError(f"Unexpected prior path {context_spec(protocol).prior_path}")
+    return f"{base[:-len('_prior')]}_return_prior{ext}"
+
+
+def resolve_prior_path(protocol: int, selection: str) -> Optional[str]:
+    """Which prior --model-type=continuous loads, from --prior-path.
+
+    ``""`` is the protocol's shipped return prior, ``"none"`` is untrained (a
+    zero prior, so the GP fits the reward itself), and anything else is taken
+    as a path to an ablation prior - one trained by that protocol's simulator
+    with, for example, ``--no-proposal-faults``. These three are the
+    pretraining ablation: pretrained, blind-pretrained and untrained.
+    """
+    value = (selection or "").strip()
+    if value == "none":
+        return None
+    if value:
+        return value
+    return return_prior_path(protocol)
+
+
+class SimReturnGPModel(SimPriorGPModel):
+    """SimPriorGPModel for rewards made of throughput and latency only
+    (reward_tps_latency): a floored, scale-free fit.
+
+    Such a reward scores a collapse at -5 and lower, and a prior fit to the raw
+    reward spends its error on those tails and loses the 0.1-sized structure
+    that ranks the usable timeouts (the p3 context of the tps_latency H18 draw
+    read flat from 450 to 3000 ms). The prior here is fit with a target floor
+    (tendermint_sim train --target-floor): rewards below the floor count as
+    the floor, a collapse is a collapse. The model applies the same floor to
+    the online reward, so the residual compares like with like; above the
+    floor the reward is untouched, so the ranking of usable timeouts is the
+    reward's own.
+
+    The GP residual, its kernel variances and the confidence bound are in units
+    of the prior's training-target standard deviation, so the same constants
+    serve a reward of any scale; H18's constants (signal 0.08, noise 0.04,
+    level 0.2 on a reward of spread 0.6) are 0.13, 0.066 and 0.33 in these
+    units, and level_std is wider here because this prior fits worse.
+
+    The prior may also be fit to the held-action return (--hold-episodes h >
+    1): the mean reward of holding the action h episodes from the context. On
+    Tendermint that leans high at base under this reward, so its prior is per
+    episode (hold 1). On SBFT the cost of a high T under a proposal delay lands
+    at the delay's next re-pin, up to one interval after the T that will pay it
+    was chosen, so a per-episode reward cannot see it. With h > 1 the online
+    residual is taken against the matching target: the mean of the h rewards
+    from that decision on, recorded h - 1 episodes later. At h = 1 the update
+    is the per-episode one, unchanged. A term linear in the action was
+    also tried in the residual (to extrapolate a slope to untried timeouts);
+    replayed on real histories it changed nothing where the reward carried no
+    slope and its extrapolations from two or three noisy points were wild, so
+    the residual is H18's: a context-shared level plus a local action term.
+    """
+
+    def __init__(
+        self,
+        action_codec: ContinuousTimeoutActionCodec,
+        field_names: Tuple[str, ...],
+        prior_path: Optional[str],
+        reward_design: str,
+        grid_size: int = 64,
+        signal_std: float = 0.13,
+        noise_std: float = 0.066,
+        action_length_scale: float = 0.1,
+        memory_size: int = 256,
+        confidence: float = 1.0,
+        level_std: float = 0.5,
+        wait_grid_size: int = 16,
+    ):
+        super().__init__(
+            action_codec,
+            field_names,
+            prior_path,
+            reward_design,
+            grid_size=grid_size,
+            signal_std=signal_std,
+            noise_std=noise_std,
+            action_length_scale=action_length_scale,
+            memory_size=memory_size,
+            confidence=confidence,
+            level_std=level_std,
+            wait_grid_size=wait_grid_size,
+        )
+        if not math.isfinite(self._prior.target_floor):
+            raise ValueError(
+                f"Prior {prior_path} was fit to the raw reward; SimReturnGPModel needs a "
+                f"floored fit: {self._spec.simulator} train --target-floor -2 "
+                f"--reward-design {reward_design}"
+            )
+        self._floor = float(self._prior.target_floor)
+        self._y_scale = float(self._prior.y_std)
+        if not math.isfinite(self._y_scale) or self._y_scale <= 0.0:
+            raise ValueError(f"Prior {prior_path} has a non-positive y_std")
+        self._hold = int(self._prior.hold_episodes)
+        if self._hold < 1:
+            raise ValueError(f"Prior {prior_path} has hold_episodes {self._hold}")
+        # Decisions whose h-episode return is not complete yet, (inputs, raw reward),
+        # are kept in self._pending (reset_model).
+
+    @property
+    def reward_floor(self) -> float:
+        """Online rewards below this are taken as this, as in the prior's fit."""
+        return self._floor
+
+    def reset_model(self) -> None:
+        super().reset_model()
+        self._pending = deque()
+
+    def _prior_scaled(self, inputs: np.ndarray) -> np.ndarray:
+        return self._prior.predict(inputs) / self._y_scale
+
+    def _choose(self, context: np.ndarray) -> np.ndarray | float:
+        grid_inputs = self._inputs(context, self._grid)
+        prior = self._prior_scaled(grid_inputs)
+        if not self._residuals:
+            # See SimPriorGPModel._choose: a flat prior carries no preference,
+            # so open in the middle of the range rather than at index 0.
+            if float(np.ptp(prior)) == 0.0:
+                return self._grid[self._mid_index]
+            return self._grid[int(np.argmax(prior))]
+        x = np.asarray(self._inputs_seen, dtype=float)
+        y = np.asarray(self._residuals, dtype=float)
+        k_xx = self._kernel(x, x) + self._noise_var * np.eye(len(x))
+        k_xg = (
+            self._kernel(x, grid_inputs)
+            if self._action_dim == 1
+            else self._kernel_grid(x, context)
+        )
+        chol = np.linalg.cholesky(k_xx)
+        alpha = np.linalg.solve(chol.T, np.linalg.solve(chol, y))
+        v = (
+            np.linalg.solve(chol, k_xg)
+            if self._action_dim == 1
+            else solve_triangular(chol, k_xg, lower=True)
+        )
+        mean = k_xg.T @ alpha
+        prior_var = self._level_var + self._signal_var
+        sd = np.sqrt(np.clip(prior_var - np.sum(v * v, axis=0), 0.0, None))
+        return self._grid[int(np.argmax(prior + mean - self._confidence * sd))]
+
+    def update_model(
+        self,
+        features: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray | float,
+        backward: bool = True,
+    ) -> float:
+        row = np.asarray(features, dtype=float).reshape(-1)
+        if row.size != self._obs_dim:
+            raise ValueError(f"Expected {self._obs_dim} features, got {row.size}")
+        action = np.asarray(actions, dtype=float).reshape(-1)
+        if action.size != self._action_dim:
+            raise ValueError(
+                f"Expected {self._action_dim} action values, got {action.size}"
+            )
+        inputs = np.append(report_context(self._spec, self._field_names, row), action)
+        if self._hold == 1:
+            reward = max(self._floor, float(np.asarray(rewards, dtype=float).reshape(-1)[0]))
+            residual = reward / self._y_scale - float(self._prior_scaled(inputs.reshape(1, -1))[0])
+            self._inputs_seen.append(inputs)
+            self._residuals.append(residual)
+            return residual
+        # h > 1: the oldest pending decision gets the mean of its own reward and the
+        # h - 1 that followed it, floored as the prior's targets were.
+        self._pending.append((inputs, float(np.asarray(rewards, dtype=float).reshape(-1)[0])))
+        if len(self._pending) < self._hold:
+            return float("nan")
+        target = max(self._floor, float(np.mean([r for _, r in self._pending])))
+        oldest, _ = self._pending.popleft()
+        residual = target / self._y_scale - float(self._prior_scaled(oldest.reshape(1, -1))[0])
+        self._inputs_seen.append(oldest)
+        self._residuals.append(residual)
+        return residual
+
+
 # The floor already carries its own multiplier - LatencyFloor's k, set by
 # --latency-floor-k - so this rule adds nothing on top of it by default: the
 # timeout it plays is the floor value itself.
@@ -732,7 +1498,6 @@ class LatencyFloorHeuristic(TensorModel):
     def reset_model(self) -> None:
         self._latency_floor.reset()
         self._held_timeout_ms = self._initial_timeout_ms
-
 
 
 # Candidate timeouts scored at each decision. Spread over the arm range in the

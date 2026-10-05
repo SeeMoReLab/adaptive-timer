@@ -21,6 +21,8 @@ REWARD_DESIGN="reward_tps"
 # Domain constraint on the action space: never apply a timeout below k times
 # the consensus latency the replicas are already achieving. 0 disables it.
 LATENCY_FLOOR_K=0
+# --model-type=continuous prior: "" the shipped one, "none" untrained, else a path.
+PRIOR_PATH=""
 SCHEDULE_FILE="learning_agent/config/schedule_tendermint.csv"
 LOAD_CONNECTIONS=5
 LOAD_RATE=20
@@ -75,7 +77,7 @@ trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic|floor>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -87,19 +89,20 @@ Flags:
   --log             Fetch remote Tendermint, ABCI, and client logs into the run artifact directory.
   --output-dir <path>
                     Store artifacts here instead of creating a timestamped run directory.
-  --model           Learning-agent model for learning/sharing modes: random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic|floor (default: random).
+  --model           Learning-agent model for learning/sharing modes: random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic (default: random).
                     claude and codex select claude_v2 and codex_v1.
-                    floor selects latency_floor_heuristic: it plays the latency floor itself as
-                    the timeout - a low quantile over recent committing windows - with no
-                    learning. It estimates the floor itself, so --latency-floor-k scales the
-                    timeout it plays rather than adding a separate constraint.
-  --reward-design   Reward the agent learns from: reward_tps|reward_mixed (default: reward_tps).
+  --reward-design   Reward the agent learns from: reward_tps|reward_mixed|reward_tps_latency (default: reward_tps).
                     reward_tps is throughput alone, concave past a 1000 tps knee. reward_mixed
                     also discounts it by the share of the window one fault would cost.
   --latency-floor-k <float>
                     Never apply a timeout below k * the consensus latency the replicas are
                     already achieving, estimated as a low quantile over recent committing
                     windows. 0 disables it (default: 0).
+  --prior-path <path|none>           Which pretrained prior --model continuous loads.
+                                     Empty (default) is the protocol's shipped
+                                     return prior; a path is an ablation prior
+                                     (<protocol>_sim.py train --no-proposal-faults);
+                                     "none" runs it untrained, with a zero prior.
   --schedule-file <repo-rel-path>
                     scheduled-mode oracle CSV, relative to the repo root
                     (default: learning_agent/config/schedule_tendermint.csv). It must be inside
@@ -124,7 +127,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_heuristic|latency_floor_heuristic)
+    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo)
       printf '%s\n' "${model_lower}"
       ;;
     # Short names for the two newest bandits. main.py knows them by their
@@ -135,9 +138,6 @@ normalize_agent_model_type() {
       ;;
     codex)
       printf '%s\n' "codex_v1"
-      ;;
-    floor)
-      printf '%s\n' "latency_floor_heuristic"
       ;;
     *)
       return 1
@@ -259,6 +259,14 @@ while [[ $# -gt 0 ]]; do
       REWARD_DESIGN="${2}"
       shift 2
       ;;
+    --prior-path)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --prior-path." >&2
+        exit 2
+      fi
+      PRIOR_PATH="${2}"
+      shift 2
+      ;;
     --latency-floor-k)
       if [[ $# -lt 2 || -z "${2}" ]]; then
         echo "Missing value for --latency-floor-k." >&2
@@ -326,15 +334,15 @@ else
   LEARNING_AGENT_ENABLED=1
 fi
 case "${REWARD_DESIGN}" in
-  reward_tps|reward_mixed) ;;
-  *) echo "Invalid --reward-design: ${REWARD_DESIGN}. Expected reward_tps|reward_mixed." >&2; exit 2 ;;
+  reward_tps|reward_mixed|reward_tps_latency) ;;
+  *) echo "Invalid --reward-design: ${REWARD_DESIGN}. Expected reward_tps|reward_mixed|reward_tps_latency." >&2; exit 2 ;;
 esac
 if ! [[ "${LATENCY_FLOOR_K}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   echo "Invalid --latency-floor-k: ${LATENCY_FLOOR_K}. Expected a non-negative number (0 disables the constraint)." >&2
   exit 2
 fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic|floor." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -471,6 +479,7 @@ fi
   printf 'agent_model=%q\n' "${AGENT_MODEL_TYPE}"
   printf 'reward_design=%q\n' "${REWARD_DESIGN}"
   printf 'latency_floor_k=%q\n' "${LATENCY_FLOOR_K}"
+  printf 'prior_path=%q\n' "${PRIOR_PATH:-}"
   printf 'schedule_file=%q\n' "${SCHEDULE_FILE}"
   printf 'dataset_enabled=%q\n' "${DATASET_ENABLED}"
   printf 'log_enabled=%q\n' "${LOG_ENABLED}"
@@ -522,7 +531,7 @@ rm -f "${LOCAL_PAYLOAD}"
 
 echo "Running remote CometBFT experiment on ${remote_host} (mode=${MODE}, f=${F}, t=${EXPERIMENT_TIME_S}s)..."
 remote_failed=0
-if ! ssh "${SSH_OPTS[@]}" "${remote_user}@${remote_host}" "bash -s" -- "${REMOTE_PAYLOAD}" "${REMOTE_APPLIER}" "${F}" "${EXPERIMENT_TIME_S}" "${MODE}" "${LOG_ENABLED}" "${DATASET_ENABLED}" "${LOAD_CONNECTIONS}" "${LOAD_RATE}" "${LOAD_SEND_PERIOD_MS}" "${AGENT_MODEL_TYPE}" "${REWARD_DESIGN}" "${LATENCY_FLOOR_K}" "${SCHEDULE_FILE}" <<'REMOTE'
+if ! ssh "${SSH_OPTS[@]}" "${remote_user}@${remote_host}" "bash -s" -- "${REMOTE_PAYLOAD}" "${REMOTE_APPLIER}" "${F}" "${EXPERIMENT_TIME_S}" "${MODE}" "${LOG_ENABLED}" "${DATASET_ENABLED}" "${LOAD_CONNECTIONS}" "${LOAD_RATE}" "${LOAD_SEND_PERIOD_MS}" "${AGENT_MODEL_TYPE}" "${REWARD_DESIGN}" "${LATENCY_FLOOR_K}" "${SCHEDULE_FILE}" "${PRIOR_PATH}" <<'REMOTE'
 set -euo pipefail
 
 payload_path="$1"
@@ -539,6 +548,7 @@ agent_model_type="${11}"
 reward_design="${12}"
 latency_floor_k="${13}"
 schedule_file_rel="${14}"
+prior_path="${15:-}"
 
 if [[ "${mode}" != "normal" && "${mode}" != "learning" && "${mode}" != "sharing" && "${mode}" != "scheduled" ]]; then
   echo "Unsupported mode on remote: ${mode} (supported: normal, learning, sharing, scheduled)" >&2
@@ -573,9 +583,9 @@ fi
 # two in sync: the heredoc is quoted, so the local list cannot be interpolated
 # here and a name added there is silently rejected on the remote.
 case "${agent_model_type}" in
-  random|pavlov|linear|cmab|cmab_reset|claude_v2|codex_v1|continuous|continuous_heuristic|latency_floor_heuristic) ;;
+  random|pavlov|linear|cmab|cmab_reset|claude_v2|codex_v1|continuous|continuous_heuristic) ;;
   *)
-    echo "Invalid agent_model_type: ${agent_model_type}. Use random|pavlov|linear|cmab|cmab_reset|claude_v2|codex_v1|continuous|continuous_heuristic|latency_floor_heuristic." >&2
+    echo "Invalid agent_model_type: ${agent_model_type}. Use random|pavlov|linear|cmab|cmab_reset|claude_v2|codex_v1|continuous|continuous_heuristic." >&2
     exit 2
     ;;
 esac
@@ -1104,6 +1114,11 @@ if (( learning_agent_enabled == 1 )); then
   # where the agent is choosing the timeout at all.
   if [[ "${agent_mode_args}" != "" && "${latency_floor_k}" != "0" ]]; then
     agent_mode_args="${agent_mode_args} --latency-floor-k ${latency_floor_k}"
+  fi
+  # Which pretrained prior the continuous model loads: "" the shipped return
+  # prior, "none" untrained, else a path to an ablation prior.
+  if [[ "${agent_model_type}" == "continuous" && -n "${prior_path}" ]]; then
+    agent_mode_args="${agent_mode_args} --prior-path ${prior_path}"
   fi
   for ((i = 0; i < num_nodes; i++)); do
     agent_session="tm_tendermint_agent_${i}"

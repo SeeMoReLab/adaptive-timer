@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 import time
 from pathlib import Path
-from typing import Dict, Generic, List, Optional, Sequence, Tuple, TypeVar, Any
+from typing import Any, Dict, Generic, List, Optional, Sequence, Tuple, TypeVar
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.tree import  DecisionTreeClassifier, DecisionTreeRegressor
 from collections import deque
@@ -42,16 +42,7 @@ A = TypeVar("A")  # generic action type
 
 
 class PbftTimeoutOption(IntEnum):
-    """CppBedrock PBFT election (view-change) timeout rungs.
-
-    These are the values learning_agent/config/schedule_pbft.csv plays, and
-    they are not SmartBFT's: PBFT here is the C++ engine, whose undisturbed
-    p50 is 168 ms at the base link, so its rungs sit lower than the Go
-    implementation's. The ladder, config/pbft/failure_spec.xml and the
-    schedule CSV are one calibration and have to move together; see
-    CppBedrock/adaptive_timers.MD for the measurements behind each rung.
-    """
-
+    # PBFT (CppBedrock) ladder, Kevin 2026-09-29 23:41: 250/550/1200.
     TIMEOUT_250_MS = 250
     TIMEOUT_550_MS = 550
     TIMEOUT_1200_MS = 1200
@@ -71,14 +62,10 @@ PBFT_TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
 PBFT_TIMEOUT_INDEX_TO_MS: Dict[int, int] = {
     idx: value_ms for idx, value_ms in enumerate(PBFT_TIMEOUT_VALUES_MS)
 }
-# Phase order of config/pbft/failure_spec.xml: base, base+delay 120,
-# base+delay 400, 5+50, 5+50+delay 500, 5+150, base recovery. The labels are
-# schedule_pbft.csv's, which ranks on mean episode reward rather than on
-# median throughput - the two disagree at base+delay 400.
 PBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE = {
     0: frozenset(PBFT_TIMEOUT_VALUES_MS),
     1: frozenset({250}),
-    2: frozenset({550}),
+    2: frozenset({250, 550}),
     3: frozenset({550, 1200}),
     4: frozenset({550}),
     5: frozenset({1200}),
@@ -87,8 +74,8 @@ PBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE = {
 
 
 class SmartbftTimeoutOption(IntEnum):
-    """SmartBFT (Go) election timeout rungs, and the simulator datasets'."""
-
+    # SmartBFT keeps its own ladder, Kevin 2026-09-29 23:41: 300/800/1800
+    # (the schedule and the 2026-09-12 dataset use it).
     TIMEOUT_300_MS = 300
     TIMEOUT_800_MS = 800
     TIMEOUT_1800_MS = 1800
@@ -105,9 +92,6 @@ SMARTBFT_TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(
 SMARTBFT_TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
     value_ms: idx for idx, value_ms in enumerate(SMARTBFT_TIMEOUT_VALUES_MS)
 }
-SMARTBFT_TIMEOUT_INDEX_TO_MS: Dict[int, int] = {
-    idx: value_ms for idx, value_ms in enumerate(SMARTBFT_TIMEOUT_VALUES_MS)
-}
 SMARTBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE = {
     0: frozenset(SMARTBFT_TIMEOUT_VALUES_MS),
     1: frozenset({300}),
@@ -120,16 +104,41 @@ SMARTBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE = {
 
 
 class TimeoutOption(IntEnum):
-    TIMEOUT_150_MS = 150
-    TIMEOUT_400_MS = 400
-    TIMEOUT_900_MS = 900
+    # Each rung sits just under the SBFT fast-path election floor of the next
+    # link level (150 / 275 / 600 at base / 5+50 / 5+150), so it survives its
+    # own level and storms one level up. See runs/2026-09-27-sbft-pairs.
+    TIMEOUT_250_MS = 250
+    TIMEOUT_525_MS = 525
+    TIMEOUT_1100_MS = 1100
 
 TIMEOUT_OPTIONS: Tuple[TimeoutOption, ...] = (
-    TimeoutOption.TIMEOUT_150_MS,
-    TimeoutOption.TIMEOUT_400_MS,
-    TimeoutOption.TIMEOUT_900_MS,
+    TimeoutOption.TIMEOUT_250_MS,
+    TimeoutOption.TIMEOUT_525_MS,
+    TimeoutOption.TIMEOUT_1100_MS,
 )
 TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(int(option) for option in TIMEOUT_OPTIONS)
+# The slow-path wait needs only two values, not the three the election timeout
+# needs. Its cost is `S` when the wait outlasts the straggler's lag and
+# `W + R` when it does not, so the best value is always either the floor -
+# give up at once and pay the extra round - or the smallest value above `S`.
+# A third value earns a place only when two different lags both fall inside
+# the window (floor, floor + R), and R, the extra round, is 2 * one_way + 25
+# ms, so that window is 39 ms wide at base delay. See adaptive_timers.MD.
+class SbftSlowPathOption(IntEnum):
+    TIMEOUT_50_MS = 50
+    TIMEOUT_150_MS = 150
+
+SBFT_SLOW_PATH_OPTIONS: Tuple[SbftSlowPathOption, ...] = (
+    SbftSlowPathOption.TIMEOUT_50_MS,
+    SbftSlowPathOption.TIMEOUT_150_MS,
+)
+SBFT_SLOW_PATH_VALUES_MS: Tuple[int, ...] = tuple(
+    int(option) for option in SBFT_SLOW_PATH_OPTIONS
+)
+SBFT_SLOW_PATH_MS_TO_INDEX: Dict[int, int] = {
+    value_ms: idx for idx, value_ms in enumerate(SBFT_SLOW_PATH_VALUES_MS)
+}
+
 TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
     value_ms: idx for idx, value_ms in enumerate(TIMEOUT_VALUES_MS)
 }
@@ -139,25 +148,20 @@ TIMEOUT_INDEX_TO_MS: Dict[int, int] = {
 
 
 class TendermintProposeTimeoutOption(IntEnum):
-    # One arm per measured optimum, from every CloudLab run pooled by the
-    # timeout actually applied:
-    #   300  - the shortest value clear of the spurious-timeout cliff. Below
-    #          ~275ms the propose step's tail overruns the timer and rounds
-    #          fail with no fault present at all (1.0 leader change per window
-    #          at <175ms, 0.8 at 175-224ms, 0.0 by 275ms). Also the omission
-    #          optimum, which is flat to ~500ms and falls off above it.
-    #   700  - the sustained-50ms-delay optimum, and clear of the collapse hole
-    #          around 350-500ms that sustained 150ms delay opens up.
-    #   1100 - the sustained-150ms-delay optimum (900-1200ms bin).
-    TIMEOUT_300_MS = 300
-    TIMEOUT_700_MS = 700
-    TIMEOUT_1100_MS = 1100
+    # Calibrated on the six-phase config/tendermint/failure_spec.xml
+    # (runs/2026-09-29-tendermint-arms/report.md), one arm per regime:
+    #   150 - proposal delay only: the cheapest escape from a withheld proposal.
+    #   450 - +50 ms links: the lowest value that clears the proposal arrival.
+    #   750 - +150 ms links: rides them without the collapse 450 falls into.
+    TIMEOUT_150_MS = 150
+    TIMEOUT_450_MS = 450
+    TIMEOUT_750_MS = 750
 
 
 TENDERMINT_PROPOSE_TIMEOUT_OPTIONS: Tuple[TendermintProposeTimeoutOption, ...] = (
-    TendermintProposeTimeoutOption.TIMEOUT_300_MS,
-    TendermintProposeTimeoutOption.TIMEOUT_700_MS,
-    TendermintProposeTimeoutOption.TIMEOUT_1100_MS,
+    TendermintProposeTimeoutOption.TIMEOUT_150_MS,
+    TendermintProposeTimeoutOption.TIMEOUT_450_MS,
+    TendermintProposeTimeoutOption.TIMEOUT_750_MS,
 )
 TENDERMINT_PROPOSE_TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(
     int(option) for option in TENDERMINT_PROPOSE_TIMEOUT_OPTIONS
@@ -169,15 +173,21 @@ TENDERMINT_PROPOSE_TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
 
 
 class HotstuffTimeoutOption(IntEnum):
-    TIMEOUT_800_MS = 800
-    TIMEOUT_2000_MS = 2000
-    TIMEOUT_5000_MS = 5000
+    # 160 and 460 sit just under what the next link level needs (one-way 5+50:
+    # 170 still locks into 3-hop rounds, 180 runs clean; 5+150: about 470), so
+    # each works at its own level and fails one level up; 760 keeps the 300 ms
+    # gap and clears the 4h band where 5+150 is bistable (no TCP_NODELAY, a
+    # vote after a Timeout waits an RTT). Calibrated 2026-10-02 against
+    # config/hotstuff/failure_spec.xml.
+    TIMEOUT_160_MS = 160
+    TIMEOUT_460_MS = 460
+    TIMEOUT_760_MS = 760
 
 
 HOTSTUFF_TIMEOUT_OPTIONS: Tuple[HotstuffTimeoutOption, ...] = (
-    HotstuffTimeoutOption.TIMEOUT_800_MS,
-    HotstuffTimeoutOption.TIMEOUT_2000_MS,
-    HotstuffTimeoutOption.TIMEOUT_5000_MS,
+    HotstuffTimeoutOption.TIMEOUT_160_MS,
+    HotstuffTimeoutOption.TIMEOUT_460_MS,
+    HotstuffTimeoutOption.TIMEOUT_760_MS,
 )
 HOTSTUFF_TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(
     int(option) for option in HOTSTUFF_TIMEOUT_OPTIONS
@@ -191,21 +201,23 @@ HOTSTUFF_TIMEOUT_INDEX_TO_MS: Dict[int, int] = {
 
 
 class AutobahnTimeoutDelayOption(IntEnum):
-    TIMEOUT_800_MS = 800
-    TIMEOUT_2000_MS = 2000
-    TIMEOUT_5000_MS = 5000
-
-
-class AutobahnFastPathTimeoutOption(IntEnum):
-    TIMEOUT_500_MS = 500
-    TIMEOUT_1500_MS = 1500
-    TIMEOUT_5000_MS = 5000
+    # The only Autobahn action (the fast-path wait is fixed in
+    # config/autobahn/parameters.json). Healthy Autobahn has no floor; the
+    # floors come from replica 3 withholding its votes, so every quorum needs
+    # all three honest replicas and a premature view change starves it. They
+    # are soft (about 400 at one-way 5+50, about 1000 at 5+150), so 250 and
+    # 750 sit as far under them as it takes to lose clearly one level up (300
+    # lost to 750 at 5+50 by only 0.03); 1250 keeps the 500 ms gap.
+    # Calibrated 2026-10-02 against config/autobahn/failure_spec.xml.
+    TIMEOUT_250_MS = 250
+    TIMEOUT_750_MS = 750
+    TIMEOUT_1250_MS = 1250
 
 
 AUTOBAHN_TIMEOUT_DELAY_OPTIONS: Tuple[AutobahnTimeoutDelayOption, ...] = (
-    AutobahnTimeoutDelayOption.TIMEOUT_800_MS,
-    AutobahnTimeoutDelayOption.TIMEOUT_2000_MS,
-    AutobahnTimeoutDelayOption.TIMEOUT_5000_MS,
+    AutobahnTimeoutDelayOption.TIMEOUT_250_MS,
+    AutobahnTimeoutDelayOption.TIMEOUT_750_MS,
+    AutobahnTimeoutDelayOption.TIMEOUT_1250_MS,
 )
 AUTOBAHN_TIMEOUT_DELAY_VALUES_MS: Tuple[int, ...] = tuple(
     int(option) for option in AUTOBAHN_TIMEOUT_DELAY_OPTIONS
@@ -213,27 +225,15 @@ AUTOBAHN_TIMEOUT_DELAY_VALUES_MS: Tuple[int, ...] = tuple(
 AUTOBAHN_TIMEOUT_DELAY_MS_TO_INDEX: Dict[int, int] = {
     value_ms: idx for idx, value_ms in enumerate(AUTOBAHN_TIMEOUT_DELAY_VALUES_MS)
 }
-AUTOBAHN_FAST_PATH_TIMEOUT_OPTIONS: Tuple[AutobahnFastPathTimeoutOption, ...] = (
-    AutobahnFastPathTimeoutOption.TIMEOUT_500_MS,
-    AutobahnFastPathTimeoutOption.TIMEOUT_1500_MS,
-    AutobahnFastPathTimeoutOption.TIMEOUT_5000_MS,
-)
-AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(
-    int(option) for option in AUTOBAHN_FAST_PATH_TIMEOUT_OPTIONS
-)
-AUTOBAHN_FAST_PATH_TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
-    value_ms: idx
-    for idx, value_ms in enumerate(AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS)
-}
 
 
 class PhaseMapping(IntEnum):
-    PHASE_0 = SmartbftTimeoutOption.TIMEOUT_300_MS
-    PHASE_1 = SmartbftTimeoutOption.TIMEOUT_300_MS
-    PHASE_2 = SmartbftTimeoutOption.TIMEOUT_300_MS
-    PHASE_3 = SmartbftTimeoutOption.TIMEOUT_800_MS
-    PHASE_4 = SmartbftTimeoutOption.TIMEOUT_800_MS
-    PHASE_5 = SmartbftTimeoutOption.TIMEOUT_1800_MS
+    PHASE_0 = PbftTimeoutOption.TIMEOUT_250_MS
+    PHASE_1 = PbftTimeoutOption.TIMEOUT_250_MS
+    PHASE_2 = PbftTimeoutOption.TIMEOUT_250_MS
+    PHASE_3 = PbftTimeoutOption.TIMEOUT_550_MS
+    PHASE_4 = PbftTimeoutOption.TIMEOUT_550_MS
+    PHASE_5 = PbftTimeoutOption.TIMEOUT_1200_MS
 
 PHASE_OPTIONS: Tuple[PhaseMapping, ...] = (
     PhaseMapping.PHASE_0,
@@ -246,7 +246,7 @@ PHASE_OPTIONS: Tuple[PhaseMapping, ...] = (
 
 PHASE_VALUES_MS: Tuple[int, ...] = tuple(int(option) for option in PHASE_OPTIONS)
 PHASE_INDEX_TO_TIMEOUT_INDEX: Dict[int, int] = {
-    idx: SMARTBFT_TIMEOUT_MS_TO_INDEX[value_ms]
+    idx: PBFT_TIMEOUT_MS_TO_INDEX[value_ms]
     for idx, value_ms in enumerate(PHASE_VALUES_MS)
 }
 
@@ -269,7 +269,9 @@ PBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "no_progress_view_change_count",
 )
 # SbftReport shares PbftReport's 16-field layout and adds the SBFT-specific
-# phase latencies and slow-path context (see proto/agent.proto).
+# phase latencies and slow-path context (see proto/agent.proto). The n-th
+# prepare fields are measured by the leader only (aggregator.py takes them from
+# the report that led the most sequences).
 SBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = PBFT_REPORT_FEATURE_FIELD_NAMES + (
     "pre_prepare_latency_ms",
     "prepare_latency_ms",
@@ -277,6 +279,9 @@ SBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = PBFT_REPORT_FEATURE_FIELD_NAM
     "slow_path_timeout_ms",
     "fast_path_count",
     "slow_path_count",
+    "nth_prepare_gap_ms",
+    "nth_prepare_seen_count",
+    "nth_prepare_unseen_count",
 )
 TENDERMINT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "total_transactions",
@@ -474,24 +479,6 @@ def autobahn_timeout_delay_index_to_ms(index: int) -> int:
     return AUTOBAHN_TIMEOUT_DELAY_VALUES_MS[index]
 
 
-def autobahn_fast_path_timeout_ms_to_index(timeout_ms: int) -> int:
-    try:
-        return AUTOBAHN_FAST_PATH_TIMEOUT_MS_TO_INDEX[timeout_ms]
-    except KeyError as exc:
-        raise ValueError(
-            f"Unsupported Autobahn fast-path timeout {timeout_ms}ms. "
-            f"Valid options: {AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS}"
-        ) from exc
-
-
-def autobahn_fast_path_timeout_index_to_ms(index: int) -> int:
-    if index < 0:
-        return AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS[0]
-    if index >= len(AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS):
-        return AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS[-1]
-    return AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS[index]
-
-
 def timeout_index_to_ms_for_protocol(protocol: int, index: int) -> int:
     protocol = _validate_protocol(protocol)
     if protocol == agent_pb2.PROTOCOL_PBFT:
@@ -507,43 +494,37 @@ def timeout_index_to_ms_for_protocol(protocol: int, index: int) -> int:
     return timeout_index_to_ms(index)
 
 
+def sbft_slow_path_ms_to_index(timeout_ms: int) -> int:
+    try:
+        return SBFT_SLOW_PATH_MS_TO_INDEX[timeout_ms]
+    except KeyError:
+        raise ValueError(
+            f"Unsupported SBFT slow-path timeout {timeout_ms}ms. "
+            f"Valid options: {SBFT_SLOW_PATH_VALUES_MS}"
+        ) from None
+
+
+def sbft_slow_path_index_to_ms(index: int) -> int:
+    bounded = max(0, min(index, len(SBFT_SLOW_PATH_VALUES_MS) - 1))
+    return SBFT_SLOW_PATH_VALUES_MS[bounded]
+
+
 def _sbft_pair_to_index(election_timeout_ms: int, slow_path_timeout_ms: int) -> int:
     election_idx = timeout_ms_to_index(election_timeout_ms)
-    slow_idx = timeout_ms_to_index(slow_path_timeout_ms)
-    base = len(TIMEOUT_VALUES_MS)
-    return (election_idx * base) + slow_idx
+    slow_idx = sbft_slow_path_ms_to_index(slow_path_timeout_ms)
+    slow_base = len(SBFT_SLOW_PATH_VALUES_MS)
+    return (election_idx * slow_base) + slow_idx
 
 
 def _sbft_index_to_pair(index: int) -> Tuple[int, int]:
-    base = len(TIMEOUT_VALUES_MS)
-    total = base * base
+    slow_base = len(SBFT_SLOW_PATH_VALUES_MS)
+    total = len(TIMEOUT_VALUES_MS) * slow_base
     bounded = max(0, min(index, total - 1))
-    election_idx = bounded // base
-    slow_idx = bounded % base
+    election_idx = bounded // slow_base
+    slow_idx = bounded % slow_base
     return (
         timeout_index_to_ms(election_idx),
-        timeout_index_to_ms(slow_idx),
-    )
-
-
-def _autobahn_pair_to_index(timeout_delay_ms: int, fast_path_timeout_ms: int) -> int:
-    # Two knobs: the view-change timer and the fast-path unanimity wait. The
-    # proto's car_timeout field is left unset; nothing in the engine reads it.
-    delay_idx = autobahn_timeout_delay_ms_to_index(timeout_delay_ms)
-    fast_idx = autobahn_fast_path_timeout_ms_to_index(fast_path_timeout_ms)
-    fast_base = len(AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS)
-    return (delay_idx * fast_base) + fast_idx
-
-
-def _autobahn_index_to_pair(index: int) -> Tuple[int, int]:
-    fast_base = len(AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS)
-    total = len(AUTOBAHN_TIMEOUT_DELAY_VALUES_MS) * fast_base
-    bounded = max(0, min(index, total - 1))
-    delay_idx = bounded // fast_base
-    fast_idx = bounded % fast_base
-    return (
-        autobahn_timeout_delay_index_to_ms(delay_idx),
-        autobahn_fast_path_timeout_index_to_ms(fast_idx),
+        sbft_slow_path_index_to_ms(slow_idx),
     )
 
 
@@ -607,15 +588,13 @@ def get_action_space_size(protocol: int) -> int:
     if protocol == agent_pb2.PROTOCOL_SMARTBFT:
         return len(SMARTBFT_TIMEOUT_VALUES_MS)
     if protocol == agent_pb2.PROTOCOL_SBFT:
-        return len(TIMEOUT_VALUES_MS) * len(TIMEOUT_VALUES_MS)
+        return len(TIMEOUT_VALUES_MS) * len(SBFT_SLOW_PATH_VALUES_MS)
     if protocol == agent_pb2.PROTOCOL_TENDERMINT:
         return len(TENDERMINT_PROPOSE_TIMEOUT_VALUES_MS)
     if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
         return len(HOTSTUFF_TIMEOUT_VALUES_MS)
     if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
-        return len(AUTOBAHN_TIMEOUT_DELAY_VALUES_MS) * len(
-            AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS
-        )
+        return len(AUTOBAHN_TIMEOUT_DELAY_VALUES_MS)
     raise ValueError(f"Unsupported protocol: {_protocol_name(protocol)}")
 
 
@@ -632,9 +611,7 @@ def timeout_to_action_index(protocol: int, timeout_used: object) -> int:
         return pbft_timeout_ms_to_index(int(timeout_msg.election_timeout_milliseconds))
     if protocol == agent_pb2.PROTOCOL_SMARTBFT:
         timeout_msg = timeout_used
-        return smartbft_timeout_ms_to_index(
-            int(timeout_msg.election_timeout_milliseconds)
-        )
+        return smartbft_timeout_ms_to_index(int(timeout_msg.election_timeout_milliseconds))
     if protocol == agent_pb2.PROTOCOL_SBFT:
         timeout_msg = timeout_used
         return _sbft_pair_to_index(
@@ -653,9 +630,8 @@ def timeout_to_action_index(protocol: int, timeout_used: object) -> int:
         return hotstuff_timeout_ms_to_index(int(timeout_msg.timeout_delay_milliseconds))
     if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
         timeout_msg = timeout_used
-        return _autobahn_pair_to_index(
-            int(timeout_msg.timeout_delay_milliseconds),
-            int(timeout_msg.fast_path_timeout_milliseconds),
+        return autobahn_timeout_delay_ms_to_index(
+            int(timeout_msg.timeout_delay_milliseconds)
         )
     raise ValueError(f"Unsupported protocol: {_protocol_name(protocol)}")
 
@@ -699,12 +675,12 @@ def action_index_to_timeout(protocol: int, index: int) -> agent_pb2.Timeout:
             hotstuff=agent_pb2.HotstuffTimeout(timeout_delay_milliseconds=timeout_ms)
         )
     if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
-        timeout_delay_ms, fast_path_timeout_ms = _autobahn_index_to_pair(index)
+        # The only Autobahn action is the view-change timer; the fast-path
+        # wait is fixed in config/autobahn/parameters.json and car_timeout is
+        # read by nothing, so both stay 0 (the replica rejects anything else).
+        timeout_ms = autobahn_timeout_delay_index_to_ms(index)
         return agent_pb2.Timeout(
-            autobahn=agent_pb2.AutobahnTimeout(
-                timeout_delay_milliseconds=timeout_delay_ms,
-                fast_path_timeout_milliseconds=fast_path_timeout_ms,
-            )
+            autobahn=agent_pb2.AutobahnTimeout(timeout_delay_milliseconds=timeout_ms)
         )
     raise ValueError(f"Unsupported protocol: {_protocol_name(protocol)}")
 
@@ -724,11 +700,7 @@ def describe_action(protocol: int, index: int) -> str:
     if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
         return f"timeout_delay_ms={hotstuff_timeout_index_to_ms(index)}"
     if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
-        timeout_delay_ms, fast_path_timeout_ms = _autobahn_index_to_pair(index)
-        return (
-            f"timeout_delay_ms={timeout_delay_ms}, "
-            f"fast_path_timeout_ms={fast_path_timeout_ms}"
-        )
+        return f"timeout_delay_ms={autobahn_timeout_delay_index_to_ms(index)}"
     propose_timeout_ms, prevote_timeout_ms, precommit_timeout_ms = _tendermint_index_to_triple(
         index
     )
@@ -845,8 +817,6 @@ class ScheduledTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
 
     @property
     def action_dim(self) -> int:
-        if self._protocol == agent_pb2.PROTOCOL_AUTOBAHN:
-            return 2
         if self._protocol == agent_pb2.PROTOCOL_SBFT:
             return 2
         return 1
@@ -912,13 +882,9 @@ class ScheduledTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
             timeout_delay_ms = _validate_scheduled_timeout_ms(
                 values[0], "Autobahn timeout delay"
             )
-            fast_path_timeout_ms = _validate_scheduled_timeout_ms(
-                values[1], "Autobahn fast-path timeout"
-            )
             return agent_pb2.Timeout(
                 autobahn=agent_pb2.AutobahnTimeout(
-                    timeout_delay_milliseconds=timeout_delay_ms,
-                    fast_path_timeout_milliseconds=fast_path_timeout_ms,
+                    timeout_delay_milliseconds=timeout_delay_ms
                 )
             )
 
@@ -983,11 +949,7 @@ class ScheduledTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
                 _validate_scheduled_timeout_ms(
                     getattr(action, "timeout_delay_milliseconds"),
                     "Autobahn timeout delay",
-                ),
-                _validate_scheduled_timeout_ms(
-                    getattr(action, "fast_path_timeout_milliseconds"),
-                    "Autobahn fast-path timeout",
-                ),
+                )
             ]
         else:
             propose_timeout_ms = _validate_scheduled_timeout_ms(
@@ -1507,22 +1469,19 @@ class ScheduledTimeoutModel(TensorModel):
                             f"Invalid HotStuff timeout at line {lineno}: {row[1]!r}"
                         ) from exc
                 elif protocol == agent_pb2.PROTOCOL_AUTOBAHN:
-                    if len(row) != 3:
+                    if len(row) != 2:
                         raise ValueError(
                             "Invalid Autobahn schedule at line "
-                            f"{lineno}: expected 3 columns "
-                            "time_s,timeout_delay_ms,fast_path_timeout_ms "
-                            f"(got {len(row)}; the car_timeout column was removed, "
-                            "nothing in the engine reads it)."
+                            f"{lineno}: expected 2 columns "
+                            "time_s,timeout_delay_ms "
+                            f"(got {len(row)}; the fast_path_timeout column was "
+                            "removed, it is fixed in config/autobahn/parameters.json)."
                         )
                     try:
-                        raw_action = (
-                            int(row[1].strip()),
-                            int(row[2].strip()),
-                        )
+                        raw_action = int(row[1].strip())
                     except ValueError as exc:
                         raise ValueError(
-                            f"Invalid Autobahn timeout at line {lineno}: {row[1:3]}"
+                            f"Invalid Autobahn timeout at line {lineno}: {row[1]!r}"
                         ) from exc
                 else:
                     if len(row) < 2:
@@ -1602,9 +1561,7 @@ class ScheduledTimeoutModel(TensorModel):
             elif self._protocol == agent_pb2.PROTOCOL_AUTOBAHN:
                 description = (
                     "timeout_delay_ms="
-                    f"{timeout.autobahn.timeout_delay_milliseconds}, "
-                    "fast_path_timeout_ms="
-                    f"{timeout.autobahn.fast_path_timeout_milliseconds}"
+                    f"{timeout.autobahn.timeout_delay_milliseconds}"
                 )
             else:
                 description = (

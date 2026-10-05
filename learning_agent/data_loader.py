@@ -8,11 +8,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 import agent_pb2
-from models import (
-    AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS,
-    AUTOBAHN_TIMEOUT_DELAY_VALUES_MS,
-    tendermint_timeouts_from_propose,
-)
+from models import tendermint_timeouts_from_propose
 from reward_utils import reward_from_report_row
 
 PBFT_LEGACY_FEATURE_ALIASES: Dict[str, Tuple[str, ...]] = {
@@ -357,7 +353,7 @@ def _extract_action_index(
             propose_timeout_ms, timeout_values_ms, row_number
         )
 
-    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+    if protocol in (agent_pb2.PROTOCOL_HOTSTUFF, agent_pb2.PROTOCOL_AUTOBAHN):
         timeout_delay_ms = _parse_timeout_ms(
             row=row,
             candidates=(
@@ -367,35 +363,6 @@ def _extract_action_index(
             row_number=row_number,
         )
         return _timeout_ms_to_index(timeout_delay_ms, timeout_values_ms, row_number)
-
-    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
-        # The two Autobahn knobs have distinct value sets, so the shared
-        # timeout_values_ms argument cannot cover them; the per-knob option
-        # tuples from models are used instead.
-        timeout_delay_ms = _parse_timeout_ms(
-            row=row,
-            candidates=(
-                "timeout_delay_milliseconds_used",
-                "timeout_delay_milliseconds",
-            ),
-            row_number=row_number,
-        )
-        fast_path_timeout_ms = _parse_timeout_ms(
-            row=row,
-            candidates=(
-                "fast_path_timeout_milliseconds_used",
-                "fast_path_timeout_milliseconds",
-            ),
-            row_number=row_number,
-        )
-        delay_idx = _timeout_ms_to_index(
-            timeout_delay_ms, AUTOBAHN_TIMEOUT_DELAY_VALUES_MS, row_number
-        )
-        fast_idx = _timeout_ms_to_index(
-            fast_path_timeout_ms, AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS, row_number
-        )
-        fast_base = len(AUTOBAHN_FAST_PATH_TIMEOUT_VALUES_MS)
-        return (delay_idx * fast_base) + fast_idx
 
     raise ValueError(f"Unsupported protocol: {protocol}")
 

@@ -24,11 +24,7 @@ NODES_SET=0
 NODES=4
 TARGETS_FILE="${TARGETS_FILE_DEFAULT}"
 EXPERIMENT_TIME_S=300
-# Doubles as the budget for every replica to bind its server port, since
-# START_UNIX_MS is derived from it. A replica dials its learning agent and
-# loads the failure spec before it listens, which measured ~11s, so this has
-# to leave room for that plus a probe pass or two.
-CLIENT_START_DELAY_S=45
+CLIENT_START_DELAY_S=10
 START_OFFSET_AFTER_CLIENT_LAUNCH_S=10
 DATASET_ENABLED=0
 LOG_ENABLED=0
@@ -39,6 +35,8 @@ REWARD_DESIGN="reward_tps"
 # Domain constraint on the action space: never apply a timeout below k times
 # the consensus latency the replicas are already achieving. 0 disables it.
 LATENCY_FLOOR_K=0
+# --model-type=continuous prior: "" the shipped one, "none" untrained, else a path.
+PRIOR_PATH=""
 SCHEDULE_FILE="learning_agent/config/schedule_smartbft.csv"
 
 BATCH_SIZE=256
@@ -111,11 +109,11 @@ trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic|floor>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
-  mode              Optional; one of normal|heuristic|learning|sharing|scheduled (default: normal).
+  mode              Optional; one of normal|learning|sharing|scheduled (default: normal).
   targets_file      Optional path to cloudlab SSH targets file.
 
 Flags:
@@ -123,14 +121,9 @@ Flags:
   --log                             Download client, server, applier, and agent logs.
   --output-dir <path>               Store artifacts here instead of creating a timestamped run directory.
   --verbose                         Enable SmartBFT debug logs on server replicas.
-  --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic|floor>
+  --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo>
                                      Learning-agent model for learning mode (default: random).
                                      claude and codex select claude_v2 and codex_v1.
-                                     floor selects latency_floor_heuristic: it plays the latency
-                                     floor itself as the timeout - a low quantile over recent
-                                     committing windows - with no learning. It estimates the floor
-                                     itself, so --latency-floor-k scales the timeout it plays
-                                     rather than adding a separate constraint.
   --reward-design <reward_tps|reward_mixed>
                                      Reward the agent learns from (default: reward_tps).
                                      reward_tps is throughput alone, concave past a 1000 tps knee.
@@ -141,6 +134,11 @@ Flags:
                                      replicas are already achieving, estimated as a low quantile
                                      over recent committing windows. Such a timeout cannot be met,
                                      so it only buys view changes. 0 disables it (default: 0).
+  --prior-path <path|none>           Which pretrained prior --model continuous loads.
+                                     Empty (default) is the protocol's shipped
+                                     return prior; a path is an ablation prior
+                                     (<protocol>_sim.py train --no-proposal-faults);
+                                     "none" runs it untrained, with a zero prior.
   --schedule-file <repo-rel-path>    scheduled-mode oracle CSV, relative to the repo root
                                      (default: learning_agent/config/schedule_smartbft.csv).
                                      It must be inside the deployed payload to exist on the remote.
@@ -156,8 +154,7 @@ SmartBFT options:
   --batch-timeout <duration>        SmartBFT batch timeout (default: 50ms).
   --request-timeout <duration>      Client request timeout (default: 30s).
   --create-workers <int>            Account creation workers (default: first workload phase terminals).
-  --client-start-delay <seconds>    Budget for replicas to bind plus the wait before launching the
-                                     client; also sets when the failure schedule starts (default: 45).
+  --client-start-delay <seconds>    Wait after servers are ready before launching client (default: 10).
   --start-offset <seconds>          Delay from client launch to benchmark/failure start (default: 20).
   --port-base <int>                 Base server port; node i listens on base+i (default: 19100).
 
@@ -178,7 +175,7 @@ EOF
 
 mode_enables_learning_agent() {
   case "$1" in
-    heuristic|learning|sharing|scheduled) return 0 ;;
+    learning|sharing|scheduled) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -187,13 +184,12 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_heuristic|latency_floor_heuristic) printf '%s\n' "${model_lower}" ;;
+    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo) printf '%s\n' "${model_lower}" ;;
     # Short names for the two newest bandits. main.py knows them by their
     # versioned names, so translate here and let everything downstream - the
     # remote validation included - carry the name main.py accepts.
     claude) printf '%s\n' "claude_v2" ;;
     codex) printf '%s\n' "codex_v1" ;;
-    floor) printf '%s\n' "latency_floor_heuristic" ;;
     *) return 1 ;;
   esac
 }
@@ -295,34 +291,20 @@ wait_for_server_endpoints_from_node0_or_fail() {
     echo "No server endpoints found in ${hosts_file}" >&2
     return 1
   fi
-  local endpoint_tokens
-  endpoint_tokens="$(awk 'NF >= 3 { printf "%s:%s:%s ", $1, $2, $3 }' <<< "${endpoints}")"
 
   while true; do
-    # One SSH for the whole pass, not one per endpoint. A round trip to a
-    # CloudLab node is seconds, so probing four endpoints over four
-    # connections took longer than the entire deadline: the loop got through a
-    # single pass, and the endpoint probed first was tested before any server
-    # had bound, which is why the node reported unreachable was always node 1.
-    local unready
-    # One token per endpoint, no whitespace inside any of them: ssh joins its
-    # command words into a string that the remote shell re-parses, so a
-    # multi-line argument would come back split across commands.
-    unready="$(ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" "bash -s" -- \
-      ${endpoint_tokens} <<'REMOTE' 2>/dev/null
-unready=""
-for token in "$@"; do
-  IFS=: read -r node_id node_ip node_port <<< "${token}"
-  [[ -z "${node_id}" || -z "${node_ip}" || -z "${node_port}" ]] && continue
-  if ! timeout 1 bash -c "exec 3<>/dev/tcp/${node_ip}/${node_port}" 2>/dev/null; then
-    unready+="${node_id}@${node_ip}:${node_port} "
-  fi
-done
-printf '%s' "${unready}"
-REMOTE
-)"
+    local all_ready=1
+    local unready=""
+    while read -r node_id node_ip node_port; do
+      [[ -z "${node_id}" ]] && continue
+      if ! ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" \
+        "timeout 1 bash -c 'exec 3<>/dev/tcp/${node_ip}/${node_port}'" >/dev/null 2>&1; then
+        all_ready=0
+        unready+="${node_id}@${node_ip}:${node_port} "
+      fi
+    done <<< "${endpoints}"
 
-    if [[ -z "${unready}" ]]; then
+    if (( all_ready == 1 )); then
       return 0
     fi
 
@@ -330,7 +312,6 @@ REMOTE
     if (( $(date +%s) >= deadline_epoch_s )); then
       break
     fi
-    echo "  waiting for SmartBFT server ports: ${unready}"
     sleep 1
   done
 
@@ -391,6 +372,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --reward-design)
       REWARD_DESIGN="${2:-}"
+      shift 2
+      ;;
+    --prior-path)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --prior-path." >&2
+        exit 2
+      fi
+      PRIOR_PATH="${2}"
       shift 2
       ;;
     --latency-floor-k)
@@ -479,7 +468,7 @@ while [[ $# -gt 0 ]]; do
       LEARNING_REWARD_DURATION="${2:-}"
       shift 2
       ;;
-    normal|heuristic|learning|sharing|scheduled)
+    normal|learning|sharing|scheduled)
       MODE="$1"
       shift
       ;;
@@ -546,7 +535,7 @@ if ! [[ "${LATENCY_FLOOR_K}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   exit 2
 fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic|floor." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -559,7 +548,7 @@ else
   LEARNING_AGENT_ENABLED=1
 fi
 if (( DATASET_ENABLED == 1 )) && (( LEARNING_AGENT_ENABLED == 0 )); then
-  echo "--dataset requires heuristic|learning|sharing|scheduled mode." >&2
+  echo "--dataset requires learning|sharing|scheduled mode." >&2
   exit 2
 fi
 if (( LEARNING_AGENT_ENABLED == 1 )); then
@@ -668,6 +657,7 @@ fi
   printf 'agent_model=%q\n' "${AGENT_MODEL_TYPE}"
   printf 'reward_design=%q\n' "${REWARD_DESIGN}"
   printf 'latency_floor_k=%q\n' "${LATENCY_FLOOR_K}"
+  printf 'prior_path=%q\n' "${PRIOR_PATH:-}"
   printf 'schedule_file=%q\n' "${SCHEDULE_FILE}"
   printf 'learning_window_mode=%q\n' "${LEARNING_WINDOW_MODE}"
   printf 'dataset_enabled=%q\n' "${DATASET_ENABLED}"
@@ -1187,7 +1177,8 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
         "${SHARING_COLLECT_WAIT_MS}" \
         "${LATENCY_FLOOR_K}" \
         "${REWARD_DESIGN}" \
-        "${SCHEDULE_FILE}" <<'REMOTE'
+        "${SCHEDULE_FILE}" \
+        "${PRIOR_PATH}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
@@ -1202,6 +1193,7 @@ sharing_collect_wait_ms="$9"
 latency_floor_k="${10}"
 reward_design="${11}"
 schedule_file="${12}"
+prior_path="${13:-}"
 run_root="$HOME/smartbft_cloudlab"
 learning_agent_python="${HOME}/.venvs/adaptive-timer-learning-agent/bin/python"
 
@@ -1226,6 +1218,12 @@ fi
 # scheduled replay, whose CSV records the reward each fixed timeout earned.
 if [[ "${agent_model_args}" != "" ]]; then
   agent_model_args="${agent_model_args} --reward-design ${reward_design}"
+fi
+# Which pretrained prior the continuous model loads: "" the shipped return
+# prior, "none" untrained, else a path to an ablation prior. main.py ignores it
+# for every other model type, so only pass it where it means something.
+if [[ "${model_type}" == "continuous" && -n "${prior_path}" ]]; then
+  agent_model_args="${agent_model_args} --prior-path ${prior_path}"
 fi
 
 for ((n = 0; n < replicas_per_machine; n++)); do
@@ -1414,10 +1412,6 @@ if (( server_start_failed != 0 )); then
   exit 1
 fi
 
-# The readiness wait stays inside the client delay on purpose: START_UNIX_MS
-# is derived from CLIENT_START_DELAY_S above, so the client has to launch at
-# that fixed moment however long the replicas took to bind. Giving the wait a
-# budget of its own would let the injection schedule start without a client.
 client_delay_deadline="$(( $(date +%s) + CLIENT_START_DELAY_S ))"
 if ! wait_for_server_endpoints_from_node0_or_fail "${node0_host}" "${node0_user}" "${HOSTS_CONFIG_LOCAL}" "${client_delay_deadline}"; then
   exit 1

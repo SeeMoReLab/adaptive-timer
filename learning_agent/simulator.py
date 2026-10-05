@@ -280,12 +280,12 @@ def _resolve_acceptable(
 def _default_acceptable(protocol: int) -> Optional[Dict[int, set]]:
     """Return the protocol-specific default phase scoring policy."""
     if protocol == agent_pb2.PROTOCOL_PBFT:
-        by_phase = PBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE
+        table = PBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE
     elif protocol == agent_pb2.PROTOCOL_SMARTBFT:
-        by_phase = SMARTBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE
+        table = SMARTBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE
     else:
         return None
-    return {phase: set(timeouts) for phase, timeouts in by_phase.items()}
+    return {phase: set(timeouts) for phase, timeouts in table.items()}
 
 
 def _parse_data(

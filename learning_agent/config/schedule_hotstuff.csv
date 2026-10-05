@@ -1,4 +1,24 @@
 # time_s,timeout_ms
 # may be any integer from 1 through 4294967295
--10,5000
-0,5000
+#
+# Oracle for config/hotstuff/failure_spec.xml: the best timeout per phase
+# (models.py 160 / 460 / 760; in a no-attack phase the lowest rung that
+# clears the floor), switched on each phase boundary, never before the fault
+# starts. ScheduledTimeoutModel shifts the schedule so its first row lands at
+# elapsed 0, so with the leading -10 row (warmUpTime=10) a switch written at
+# T fires at warmUpTime + T: each phase's atTime lands on its boundary, and
+# the agent applies it at its next decision.
+#
+#   p0 @0     base, no attack            160
+#   p1 @300   base + slow leader         160
+#   p2 @600   5+50, no attack            460
+#   p3 @900   5+50 + slow leader         460
+#   p4 @1200  5+150, no attack           760
+#   p5 @1500  base, no attack            160
+-10,160
+0,160
+300,160
+600,460
+900,460
+1200,760
+1500,160

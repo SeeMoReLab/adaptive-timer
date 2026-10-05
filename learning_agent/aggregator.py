@@ -48,6 +48,13 @@ def _extract_state(report_local: agent_pb2.ReportLocal, protocol: int) -> object
     raise ValueError(f"Unsupported protocol: {protocol}")
 
 
+SBFT_LEADER_MEASURED_FIELDS = (
+    "nth_prepare_gap_ms",
+    "nth_prepare_seen_count",
+    "nth_prepare_unseen_count",
+)
+
+
 def _report_to_array(protocol: int, report: object) -> np.ndarray:
     fields = get_report_feature_field_names(protocol)
     return np.array([float(getattr(report, field_name)) for field_name in fields], dtype=float)
@@ -147,6 +154,24 @@ class BaseAggregator(ABC):
 
         data = {node: _report_to_array(self.protocol, report) for node, report in reports_by_node.items()}
         aggregated_values = self._calculate(data, node_id=node_id)
+        if self.protocol == agent_pb2.PROTOCOL_SBFT:
+            # Only the replica that led a sequence measures its n-th prepare, so a
+            # median would read the replicas that led nothing: take these fields
+            # from the report that led the most sequences (lowest node id on a
+            # tie, so every agent aggregates the same batch the same way).
+            leader = min(
+                reports_by_node,
+                key=lambda node: (
+                    -(reports_by_node[node].nth_prepare_seen_count
+                      + reports_by_node[node].nth_prepare_unseen_count),
+                    node,
+                ),
+            )
+            fields = get_report_feature_field_names(self.protocol)
+            for name in SBFT_LEADER_MEASURED_FIELDS:
+                aggregated_values[fields.index(name)] = float(
+                    getattr(reports_by_node[leader], name)
+                )
         return _array_to_report(self.protocol, aggregated_values)
 
     @abstractmethod

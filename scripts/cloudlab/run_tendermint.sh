@@ -75,7 +75,7 @@ trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic|floor>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -87,8 +87,12 @@ Flags:
   --log             Fetch remote Tendermint, ABCI, and client logs into the run artifact directory.
   --output-dir <path>
                     Store artifacts here instead of creating a timestamped run directory.
-  --model           Learning-agent model for learning/sharing modes: random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic (default: random).
+  --model           Learning-agent model for learning/sharing modes: random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic|floor (default: random).
                     claude and codex select claude_v2 and codex_v1.
+                    floor selects latency_floor_heuristic: it plays the latency floor itself as
+                    the timeout - a low quantile over recent committing windows - with no
+                    learning. It estimates the floor itself, so --latency-floor-k scales the
+                    timeout it plays rather than adding a separate constraint.
   --reward-design   Reward the agent learns from: reward_tps|reward_mixed (default: reward_tps).
                     reward_tps is throughput alone, concave past a 1000 tps knee. reward_mixed
                     also discounts it by the share of the window one fault would cost.
@@ -120,7 +124,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_heuristic)
+    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_heuristic|latency_floor_heuristic)
       printf '%s\n' "${model_lower}"
       ;;
     # Short names for the two newest bandits. main.py knows them by their
@@ -131,6 +135,9 @@ normalize_agent_model_type() {
       ;;
     codex)
       printf '%s\n' "codex_v1"
+      ;;
+    floor)
+      printf '%s\n' "latency_floor_heuristic"
       ;;
     *)
       return 1
@@ -327,7 +334,7 @@ if ! [[ "${LATENCY_FLOOR_K}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   exit 2
 fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic|floor." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -566,9 +573,9 @@ fi
 # two in sync: the heredoc is quoted, so the local list cannot be interpolated
 # here and a name added there is silently rejected on the remote.
 case "${agent_model_type}" in
-  random|pavlov|linear|cmab|cmab_reset|claude_v2|codex_v1|continuous|continuous_heuristic) ;;
+  random|pavlov|linear|cmab|cmab_reset|claude_v2|codex_v1|continuous|continuous_heuristic|latency_floor_heuristic) ;;
   *)
-    echo "Invalid agent_model_type: ${agent_model_type}. Use random|pavlov|linear|cmab|cmab_reset|claude_v2|codex_v1|continuous|continuous_heuristic." >&2
+    echo "Invalid agent_model_type: ${agent_model_type}. Use random|pavlov|linear|cmab|cmab_reset|claude_v2|codex_v1|continuous|continuous_heuristic|latency_floor_heuristic." >&2
     exit 2
     ;;
 esac

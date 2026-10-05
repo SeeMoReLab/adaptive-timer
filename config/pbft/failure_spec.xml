@@ -9,17 +9,25 @@
       CppBedrock/adaptive_timers.MD for the measurements.
       learning_agent/config/schedule_pbft.csv holds the best timeout per phase.
 
-      Election timeout ladder: 250 (low), 600 (medium), 1200 (high).
+      Election timeout ladder: 250 (low), 550 (medium), 1200 (high).
+      The medium rung was moved from 600 to 550; the numbers quoted in
+      this comment were measured at 600 and have not been re-measured.
 
       Two mechanisms, kept separate.
 
-      The network delay sets the healthy latency tail: p50 is 168 ms at the
-      base 5 ms link, 335 ms at 5+50 and 630 ms at 5+150. A rung at or below
-      its level's tail fires on ordinary latency and storms, with no fault
-      injected at all. That is what removes 250 at 5+50, and both 250 and 600
-      at 5+150. Latency is near-deterministic - p95 runs about 20 ms above p50
-      at every level - so a rung only has to clear that spread to be removed
-      by a tail, which is why 600 storms at 5+150 on 30 ms of margin.
+      The network delay sets the healthy latency tail. Measured: p50 is 168 ms
+      at the base 5 ms link, 335 ms at 5+50 and 630 ms at 5+150 - about 3 ms of
+      tail per ms of one-way delay. A rung at or below its level's tail fires on
+      ordinary latency and storms, with no fault injected at all. That is what
+      removes 250 at the 5+75 phases, and both 250 and 550 at 5+175. Latency is
+      near-deterministic - p95 runs about 20 ms above p50 at every level - so a
+      rung only has to clear that spread to be removed by a tail.
+
+      The delays were 50 and 150, where the removals held on 85 ms and 80 ms of
+      margin. They were raised to 75 and 175 to put roughly 155 ms under each
+      removed rung instead, since a margin of that size was being decided by
+      jitter. The 5+75 and 5+175 tails are extrapolated from the fit above at
+      about 405 ms and 705 ms; neither has been measured.
 
       The leader proposal delay D decides which of the surviving rungs fires.
       A rung below the delayed leader's latency escapes to a clean leader once
@@ -39,7 +47,7 @@
       proposal occupies its consensus-window slot long enough to throttle the
       pipeline, so the cost grows faster than D and the spread widens with it.
       At 5+50 the cost is about 1.0*D throughout, because there the delay
-      overlaps work already in flight.
+      overlaps work already in flight. Not re-measured at 5+75.
 
       Each delay sits mid-window between the rung that must escape it and the
       rung that must sleep through it:
@@ -47,7 +55,7 @@
         phase           must escape     must sleep      window      D
         base + small    250             600             100-150    120
         base + big      600             1200            254-607    400
-        5+50 + small    600             1200            265-865    500
+        5+75 + small    600             1200            265-865    500
 
       The small delay's upper bound is set by the transient, not by the median
       cost. pinLeaderWindow re-pins its victim once per interval tick and the
@@ -60,7 +68,14 @@
       200 the steady state has degraded as well (p50 513, p95 685).
 
       Raising D brings the next rung up into play; it does not push the winner
-      higher. So 5+150 carries no delay - its tail alone leaves only 1200.
+      higher. So 5+175 carries no delay - its tail alone leaves only 1200.
+
+      The 5+75 phase at t=900 carries no delay either, and so has nothing for
+      550 to escape that 1200 sleeps through: 550 and 1200 both clear its tail
+      and tie. schedule_pbft.csv labels it 550 by the prefer-the-lower-rung
+      convention, but no arm is uniquely best there. Giving it a proposal delay
+      in the 550/1200 window, as t=1200 has, would turn the tie into a phase
+      that discriminates.
 
       netem jitter reorders packets and TCP treats reordering as loss, which
       at this rate costs more than half the throughput, so jitterRatio is 0.
@@ -145,7 +160,7 @@
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
                 <global>
-                    <delayMs>50</delayMs>
+                    <delayMs>75</delayMs>
                     <burstDurationMs>10000</burstDurationMs>
                     <burstIntervalMs>10000</burstIntervalMs>
                 </global>
@@ -162,7 +177,7 @@
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
                 <global>
-                    <delayMs>50</delayMs>
+                    <delayMs>75</delayMs>
                     <burstDurationMs>10000</burstDurationMs>
                     <burstIntervalMs>10000</burstIntervalMs>
                 </global>
@@ -185,7 +200,7 @@
                 <directedEdges>true</directedEdges>
                 <precedence>global,source,edge</precedence>
                 <global>
-                    <delayMs>150</delayMs>
+                    <delayMs>175</delayMs>
                     <burstDurationMs>10000</burstDurationMs>
                     <burstIntervalMs>10000</burstIntervalMs>
                 </global>

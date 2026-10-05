@@ -23,9 +23,12 @@ import agent_pb2_grpc
 from aggregator import BaseAggregator, MedianAggregator, WeightedMedianAggregator
 from continuous_bandit import (
     DEFAULT_PROPORTIONAL_K,
+    ContinuousLinUCB,
+    ContinuousPPO,
     ContinuousThompsonSamplingModel,
     ContinuousHeuristicTimeoutModel,
     ContinuousTimeoutActionCodec,
+    LatencyFloorHeuristic,
     NormalizedLatencyFloor,
 )
 from latency_floor import (
@@ -38,6 +41,7 @@ from latency_floor import (
 from models import (
     ActionCodec,
     CMAB,
+    DiscretePPO,
     DiscountedLinUCB,
     FeatureExtractor,
     LinearModel,
@@ -2011,6 +2015,85 @@ def serve(
                 )
             ),
         )
+    elif model_type == "continuous_codex":
+        action_codec = ContinuousTimeoutActionCodec(protocol)
+        arms_ms = get_timeout_values_ms(protocol)
+        model = ContinuousLinUCB(
+            action_codec=action_codec,
+            n_features=get_report_feature_dim(protocol),
+            seed=42,
+            latency_floor=(
+                None
+                if latency_floor is None
+                else NormalizedLatencyFloor(
+                    action_codec=action_codec,
+                    latency_index=latency_index,
+                    n_features=get_report_feature_dim(protocol),
+                    instances_index=instances_index,
+                    latency_floor=latency_floor,
+                )
+            ),
+        )
+        print(
+            "[continuous_codex] discounted LinUCB over "
+            f"{min(arms_ms)}..{max(arms_ms)}ms, basis centred on the arms "
+            f"{tuple(sorted(arms_ms))}"
+        )
+    elif model_type == "continuous_ppo":
+        action_codec = ContinuousTimeoutActionCodec(protocol)
+        arms_ms = get_timeout_values_ms(protocol)
+        model = ContinuousPPO(
+            action_codec=action_codec,
+            n_features=get_report_feature_dim(protocol),
+            seed=42,
+            latency_floor=(
+                None
+                if latency_floor is None
+                else NormalizedLatencyFloor(
+                    action_codec=action_codec,
+                    latency_index=latency_index,
+                    n_features=get_report_feature_dim(protocol),
+                    instances_index=instances_index,
+                    latency_floor=latency_floor,
+                )
+            ),
+        )
+        print(
+            "[continuous_ppo] Beta policy over "
+            f"{min(arms_ms)}..{max(arms_ms)}ms, linear actor + value baseline, "
+            "on-policy from scratch"
+        )
+    elif model_type == "latency_floor_heuristic":
+        action_codec = ContinuousTimeoutActionCodec(protocol)
+        # The floor is this model's rule rather than a constraint on top of
+        # one, so it is built here whether or not --latency-floor-k asked for
+        # the constraint. k then means what it means everywhere else, and is
+        # the only scaling there is: the timeout played is k times the
+        # measured round time.
+        heuristic_floor = (
+            LatencyFloor(quantile=latency_floor_quantile)
+            if latency_floor is None
+            else latency_floor
+        )
+        arms_ms = get_timeout_values_ms(protocol)
+        model = LatencyFloorHeuristic(
+            action_codec=action_codec,
+            n_features=get_report_feature_dim(protocol),
+            clamp_ms=(min(arms_ms), max(arms_ms)),
+            latency_floor=NormalizedLatencyFloor(
+                action_codec=action_codec,
+                latency_index=latency_index,
+                n_features=get_report_feature_dim(protocol),
+                instances_index=instances_index,
+                latency_floor=heuristic_floor,
+            ),
+        )
+        print(
+            "[latency_floor_heuristic] playing the floor itself, clamped to "
+            f"{min(arms_ms)}..{max(arms_ms)}ms "
+            f"(k={heuristic_floor.multiplier:g}, "
+            f"quantile={latency_floor_quantile:g}); no learning"
+        )
     elif model_type == "random":
         # Seeded like the other models so that, in sharing mode, every node
         # draws the same action from the same agreed features. Reward
@@ -2081,6 +2164,17 @@ def serve(
             n_features=get_report_feature_dim(protocol),
             seed=42,
         )
+    elif model_type == "ppo":
+        model = DiscretePPO(
+            action_dim=get_action_space_size(protocol),
+            n_features=get_report_feature_dim(protocol),
+            seed=42,
+        )
+        print(
+            "[ppo] softmax policy over "
+            f"{tuple(sorted(get_timeout_values_ms(protocol)))}, "
+            "linear actor + value baseline, on-policy from scratch"
+        )
     elif model_type == "scheduled":
         if schedule_file is None:
             raise ValueError("--schedule-file is required when --model-type=scheduled")
@@ -2092,17 +2186,22 @@ def serve(
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 
-    # continuous takes the floor through its own candidate sampler, above.
-    # continuous_heuristic is already a multiple of the same latency, and
-    # scheduled is a fixed-baseline replay that must not be overridden.
+    # continuous, continuous_codex and continuous_ppo take the floor through their own
+    # candidate samplers, above. continuous_heuristic is already a multiple of
+    # the same latency, and scheduled is a fixed-baseline replay that must not
+    # be overridden.
     #
     # In sharing mode the floor stays identical on every replica for free: it
     # is estimated from the consensus-agreed feature vector, which is the same
     # on all of them, so constraining the action space does not break the
     # lockstep the aggregated reward depends on.
-    floor_exempt = ("continuous_heuristic", "scheduled")
+    floor_exempt = (
+        "continuous_heuristic",
+        "latency_floor_heuristic",
+        "scheduled",
+    )
     if latency_floor is not None and model_type not in (
-        ("continuous",) + floor_exempt
+        ("continuous", "continuous_codex", "continuous_ppo") + floor_exempt
     ):
         model = LatencyFloorPolicy(
             model=model,
@@ -2113,7 +2212,12 @@ def serve(
             latency_floor=latency_floor,
         )
     if latency_floor is not None:
-        applied = "not applied (latency rule already)" if model_type in floor_exempt else "applied"
+        if model_type == "latency_floor_heuristic":
+            applied = "applied as the timeout itself"
+        elif model_type in floor_exempt:
+            applied = "not applied (latency rule already)"
+        else:
+            applied = "applied"
         print(
             f"[latency_floor] k={latency_floor_k} "
             f"quantile={latency_floor_quantile} {applied} to {model_type}"
@@ -2122,7 +2226,13 @@ def serve(
     feature_extractor = ProtocolReportFeatureExtractor(protocol)
     if model_type == "scheduled":
         action_codec = ScheduledTimeoutActionCodec(protocol)
-    elif model_type not in ("continuous", "continuous_heuristic"):
+    elif model_type not in (
+        "continuous",
+        "continuous_codex",
+        "continuous_ppo",
+        "continuous_heuristic",
+        "latency_floor_heuristic",
+    ):
         action_codec = ProtocolTimeoutActionCodec(protocol)
     if aggregate_function == "median":
         aggregator: BaseAggregator = MedianAggregator(protocol=protocol)
@@ -2268,8 +2378,12 @@ def main():
             "cmab_v4",
             "claude_v2",
             "codex_v1",
+            "ppo",
             "continuous",
+            "continuous_codex",
+            "continuous_ppo",
             "continuous_heuristic",
+            "latency_floor_heuristic",
             "scheduled",
             "thompson",
         ),
@@ -2292,8 +2406,23 @@ def main():
             "ranks on the second, so a timeout that stalls is ruled out from a "
             "handful of samples instead of averaged into a conditional mean; "
             "continuous: bootstrapped continuous contextual bandit; "
+            "continuous_codex: codex_v1 over a continuous timeout - the "
+            "same discounted LinUCB with the per-arm one-hot replaced by a "
+            "smooth basis centred on the arms, so neighbouring timeouts share "
+            "evidence instead of each arm learning alone; "
+            "ppo: clipped-objective PPO with a softmax policy over the arm "
+            "ladder and a value baseline - a policy gradient rather than a "
+            "reward model, so no arm carries a stale per-arm estimate and a "
+            "mixed-in uniform floor keeps every arm reachable; "
+            "continuous_ppo: the same PPO with a Beta policy over the "
+            "continuous timeout, which starts almost uniform over the arm "
+            "range instead of opening with a design sweep; "
             "continuous_heuristic: k * avg_consensus_latency_ms, clamped to "
             "the arm range; no learning; "
+            "latency_floor_heuristic: plays the latency floor itself - a low "
+            "quantile over recent committing windows, times --latency-floor-k "
+            "- as the timeout; no learning, and unlike continuous_heuristic "
+            "one degraded window cannot carry the estimate; "
             "thompson: deprecated alias for cmab; "
             "scheduled: timeout from a time-based schedule CSV. "
             "The remaining CMAB iterations (v1, v3) are simulator-only; see "

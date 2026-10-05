@@ -9,7 +9,8 @@ from google.protobuf import empty_pb2
 import agent_pb2
 import agent_pb2_grpc
 
-PBFT_TIMEOUT_OPTIONS_MS = (300, 800, 1800)
+PBFT_TIMEOUT_OPTIONS_MS = (250, 550, 1200)
+SMARTBFT_TIMEOUT_OPTIONS_MS = (300, 800, 1800)
 SBFT_TIMEOUT_OPTIONS_MS = (150, 400, 900)
 TENDERMINT_PROPOSE_TIMEOUT_OPTIONS_MS = (300, 700, 1100)
 HOTSTUFF_TIMEOUT_DELAY_OPTIONS_MS = (800, 2000, 5000)
@@ -124,6 +125,15 @@ def _load_hosts_config(path: Path) -> Dict[int, str]:
     return entries
 
 
+# The three protocols share the PbftReport layout but not the timeout ladder,
+# so the report's timeout_ms has to come from the caller's own arms.
+_REPORT_CLS_TIMEOUT_OPTIONS_MS = {
+    agent_pb2.PbftReport: PBFT_TIMEOUT_OPTIONS_MS,
+    agent_pb2.SmartbftReport: SMARTBFT_TIMEOUT_OPTIONS_MS,
+    agent_pb2.SbftReport: SBFT_TIMEOUT_OPTIONS_MS,
+}
+
+
 def _random_pbft_report(
     rng: random.Random, report_cls: type = agent_pb2.PbftReport
 ) -> object:
@@ -142,7 +152,9 @@ def _random_pbft_report(
     p95_batch_size = rng.uniform(avg_batch_size, max(avg_batch_size, avg_batch_size * 1.5))
     leader_change_count = rng.randint(0, 8)
     regency_change_count = rng.randint(0, 8)
-    timeout_ms = rng.choice([300, 800, 1800])
+    timeout_ms = rng.choice(
+        _REPORT_CLS_TIMEOUT_OPTIONS_MS.get(report_cls, PBFT_TIMEOUT_OPTIONS_MS)
+    )
     avg_inter_commit_gap_ms = rng.uniform(1.0, 250.0)
     p50_inter_commit_gap_ms = rng.uniform(1.0, avg_inter_commit_gap_ms)
     p95_inter_commit_gap_ms = rng.uniform(
@@ -292,7 +304,7 @@ def _random_timeout_used(protocol: int, rng: random.Random) -> object:
         )
     if protocol == agent_pb2.PROTOCOL_SMARTBFT:
         return agent_pb2.SmartbftTimeout(
-            election_timeout_milliseconds=rng.choice(PBFT_TIMEOUT_OPTIONS_MS)
+            election_timeout_milliseconds=rng.choice(SMARTBFT_TIMEOUT_OPTIONS_MS)
         )
     if protocol == agent_pb2.PROTOCOL_SBFT:
         election_timeout_ms = rng.choice(SBFT_TIMEOUT_OPTIONS_MS)

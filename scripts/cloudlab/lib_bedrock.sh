@@ -65,6 +65,10 @@ LOG_ENABLED=0
 VERBOSE_ENABLED=0
 AGENT_MODEL_TYPE="random"
 AGENT_MODEL_SET=0
+REWARD_DESIGN="reward_tps"
+# Domain constraint on the action space: never apply a timeout below k times
+# the consensus latency the replicas are already achieving. 0 disables it.
+LATENCY_FLOOR_K=0
 
 TX_RATE="${TX_RATE:-40000}"
 REQUEST_TIMEOUT_MS=10000
@@ -173,8 +177,27 @@ Flags:
   --log                             Download client, server, applier, and agent logs.
   --output-dir <path>               Store artifacts here instead of a timestamped run directory.
   --verbose                         Enable per-message debug logs on server replicas.
-  --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous>
+  --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|ppo|continuous|continuous_codex|continuous_ppo|continuous_heuristic|floor>
                                      Learning-agent model for learning mode (default: random).
+                                     claude and codex select claude_v2 and codex_v1.
+                                     floor selects latency_floor_heuristic: it plays the latency
+                                     floor itself as the timeout - a low quantile over recent
+                                     committing windows - with no learning. It estimates the floor
+                                     itself, so --latency-floor-k scales the timeout it plays
+                                     rather than adding a separate constraint.
+  --reward-design <reward_tps|reward_mixed>
+                                     Reward the agent learns from (default: reward_tps).
+                                     reward_tps is throughput alone, concave past a 1000 tps knee.
+                                     reward_mixed also discounts it by the share of the window one
+                                     fault would cost (applied timeout + one consensus latency),
+                                     so a longer timer has to earn the detection delay it buys.
+  --latency-floor-k <float>          Never apply a timeout below k * the consensus latency the
+                                     replicas are already achieving, estimated as a low quantile
+                                     over recent committing windows. Such a timeout cannot be met,
+                                     so it only buys view changes. 0 disables it (default: 0).
+  --schedule-file <repo-rel-path>    scheduled-mode oracle CSV, relative to the repo root. It
+                                     must be inside the deployed payload to exist on the remote
+                                     (default: ${SCHEDULE_FILE_REL}).
   -f <int>                          Fault tolerance f; nodes defaults to 3f+1 (default: 1).
   -t <int>                          Seconds to run after benchmark start (default: 300).
 
@@ -236,9 +259,13 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|pavlov|linear|cmab|cmab_reset|continuous) printf '%s\n' "${model_lower}" ;;
+    random|pavlov|linear|cmab|cmab_reset|ppo|continuous|continuous_codex|continuous_ppo|continuous_heuristic|latency_floor_heuristic) printf '%s\n' "${model_lower}" ;;
+    # Short names for the two newest bandits. main.py knows them by their
+    # versioned names, so translate here and let everything downstream - the
+    # remote launch included - carry the name main.py accepts.
     claude) printf '%s\n' "claude_v2" ;;
     codex) printf '%s\n' "codex_v1" ;;
+    floor) printf '%s\n' "latency_floor_heuristic" ;;
     *) return 1 ;;
   esac
 }
@@ -392,6 +419,33 @@ bedrock_main() {
         ;;
       --verbose) VERBOSE_ENABLED=1; shift ;;
       --model) AGENT_MODEL_TYPE="${2:-}"; AGENT_MODEL_SET=1; shift 2 ;;
+      --reward-design)
+        if [[ $# -lt 2 || -z "${2}" ]]; then
+          echo "Missing value for --reward-design." >&2
+          usage >&2
+          exit 2
+        fi
+        REWARD_DESIGN="${2}"
+        shift 2
+        ;;
+      --latency-floor-k)
+        if [[ $# -lt 2 || -z "${2}" ]]; then
+          echo "Missing value for --latency-floor-k." >&2
+          usage >&2
+          exit 2
+        fi
+        LATENCY_FLOOR_K="${2}"
+        shift 2
+        ;;
+      --schedule-file)
+        if [[ $# -lt 2 || -z "${2}" ]]; then
+          echo "Missing value for --schedule-file." >&2
+          usage >&2
+          exit 2
+        fi
+        SCHEDULE_FILE_REL="${2}"
+        shift 2
+        ;;
       --nodes) NODES="${2:-}"; NODES_SET=1; shift 2 ;;
       --failure-spec) FAILURE_SPEC_PATH="${2:-}"; FAILURE_SPEC_ENABLED=1; shift 2 ;;
       --no-failure-spec) FAILURE_SPEC_ENABLED=0; shift ;;
@@ -503,10 +557,21 @@ bedrock_main() {
     echo "Invalid --client-connections value: ${CLIENT_CONNECTIONS_PER_TARGET}. Use a positive integer." >&2
     exit 2
   fi
-  if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-    echo "Invalid --model value. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous." >&2
+  case "${REWARD_DESIGN}" in
+    reward_tps|reward_mixed) ;;
+    *) echo "Invalid --reward-design: ${REWARD_DESIGN}. Expected reward_tps|reward_mixed." >&2; exit 2 ;;
+  esac
+  if ! [[ "${LATENCY_FLOOR_K}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "Invalid --latency-floor-k: ${LATENCY_FLOOR_K}. Expected a non-negative number (0 disables the constraint)." >&2
     exit 2
   fi
+  # Assigning the substitution straight to AGENT_MODEL_TYPE would blank it on
+  # failure, so the error message could not name what was rejected.
+  if ! normalized_model="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
+    echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|ppo|continuous|continuous_codex|continuous_ppo|continuous_heuristic|floor." >&2
+    exit 2
+  fi
+  AGENT_MODEL_TYPE="${normalized_model}"
   if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" ]]; then
     echo "--model is only supported with learning mode." >&2
     exit 2
@@ -551,6 +616,10 @@ bedrock_main() {
   if (( FAILURE_SPEC_ENABLED == 1 )) && [[ ! -f "${FAILURE_SPEC_PATH}" ]]; then
     echo "Failure spec not found: ${FAILURE_SPEC_PATH}" >&2
     exit 1
+  fi
+  if [[ "${SCHEDULE_FILE_REL}" == /* || "${SCHEDULE_FILE_REL}" == ../* ]]; then
+    echo "--schedule-file must be relative to the repo root so it rides the payload: ${SCHEDULE_FILE_REL}" >&2
+    exit 2
   fi
   if [[ "${MODE}" == "scheduled" && ! -f "${REPO_ROOT}/${SCHEDULE_FILE_REL}" ]]; then
     echo "Schedule file not found: ${REPO_ROOT}/${SCHEDULE_FILE_REL}" >&2
@@ -633,6 +702,9 @@ bedrock_main() {
     printf 'initial_timeout_ms=%q\n' "${INITIAL_TIMEOUT_MS:-from-config}"
     printf 'initial_slow_path_timeout_ms=%q\n' "${INITIAL_SLOW_PATH_TIMEOUT_MS:-from-config}"
     printf 'agent_model=%q\n' "${AGENT_MODEL_TYPE}"
+    printf 'reward_design=%q\n' "${REWARD_DESIGN}"
+    printf 'latency_floor_k=%q\n' "${LATENCY_FLOOR_K}"
+    printf 'schedule_file=%q\n' "${SCHEDULE_FILE_REL}"
     printf 'learning_window_mode=%q\n' "${LEARNING_WINDOW_MODE}"
     printf 'learning_feature_duration_ms=%q\n' "${LEARNING_FEATURE_DURATION_MS}"
     printf 'learning_reply_wait_ms=%q\n' "${LEARNING_REPLY_WAIT_MS}"
@@ -1192,7 +1264,9 @@ REMOTE
           "${PROTOCOL_NAME}" \
           "${AGENT_PROTOCOL}" \
           "${SCHEDULE_FILE_REL}" \
-          "${FAILURE_SPEC_ENABLED}" <<'REMOTE'
+          "${FAILURE_SPEC_ENABLED}" \
+          "${REWARD_DESIGN}" \
+          "${LATENCY_FLOOR_K}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
@@ -1208,6 +1282,8 @@ protocol="${10}"
 agent_protocol="${11}"
 schedule_file_rel="${12}"
 failure_spec_enabled="${13}"
+reward_design="${14}"
+latency_floor_k="${15}"
 learning_agent_python="${HOME}/.venvs/adaptive-timer-learning-agent/bin/python"
 
 if [[ ! -x "${learning_agent_python}" ]]; then
@@ -1221,6 +1297,17 @@ if [[ "${mode}" == "learning" ]]; then
   agent_model_args="--model-type ${model_type}"
 elif [[ "${mode}" == "scheduled" ]]; then
   agent_model_args="--model-type scheduled --schedule-file ${schedule_file_rel}"
+fi
+
+# The reward shaping applies to every agent mode that trains, including the
+# scheduled replay, whose CSV records the reward each fixed timeout earned.
+if [[ -n "${agent_model_args}" ]]; then
+  agent_model_args="${agent_model_args} --reward-design ${reward_design}"
+fi
+# The floor is a constraint on the action space, so it only means anything
+# where the agent is choosing the timeout at all.
+if [[ -n "${agent_model_args}" && "${latency_floor_k}" != "0" ]]; then
+  agent_model_args="${agent_model_args} --latency-floor-k ${latency_floor_k}"
 fi
 
 failure_args=""

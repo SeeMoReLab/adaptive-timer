@@ -11,6 +11,7 @@ from continuous_bandit import (
 )
 from models import (
     PBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE,
+    SMARTBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE,
     ProtocolTimeoutActionCodec,
     ScheduledTimeoutActionCodec,
     ScheduledTimeoutModel,
@@ -20,15 +21,37 @@ from models import (
 
 
 class DiscreteTimeoutActionCodecTest(unittest.TestCase):
-    def test_pbft_uses_updated_discrete_arms(self) -> None:
+    def test_pbft_arms_are_the_schedule_csv_ladder(self) -> None:
+        # learning_agent/config/schedule_pbft.csv is the calibration of record
+        # for CppBedrock PBFT, so the oracle and the bandits play one ladder.
         self.assertEqual(
             get_timeout_values_ms(agent_pb2.PROTOCOL_PBFT),
+            (250, 550, 1200),
+        )
+
+    def test_smartbft_keeps_its_own_arms(self) -> None:
+        self.assertEqual(
+            get_timeout_values_ms(agent_pb2.PROTOCOL_SMARTBFT),
             (300, 800, 1800),
         )
 
     def test_pbft_phase_accuracy_policy(self) -> None:
         self.assertEqual(
             PBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE,
+            {
+                0: frozenset({250, 550, 1200}),
+                1: frozenset({250}),
+                2: frozenset({550}),
+                3: frozenset({550, 1200}),
+                4: frozenset({550}),
+                5: frozenset({1200}),
+                6: frozenset({250, 550, 1200}),
+            },
+        )
+
+    def test_smartbft_phase_accuracy_policy(self) -> None:
+        self.assertEqual(
+            SMARTBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE,
             {
                 0: frozenset({300, 800, 1800}),
                 1: frozenset({300}),
@@ -42,13 +65,23 @@ class DiscreteTimeoutActionCodecTest(unittest.TestCase):
 
     def test_existing_pbft_arm_encoding_is_unchanged(self) -> None:
         codec = ProtocolTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT)
-        timeout = agent_pb2.PbftTimeout(election_timeout_milliseconds=800)
+        timeout = agent_pb2.PbftTimeout(election_timeout_milliseconds=550)
 
         action = codec.encode(timeout)
         decoded = codec.decode(action)
 
         self.assertEqual(float(action.item()), 1.0)
-        self.assertEqual(decoded.pbft.election_timeout_milliseconds, 800)
+        self.assertEqual(decoded.pbft.election_timeout_milliseconds, 550)
+
+    def test_smartbft_arm_encoding_is_unchanged(self) -> None:
+        codec = ProtocolTimeoutActionCodec(agent_pb2.PROTOCOL_SMARTBFT)
+        timeout = agent_pb2.SmartbftTimeout(election_timeout_milliseconds=800)
+
+        action = codec.encode(timeout)
+        decoded = codec.decode(action)
+
+        self.assertEqual(float(action.item()), 1.0)
+        self.assertEqual(decoded.smartbft.election_timeout_milliseconds, 800)
 
     def test_tendermint_arms_couple_phase_timeouts(self) -> None:
         codec = ProtocolTimeoutActionCodec(agent_pb2.PROTOCOL_TENDERMINT)

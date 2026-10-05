@@ -24,7 +24,11 @@ NODES_SET=0
 NODES=4
 TARGETS_FILE="${TARGETS_FILE_DEFAULT}"
 EXPERIMENT_TIME_S=300
-CLIENT_START_DELAY_S=10
+# Doubles as the budget for every replica to bind its server port, since
+# START_UNIX_MS is derived from it. A replica dials its learning agent and
+# loads the failure spec before it listens, which measured ~11s, so this has
+# to leave room for that plus a probe pass or two.
+CLIENT_START_DELAY_S=45
 START_OFFSET_AFTER_CLIENT_LAUNCH_S=10
 DATASET_ENABLED=0
 LOG_ENABLED=0
@@ -107,7 +111,7 @@ trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|heuristic|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic|floor>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -119,9 +123,14 @@ Flags:
   --log                             Download client, server, applier, and agent logs.
   --output-dir <path>               Store artifacts here instead of creating a timestamped run directory.
   --verbose                         Enable SmartBFT debug logs on server replicas.
-  --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic>
+  --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic|floor>
                                      Learning-agent model for learning mode (default: random).
                                      claude and codex select claude_v2 and codex_v1.
+                                     floor selects latency_floor_heuristic: it plays the latency
+                                     floor itself as the timeout - a low quantile over recent
+                                     committing windows - with no learning. It estimates the floor
+                                     itself, so --latency-floor-k scales the timeout it plays
+                                     rather than adding a separate constraint.
   --reward-design <reward_tps|reward_mixed>
                                      Reward the agent learns from (default: reward_tps).
                                      reward_tps is throughput alone, concave past a 1000 tps knee.
@@ -147,7 +156,8 @@ SmartBFT options:
   --batch-timeout <duration>        SmartBFT batch timeout (default: 50ms).
   --request-timeout <duration>      Client request timeout (default: 30s).
   --create-workers <int>            Account creation workers (default: first workload phase terminals).
-  --client-start-delay <seconds>    Wait after servers are ready before launching client (default: 10).
+  --client-start-delay <seconds>    Budget for replicas to bind plus the wait before launching the
+                                     client; also sets when the failure schedule starts (default: 45).
   --start-offset <seconds>          Delay from client launch to benchmark/failure start (default: 20).
   --port-base <int>                 Base server port; node i listens on base+i (default: 19100).
 
@@ -177,12 +187,13 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_heuristic) printf '%s\n' "${model_lower}" ;;
+    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_heuristic|latency_floor_heuristic) printf '%s\n' "${model_lower}" ;;
     # Short names for the two newest bandits. main.py knows them by their
     # versioned names, so translate here and let everything downstream - the
     # remote validation included - carry the name main.py accepts.
     claude) printf '%s\n' "claude_v2" ;;
     codex) printf '%s\n' "codex_v1" ;;
+    floor) printf '%s\n' "latency_floor_heuristic" ;;
     *) return 1 ;;
   esac
 }
@@ -284,20 +295,34 @@ wait_for_server_endpoints_from_node0_or_fail() {
     echo "No server endpoints found in ${hosts_file}" >&2
     return 1
   fi
+  local endpoint_tokens
+  endpoint_tokens="$(awk 'NF >= 3 { printf "%s:%s:%s ", $1, $2, $3 }' <<< "${endpoints}")"
 
   while true; do
-    local all_ready=1
-    local unready=""
-    while read -r node_id node_ip node_port; do
-      [[ -z "${node_id}" ]] && continue
-      if ! ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" \
-        "timeout 1 bash -c 'exec 3<>/dev/tcp/${node_ip}/${node_port}'" >/dev/null 2>&1; then
-        all_ready=0
-        unready+="${node_id}@${node_ip}:${node_port} "
-      fi
-    done <<< "${endpoints}"
+    # One SSH for the whole pass, not one per endpoint. A round trip to a
+    # CloudLab node is seconds, so probing four endpoints over four
+    # connections took longer than the entire deadline: the loop got through a
+    # single pass, and the endpoint probed first was tested before any server
+    # had bound, which is why the node reported unreachable was always node 1.
+    local unready
+    # One token per endpoint, no whitespace inside any of them: ssh joins its
+    # command words into a string that the remote shell re-parses, so a
+    # multi-line argument would come back split across commands.
+    unready="$(ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" "bash -s" -- \
+      ${endpoint_tokens} <<'REMOTE' 2>/dev/null
+unready=""
+for token in "$@"; do
+  IFS=: read -r node_id node_ip node_port <<< "${token}"
+  [[ -z "${node_id}" || -z "${node_ip}" || -z "${node_port}" ]] && continue
+  if ! timeout 1 bash -c "exec 3<>/dev/tcp/${node_ip}/${node_port}" 2>/dev/null; then
+    unready+="${node_id}@${node_ip}:${node_port} "
+  fi
+done
+printf '%s' "${unready}"
+REMOTE
+)"
 
-    if (( all_ready == 1 )); then
+    if [[ -z "${unready}" ]]; then
       return 0
     fi
 
@@ -305,6 +330,7 @@ wait_for_server_endpoints_from_node0_or_fail() {
     if (( $(date +%s) >= deadline_epoch_s )); then
       break
     fi
+    echo "  waiting for SmartBFT server ports: ${unready}"
     sleep 1
   done
 
@@ -520,7 +546,7 @@ if ! [[ "${LATENCY_FLOOR_K}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   exit 2
 fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic|floor." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -1388,6 +1414,10 @@ if (( server_start_failed != 0 )); then
   exit 1
 fi
 
+# The readiness wait stays inside the client delay on purpose: START_UNIX_MS
+# is derived from CLIENT_START_DELAY_S above, so the client has to launch at
+# that fixed moment however long the replicas took to bind. Giving the wait a
+# budget of its own would let the injection schedule start without a client.
 client_delay_deadline="$(( $(date +%s) + CLIENT_START_DELAY_S ))"
 if ! wait_for_server_endpoints_from_node0_or_fail "${node0_host}" "${node0_user}" "${HOSTS_CONFIG_LOCAL}" "${client_delay_deadline}"; then
   exit 1

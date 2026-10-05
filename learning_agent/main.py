@@ -28,6 +28,8 @@ from continuous_bandit import (
     ContinuousLinUCB,
     ContinuousPPO,
     ContinuousTimeoutActionCodec,
+    DEFAULT_WAIT_DIVISOR,
+    DerivedWaitActionCodec,
     LatencyFloorHeuristic,
     NormalizedLatencyFloor,
     SimPriorGPModel,
@@ -1967,6 +1969,7 @@ def serve(
     latency_floor_k: float,
     latency_floor_quantile: float,
     prior_path: str,
+    wait_divisor: float,
     dataset_csv: Optional[Path],
     failure_spec: Optional[Path],
     injection_start_unix_ms: Optional[int],
@@ -2028,8 +2031,27 @@ def serve(
     )
 
 
+
+    # SBFT's action is two-dimensional. The models below each place one
+    # timeout on a line and refuse a 2-D codec, so on SBFT they get the
+    # election timeout and the fast-path wait is derived from it,
+    # W = T / --wait-divisor; everywhere else this is the ordinary codec.
+    # continuous searches both dimensions and does not use this.
+    def one_dimensional_codec() -> ActionCodec:
+        if protocol != agent_pb2.PROTOCOL_SBFT:
+            return ContinuousTimeoutActionCodec(protocol)
+        sbft_spec = context_spec(protocol)
+        return DerivedWaitActionCodec(
+            ContinuousTimeoutActionCodec(
+                protocol,
+                bounds_ms=sbft_spec.bounds_ms,
+                wait_bounds_ms=sbft_spec.wait_bounds_ms,
+            ),
+            divisor=wait_divisor,
+        )
+
     if model_type == "continuous_heuristic":
-        action_codec = ContinuousTimeoutActionCodec(protocol)
+        action_codec = one_dimensional_codec()
         feature_fields = get_report_feature_field_names(protocol)
         arms_ms = get_timeout_values_ms(protocol)
         model = ContinuousHeuristicTimeoutModel(
@@ -2144,7 +2166,7 @@ def serve(
             seed=42,
         )
     elif model_type == "latency_floor_heuristic":
-        action_codec = ContinuousTimeoutActionCodec(protocol)
+        action_codec = one_dimensional_codec()
         # The floor is this model's rule rather than a constraint on top of
         # one, so it is built here whether or not --latency-floor-k asked for
         # the constraint. k then means what it means everywhere else, and is
@@ -2186,7 +2208,7 @@ def serve(
             "linear actor + value baseline, on-policy from scratch"
         )
     elif model_type == "continuous_codex":
-        action_codec = ContinuousTimeoutActionCodec(protocol)
+        action_codec = one_dimensional_codec()
         arms_ms = get_timeout_values_ms(protocol)
         model = ContinuousLinUCB(
             action_codec=action_codec,
@@ -2210,7 +2232,7 @@ def serve(
             f"{tuple(sorted(arms_ms))}"
         )
     elif model_type == "continuous_ppo":
-        action_codec = ContinuousTimeoutActionCodec(protocol)
+        action_codec = one_dimensional_codec()
         arms_ms = get_timeout_values_ms(protocol)
         model = ContinuousPPO(
             action_codec=action_codec,
@@ -2539,6 +2561,22 @@ def main():
         ),
     )
     parser.add_argument(
+        "--wait-divisor",
+        type=float,
+        default=DEFAULT_WAIT_DIVISOR,
+        help=(
+            "SBFT only: the models that control one timeout - "
+            "continuous_heuristic, latency_floor_heuristic, continuous_codex "
+            "and continuous_ppo - pair their election timeout T with a "
+            "fast-path wait W = clamp(T / this, 10..500 ms). Both quantities "
+            "carry the same one-way-delay term, so a T that has tracked the "
+            "delay drags W with it. Measured on sbft_sim: holding the phase's "
+            "best T, 8 costs a mean 0.038 reward against the best W at that T "
+            "(12 costs 0.084, 5 costs 0.289). --model-type=continuous searches "
+            f"both dimensions and ignores this (default: {DEFAULT_WAIT_DIVISOR:g})."
+        ),
+    )
+    parser.add_argument(
         "--prior-path",
         type=str,
         default="",
@@ -2682,6 +2720,7 @@ def main():
         latency_floor_k=args.latency_floor_k,
         latency_floor_quantile=args.latency_floor_quantile,
         prior_path=args.prior_path,
+        wait_divisor=args.wait_divisor,
         dataset_csv=args.dataset_csv,
         failure_spec=args.failure_spec,
         injection_start_unix_ms=args.injection_start_unix_ms,

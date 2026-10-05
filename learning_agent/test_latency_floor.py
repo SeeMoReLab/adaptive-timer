@@ -7,6 +7,7 @@ from continuous_bandit import (
     ContinuousHeuristicTimeoutModel,
     ContinuousLinUCB,
     ContinuousPPO,
+    DerivedWaitActionCodec,
     SimReturnGPModel,
     context_spec,
     resolve_prior_path,
@@ -851,3 +852,133 @@ class PretrainingAblationTest(unittest.TestCase):
             with self.subTest(dimension=dimension):
                 self.assertGreater(value, lower_ms)
                 self.assertLess(value, upper_ms)
+
+
+class DerivedWaitActionCodecTest(unittest.TestCase):
+    """SBFT's fast-path wait derived from the election timeout, W = T / k."""
+
+    def _inner(self) -> ContinuousTimeoutActionCodec:
+        spec = context_spec(agent_pb2.PROTOCOL_SBFT)
+        return ContinuousTimeoutActionCodec(
+            agent_pb2.PROTOCOL_SBFT,
+            bounds_ms=spec.bounds_ms,
+            wait_bounds_ms=spec.wait_bounds_ms,
+        )
+
+    def test_presents_one_dimension(self) -> None:
+        codec = DerivedWaitActionCodec(self._inner())
+        self.assertEqual(codec.action_dim, 1)
+        self.assertEqual(codec.bounds_ms, (self._inner().bounds_ms[0],))
+        self.assertEqual(codec.protocol, agent_pb2.PROTOCOL_SBFT)
+
+    def test_wait_is_the_timeout_over_the_divisor(self) -> None:
+        codec = DerivedWaitActionCodec(self._inner(), divisor=8.0)
+        for timeout_ms, wait_ms in ((250, 31), (525, 66), (1100, 138), (2000, 250)):
+            with self.subTest(timeout_ms=timeout_ms):
+                self.assertEqual(codec.wait_for_timeout_ms(timeout_ms), wait_ms)
+
+    def test_wait_is_clamped_to_the_codecs_wait_bounds(self) -> None:
+        wait_lower_ms, wait_upper_ms = self._inner().bounds_ms[1]
+        # A divisor large enough to push the wait under the floor, and one
+        # small enough to push it over the ceiling.
+        self.assertEqual(
+            DerivedWaitActionCodec(self._inner(), divisor=1000.0).wait_for_timeout_ms(100),
+            wait_lower_ms,
+        )
+        self.assertEqual(
+            DerivedWaitActionCodec(self._inner(), divisor=1.0).wait_for_timeout_ms(3000),
+            wait_upper_ms,
+        )
+
+    def test_decode_pairs_the_derived_wait_with_the_chosen_timeout(self) -> None:
+        codec = DerivedWaitActionCodec(self._inner(), divisor=8.0)
+        for timeout_ms in (250, 525, 1100):
+            with self.subTest(timeout_ms=timeout_ms):
+                timeout = codec.decode(np.array([codec.normalize_ms(timeout_ms)]))
+                self.assertEqual(
+                    timeout.sbft.election_timeout_milliseconds, timeout_ms
+                )
+                self.assertEqual(
+                    timeout.sbft.slow_path_timeout_milliseconds,
+                    codec.wait_for_timeout_ms(timeout_ms),
+                )
+
+    def test_the_wait_moves_with_the_timeout(self) -> None:
+        codec = DerivedWaitActionCodec(self._inner(), divisor=8.0)
+        waits = [
+            codec.decode(
+                np.array([codec.normalize_ms(timeout_ms)])
+            ).sbft.slow_path_timeout_milliseconds
+            for timeout_ms in (250, 525, 1100)
+        ]
+        self.assertEqual(waits, sorted(waits))
+        self.assertLess(waits[0], waits[-1])
+
+    def test_rejects_a_one_dimensional_codec_and_a_bad_divisor(self) -> None:
+        with self.assertRaisesRegex(ValueError, "two dimensions"):
+            DerivedWaitActionCodec(
+                ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT)
+            )
+        with self.assertRaisesRegex(ValueError, "divisor must be > 0"):
+            DerivedWaitActionCodec(self._inner(), divisor=0.0)
+
+    def test_the_one_timeout_models_run_on_sbft_through_it(self) -> None:
+        protocol = agent_pb2.PROTOCOL_SBFT
+        names = get_report_feature_field_names(protocol)
+        n_features = get_report_feature_dim(protocol)
+        latency_index, instances_index = latency_feature_indices(names)
+        arms_ms = get_timeout_values_ms(protocol)
+        features = np.zeros(n_features)
+        features[0], features[1], features[2], features[5] = 75000, 100, 90.0, 15000
+
+        def codec() -> DerivedWaitActionCodec:
+            return DerivedWaitActionCodec(self._inner())
+
+        builders = {
+            "continuous_heuristic": lambda: ContinuousHeuristicTimeoutModel(
+                action_codec=codec(),
+                n_features=n_features,
+                latency_index=names.index("avg_consensus_latency_ms"),
+                transactions_index=names.index("total_transactions"),
+                multiplier=2.0,
+                clamp_ms=(min(arms_ms), max(arms_ms)),
+                initial_timeout_ms=sorted(arms_ms)[len(arms_ms) // 2],
+            ),
+            "latency_floor_heuristic": lambda: LatencyFloorHeuristic(
+                action_codec=codec(),
+                n_features=n_features,
+                clamp_ms=(min(arms_ms), max(arms_ms)),
+                latency_floor=NormalizedLatencyFloor(
+                    action_codec=codec(),
+                    latency_index=latency_index,
+                    n_features=n_features,
+                    instances_index=instances_index,
+                    latency_floor=LatencyFloor(),
+                ),
+            ),
+            "continuous_codex": lambda: ContinuousLinUCB(
+                action_codec=codec(), n_features=n_features, seed=42, latency_floor=None
+            ),
+            "continuous_ppo": lambda: ContinuousPPO(
+                action_codec=codec(), n_features=n_features, seed=42, latency_floor=None
+            ),
+        }
+        wait_lower_ms, wait_upper_ms = self._inner().bounds_ms[1]
+        for name, build in builders.items():
+            with self.subTest(model=name):
+                action = np.atleast_1d(
+                    np.asarray(build().predict_action(features), dtype=float)
+                ).ravel()[:1]
+                timeout = codec().decode(action).sbft
+                self.assertEqual(
+                    timeout.slow_path_timeout_milliseconds,
+                    codec().wait_for_timeout_ms(
+                        timeout.election_timeout_milliseconds
+                    ),
+                )
+                self.assertGreaterEqual(
+                    timeout.slow_path_timeout_milliseconds, wait_lower_ms
+                )
+                self.assertLessEqual(
+                    timeout.slow_path_timeout_milliseconds, wait_upper_ms
+                )

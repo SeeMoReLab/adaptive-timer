@@ -228,6 +228,111 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
         return np.asarray(normalized, dtype=float)
 
 
+
+# Divisor for the fast-path wait derived from the election timeout, W = T / k.
+# Measured on sbft_sim check --mode cal (5 seeds, W swept 20..400 ms at each
+# rung): holding the phase's best T, k = 8 costs a mean 0.038 reward against
+# the best W at that T, worst phase 0.16. k = 12 costs 0.084, k = 5 0.289 and
+# k = 3 0.204. The simulator reproduces the hardware ranking in 2 of 5 phases,
+# so treat 8 as a starting point, not a calibration.
+DEFAULT_WAIT_DIVISOR = 8.0
+
+
+class DerivedWaitActionCodec(ActionCodec[agent_pb2.Timeout]):
+    """A two-dimensional codec presented as one, the second derived from the first.
+
+    SBFT's action is an election timeout T and a fast-path wait W.
+    ContinuousHeuristicTimeoutModel, LatencyFloorHeuristic, ContinuousLinUCB
+    and ContinuousPPO each place one timeout on a line and refuse a 2-D codec,
+    so without this they cannot run on SBFT at all.
+
+    W = clamp(T / divisor, wait bounds). The two are not independent the way
+    the oracle's schedule is - schedule_sbft.csv plays W = 50, 150, 50 at the
+    same T = 525, which no function of T can express - so this does not
+    reproduce a per-phase joint optimum. It does not have to: these models
+    choose T by their own rule, and the only question left is which W to pair
+    with the T they chose. On that question a divisor is cheap, because both
+    quantities carry the same one-way-delay term (the extra round R is
+    2 * one_way + 25 ms), so a T that has tracked the delay drags W with it.
+
+    What it cannot track is the straggler-specific part of the lag, which
+    moves W without moving T. SBFT reports that directly as
+    nth_prepare_gap_ms, the n-th minus the 2f+1-th prepare; a rule reading it
+    would be strictly better informed and is the obvious next step.
+    """
+
+    def __init__(
+        self,
+        action_codec: ContinuousTimeoutActionCodec,
+        divisor: float = DEFAULT_WAIT_DIVISOR,
+    ) -> None:
+        if action_codec.action_dim != 2:
+            raise ValueError(
+                "DerivedWaitActionCodec derives the second of two dimensions, "
+                f"but the codec has {action_codec.action_dim}"
+            )
+        if not math.isfinite(divisor) or divisor <= 0.0:
+            raise ValueError(f"divisor must be > 0, got {divisor}")
+        self._inner = action_codec
+        self._divisor = float(divisor)
+        self._wait_bounds_ms = action_codec.bounds_ms[1]
+
+    @property
+    def inner(self) -> ContinuousTimeoutActionCodec:
+        return self._inner
+
+    @property
+    def divisor(self) -> float:
+        return self._divisor
+
+    @property
+    def action_dim(self) -> int:
+        return 1
+
+    @property
+    def protocol(self) -> int:
+        return self._inner.protocol
+
+    @property
+    def bounds_ms(self) -> Tuple[Tuple[int, int], ...]:
+        return (self._inner.bounds_ms[0],)
+
+    def wait_for_timeout_ms(self, timeout_ms: int) -> int:
+        """The fast-path wait this codec pairs with ``timeout_ms``."""
+        lower_ms, upper_ms = self._wait_bounds_ms
+        return int(min(upper_ms, max(lower_ms, round(int(timeout_ms) / self._divisor))))
+
+    def normalize_ms(self, timeout_ms: int, dimension: int = 0) -> float:
+        if dimension != 0:
+            raise ValueError(
+                f"DerivedWaitActionCodec exposes one dimension, got {dimension}"
+            )
+        return self._inner.normalize_ms(int(timeout_ms), 0)
+
+    def denormalize_ms(self, normalized: float, dimension: int = 0) -> int:
+        if dimension != 0:
+            raise ValueError(
+                f"DerivedWaitActionCodec exposes one dimension, got {dimension}"
+            )
+        return self._inner.denormalize_ms(float(normalized), 0)
+
+    def decode(self, action: np.ndarray) -> agent_pb2.Timeout:
+        values = np.asarray(action, dtype=float).reshape(-1)
+        if values.size != 1:
+            raise ValueError(
+                f"Expected 1 continuous action value, got {values.size}"
+            )
+        timeout_ms = self._inner.denormalize_ms(float(values[0]), 0)
+        wait_normalized = self._inner.normalize_ms(
+            self.wait_for_timeout_ms(timeout_ms), 1
+        )
+        return self._inner.decode(
+            np.array([values[0], wait_normalized], dtype=float)
+        )
+
+    def encode(self, action: object) -> np.ndarray:
+        return np.asarray(self._inner.encode(action), dtype=float).reshape(-1)[:1]
+
 class NormalizedLatencyFloor:
     """:class:`LatencyFloor` expressed in the codec's normalized action space.
 

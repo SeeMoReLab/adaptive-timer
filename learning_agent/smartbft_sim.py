@@ -587,9 +587,22 @@ def generate(n_runs: int, seed: int, workers: int, design: str) -> Tuple[np.ndar
     return np.vstack([p[0] for p in parts]), np.concatenate([p[1] for p in parts])
 
 
-def train_prior(x: np.ndarray, y: np.ndarray, out_path: str, seed: int, design: str) -> float:
+def train_prior(
+    x: np.ndarray,
+    y: np.ndarray,
+    out_path: str,
+    seed: int,
+    design: str,
+    target_floor: float = -math.inf,
+) -> float:
     from sklearn.neural_network import MLPRegressor
 
+    # Rewards below the floor are fit as the floor. SimReturnGPModel applies
+    # the same floor to the online reward, so the residual compares like with
+    # like, and the fit stops spending its error on collapses instead of on
+    # the structure that ranks the usable timeouts. A raw fit (-inf) is only
+    # usable by SimPriorGPModel.
+    y = np.maximum(y, target_floor)
     x_mean, x_std = x.mean(axis=0), x.std(axis=0) + 1e-9
     y_mean, y_std = float(y.mean()), float(y.std() + 1e-9)
     rng = np.random.default_rng(seed)
@@ -629,6 +642,7 @@ def train_prior(x: np.ndarray, y: np.ndarray, out_path: str, seed: int, design: 
         y_mean=np.asarray(y_mean),
         y_std=np.asarray(y_std),
         reward_design=np.asarray(design),
+        target_floor=np.asarray(float(target_floor)),
         target_log=np.asarray(1),
     )
     np.savez(out_path, **arrays)
@@ -741,6 +755,10 @@ def main() -> None:
     t.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     t.add_argument("--out", default=DEFAULT_PRIOR_PATH)
     t.add_argument("--reward-design", default="reward_mixed")
+    t.add_argument("--target-floor", type=float, default=-math.inf,
+                   help="fit rewards below this value as this value "
+                        "(SimReturnGPModel applies the same floor online, and "
+                        "refuses a prior fit to the raw reward); default: no floor")
     t.add_argument("--no-proposal-faults", action="store_true",
                    help="train on network-delay phases only; the prior never "
                         "sees a delayed or silent proposer")
@@ -757,7 +775,7 @@ def main() -> None:
         global NO_PROPOSAL_FAULTS
         NO_PROPOSAL_FAULTS = bool(args.no_proposal_faults)  # inherited by the forked workers
         x, y = generate(args.runs, args.seed, args.workers, args.reward_design)
-        rmse = train_prior(x, y, args.out, args.seed, args.reward_design)
+        rmse = train_prior(x, y, args.out, args.seed, args.reward_design, args.target_floor)
         print(f"samples={len(x)} reward_std={y.std():.4f} holdout_rmse={rmse:.4f} -> {args.out}")
         return
 

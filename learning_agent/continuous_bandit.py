@@ -83,10 +83,6 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
     def bounds_ms(self) -> Tuple[Tuple[int, int], ...]:
         return self._bounds_ms
 
-    @property
-    def protocol(self) -> int:
-        return self._protocol
-
     def normalize_ms(self, timeout_ms: int, dimension: int = 0) -> float:
         """Public form of the log-space mapping that decode() inverts."""
         return self._normalize_value(int(timeout_ms), dimension)
@@ -231,6 +227,101 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
         ]
         return np.asarray(normalized, dtype=float)
 
+
+
+# Default fast-path wait the one-dimensional models hold on SBFT. 50 ms is the
+# lower discrete rung and the value schedule_sbft.csv plays in 7 of its 9 rows,
+# so pinning here is the protocol's ordinary setting rather than a new one.
+DEFAULT_FIXED_WAIT_MS = 50
+
+
+class FixedWaitActionCodec(ActionCodec[agent_pb2.Timeout]):
+    """A two-dimensional codec presented as one dimension, the second pinned.
+
+    SBFT's action is an election timeout and a fast-path wait.
+    ContinuousHeuristicTimeoutModel, LatencyFloorHeuristic, ContinuousLinUCB
+    and ContinuousPPO each place ONE timeout on a line - their rule, their
+    candidate grid and their Beta policy are all one-dimensional - and they
+    refuse a 2-D codec rather than silently controlling half of the action.
+
+    There is no rule in any of them for what the fast-path wait should be: it
+    trades the common-path latency against how long the primary waits for all
+    3f+1 replies, which is not what a view-change timeout is about. So rather
+    than invent one, this holds the wait at a stated constant and lets the
+    model own the election timeout, exactly as it does on PBFT. The run is then
+    "this model on SBFT's election timeout, wait pinned at W", which is a
+    claim the plan can make and a reader can check - ``--fixed-wait-ms`` is
+    recorded in run.env.
+
+    Only ``continuous`` (SimReturnGPModel) searches both dimensions.
+    """
+
+    def __init__(
+        self,
+        action_codec: ContinuousTimeoutActionCodec,
+        wait_ms: int = DEFAULT_FIXED_WAIT_MS,
+    ) -> None:
+        if action_codec.action_dim != 2:
+            raise ValueError(
+                "FixedWaitActionCodec pins the second of two dimensions, but "
+                f"the codec has {action_codec.action_dim}"
+            )
+        wait_lower_ms, wait_upper_ms = action_codec.bounds_ms[1]
+        if not wait_lower_ms <= int(wait_ms) <= wait_upper_ms:
+            raise ValueError(
+                f"wait_ms {wait_ms} is outside the codec's wait bounds "
+                f"{wait_lower_ms}..{wait_upper_ms}ms"
+            )
+        self._inner = action_codec
+        self._wait_ms = int(wait_ms)
+        self._wait_normalized = action_codec.normalize_ms(int(wait_ms), 1)
+
+    @property
+    def inner(self) -> ContinuousTimeoutActionCodec:
+        return self._inner
+
+    @property
+    def wait_ms(self) -> int:
+        return self._wait_ms
+
+    @property
+    def action_dim(self) -> int:
+        return 1
+
+    @property
+    def protocol(self) -> int:
+        return self._inner.protocol
+
+    @property
+    def bounds_ms(self) -> Tuple[Tuple[int, int], ...]:
+        return (self._inner.bounds_ms[0],)
+
+    def normalize_ms(self, timeout_ms: int, dimension: int = 0) -> float:
+        if dimension != 0:
+            raise ValueError(
+                f"FixedWaitActionCodec exposes one dimension, got {dimension}"
+            )
+        return self._inner.normalize_ms(int(timeout_ms), 0)
+
+    def denormalize_ms(self, normalized: float, dimension: int = 0) -> int:
+        if dimension != 0:
+            raise ValueError(
+                f"FixedWaitActionCodec exposes one dimension, got {dimension}"
+            )
+        return self._inner.denormalize_ms(float(normalized), 0)
+
+    def decode(self, action: np.ndarray) -> agent_pb2.Timeout:
+        values = np.asarray(action, dtype=float).reshape(-1)
+        if values.size != 1:
+            raise ValueError(
+                f"Expected 1 continuous action value, got {values.size}"
+            )
+        return self._inner.decode(
+            np.array([values[0], self._wait_normalized], dtype=float)
+        )
+
+    def encode(self, action: object) -> np.ndarray:
+        return np.asarray(self._inner.encode(action), dtype=float).reshape(-1)[:1]
 
 class NormalizedLatencyFloor:
     """:class:`LatencyFloor` expressed in the codec's normalized action space.

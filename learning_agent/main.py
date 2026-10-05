@@ -28,8 +28,6 @@ from continuous_bandit import (
     ContinuousLinUCB,
     ContinuousPPO,
     ContinuousTimeoutActionCodec,
-    DEFAULT_FIXED_WAIT_MS,
-    FixedWaitActionCodec,
     LatencyFloorHeuristic,
     NormalizedLatencyFloor,
     SimPriorGPModel,
@@ -1969,7 +1967,6 @@ def serve(
     latency_floor_k: float,
     latency_floor_quantile: float,
     prior_path: str,
-    fixed_wait_ms: int,
     dataset_csv: Optional[Path],
     failure_spec: Optional[Path],
     injection_start_unix_ms: Optional[int],
@@ -2031,26 +2028,8 @@ def serve(
     )
 
 
-    # SBFT's action is two-dimensional. The models below each place one
-    # timeout on a line and refuse a 2-D codec, so on SBFT they get the
-    # election-timeout dimension with the fast-path wait pinned; everywhere
-    # else this is the ordinary codec. Only --model-type=continuous searches
-    # both dimensions. See FixedWaitActionCodec.
-    def one_dimensional_codec() -> ActionCodec:
-        if protocol != agent_pb2.PROTOCOL_SBFT:
-            return ContinuousTimeoutActionCodec(protocol)
-        sbft_spec = context_spec(protocol)
-        return FixedWaitActionCodec(
-            ContinuousTimeoutActionCodec(
-                protocol,
-                bounds_ms=sbft_spec.bounds_ms,
-                wait_bounds_ms=sbft_spec.wait_bounds_ms,
-            ),
-            wait_ms=fixed_wait_ms,
-        )
-
     if model_type == "continuous_heuristic":
-        action_codec = one_dimensional_codec()
+        action_codec = ContinuousTimeoutActionCodec(protocol)
         feature_fields = get_report_feature_field_names(protocol)
         arms_ms = get_timeout_values_ms(protocol)
         model = ContinuousHeuristicTimeoutModel(
@@ -2165,7 +2144,7 @@ def serve(
             seed=42,
         )
     elif model_type == "latency_floor_heuristic":
-        action_codec = one_dimensional_codec()
+        action_codec = ContinuousTimeoutActionCodec(protocol)
         # The floor is this model's rule rather than a constraint on top of
         # one, so it is built here whether or not --latency-floor-k asked for
         # the constraint. k then means what it means everywhere else, and is
@@ -2207,7 +2186,7 @@ def serve(
             "linear actor + value baseline, on-policy from scratch"
         )
     elif model_type == "continuous_codex":
-        action_codec = one_dimensional_codec()
+        action_codec = ContinuousTimeoutActionCodec(protocol)
         arms_ms = get_timeout_values_ms(protocol)
         model = ContinuousLinUCB(
             action_codec=action_codec,
@@ -2231,7 +2210,7 @@ def serve(
             f"{tuple(sorted(arms_ms))}"
         )
     elif model_type == "continuous_ppo":
-        action_codec = one_dimensional_codec()
+        action_codec = ContinuousTimeoutActionCodec(protocol)
         arms_ms = get_timeout_values_ms(protocol)
         model = ContinuousPPO(
             action_codec=action_codec,
@@ -2560,20 +2539,6 @@ def main():
         ),
     )
     parser.add_argument(
-        "--fixed-wait-ms",
-        type=int,
-        default=DEFAULT_FIXED_WAIT_MS,
-        help=(
-            "SBFT only: the fast-path wait held constant for the models that "
-            "control one timeout - continuous_heuristic, "
-            "latency_floor_heuristic, continuous_codex and continuous_ppo. "
-            "Each of them places one timeout on a line and has no rule for a "
-            "fast-path wait, so on SBFT they take the election timeout and "
-            "this value is pinned. --model-type=continuous searches both "
-            f"dimensions and ignores it (default: {DEFAULT_FIXED_WAIT_MS})."
-        ),
-    )
-    parser.add_argument(
         "--prior-path",
         type=str,
         default="",
@@ -2717,7 +2682,6 @@ def main():
         latency_floor_k=args.latency_floor_k,
         latency_floor_quantile=args.latency_floor_quantile,
         prior_path=args.prior_path,
-        fixed_wait_ms=args.fixed_wait_ms,
         dataset_csv=args.dataset_csv,
         failure_spec=args.failure_spec,
         injection_start_unix_ms=args.injection_start_unix_ms,

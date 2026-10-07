@@ -15,7 +15,7 @@ DEFAULT_LATENCY_FLOOR_K = 1.0
 
 # Windows kept for the quantile. Long enough that a burst of degraded windows
 # cannot carry the quantile on its own, short enough to follow a regime change.
-DEFAULT_LATENCY_FLOOR_WINDOW = 16
+DEFAULT_LATENCY_FLOOR_WINDOW = 1
 
 # Two pressures push this in opposite directions.
 #
@@ -45,7 +45,7 @@ DEFAULT_LATENCY_FLOOR_WINDOW = 16
 # per-arm windows, floor = the minimum across arms of each arm's own low
 # quantile - is not implemented. Re-check the exclusion count on any new spec
 # rather than assuming this transfers.
-DEFAULT_LATENCY_FLOOR_QUANTILE = 0.50
+DEFAULT_LATENCY_FLOOR_QUANTILE = 0.75
 
 
 class LatencyFloor:

@@ -390,6 +390,26 @@ def get_timeout_values_ms(protocol: int) -> Tuple[int, ...]:
     return TIMEOUT_VALUES_MS
 
 
+def get_arm_timeout_values_ms(protocol: int) -> Tuple[int, ...]:
+    """The election timeout of each action index, one entry per arm.
+
+    ``get_timeout_values_ms`` returns the distinct ladder, which is the same
+    thing for every protocol whose action is one timeout. SBFT's action is the
+    (election timeout, fast-path wait) pair, so its ladder is 3 long while its
+    action space is 6; anything indexing a per-arm structure by action index -
+    ``LatencyFloorPolicy``'s feasibility mask above all - needs this instead,
+    or it silently truncates the arm set to the first ``len(ladder)`` arms and
+    makes the long timeouts unplayable.
+    """
+    protocol = _validate_protocol(protocol)
+    if protocol == agent_pb2.PROTOCOL_SBFT:
+        return tuple(
+            _sbft_index_to_pair(index)[0]
+            for index in range(get_action_space_size(protocol))
+        )
+    return get_timeout_values_ms(protocol)
+
+
 def timeout_ms_to_index(timeout_ms: int) -> int:
     try:
         return TIMEOUT_MS_TO_INDEX[timeout_ms]

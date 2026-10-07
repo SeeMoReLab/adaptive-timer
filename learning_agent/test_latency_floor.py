@@ -25,7 +25,10 @@ from latency_floor import (
     latency_feature_indices,
 )
 from models import (
+    DiscountedLinUCB,
     TensorModel,
+    get_action_space_size,
+    get_arm_timeout_values_ms,
     get_report_feature_dim,
     get_report_feature_field_names,
     get_timeout_values_ms,
@@ -77,6 +80,63 @@ class FixedArmModel(TensorModel):
 
     def reset_model(self) -> None:
         self.was_reset = True
+
+
+
+class ArmIndexedTimeoutsTest(unittest.TestCase):
+    """LatencyFloorPolicy indexes its mask by action index, so the timeout
+    vector it is built with has to have one entry per arm. SBFT's action is a
+    (timeout, wait) pair, so the distinct 3-rung ladder is half as long as its
+    6-arm space; built with the ladder, the wrapper emitted a 3-wide one-hot
+    and arms 3-5 - both 1100 ms rungs - could never be played."""
+
+    def test_one_timeout_per_arm_for_every_protocol(self):
+        for protocol in (
+            agent_pb2.PROTOCOL_PBFT,
+            agent_pb2.PROTOCOL_SMARTBFT,
+            agent_pb2.PROTOCOL_SBFT,
+            agent_pb2.PROTOCOL_TENDERMINT,
+            agent_pb2.PROTOCOL_HOTSTUFF,
+            agent_pb2.PROTOCOL_AUTOBAHN,
+        ):
+            with self.subTest(protocol=protocol):
+                self.assertEqual(
+                    len(get_arm_timeout_values_ms(protocol)),
+                    get_action_space_size(protocol),
+                )
+
+    def test_sbft_floor_can_reach_every_arm(self):
+        protocol = agent_pb2.PROTOCOL_SBFT
+        n_arms = get_action_space_size(protocol)
+        n_features = get_report_feature_dim(protocol)
+        latency_index, instances_index = latency_feature_indices(
+            get_report_feature_field_names(protocol)
+        )
+        policy = LatencyFloorPolicy(
+            model=DiscountedLinUCB(
+                action_dim=n_arms, n_features=n_features, seed=42
+            ),
+            timeouts_ms=get_arm_timeout_values_ms(protocol),
+            latency_index=latency_index,
+            n_features=n_features,
+            instances_index=instances_index,
+            latency_floor=LatencyFloor(multiplier=1.0, quantile=0.5),
+        )
+        row = np.full(n_features, 100.0)
+        row[latency_index] = 10.0  # floor below every rung: nothing is masked
+        row[instances_index] = 500.0
+        self.assertEqual(np.asarray(policy.predict_action(row)).size, n_arms)
+
+        # The +inf initialization sweeps the arms in index order; every one of
+        # the six has to come up, the 1100 ms rungs included.
+        played = set()
+        for _ in range(n_arms):
+            scores = np.asarray(policy.predict_action(row))
+            arm = int(np.argmax(scores))
+            played.add(arm)
+            # DiscountedLinUCB learns from arm indices, not one-hot rows.
+            policy.update_model(row, np.asarray([arm], dtype=float), 1.0)
+        self.assertEqual(played, set(range(n_arms)))
 
 
 class ScoreModel(TensorModel):

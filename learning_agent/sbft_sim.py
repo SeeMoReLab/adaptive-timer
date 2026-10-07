@@ -1400,6 +1400,18 @@ def _around(rng: np.random.Generator, host: float, lo: float = 0.5, hi: float = 
     return float(host * math.exp(rng.uniform(math.log(lo), math.log(hi))))
 
 
+# Offered load the training draw is centred on: the client rate the CloudLab blocks
+# run at (run_sbft.sh --rate). Each run draws load_tps uniformly over
+# LOAD_DRAW_FACTORS x this, the same 0.5-1.25 x bracket the draw had around the 20k
+# calibration rate, so the deployment rate sits inside the support rather than past
+# its top edge. It matters because the arm ranking moves with load: at 20k the 250 ms
+# election wins phase 0 and at 30k it storms and loses to 525/1100. train --rate sets
+# it, and the fitted prior records it as load_tps. check and eval keep SPEC_RATE_TPS,
+# which is the rate of the MEASURED_20K fixture they are scored against.
+TRAIN_RATE_TPS = 30000.0
+LOAD_DRAW_FACTORS: Tuple[float, float] = (0.5, 1.25)
+
+
 def sample_constants(rng: np.random.Generator) -> SimConstants:
     """Per-run physics. The processing, transfer and view-change constants are drawn
     within 0.5-2 x their values measured on the calibration host (SimConstants'
@@ -1428,7 +1440,8 @@ def sample_constants(rng: np.random.Generator) -> SimConstants:
         onset_stall_ms=0.0 if rng.random() < 0.3 else _around(rng, h.onset_stall_ms),
         init_window_bytes=1448.0 * float(rng.integers(4, 41)),
         max_window_bytes=_around(rng, h.max_window_bytes),
-        load_tps=float(rng.uniform(10000.0, 25000.0)),
+        load_tps=float(rng.uniform(LOAD_DRAW_FACTORS[0] * TRAIN_RATE_TPS,
+                                   LOAD_DRAW_FACTORS[1] * TRAIN_RATE_TPS)),
         batch_cap=int(rng.integers(3000, BATCH_MAX_REQUESTS + 1)),
         initial_backlog=int(rng.integers(0, MAX_PENDING_REQUESTS + 1)) if rng.random() < 0.3 else 0,
     )
@@ -1723,7 +1736,8 @@ def generate(n_runs: int, seed: int, workers: int, design: str, hold: int = 1,
 
 def train_prior(x: np.ndarray, y: np.ndarray, out_path: str, seed: int, design: str,
                 target_floor: float, hold: int = 1,
-                hidden: Tuple[int, ...] = (128, 128, 64)) -> float:
+                hidden: Tuple[int, ...] = (128, 128, 64),
+                rate_tps: Optional[float] = None) -> float:
     from sklearn.neural_network import MLPRegressor
 
     y = np.maximum(y, target_floor)
@@ -1761,6 +1775,9 @@ def train_prior(x: np.ndarray, y: np.ndarray, out_path: str, seed: int, design: 
         target_floor=np.asarray(float(target_floor)),
         peer_spread=np.asarray(0.0),
         action_dim=np.asarray(2),
+        # Centre of the load draw the episodes were generated at (train --rate), so a
+        # prior deployed at a different client rate is recognisable as one.
+        load_tps=np.asarray(float(TRAIN_RATE_TPS if rate_tps is None else rate_tps)),
     )
     np.savez(out_path, **arrays)
     return rmse
@@ -1956,9 +1973,9 @@ def make_candidate(prior_path: str):
     return predict, update
 
 
-def _eval_rows(kind: str, seed: int, prior: str):
+def _eval_rows(kind: str, seed: int, prior: str, rate_tps: float = SPEC_RATE_TPS):
     c = SimConstants()
-    c.load_tps = SPEC_RATE_TPS
+    c.load_tps = rate_tps
     sim = SbftSim(c, spec_schedule(), seed=seed, start_offset_s=0.2)
     episodes = int(SPEC_RUN_S // EPISODE_S)
     if kind == "oracle":
@@ -1971,13 +1988,14 @@ def _eval_rows(kind: str, seed: int, prior: str):
     return run_agent(sim, episodes, predict, update)
 
 
-def run_eval(seeds: int, prior: str) -> str:
+def run_eval(seeds: int, prior: str, rate_tps: float = SPEC_RATE_TPS) -> str:
     from reward_utils import set_reward_design
 
     set_reward_design("reward_tps_latency")
-    lines = [f"sbft_sim eval prior={prior} seeds={seeds} (phase: candidate p50/tps/reward @T,W | oracle)"]
+    lines = [f"sbft_sim eval prior={prior} seeds={seeds} rate={rate_tps:.0f} "
+             f"(phase: candidate p50/tps/reward @T,W | oracle)"]
     for s in range(seeds):
-        res = {k: _eval_rows(k, 2000 + s, prior) for k in ("candidate", "oracle")}
+        res = {k: _eval_rows(k, 2000 + s, prior, rate_tps) for k in ("candidate", "oracle")}
         parts = []
         for p in range(5):
             out = []
@@ -1995,6 +2013,10 @@ def run_eval(seeds: int, prior: str) -> str:
 
 
 def main() -> None:
+    # Both are read by the forked generate() workers; declared here because argparse
+    # reads TRAIN_RATE_TPS below for its defaults.
+    global NO_PROPOSAL_FAULTS, TRAIN_RATE_TPS
+
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
     t = sub.add_parser("train", help="generate randomized episodes and fit the prior")
@@ -2007,6 +2029,10 @@ def main() -> None:
                    help="train on network-delay phases only; the prior never "
                         "sees a delayed or silent proposer")
     t.add_argument("--target-floor", type=float, default=-2.0)
+    t.add_argument("--rate", type=float, default=TRAIN_RATE_TPS,
+                   help=f"client rate (req/s) the load draw is centred on; each run draws "
+                        f"load_tps over {LOAD_DRAW_FACTORS[0]}-{LOAD_DRAW_FACTORS[1]} x it "
+                        f"(default {TRAIN_RATE_TPS:.0f}, the rate the CloudLab blocks run at)")
     t.add_argument("--hold-episodes", type=int, default=1,
                    help="fit the mean reward of holding each action this many episodes")
     t.add_argument("--save-data", default=None, help="also save the generated (x, y) here")
@@ -2033,12 +2059,18 @@ def main() -> None:
     e = sub.add_parser("eval", help="SimReturnGPModel against the oracle on the spec")
     e.add_argument("--seeds", type=int, default=3)
     e.add_argument("--prior", default=DEFAULT_PRIOR_PATH)
+    e.add_argument("--rate", type=float, default=TRAIN_RATE_TPS,
+                   help=f"client rate (req/s) to score the prior at (default "
+                        f"{TRAIN_RATE_TPS:.0f}); check stays at {SPEC_RATE_TPS:.0f}, the "
+                        f"rate of the measured fixture it compares against")
     args = parser.parse_args()
     from reward_utils import set_reward_design
 
     if args.cmd == "train":
-        global NO_PROPOSAL_FAULTS
         NO_PROPOSAL_FAULTS = bool(args.no_proposal_faults)  # inherited by the forked workers
+        if args.rate <= 0:
+            raise ValueError("--rate must be positive")
+        TRAIN_RATE_TPS = float(args.rate)  # likewise
         if not math.isfinite(args.target_floor):
             raise ValueError("SimReturnGPModel needs a finite --target-floor")
         check_model_spec()
@@ -2058,8 +2090,9 @@ def main() -> None:
                      policy_prior=np.asarray(args.policy_prior or ""), probe=np.asarray(args.probe))
         hidden = tuple(int(v) for v in args.hidden.split(","))
         rmse = train_prior(x, y, args.out, args.seed, args.reward_design, args.target_floor,
-                           args.hold_episodes, hidden)
+                           args.hold_episodes, hidden, args.rate)
         print(f"samples={len(x)} input_dim={x.shape[1]} runs={args.runs} hold={args.hold_episodes} workers={args.workers} "
+              f"rate={args.rate:.0f} load_draw={LOAD_DRAW_FACTORS[0] * args.rate:.0f}-{LOAD_DRAW_FACTORS[1] * args.rate:.0f} "
               f"gen_s={t_gen:.1f} reward_mean={y.mean():.4f} reward_std={y.std():.4f} "
               f"floored_std={np.maximum(y, args.target_floor).std():.4f} "
               f"floored_share={(y < args.target_floor).mean():.3f} holdout_rmse={rmse:.4f} -> {args.out}")
@@ -2087,7 +2120,7 @@ def main() -> None:
         print(run_check(args.seeds, args.workers, args.mode, pairs, args.out))
         return
     check_model_spec()
-    print(run_eval(args.seeds, args.prior))
+    print(run_eval(args.seeds, args.prior, args.rate))
 
 
 if __name__ == "__main__":

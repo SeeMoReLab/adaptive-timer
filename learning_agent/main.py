@@ -65,6 +65,7 @@ from models import (
     get_action_space_size,
     get_report_feature_dim,
     get_report_feature_field_names,
+    get_arm_timeout_values_ms,
     get_timeout_values_ms,
     report_to_feature_values,
 )
@@ -2280,7 +2281,10 @@ def serve(
     ):
         model = LatencyFloorPolicy(
             model=model,
-            timeouts_ms=get_timeout_values_ms(protocol),
+            # Per arm, not the distinct ladder: SBFT has 6 arms over a 3-rung
+            # ladder, and the shorter vector left arms 3-5 - both 1100 rungs -
+            # unreachable.
+            timeouts_ms=get_arm_timeout_values_ms(protocol),
             latency_index=latency_index,
             n_features=get_report_feature_dim(protocol),
             instances_index=instances_index,

@@ -1327,7 +1327,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
     rm -rf "${run_root}/sharing_wal_${replica_id}"
     tmux kill-session -t "${sharing_session}" >/dev/null 2>&1 || true
     tmux new-session -d -s "${sharing_session}" \
-      "sudo -n ip netns exec ${ns_name} sudo -n -u $(id -un) env HOME=${HOME} bash -lc 'cd \"${run_root}\" && exec ./bin/smartbft-sharing --role server --node-id $((replica_id + 1)) --protocol ${agent_protocol} --hosts-config \"${run_root}/sharing_hosts.config\" --data-dir \"${run_root}/sharing_wal_${replica_id}\" --keep-data' > \"${run_root}/logs/sharing_${replica_id}.log\" 2>&1"
+      "sudo -n ip netns exec ${ns_name} sudo -n -u $(id -un) env HOME=${HOME} bash -lc 'cd \"${run_root}\" && exec ./bin/smartbft-sharing --node-id $((replica_id + 1)) --protocol ${agent_protocol} --hosts-config \"${run_root}/sharing_hosts.config\" --data-dir \"${run_root}/sharing_wal_${replica_id}\"' > \"${run_root}/logs/sharing_${replica_id}.log\" 2>&1"
   fi
 done
 

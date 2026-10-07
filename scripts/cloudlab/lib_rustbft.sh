@@ -76,11 +76,8 @@ AGENT_MODEL_SET=0
 TX_RATE=60000
 TX_SIZE=512
 REQUEST_TIMEOUT_MS=10000
-CLIENT_RETRY_TIMEOUT_MS=1000
-# Resolved after parsing: spread unless given explicitly.
-CLIENT_TARGET_MODE=""
 # Parallel client connections (independent senders) per replica front. One
-# framed connection tops out around 10k tx/s, so leader mode needs several.
+# framed connection tops out around 10k tx/s.
 CLIENT_CONNECTIONS_PER_TARGET=4
 MONITOR_INTERVAL_MS=1000
 # Consensus/mempool knobs default to the checked-in template
@@ -182,13 +179,6 @@ ${PROTOCOL_NAME} options:
   --rate <int>                      Total client tx/s across all replicas (default: 1000).
   --tx-size <int>                   Transaction size in bytes, >= 9 (default: 512).
   --request-timeout <ms>            Client per-tx timeout in ms (default: 10000).
-  --client-retry-timeout <ms>       Broadcast mode: re-broadcast an unacked tx after this many ms, doubling per retry (default: 1000).
-  --client-target-mode <mode>       spread: rate split across all replicas (default); leader: all
-                                     transactions go to the current leader, following leader hints;
-                                     broadcast: like leader, plus shadow tx headers to every other
-                                     replica so followers measure client latency. leader and
-                                     broadcast need a stable-leader protocol, which none of the
-                                     current Rust protocols is.
   --client-connections <int>        Parallel client connections (independent senders) per replica
                                      front (default: 4). One framed connection tops out around
                                      10k tx/s, so high rates in leader mode need several.
@@ -392,8 +382,6 @@ rustbft_main() {
       --rate) TX_RATE="${2:-}"; shift 2 ;;
       --tx-size) TX_SIZE="${2:-}"; shift 2 ;;
       --request-timeout) REQUEST_TIMEOUT_MS="${2:-}"; shift 2 ;;
-      --client-retry-timeout) CLIENT_RETRY_TIMEOUT_MS="${2:-}"; shift 2 ;;
-      --client-target-mode) CLIENT_TARGET_MODE="${2:-}"; shift 2 ;;
       --client-connections) CLIENT_CONNECTIONS_PER_TARGET="${2:-}"; shift 2 ;;
       --max-payload-size) MAX_PAYLOAD_SIZE="${2:-}"; shift 2 ;;
       --min-block-delay) MIN_BLOCK_DELAY_MS="${2:-}"; shift 2 ;;
@@ -458,7 +446,7 @@ rustbft_main() {
   if (( NODES_SET == 0 )); then
     NODES="$((3 * F + 1))"
   fi
-  for value_name in NODES EXPERIMENT_TIME_S TX_RATE TX_SIZE REQUEST_TIMEOUT_MS CLIENT_RETRY_TIMEOUT_MS FRONT_PORT AGENT_PORT; do
+  for value_name in NODES EXPERIMENT_TIME_S TX_RATE TX_SIZE REQUEST_TIMEOUT_MS FRONT_PORT AGENT_PORT; do
     value="${!value_name}"
     if ! [[ "${value}" =~ ^[0-9]+$ ]] || (( value < 1 )); then
       echo "Invalid ${value_name}: ${value}" >&2
@@ -497,17 +485,6 @@ rustbft_main() {
   case "${LEARNING_WINDOW_MODE}" in
     wall-clock) ;;
     *) echo "Invalid --learning-window-mode value: ${LEARNING_WINDOW_MODE}. Rust protocols support wall-clock only." >&2; exit 2 ;;
-  esac
-  if [[ -z "${CLIENT_TARGET_MODE}" ]]; then
-    CLIENT_TARGET_MODE="spread"
-  fi
-  case "${CLIENT_TARGET_MODE}" in
-    spread) ;;
-    # The leader-following modes need a stable leader to follow; every
-    # current Rust protocol rotates leaders, so there is nothing to allow
-    # here until a stable-leader protocol is added.
-    leader|broadcast) echo "--client-target-mode ${CLIENT_TARGET_MODE} requires a stable-leader protocol; ${PROTOCOL_NAME} rotates leaders." >&2; exit 2 ;;
-    *) echo "Invalid --client-target-mode value: ${CLIENT_TARGET_MODE}. Use spread, leader, or broadcast." >&2; exit 2 ;;
   esac
   if ! [[ "${CLIENT_CONNECTIONS_PER_TARGET}" =~ ^[1-9][0-9]*$ ]]; then
     echo "Invalid --client-connections value: ${CLIENT_CONNECTIONS_PER_TARGET}. Use a positive integer." >&2
@@ -626,8 +603,6 @@ rustbft_main() {
     printf 'tx_rate=%q\n' "${TX_RATE}"
     printf 'tx_size=%q\n' "${TX_SIZE}"
     printf 'request_timeout_ms=%q\n' "${REQUEST_TIMEOUT_MS}"
-    printf 'client_retry_timeout_ms=%q\n' "${CLIENT_RETRY_TIMEOUT_MS}"
-    printf 'client_target_mode=%q\n' "${CLIENT_TARGET_MODE}"
     printf 'client_connections_per_target=%q\n' "${CLIENT_CONNECTIONS_PER_TARGET}"
     printf 'parameters_template=%q\n' "${PARAMETERS_TEMPLATE_REL}"
     printf 'max_payload_size=%q\n' "${MAX_PAYLOAD_SIZE:-from-template}"
@@ -760,7 +735,7 @@ rustbft_main() {
 
   echo "Selected mode: ${MODE}"
   echo "${PROTOCOL_NAME} nodes: ${NODES} (f=${F}, replicas_per_server_machine=${replicas_per_server_machine})"
-  echo "Client rate: ${TX_RATE} tx/s; tx size: ${TX_SIZE} B; request timeout: ${REQUEST_TIMEOUT_MS} ms; retry timeout: ${CLIENT_RETRY_TIMEOUT_MS} ms"
+  echo "Client rate: ${TX_RATE} tx/s; tx size: ${TX_SIZE} B; request timeout: ${REQUEST_TIMEOUT_MS} ms"
   echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (dataset=${DATASET_ENABLED}, log=${LOG_ENABLED})"
 
   echo "Creating ${PROTOCOL_NAME} CloudLab payload tarball..."
@@ -1324,7 +1299,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
     rm -rf "${run_root}/sharing_wal_${replica_id}"
     tmux kill-session -t "${sharing_session}" >/dev/null 2>&1 || true
     tmux new-session -d -s "${sharing_session}" \
-      "sudo -n ip netns exec ${ns_name} sudo -n -u $(id -un) env HOME=${HOME} bash -lc 'cd \"${run_root}\" && exec ./bin/smartbft-sharing --role server --node-id $((replica_id + 1)) --protocol ${agent_protocol} --hosts-config \"${run_root}/sharing_hosts.config\" --data-dir \"${run_root}/sharing_wal_${replica_id}\" --keep-data' > \"${run_root}/logs/sharing_${replica_id}.log\" 2>&1"
+      "sudo -n ip netns exec ${ns_name} sudo -n -u $(id -un) env HOME=${HOME} bash -lc 'cd \"${run_root}\" && exec ./bin/smartbft-sharing --node-id $((replica_id + 1)) --protocol ${agent_protocol} --hosts-config \"${run_root}/sharing_hosts.config\" --data-dir \"${run_root}/sharing_wal_${replica_id}\"' > \"${run_root}/logs/sharing_${replica_id}.log\" 2>&1"
   fi
 done
 
@@ -1462,7 +1437,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
     tmux new-session -d -s "${worker_session}" \
       "sudo -n ip netns exec ${ns_name} bash -lc 'exec ${worker_cmd}' > \"${worker_log}\" 2>&1"
   else
-    args=("${base_args[@]}" "--store" "${store_dir}" "--protocol" "${protocol}" "${adaptive_args[@]}")
+    args=("${base_args[@]}" "--store" "${store_dir}" "${adaptive_args[@]}")
     printf -v server_cmd '%q ' "${args[@]}"
     tmux new-session -d -s "${session_name}" \
       "sudo -n ip netns exec ${ns_name} bash -lc 'exec ${server_cmd}' > \"${server_log}\" 2>&1"
@@ -1521,9 +1496,7 @@ REMOTE
     "${MONITOR_INTERVAL_MS}" \
     "${RUN_ROOT_REMOTE_NAME}" \
     "${PROTOCOL_NAME}" \
-    "${CLIENT_TARGET_MODE}" \
     "${CLIENT_CONNECTIONS_PER_TARGET}" \
-    "${CLIENT_RETRY_TIMEOUT_MS}" \
     ${client_targets_args} <<'REMOTE'
 set -euo pipefail
 
@@ -1534,10 +1507,8 @@ request_timeout_ms="$4"
 monitor_interval_ms="$5"
 run_root="$HOME/$6"
 protocol="$7"
-client_target_mode="$8"
-client_connections_per_target="$9"
-client_retry_timeout_ms="${10}"
-shift 10
+client_connections_per_target="$8"
+shift 8
 targets=("$@")
 
 args=(
@@ -1548,9 +1519,7 @@ args=(
   "--request-timeout" "${request_timeout_ms}"
   "--monitor-interval" "${monitor_interval_ms}"
   "--start-unix-ms" "${start_unix_ms}"
-  "--target-mode" "${client_target_mode}"
   "--connections-per-target" "${client_connections_per_target}"
-  "--retry-timeout" "${client_retry_timeout_ms}"
 )
 printf -v client_cmd '%q ' "${args[@]}"
 tmux kill-session -t "${protocol}_client" >/dev/null 2>&1 || true

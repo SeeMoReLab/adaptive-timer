@@ -46,9 +46,7 @@ AGENT_PORT=15501
 SHARING_REPORT_PORT=15601
 SHARING_CONSENSUS_PORT=15701
 SHARING_COLLECT_WAIT_MS=100
-LEARNING_NODE_ID=1
 INITIAL_TIMEOUT="5s"
-LEARNING_WINDOW_MODE="consensus"
 LEARNING_FEATURE_DURATION="10s"
 LEARNING_REPLY_WAIT="2s"
 LEARNING_WARMUP_DURATION="3s"
@@ -153,9 +151,7 @@ SmartBFT options:
 
 Learning-agent options:
   --agent-port <port>               Learning-agent port inside each replica namespace (default: 15501).
-  --learning-node-id <id>           Deprecated; SmartBFT CloudLab now starts one agent per node.
   --initial-timeout <duration>      Initial PBFT timeout value reported by SmartBFT (default: 5s).
-  --learning-window-mode <mode>     Episode boundaries: consensus|wall-clock (default: consensus).
   --learning-feature-duration <duration>
                                      Feature window in wall-clock mode (default: 10s).
   --learning-reply-wait <duration>  Recommendation wait in wall-clock mode (default: 2s).
@@ -425,16 +421,8 @@ while [[ $# -gt 0 ]]; do
       AGENT_PORT="${2:-}"
       shift 2
       ;;
-    --learning-node-id)
-      LEARNING_NODE_ID="${2:-}"
-      shift 2
-      ;;
     --initial-timeout)
       INITIAL_TIMEOUT="${2:-}"
-      shift 2
-      ;;
-    --learning-window-mode)
-      LEARNING_WINDOW_MODE="${2:-}"
       shift 2
       ;;
     --learning-feature-duration)
@@ -503,10 +491,6 @@ if (( SERVER_PORT_BASE + NODES > 65535 )); then
   echo "Invalid --port-base ${SERVER_PORT_BASE} for ${NODES} nodes." >&2
   exit 2
 fi
-case "${LEARNING_WINDOW_MODE}" in
-  consensus|wall-clock) ;;
-  *) echo "Invalid --learning-window-mode value: ${LEARNING_WINDOW_MODE}. Expected consensus or wall-clock." >&2; exit 2 ;;
-esac
 if [[ -n "${CREATE_WORKERS}" ]] && (! [[ "${CREATE_WORKERS}" =~ ^[0-9]+$ ]] || (( CREATE_WORKERS < 1 ))); then
   echo "Invalid --create-workers value: ${CREATE_WORKERS}." >&2
   exit 2
@@ -643,7 +627,7 @@ fi
   printf 'reward_design=%q\n' "${REWARD_DESIGN}"
   printf 'latency_floor_k=%q\n' "${LATENCY_FLOOR_K}"
   printf 'schedule_file=%q\n' "${SCHEDULE_FILE}"
-  printf 'learning_window_mode=%q\n' "${LEARNING_WINDOW_MODE}"
+  printf 'learning_window_mode=wall-clock\n'
   printf 'dataset_enabled=%q\n' "${DATASET_ENABLED}"
   printf 'log_enabled=%q\n' "${LOG_ENABLED}"
   printf 'failure_spec_enabled=%q\n' "${FAILURE_SPEC_ENABLED}"
@@ -1228,7 +1212,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
     rm -rf "${run_root}/sharing_wal_${replica_id}"
     tmux kill-session -t "${sharing_session}" >/dev/null 2>&1 || true
     tmux new-session -d -s "${sharing_session}" \
-      "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec ./bin/smartbft-sharing --role server --node-id $((replica_id + 1)) --protocol smartbft --hosts-config \"${run_root}/sharing_hosts.config\" --data-dir \"${run_root}/sharing_wal_${replica_id}\" --keep-data' > \"${sharing_log}\" 2>&1"
+      "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec ./bin/smartbft-sharing --node-id $((replica_id + 1)) --protocol smartbft --hosts-config \"${run_root}/sharing_hosts.config\" --data-dir \"${run_root}/sharing_wal_${replica_id}\"' > \"${sharing_log}\" 2>&1"
   fi
 done
 
@@ -1289,9 +1273,7 @@ for i in "${!server_nodes[@]}"; do
 	      "${AGENT_PORT}" \
 	      "${BATCH_SIZE}" \
 	      "${BATCH_TIMEOUT}" \
-	      "${REQUEST_TIMEOUT}" \
 	      "${INITIAL_TIMEOUT}" \
-	      "${LEARNING_WINDOW_MODE}" \
 	      "${LEARNING_FEATURE_DURATION}" \
 	      "${LEARNING_REPLY_WAIT}" \
 	      "${LEARNING_WARMUP_DURATION}" \
@@ -1307,14 +1289,12 @@ learning_enabled="$5"
 agent_port="$6"
 batch_size="$7"
 batch_timeout="$8"
-request_timeout="$9"
-initial_timeout="${10}"
-learning_window_mode="${11}"
-learning_feature_duration="${12}"
-learning_reply_wait="${13}"
-learning_warmup_duration="${14}"
-learning_reward_duration="${15}"
-verbose_enabled="${16}"
+initial_timeout="$9"
+learning_feature_duration="${10}"
+learning_reply_wait="${11}"
+learning_warmup_duration="${12}"
+learning_reward_duration="${13}"
+verbose_enabled="${14}"
 run_root="$HOME/smartbft_cloudlab"
 
 for ((n = 0; n < replicas_per_machine; n++)); do
@@ -1331,9 +1311,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
     "--hosts-config" "${run_root}/hosts.config"
     "--batch-size" "${batch_size}"
     "--batch-timeout" "${batch_timeout}"
-    "--request-timeout" "${request_timeout}"
     "--data-dir" "${data_dir}"
-    "--keep-data"
   )
 	  if [[ "${failure_enabled}" == "1" ]]; then
 	    args+=("--failure-spec" "${run_root}/config/smartbft/failure_spec.xml" "--failure-start-unix-ms" "${start_unix_ms}")
@@ -1342,9 +1320,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
 	    args+=(
 	      "--learning"
 	      "--agent-target" "127.0.0.1:${agent_port}"
-	      "--learning-node-id" "${node_id}"
 	      "--learning-initial-election-timeout" "${initial_timeout}"
-	      "--learning-window-mode" "${learning_window_mode}"
 	      "--learning-feature-duration" "${learning_feature_duration}"
 	      "--learning-reply-wait" "${learning_reply_wait}"
 	      "--learning-warmup-duration" "${learning_warmup_duration}"

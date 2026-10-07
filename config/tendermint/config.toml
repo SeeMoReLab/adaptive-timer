@@ -352,21 +352,9 @@ timeout_commit = "0s"
 # So, validators should stop the state machine, wait for some blocks, and then restart the state machine to avoid panic.
 double_sign_check_height = 0
 
-# How learning episode boundaries are drawn: "consensus" counts committed consensus
-# instances (adaptive_timer_epoch_size), "wall-clock" uses elapsed time
-# (adaptive_timer_feature_duration and friends).
-adaptive_timer_window_mode = "wall-clock"
-
-# Number of committed consensus instances in each feature and reward window.
-# After collecting epoch_size features, wait 0.1*epoch_size for a prediction,
-# apply it, warm up for 0.1*epoch_size, then collect epoch_size rewards.
-# Only used when adaptive_timer_window_mode = "consensus".
-adaptive_timer_epoch_size = 20
-
 # Wall-clock learning window durations. Each episode collects features for
 # feature_duration, waits reply_wait for the agent's prediction, applies it and
 # discards warmup_duration, then collects the reward for reward_duration.
-# Only used when adaptive_timer_window_mode = "wall-clock".
 adaptive_timer_feature_duration = "8s"
 adaptive_timer_reply_wait = "2s"
 adaptive_timer_warmup_duration = "2s"

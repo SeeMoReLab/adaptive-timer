@@ -11,9 +11,9 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
-TIMESTAMP_RE = re.compile(
-    r"^[A-Z]\[(?:(\d{4}-\d{2}-\d{2})\|)?(\d{2}:\d{2}:\d{2}\.\d{3})\]"
-)
+# CometBFT log lines start with the level letter and an ISO-8601 UTC timestamp,
+# e.g. "I[2026-10-04T01:35:11.464Z] ...".
+TIMESTAMP_RE = re.compile(r"^[A-Z]\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\]")
 NEW_HEIGHT_RE = re.compile(
     r"phase enter\s+module=consensus\s+height=(\d+)\s+round=-?\d+\s+"
     r"phase=RoundStepNewHeight\b"
@@ -73,27 +73,14 @@ def load_failure_schedule(path):
     return warmup_s, phase_starts_s
 
 
-def parse_timestamp(line, experiment_start):
+def parse_timestamp(line):
     match = TIMESTAMP_RE.search(line)
     if match is None:
         return None
-
-    date_part, time_part = match.groups()
-    if date_part:
-        return datetime.datetime.strptime(
-            f"{date_part} {time_part}", "%Y-%m-%d %H:%M:%S.%f"
-        )
-
-    parsed_time = datetime.datetime.strptime(time_part, "%H:%M:%S.%f").time()
-    timestamp = datetime.datetime.combine(experiment_start.date(), parsed_time)
-    if timestamp < experiment_start - datetime.timedelta(hours=12):
-        timestamp += datetime.timedelta(days=1)
-    elif timestamp > experiment_start + datetime.timedelta(hours=12):
-        timestamp -= datetime.timedelta(days=1)
-    return timestamp
+    return datetime.datetime.fromisoformat(match.group(1).replace("Z", "+00:00"))
 
 
-def load_node_log(path, experiment_start):
+def load_node_log(path):
     new_height_start = {}
     committed = {}
     batch_sizes = {}
@@ -104,7 +91,7 @@ def load_node_log(path, experiment_start):
 
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
-            timestamp = parse_timestamp(line, experiment_start)
+            timestamp = parse_timestamp(line)
             if timestamp is None:
                 continue
 
@@ -230,10 +217,12 @@ def complete_height_phase_totals(height, phase_rounds):
 
 
 def print_report(logs_dir, failure_spec, start_unix_ms):
-    experiment_start = datetime.datetime.fromtimestamp(start_unix_ms / 1000.0)
+    experiment_start = datetime.datetime.fromtimestamp(
+        start_unix_ms / 1000.0, tz=datetime.timezone.utc
+    )
     warmup_s, phase_starts_s = load_failure_schedule(failure_spec)
     new_height_start, committed, batch_sizes, phase_rounds = load_node_log(
-        logs_dir / "node_0.log", experiment_start
+        logs_dir / "node_0.log"
     )
 
     round_keys = sorted(

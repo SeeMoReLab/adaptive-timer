@@ -16,10 +16,9 @@
           Outside bursts: delay = globalNetworkDelay.
         - Set both burst fields to 0 to disable phase network bursts.
           If burstDurationMs >= burstIntervalMs, the edge is continuously slow.
-      Protocol precedence per phase: replica override > global default.
       Proposal delay:
         - <interval> repeats the proposal-delay phase every N seconds until the
-          next phase starts. <intervalMs> can be used for millisecond precision.
+          next phase starts.
         - For <id>leader</id>, the leader is resolved independently at each
           interval tick.
 

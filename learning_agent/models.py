@@ -318,6 +318,7 @@ HOTSTUFF_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "view_change_count",
     "no_progress_view_change_count",
 )
+# AutobahnReport has HotstuffReport's layout without regency_change_count.
 AUTOBAHN_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "total_transactions",
     "total_consensus_instances",
@@ -328,7 +329,6 @@ AUTOBAHN_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "avg_batch_size",
     "p95_batch_size",
     "leader_change_count",
-    "regency_change_count",
     "timeout_ms",
     "avg_inter_commit_gap_ms",
     "p50_inter_commit_gap_ms",
@@ -676,8 +676,7 @@ def action_index_to_timeout(protocol: int, index: int) -> agent_pb2.Timeout:
         )
     if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
         # The only Autobahn action is the view-change timer; the fast-path
-        # wait is fixed in config/autobahn/parameters.json and car_timeout is
-        # read by nothing, so both stay 0 (the replica rejects anything else).
+        # wait is fixed in config/autobahn/parameters.json.
         timeout_ms = autobahn_timeout_delay_index_to_ms(index)
         return agent_pb2.Timeout(
             autobahn=agent_pb2.AutobahnTimeout(timeout_delay_milliseconds=timeout_ms)

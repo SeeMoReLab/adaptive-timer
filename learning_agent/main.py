@@ -232,7 +232,6 @@ def reward_engineering(
             avg_batch_size=float(report.avg_batch_size),
             p95_batch_size=float(report.p95_batch_size),
             leader_change_count=int(report.leader_change_count),
-            regency_change_count=int(report.regency_change_count),
             timeout_ms=int(report.timeout_ms),
             avg_inter_commit_gap_ms=float(report.avg_inter_commit_gap_ms),
             p50_inter_commit_gap_ms=float(report.p50_inter_commit_gap_ms),
@@ -253,16 +252,6 @@ PROTOCOL_NAME_TO_ENUM = {
     "autobahn": agent_pb2.PROTOCOL_AUTOBAHN,
     "smartbft": agent_pb2.PROTOCOL_SMARTBFT,
 }
-
-# Protocols whose report windows are bounded by wall-clock time rather than by
-# consensus ticks: window_consensus_count == 0 marks a wall-clock window.
-WALL_CLOCK_PROTOCOLS = (
-    agent_pb2.PROTOCOL_PBFT,
-    agent_pb2.PROTOCOL_SBFT,
-    agent_pb2.PROTOCOL_HOTSTUFF,
-    agent_pb2.PROTOCOL_AUTOBAHN,
-    agent_pb2.PROTOCOL_SMARTBFT,
-)
 
 
 def _parse_protocol(value: str) -> int:
@@ -869,13 +858,9 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 [int(report.window_consensus_count) for report in reports]
             )
         )
-        is_wall_clock = (
-            self._protocol in WALL_CLOCK_PROTOCOLS
-            and window_consensus_count == 0
-        )
-        if report_seq < start_tick or (
-            report_seq == start_tick and not is_wall_clock
-        ):
+        # Every protocol reports wall-clock windows, which may contain no
+        # decision, so the window may end where it started.
+        if report_seq < start_tick:
             raise ValueError(
                 f"Invalid consensus report window: start={start_tick}, seq={report_seq}"
             )
@@ -1187,9 +1172,6 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         dirty_report.leader_change_count = self._rng.randint(
             0, max(int(state.leader_change_count), 1) * 3
         )
-        dirty_report.regency_change_count = self._rng.randint(
-            0, max(int(state.regency_change_count), 1) * 3
-        )
         dirty_report.timeout_ms = max(0, int(round(float(state.timeout_ms) * self._rng.uniform(0.8, 1.2))))
         dirty_report.avg_inter_commit_gap_ms = float(
             max(0.0, float(state.avg_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.0))
@@ -1261,18 +1243,10 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 "Protocol mismatch in report: "
                 f"expected={self._protocol}, got={request.protocol}",
             )
-        is_wall_clock = (
-            self._protocol in WALL_CLOCK_PROTOCOLS
-            and int(request.window_consensus_count) == 0
-        )
-        if int(request.report_seq) < int(request.start_tick) or (
-            int(request.report_seq) == int(request.start_tick)
-            and not is_wall_clock
-        ):
+        if int(request.report_seq) < int(request.start_tick):
             context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
-                "Invalid report window: report_seq must be greater than start_tick "
-                "unless this is a wall-clock window.",
+                "Invalid report window: report_seq must not be below start_tick.",
             )
         try:
             incoming_state = _extract_state(request, self._protocol)
@@ -1331,7 +1305,6 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                     state,
                     int(local_report.start_tick),
                     int(local_report.report_seq),
-                    int(local_report.window_consensus_count),
                 )
                 self._timeouts_by_episode[local_report.episode] = TimeoutDecision(
                     timeout=timeout,
@@ -1357,14 +1330,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             return empty_pb2.Empty()
         if not _protocols_compatible(request.protocol, self._protocol):
             return empty_pb2.Empty()
-        is_wall_clock = (
-            self._protocol in WALL_CLOCK_PROTOCOLS
-            and int(request.window_consensus_count) == 0
-        )
-        if int(request.report_seq) < int(request.start_tick) or (
-            int(request.report_seq) == int(request.start_tick)
-            and not is_wall_clock
-        ):
+        if int(request.report_seq) < int(request.start_tick):
             return empty_pb2.Empty()
         if not self._verify_report(request):
             return empty_pb2.Empty()
@@ -1482,7 +1448,6 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 aggregated_report,
                 start_tick,
                 report_seq,
-                window_consensus_count,
             )
             self._timeouts_by_episode[request.episode] = TimeoutDecision(
                 timeout=timeout,
@@ -1902,15 +1867,8 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         report: object,
         start_tick: int,
         report_seq: int,
-        window_consensus_count: int,
     ) -> agent_pb2.Timeout:
-        is_wall_clock = (
-            self._protocol in WALL_CLOCK_PROTOCOLS
-            and window_consensus_count == 0
-        )
-        if report_seq < start_tick or (
-            report_seq == start_tick and not is_wall_clock
-        ):
+        if report_seq < start_tick:
             raise ValueError(
                 f"Invalid report window for timeout prediction: start={start_tick}, seq={report_seq}"
             )

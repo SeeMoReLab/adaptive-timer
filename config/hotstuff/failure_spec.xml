@@ -29,19 +29,15 @@
       <id>leader</id> is rejected because both HotStuff and Autobahn rotate
       leaders):
         - <proposalDelay>: the replica holds the consensus proposals it
-          leads. Autobahn only: <messages>prepare,confirm,commit</messages>
-          selects which leader-originated phases are held (default prepare),
-          and <forceSlowPath>true</forceSlowPath> makes the leader ignore a
-          unanimous Prepare QC after its own fast-path wait.
+          leads (the HotStuff block proposal, the Autobahn Prepare).
         - <voteDelay> (Autobahn only): the replica holds its consensus votes
           and nothing else, defeating unanimity without being a slow leader.
         - Each rule or replica takes <delayMs> (fixed) or
           <delayRelativeToTimeoutMs> (live view-change timeout plus a signed
           offset, clamped at zero).
 
-      Phase timing:
-        - Preferred: <atTime> means "activate this phase at t seconds from start".
-        - Legacy: <time> is interpreted as phase duration by the network applier.
+      Phase timing: every phase needs exactly one of <atTime> (seconds) or
+      <atTimeMs>, the activation time after the warm-up.
     -->
 
     <schemaVersion>4</schemaVersion>

@@ -349,7 +349,6 @@ def calculate_autobahn_reward(
     avg_batch_size: float,
     p95_batch_size: float,
     leader_change_count: int,
-    regency_change_count: int,
     timeout_ms: int,
     avg_inter_commit_gap_ms: float,
     p50_inter_commit_gap_ms: float,

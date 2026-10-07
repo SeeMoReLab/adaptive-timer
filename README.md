@@ -100,11 +100,13 @@ Both runners source `scripts/cloudlab/lib_bedrock.sh`; `run_pbft.sh --help` list
 
 Timeout sweeps in scheduled mode, one CloudLab run per value with combined agent datasets, use `scripts/cloudlab/run_pbft_sweep.sh <key> -d <seconds> -t '300;1000;3000'` and `run_sbft_sweep.sh <key> -d <seconds> -t '1000;3000' -s '20;100'` (every election and slow-path timeout pair).
 
-Outputs land in `scripts/cloudlab/tmp/runs/<protocol>/<run_id>/` (`<protocol>_output.txt`, `client.log`, `committee.json`, `run.env`, and with `--log` the server, applier, and agent logs). Plot a run with:
+Outputs land in `scripts/cloudlab/tmp/runs/<protocol>/<run_id>/` (`<protocol>_output.txt`, `client.log`, `committee.json`, `run.env`, and with `--log` the server, applier, and agent logs). Plot a run of any protocol (it needs `--log`) with:
 
 ```bash
-python3 scripts/cloudlab/plot_pbft.py --input scripts/cloudlab/tmp/runs/pbft/<run_id> --output plot.png
+python3 scripts/cloudlab/plot_run.py --input scripts/cloudlab/tmp/runs/pbft/<run_id> --output plot.png
 ```
+
+`plot_run.py` relies on three lines every protocol prints, after a prefix that may differ: the client's `Waiting until benchmark start unix ms <N>` and `[client <ISO-8601 ts>] Monitor duration=... succ=... p50=... p95=...`, and each replica's `applied timeouts: <timer>_ms=<v> ...` (logged at startup and on every change, one panel per timer). Every harness lays a run out the same way: `client.log` in the run directory and `logs/servers/server_N.log`, `logs/appliers/`, `logs/agents/`.
 
 For a local loopback run without the harness see `CppBedrock/adaptive_timers.MD`.
 

@@ -96,6 +96,7 @@ class _Window:
     txs: int = 0
     heights: int = 0
     rounds_gt0: int = 0
+    round_changes: int = 0
     lat: List[float] = field(default_factory=list)
     prop: List[float] = field(default_factory=list)
     prev: List[float] = field(default_factory=list)
@@ -124,7 +125,7 @@ class _Window:
             "p50_batch_size": pct(self.batch, 50),
             "p90_batch_size": pct(self.batch, 90),
             "leader_change_count": float(self.rounds_gt0),
-            "regency_change_count": float(self.rounds_gt0),
+            "regency_change_count": float(self.round_changes),
             "propose_latency_ms": avg(self.prop),
             "prevote_latency_ms": avg(self.prev),
             "precommit_latency_ms": avg(self.prec),
@@ -272,6 +273,7 @@ class TendermintSim:
                         w.heights += 1
                         w.txs += int(s["ntx"])
                         w.rounds_gt0 += int(s["round"] > 0)
+                        w.round_changes += int(s["round"])
                         w.lat.append(s["lat"])
                         w.batch.append(s["ntx"])
                         if "prop" in s:

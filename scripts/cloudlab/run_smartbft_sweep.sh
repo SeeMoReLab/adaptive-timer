@@ -14,12 +14,10 @@ MAX_TIMEOUT_MS=4294967295
 duration_s=""
 timeouts_spec=""
 targets_file=""
-learning_window_mode=""
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> -d <experiment_seconds> -t <timeouts>
-          [--learning-window-mode <consensus|wall-clock>] [targets_file]
+Usage: $0 <private_key_path> -d <experiment_seconds> -t <timeouts> [targets_file]
 
 Runs each proposed timeout sequentially through CloudLab in scheduled mode with
 --dataset and --log. The load settings come from run_smartbft.sh.
@@ -33,9 +31,6 @@ Flags:
   -t <timeouts>     Semicolon-separated PBFT election timeout values in ms,
                     e.g. '300;437;1800'. Each value must be between 1 and
                     ${MAX_TIMEOUT_MS}.
-  --learning-window-mode <consensus|wall-clock>
-                    Episode boundary mode forwarded to run_smartbft.sh.
-                    Omitted by default, so run_smartbft.sh picks its own.
 EOF
 }
 
@@ -63,11 +58,6 @@ while [[ $# -gt 0 ]]; do
     -t)
       [[ $# -ge 2 ]] || { echo "Missing value for -t." >&2; exit 2; }
       timeouts_spec="$2"
-      shift 2
-      ;;
-    --learning-window-mode)
-      [[ $# -ge 2 ]] || { echo "Missing value for --learning-window-mode." >&2; exit 2; }
-      learning_window_mode="$2"
       shift 2
       ;;
     -h|--help)
@@ -99,13 +89,6 @@ if ! [[ "${timeouts_spec}" =~ ^[1-9][0-9]*(\;[1-9][0-9]*)*$ ]]; then
   echo "Invalid or missing -t value: '${timeouts_spec}'." >&2
   exit 2
 fi
-case "${learning_window_mode}" in
-  ""|consensus|wall-clock) ;;
-  *)
-    echo "Invalid --learning-window-mode value: '${learning_window_mode}'. Expected consensus or wall-clock." >&2
-    exit 2
-    ;;
-esac
 if [[ ! -x "${RUNNER}" ]]; then
   echo "CloudLab runner is missing or not executable: ${RUNNER}" >&2
   exit 1
@@ -205,8 +188,8 @@ total_runs=${#timeouts[@]}
 run_number=0
 failed_runs=0
 
-printf 'duration_s=%s\ntimeouts=%s\nmode=scheduled\ndataset=true\nlearning_window_mode=%s\n' \
-  "${duration_s}" "${timeouts_spec}" "${learning_window_mode:-default}" \
+printf 'duration_s=%s\ntimeouts=%s\nmode=scheduled\ndataset=true\nlearning_window_mode=wall-clock\n' \
+  "${duration_s}" "${timeouts_spec}" \
   > "${results_root}/sweep.conf"
 
 for timeout_ms in "${timeouts[@]}"; do
@@ -229,9 +212,6 @@ for timeout_ms in "${timeouts[@]}"; do
     --output-dir "${run_dir}"
     -t "${duration_s}"
   )
-  if [[ -n "${learning_window_mode}" ]]; then
-    runner_args+=(--learning-window-mode "${learning_window_mode}")
-  fi
   if [[ -n "${targets_file}" ]]; then
     runner_args+=("${targets_file}")
   fi
@@ -248,7 +228,7 @@ for timeout_ms in "${timeouts[@]}"; do
     printf 'duration_s=%s\n' "${duration_s}"
     printf 'mode=scheduled\n'
     printf 'dataset=true\n'
-    printf 'learning_window_mode=%s\n' "${learning_window_mode:-default}"
+    printf 'learning_window_mode=wall-clock\n'
   } > "${run_dir}/run.conf"
 
   echo "==> Archived ${run_status} run: ${run_dir}"

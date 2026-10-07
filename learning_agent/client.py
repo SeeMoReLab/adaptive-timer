@@ -240,7 +240,6 @@ def _random_autobahn_report(rng: random.Random) -> agent_pb2.AutobahnReport:
     throughput_tps = total_transactions / rng.uniform(0.5, 5.0)
     p95_batch_size = rng.uniform(avg_batch_size, max(avg_batch_size, avg_batch_size * 1.5))
     leader_change_count = rng.randint(0, 8)
-    regency_change_count = rng.randint(0, 8)
     timeout_ms = rng.choice(AUTOBAHN_TIMEOUT_DELAY_OPTIONS_MS)
     avg_inter_commit_gap_ms = rng.uniform(1.0, 250.0)
     p50_inter_commit_gap_ms = rng.uniform(1.0, avg_inter_commit_gap_ms)
@@ -259,7 +258,6 @@ def _random_autobahn_report(rng: random.Random) -> agent_pb2.AutobahnReport:
         avg_batch_size=avg_batch_size,
         p95_batch_size=p95_batch_size,
         leader_change_count=leader_change_count,
-        regency_change_count=regency_change_count,
         timeout_ms=timeout_ms,
         avg_inter_commit_gap_ms=avg_inter_commit_gap_ms,
         p50_inter_commit_gap_ms=p50_inter_commit_gap_ms,

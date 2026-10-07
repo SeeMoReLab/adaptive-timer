@@ -81,6 +81,8 @@ Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
   mode              Optional; one of normal|learning|sharing|scheduled (default: normal).
   targets_file      Optional path to cloudlab SSH targets file.
+                    One machine runs everything; with more, node0 runs the load client and
+                    the others host an equal share of the replicas, as in the other harnesses.
 
 Flags:
   --dataset         Collect per-replica learning-agent dataset CSVs as agentN.csv.
@@ -138,28 +140,45 @@ normalize_agent_model_type() {
   esac
 }
 
+# Fetch the run's logs into the layout the other protocols' harnesses use:
+# client.log in the run directory, replica processes under servers/, then
+# appliers/, agents/ and sharing/. Each replica's logs come from the machine
+# hosting it, client.log from the client machine.
 fetch_tendermint_logs_parallel() {
-  local remote="$1"
-  local remote_logs_dir="$2"
-  local local_logs_dir="$3"
-  local num_nodes="$4"
-  local learning_agent_enabled="$5"
-  local sharing_enabled="${6:-0}"
-  local i idx log_file failed=0
-  local log_files=("client.log")
+  local local_logs_dir="$1"
+  local i idx machine src failed=0
+  local sources=("${client_user}@${client_host}")
+  local remote_files=("client.log")
+  local local_paths=("$(dirname "${local_logs_dir}")/client.log")
   local pids=()
 
-  for ((i = 0; i < num_nodes; i++)); do
-    log_files+=("node_${i}.log" "abci_${i}.log" "applier_${i}.log")
-    if (( learning_agent_enabled == 1 )); then
-      log_files+=("agent_${i}.log")
+  mkdir -p "${local_logs_dir}/servers" "${local_logs_dir}/appliers" "${local_logs_dir}/agents"
+  if [[ "${MODE}" == "sharing" ]]; then
+    mkdir -p "${local_logs_dir}/sharing"
+  fi
+  for ((i = 0; i < LOCAL_NUM_NODES; i++)); do
+    machine=$((i / replicas_per_machine))
+    src="${server_users[$machine]}@${server_hosts[$machine]}"
+    sources+=("${src}" "${src}" "${src}")
+    remote_files+=("node_${i}.log" "abci_${i}.log" "applier_${i}.log")
+    local_paths+=(
+      "${local_logs_dir}/servers/server_${i}.log"
+      "${local_logs_dir}/servers/abci_${i}.log"
+      "${local_logs_dir}/appliers/applier_${i}.log"
+    )
+    if (( LEARNING_AGENT_ENABLED == 1 )); then
+      sources+=("${src}")
+      remote_files+=("agent_${i}.log")
+      local_paths+=("${local_logs_dir}/agents/agent_${i}.log")
     fi
-    if (( sharing_enabled == 1 )); then
-      log_files+=("sharing_${i}.log")
+    if [[ "${MODE}" == "sharing" ]]; then
+      sources+=("${src}")
+      remote_files+=("sharing_${i}.log")
+      local_paths+=("${local_logs_dir}/sharing/sharing_${i}.log")
     fi
   done
 
-  for log_file in "${log_files[@]}"; do
+  for idx in "${!remote_files[@]}"; do
     while (( $(jobs -pr | wc -l | tr -d '[:space:]') >= LOG_FETCH_MAX_PARALLEL )); do
       sleep 0.05
     done
@@ -167,10 +186,10 @@ fetch_tendermint_logs_parallel() {
     (
       local attempt
       for ((attempt = 1; attempt <= LOG_FETCH_MAX_ATTEMPTS; attempt++)); do
-        rm -f "${local_logs_dir}/${log_file}"
+        rm -f "${local_paths[$idx]}"
         if scp -q "${SSH_OPTS[@]}" \
-          "${remote}:${remote_logs_dir}/${log_file}" \
-          "${local_logs_dir}/${log_file}"; then
+          "${sources[$idx]}:tendermint_cloudlab/logs/${remote_files[$idx]}" \
+          "${local_paths[$idx]}"; then
           exit 0
         fi
         if (( attempt < LOG_FETCH_MAX_ATTEMPTS )); then
@@ -184,7 +203,7 @@ fetch_tendermint_logs_parallel() {
 
   for idx in "${!pids[@]}"; do
     if ! wait "${pids[$idx]}"; then
-      echo "Missing or failed to fetch ${log_files[$idx]} from ${remote}." >&2
+      echo "Missing or failed to fetch ${remote_files[$idx]} from ${sources[$idx]}." >&2
       failed=1
     fi
   done
@@ -395,20 +414,43 @@ if (( ${#targets_nodes[@]} < 1 )); then
   exit 1
 fi
 
-remote_host=""
-remote_user=""
+# Machine roles, as in the other protocols' harnesses: a single machine runs
+# everything; with more, node0 runs the load client and every other machine
+# hosts an equal share of the replicas, replica i on server machine
+# i / replicas_per_machine.
+machine_count=${#targets_nodes[@]}
+client_host=""
+client_user=""
 for i in "${!targets_nodes[@]}"; do
   if [[ "${targets_nodes[$i]}" == "node0" ]]; then
-    remote_host="${targets_hosts[$i]}"
-    remote_user="${targets_users[$i]}"
-    break
+    client_host="${targets_hosts[$i]}"
+    client_user="${targets_users[$i]}"
   fi
 done
-if [[ -z "${remote_host}" || -z "${remote_user}" ]]; then
-  remote_host="${targets_hosts[0]}"
-  remote_user="${targets_users[0]}"
+if [[ -z "${client_host}" || -z "${client_user}" ]]; then
+  echo "node0 entry not found in ${TARGETS_FILE}" >&2
+  exit 1
 fi
-acquire_target_lock "${remote_user}" "${remote_host}"
+server_names=()
+server_hosts=()
+server_users=()
+for i in "${!targets_nodes[@]}"; do
+  if (( machine_count == 1 )) || [[ "${targets_nodes[$i]}" != "node0" ]]; then
+    server_names+=("${targets_nodes[$i]}")
+    server_hosts+=("${targets_hosts[$i]}")
+    server_users+=("${targets_users[$i]}")
+  fi
+done
+server_machine_count=${#server_hosts[@]}
+LOCAL_NUM_NODES=$((F * 3 + 1))
+if (( LOCAL_NUM_NODES % server_machine_count != 0 )); then
+  echo "Replica layout mismatch: nodes=${LOCAL_NUM_NODES} not divisible by server machine count=${server_machine_count}" >&2
+  exit 1
+fi
+replicas_per_machine=$((LOCAL_NUM_NODES / server_machine_count))
+for i in "${!targets_nodes[@]}"; do
+  acquire_target_lock "${targets_users[$i]}" "${targets_hosts[$i]}"
+done
 
 if [[ -z "${OUTPUT_DIR}" ]]; then
   mkdir -p "${RUNS_ROOT}"
@@ -442,7 +484,6 @@ LOGS_LOCAL_DIR="${ARTIFACT_DIR}/logs"
 LOCAL_PAYLOAD="${ARTIFACT_DIR}/tendermint_cloudlab_payload.tar.gz"
 rm -f "${LOCAL_PAYLOAD}" "${OUTPUT_LOCAL}"
 : > "${OUTPUT_LOCAL}"
-LOCAL_NUM_NODES=$((F * 3 + 1))
 if (( LOG_ENABLED == 1 )); then
   rm -rf "${LOGS_LOCAL_DIR}"
   mkdir -p "${LOGS_LOCAL_DIR}"
@@ -468,6 +509,8 @@ fi
   printf 'dataset_enabled=%q\n' "${DATASET_ENABLED}"
   printf 'log_enabled=%q\n' "${LOG_ENABLED}"
   printf 'targets_file=%q\n' "${TARGETS_FILE}"
+  printf 'server_machines=%q\n' "${server_names[*]}"
+  printf 'replicas_per_machine=%q\n' "${replicas_per_machine}"
   printf 'command='
   printf '%q ' "$0" "${ORIGINAL_ARGS[@]}"
   printf '\n'
@@ -507,85 +550,88 @@ fi
 
 REMOTE_PAYLOAD="/tmp/tendermint_cloudlab_payload_$$.tar.gz"
 REMOTE_APPLIER="/tmp/tendermint_apply_network_failures_$$.py"
+REMOTE_TESTNET="tendermint_testnet_$$.tar.gz"
 
-echo "Copying payload to ${remote_user}@${remote_host}..."
-scp "${SSH_OPTS[@]}" "${LOCAL_PAYLOAD}" "${remote_user}@${remote_host}:${REMOTE_PAYLOAD}"
-scp "${SSH_OPTS[@]}" "${APPLIER_LOCAL_PATH}" "${remote_user}@${remote_host}:${REMOTE_APPLIER}"
-rm -f "${LOCAL_PAYLOAD}"
+is_ipv4_literal() {
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
 
-echo "Running remote CometBFT experiment on ${remote_host} (mode=${MODE}, f=${F}, t=${EXPERIMENT_TIME_S}s)..."
-remote_failed=0
-if ! ssh "${SSH_OPTS[@]}" "${remote_user}@${remote_host}" "bash -s" -- "${REMOTE_PAYLOAD}" "${REMOTE_APPLIER}" "${F}" "${EXPERIMENT_TIME_S}" "${MODE}" "${LOG_ENABLED}" "${DATASET_ENABLED}" "${LOAD_CONNECTIONS}" "${LOAD_RATE}" "${LOAD_SEND_PERIOD_MS}" "${AGENT_MODEL_TYPE}" "${REWARD_DESIGN}" "${LATENCY_FLOOR_K}" "${SCHEDULE_FILE}" <<'REMOTE'
+# Server machines reach each other's replica subnets through these, as in
+# lib_bedrock.sh: the first address of `hostname -I` on each server machine.
+GATEWAY_IPS_CSV="-"
+if (( machine_count > 1 )); then
+  echo "Resolving server gateway IPs..."
+  gateway_ips=()
+  for m in "${!server_hosts[@]}"; do
+    if is_ipv4_literal "${server_hosts[$m]}"; then
+      gateway_ip="${server_hosts[$m]}"
+    else
+      gateway_ip="$(ssh "${SSH_OPTS[@]}" "${server_users[$m]}@${server_hosts[$m]}" "hostname -I | awk '{print \$1}'" 2>/dev/null || true)"
+    fi
+    if ! is_ipv4_literal "${gateway_ip}"; then
+      echo "Failed to resolve gateway IP for ${server_names[$m]} (${server_hosts[$m]})." >&2
+      exit 1
+    fi
+    gateway_ips+=("${gateway_ip}")
+    echo "  - ${server_names[$m]}: ${gateway_ip}"
+  done
+  GATEWAY_IPS_CSV="$(IFS=,; echo "${gateway_ips[*]}")"
+fi
+# The client machine resolves each server machine by its node name first, as
+# lib_bedrock.sh's client routes do, then by its host name.
+SERVER_ROUTE_NAMES_CSV="$(IFS=,; echo "${server_names[*]}")"
+SERVER_ROUTE_HOSTS_CSV="$(IFS=,; echo "${server_hosts[*]}")"
+START_UNIX_MS=0
+# Seconds from choosing the shared start to the benchmark start: covers the
+# replicas' launch, their RPC readiness and peering, and the client's launch.
+START_DELAY_S=45
+
+# The remote side, one phase per invocation:
+#   prepare         every machine: unpack the payload, build
+#   testnet         server machine 0: generate every replica's home, tar it
+#   install_testnet other server machines: unpack that tar
+#   start           every server machine: namespaces, routes, agents, nodes, appliers
+#   client          client machine: routes, wait for peering, run the load
+#   stop            every server machine: stop the replicas
+#   report          server machine 0: latency, throughput and phase reports on stdout
+#   teardown        every machine: namespaces, bridge, routes
+IFS= read -r -d '' REMOTE_SCRIPT <<'REMOTE' || true
 set -euo pipefail
 
-payload_path="$1"
-applier_path="$2"
-fault_tolerance="$3"
-experiment_time_s="$4"
-mode="$5"
-log_enabled="$6"
-dataset_enabled="$7"
-load_connections="$8"
-load_rate="$9"
-load_send_period_ms="${10}"
-agent_model_type="${11}"
-reward_design="${12}"
-latency_floor_k="${13}"
-schedule_file_rel="${14}"
-
-if [[ "${mode}" != "normal" && "${mode}" != "learning" && "${mode}" != "sharing" && "${mode}" != "scheduled" ]]; then
-  echo "Unsupported mode on remote: ${mode} (supported: normal, learning, sharing, scheduled)" >&2
-  exit 2
-fi
-if ! [[ "${fault_tolerance}" =~ ^[0-9]+$ ]] || (( fault_tolerance < 1 )); then
-  echo "Invalid fault_tolerance: ${fault_tolerance}" >&2
-  exit 2
-fi
-if ! [[ "${experiment_time_s}" =~ ^[0-9]+$ ]] || (( experiment_time_s < 1 )); then
-  echo "Invalid experiment_time_s: ${experiment_time_s}" >&2
-  exit 2
-fi
-if ! [[ "${dataset_enabled}" =~ ^[0-9]+$ ]] || (( dataset_enabled < 0 || dataset_enabled > 1 )); then
-  echo "Invalid dataset_enabled: ${dataset_enabled}" >&2
-  exit 2
-fi
-if ! [[ "${load_connections}" =~ ^[0-9]+$ ]] || (( load_connections < 1 )); then
-  echo "Invalid load_connections: ${load_connections}" >&2
-  exit 2
-fi
-if ! [[ "${load_rate}" =~ ^[0-9]+$ ]] || (( load_rate < 1 )); then
-  echo "Invalid load_rate: ${load_rate}" >&2
-  exit 2
-fi
-if ! [[ "${load_send_period_ms}" =~ ^[0-9]+$ ]] || (( load_send_period_ms < 1 )); then
-  echo "Invalid load_send_period_ms: ${load_send_period_ms}" >&2
-  exit 2
-fi
-# Post-normalization names, so this list is normalize_agent_model_type's
-# output alphabet (claude/codex already translated), not its input. Keep the
-# two in sync: the heredoc is quoted, so the local list cannot be interpolated
-# here and a name added there is silently rejected on the remote.
-case "${agent_model_type}" in
-  random|pavlov|linear|cmab|cmab_reset|claude_v2|codex_v1|continuous|continuous_heuristic) ;;
-  *)
-    echo "Invalid agent_model_type: ${agent_model_type}. Use random|pavlov|linear|cmab|cmab_reset|claude_v2|codex_v1|continuous|continuous_heuristic." >&2
-    exit 2
-    ;;
-esac
-if [[ "${mode}" != "learning" && "${mode}" != "sharing" && "${agent_model_type}" != "random" ]]; then
-  echo "agent_model_type is only supported with learning/sharing mode." >&2
-  exit 2
-fi
-if (( dataset_enabled == 1 )) && [[ "${mode}" != "learning" && "${mode}" != "sharing" && "${mode}" != "scheduled" ]]; then
-  echo "dataset_enabled requires learning-agent mode." >&2
-  exit 2
-fi
+phase="$1"
+payload_path="$2"
+applier_path="$3"
+fault_tolerance="$4"
+experiment_time_s="$5"
+mode="$6"
+log_enabled="$7"
+dataset_enabled="$8"
+load_connections="$9"
+load_rate="${10}"
+load_send_period_ms="${11}"
+agent_model_type="${12}"
+reward_design="${13}"
+latency_floor_k="${14}"
+schedule_file_rel="${15}"
+# Index among the server machines, or -1 on a client-only machine.
+machine_idx="${16}"
+is_client="${17}"
+server_machine_count="${18}"
+replicas_per_machine="${19}"
+start_unix_ms="${20}"
+gateway_ips_csv="${21}"
+server_route_names_csv="${22}"
+server_route_hosts_csv="${23}"
+testnet_tar="$HOME/${24}"
 
 num_nodes=$((fault_tolerance * 3 + 1))
 learning_agent_enabled=0
 if [[ "${mode}" == "learning" || "${mode}" == "sharing" || "${mode}" == "scheduled" ]]; then
   learning_agent_enabled=1
 fi
+IFS=, read -r -a gateway_ips <<< "${gateway_ips_csv}"
+IFS=, read -r -a server_route_names <<< "${server_route_names_csv}"
+IFS=, read -r -a server_route_hosts <<< "${server_route_hosts_csv}"
 
 run_root="$HOME/tendermint_cloudlab"
 src_dir="${run_root}/cometbft"
@@ -603,33 +649,23 @@ sharing_bin="${run_root}/bin/smartbft-sharing"
 schedule_file="${run_root}/${schedule_file_rel}"
 applier_hosts_config="${run_root}/applier_hosts.config"
 applier_script="${run_root}/apply_network_failures.py"
+cometbft_bin="${src_dir}/build/cometbft"
 
 load_size=500
 post_peer_connect_delay=5
-start_align_delay_ms=15000
 buildvcs_flag="-buildvcs=false"
 failure_spec="${run_root}/config/tendermint/failure_spec.xml"
 report_state_log="${logs_dir}/node_0.log"
 overlay_a=10
 overlay_b=251
-overlay_subnet=1
 overlay_mask=24
 overlay_host_offset=10
 overlay_bridge_name="br-tendermint"
-overlay_bridge_ip="${overlay_a}.${overlay_b}.${overlay_subnet}.1"
 max_overlay_nodes=$((255 - overlay_host_offset))
 run_as_user="$(id -un)"
 run_as_home="${HOME}"
 learning_agent_python="${run_as_home}/.venvs/adaptive-timer-learning-agent/bin/python"
-
-# Ensure caller can always try to fetch a run log, even on early failures.
-: > "${output_file}"
-{
-  echo "==> remote run initialized"
-  echo "==> mode=${mode}"
-  echo "==> f=${fault_tolerance} n=${num_nodes}"
-  echo "==> duration=${experiment_time_s}s"
-} >> "${output_file}"
+export PATH="$HOME/go/bin:${PATH}"
 
 p2p_port() { echo $((26656 + $1 * 3)); }
 rpc_port() { echo $((26657 + $1 * 3)); }
@@ -637,17 +673,22 @@ abci_port() { echo $((26658 + $1 * 3)); }
 agent_port() { echo $((50000 + $1)); }
 sharing_report_port() { echo $((50200 + $1)); }
 sharing_consensus_port() { echo $((50400 + $1)); }
-node_ip() { echo "${overlay_a}.${overlay_b}.${overlay_subnet}.$((overlay_host_offset + $1))"; }
+# Replica i lives on server machine i / replicas_per_machine, whose replicas
+# share the subnet a.b.(machine + 1).0/24; one machine gives a.b.1.(offset + i).
+node_ip() { echo "${overlay_a}.${overlay_b}.$(($1 / replicas_per_machine + 1)).$((overlay_host_offset + $1 % replicas_per_machine))"; }
+# What `cometbft testnet --starting-ip-address` assigns: consecutive addresses.
+testnet_ip() { echo "${overlay_a}.${overlay_b}.1.$((overlay_host_offset + $1))"; }
+machine_subnet() { echo "${overlay_a}.${overlay_b}.$(($1 + 1)).0/${overlay_mask}"; }
 ns_name() { echo "tm-r$1"; }
 ns_host_if() { echo "tm-vh$1"; }
 ns_inner_if() { echo "tm-vn$1"; }
+first_local_replica=$((machine_idx * replicas_per_machine))
+last_local_replica=$((first_local_replica + replicas_per_machine - 1))
 load_endpoints_csv() {
   local endpoints=()
-  local i rpc_p ip
+  local i
   for ((i = 0; i < num_nodes; i++)); do
-    rpc_p="$(rpc_port "${i}")"
-    ip="$(node_ip "${i}")"
-    endpoints+=("ws://${ip}:${rpc_p}/websocket")
+    endpoints+=("ws://$(node_ip "${i}"):$(rpc_port "${i}")/websocket")
   done
   local IFS=,
   echo "${endpoints[*]}"
@@ -655,10 +696,9 @@ load_endpoints_csv() {
 
 write_applier_hosts_config() {
   : > "${applier_hosts_config}"
-  local i ip
+  local i
   for ((i = 0; i < num_nodes; i++)); do
-    ip="$(node_ip "${i}")"
-    echo "${i} ${ip}" >> "${applier_hosts_config}"
+    echo "${i} $(node_ip "${i}")" >> "${applier_hosts_config}"
   done
 }
 
@@ -778,55 +818,12 @@ force_stop_run_processes() {
   done <<< "${pids}"
 }
 
-setup_network_namespaces() {
+require_sudo() {
   if ! sudo -n true >/dev/null 2>&1; then
-    echo "Namespace setup requires passwordless sudo on remote host." >&2
+    echo "Namespace and route setup requires passwordless sudo on $(hostname)." >&2
     echo "Verify with: ssh <node> 'sudo -n true'" >&2
     return 1
   fi
-
-  existing_ns="$(ip netns list | awk '/^tm-r[0-9]+/ {print $1}')"
-  if [[ -n "${existing_ns}" ]]; then
-    printf '%s\n' "${existing_ns}" | while read -r name; do
-      [[ -z "${name}" ]] && continue
-      sudo -n ip netns del "${name}" >/dev/null 2>&1 || true
-    done
-  fi
-
-  stale_veths="$(ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*//' | awk '/^tm-vh[0-9]+$/')"
-  if [[ -n "${stale_veths}" ]]; then
-    printf '%s\n' "${stale_veths}" | while read -r if_name; do
-      [[ -z "${if_name}" ]] && continue
-      sudo -n ip link del "${if_name}" >/dev/null 2>&1 || true
-    done
-  fi
-
-  sudo -n ip link set "${overlay_bridge_name}" down >/dev/null 2>&1 || true
-  sudo -n ip link del "${overlay_bridge_name}" type bridge >/dev/null 2>&1 || true
-  sudo -n ip link add name "${overlay_bridge_name}" type bridge
-  sudo -n ip addr replace "${overlay_bridge_ip}/${overlay_mask}" dev "${overlay_bridge_name}"
-  sudo -n ip link set "${overlay_bridge_name}" up
-  sudo -n sysctl -w net.ipv4.ip_forward=1 >/dev/null
-
-  local i ns host_if inner_if ip
-  for ((i = 0; i < num_nodes; i++)); do
-    ns="$(ns_name "${i}")"
-    host_if="$(ns_host_if "${i}")"
-    inner_if="$(ns_inner_if "${i}")"
-    ip="$(node_ip "${i}")"
-
-    sudo -n ip netns del "${ns}" >/dev/null 2>&1 || true
-    sudo -n ip link del "${host_if}" >/dev/null 2>&1 || true
-    sudo -n ip netns add "${ns}"
-    sudo -n ip link add "${host_if}" type veth peer name "${inner_if}"
-    sudo -n ip link set "${inner_if}" netns "${ns}"
-    sudo -n ip link set "${host_if}" master "${overlay_bridge_name}"
-    sudo -n ip link set "${host_if}" up
-    sudo -n ip netns exec "${ns}" ip link set lo up
-    sudo -n ip netns exec "${ns}" ip addr replace "${ip}/${overlay_mask}" dev "${inner_if}"
-    sudo -n ip netns exec "${ns}" ip link set "${inner_if}" up
-    sudo -n ip netns exec "${ns}" ip route replace default via "${overlay_bridge_ip}"
-  done
 }
 
 teardown_network_namespaces() {
@@ -839,8 +836,86 @@ teardown_network_namespaces() {
     done
   fi
 
+  local stale_veths
+  stale_veths="$(ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*//' | awk '/^tm-vh[0-9]+$/')"
+  if [[ -n "${stale_veths}" ]]; then
+    printf '%s\n' "${stale_veths}" | while read -r if_name; do
+      [[ -z "${if_name}" ]] && continue
+      sudo -n ip link del "${if_name}" >/dev/null 2>&1 || true
+    done
+  fi
+
   sudo -n ip link set "${overlay_bridge_name}" down >/dev/null 2>&1 || true
   sudo -n ip link del "${overlay_bridge_name}" type bridge >/dev/null 2>&1 || true
+}
+
+# Routes to the other server machines' replica subnets (never to this one's).
+delete_peer_routes() {
+  local peer
+  for ((peer = 0; peer < server_machine_count; peer++)); do
+    (( peer == machine_idx )) && continue
+    sudo -n ip route del "$(machine_subnet "${peer}")" >/dev/null 2>&1 || true
+  done
+}
+
+setup_network_namespaces() {
+  require_sudo
+  teardown_network_namespaces
+
+  local bridge_ip="${overlay_a}.${overlay_b}.$((machine_idx + 1)).1"
+  sudo -n ip link add name "${overlay_bridge_name}" type bridge
+  sudo -n ip addr replace "${bridge_ip}/${overlay_mask}" dev "${overlay_bridge_name}"
+  sudo -n ip link set "${overlay_bridge_name}" up
+  sudo -n sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+  local i ns host_if inner_if ip
+  for ((i = first_local_replica; i <= last_local_replica; i++)); do
+    ns="$(ns_name "${i}")"
+    host_if="$(ns_host_if "${i}")"
+    inner_if="$(ns_inner_if "${i}")"
+    ip="$(node_ip "${i}")"
+
+    sudo -n ip netns add "${ns}"
+    sudo -n ip link add "${host_if}" type veth peer name "${inner_if}"
+    sudo -n ip link set "${inner_if}" netns "${ns}"
+    sudo -n ip link set "${host_if}" master "${overlay_bridge_name}"
+    sudo -n ip link set "${host_if}" up
+    sudo -n ip netns exec "${ns}" ip link set lo up
+    sudo -n ip netns exec "${ns}" ip addr replace "${ip}/${overlay_mask}" dev "${inner_if}"
+    sudo -n ip netns exec "${ns}" ip link set "${inner_if}" up
+    sudo -n ip netns exec "${ns}" ip route replace default via "${bridge_ip}"
+  done
+
+  local peer
+  for ((peer = 0; peer < server_machine_count; peer++)); do
+    (( peer == machine_idx )) && continue
+    sudo -n ip route replace "$(machine_subnet "${peer}")" via "${gateway_ips[$peer]}"
+  done
+}
+
+# A client-only machine reaches every server machine's replica subnet, resolving
+# each server machine as lib_bedrock.sh's client routes do.
+setup_client_routes() {
+  require_sudo
+  local peer gw_ip route_get route_dev
+  for ((peer = 0; peer < server_machine_count; peer++)); do
+    gw_ip="$(getent ahostsv4 "${server_route_names[$peer]}" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
+    if ! [[ "${gw_ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      gw_ip="$(getent ahostsv4 "${server_route_hosts[$peer]}" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
+    fi
+    if ! [[ "${gw_ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      echo "Failed to resolve a gateway for ${server_route_names[$peer]}/${server_route_hosts[$peer]}" >&2
+      return 1
+    fi
+    if ! sudo -n ip route replace "$(machine_subnet "${peer}")" via "${gw_ip}"; then
+      route_get="$(ip -4 route get "${gw_ip}" 2>/dev/null | head -n1 || true)"
+      route_dev="$(awk '{for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }}' <<< "${route_get}")"
+      if [[ -z "${route_dev}" ]] || ! sudo -n ip route replace "$(machine_subnet "${peer}")" via "${gw_ip}" dev "${route_dev}" onlink; then
+        echo "Failed route replace: subnet=$(machine_subnet "${peer}") gw=${gw_ip}" >&2
+        return 1
+      fi
+    fi
+  done
 }
 
 start_network_appliers() {
@@ -858,7 +933,7 @@ start_network_appliers() {
     return 1
   fi
 
-  for ((i = 0; i < num_nodes; i++)); do
+  for ((i = first_local_replica; i <= last_local_replica; i++)); do
     ns="$(ns_name "${i}")"
     iface="$(ns_inner_if "${i}")"
     session="tm_applier_${i}"
@@ -901,18 +976,6 @@ run_report_with_retry() {
   done
 }
 
-append_tendermint_phase_report() {
-  local out_file="$1"
-  local node_logs_dir="$2"
-  local failure_spec_path="$3"
-  local experiment_start_unix_ms="$4"
-  local report_script="$5"
-  python3 "$report_script" \
-    --logs-dir "$node_logs_dir" \
-    --failure-spec "$failure_spec_path" \
-    --start-unix-ms "$experiment_start_unix_ms" >> "$out_file"
-}
-
 stop_progress_reporter() {
   if [[ -z "${progress_reporter_pid:-}" ]]; then
     return
@@ -941,292 +1004,316 @@ report_time_remaining() {
   done
 }
 
-cleanup() {
-  stop_progress_reporter
-  kill_run_sessions
-  force_stop_run_processes
-  teardown_network_namespaces
-  rm -f "${payload_path}"
-  rm -f "${applier_path}"
-}
-trap cleanup EXIT
-
-for cmd in go tmux curl python3 tar awk sed ip sudo; do
-  if ! command -v "${cmd}" >/dev/null 2>&1; then
-    echo "Required command not found on remote host: ${cmd}" >&2
-    exit 1
-  fi
-done
-
-start_unix_ms="$(( $(python3 -c 'import time; print(int(time.time() * 1000))') + start_align_delay_ms ))"
-
-rm -rf "${run_root}"
-mkdir -p "${run_root}" "${logs_dir}"
-tar --warning=no-unknown-keyword -xzf "${payload_path}" -C "${run_root}"
-cp -a "${applier_path}" "${applier_script}"
-chmod +x "${applier_script}"
-
-if [[ ! -d "${src_dir}" ]]; then
-  echo "Extracted cometbft directory missing: ${src_dir}" >&2
-  exit 1
-fi
-if [[ ! -f "${master_config}" ]]; then
-  echo "Extracted master config missing: ${master_config}" >&2
-  exit 1
-fi
-if (( learning_agent_enabled == 1 )); then
-  if [[ ! -f "${learning_agent_dir}/main.py" ]]; then
-    echo "Extracted learning_agent missing: ${learning_agent_dir}/main.py" >&2
-    exit 1
-  fi
-  if [[ ! -f "${schedule_file}" ]]; then
-    echo "Missing Tendermint schedule file: ${schedule_file}" >&2
-    exit 1
-  fi
-  if [[ ! -x "${learning_agent_python}" ]]; then
-    echo "Learning-agent virtual environment not found: ${learning_agent_python}" >&2
-    echo "Run scripts/cloudlab/setup.sh first." >&2
-    exit 1
-  fi
-  if ! "${learning_agent_python}" -c "import cryptography, grpc, sklearn" >/dev/null 2>&1; then
-    echo "Learning-agent dependencies are unavailable in ${learning_agent_python}." >&2
-    echo "Run scripts/cloudlab/setup.sh first." >&2
-    exit 1
-  fi
-fi
-
-cd "${src_dir}"
-export PATH="$HOME/go/bin:${PATH}"
-
-echo "Installing required CLIs (abci-cli/load/report)..."
-go install "${buildvcs_flag}" ./abci/cmd/abci-cli
-go install "${buildvcs_flag}" ./test/loadtime/cmd/load
-go install "${buildvcs_flag}" ./test/loadtime/cmd/report
-
-echo "Building cometbft binary..."
-GOFLAGS="${GOFLAGS:-} ${buildvcs_flag}" make build
-
-if [[ "${mode}" == "sharing" ]]; then
-  echo "Building report-chain (sharing) binary..."
-  if [[ ! -d "${sharing_src_dir}" ]]; then
-    echo "Sharing mode requires the SmartBFT sources in the payload: ${sharing_src_dir}" >&2
-    exit 1
-  fi
-  mkdir -p "${run_root}/bin"
-  (cd "${sharing_src_dir}" && GOCACHE="${run_root}/gocache" go build "${buildvcs_flag}" -o "${sharing_bin}" ./examples/sharing)
-fi
-
-cometbft_bin="${src_dir}/build/cometbft"
-if [[ ! -x "${cometbft_bin}" ]]; then
-  echo "Missing built cometbft binary: ${cometbft_bin}" >&2
-  exit 1
-fi
-
-if [[ ! -f "${failure_spec}" ]]; then
-  echo "Missing failure spec: ${failure_spec}" >&2
-  exit 1
-fi
-if (( num_nodes > max_overlay_nodes )); then
-  echo "Too many nodes (${num_nodes}) for overlay host offset ${overlay_host_offset} in /24 subnet." >&2
-  exit 1
-fi
-
-echo "Setting up per-node network namespaces..."
-setup_network_namespaces
-
-echo "Generating local testnet config (n=${num_nodes})..."
-"${cometbft_bin}" testnet \
-  --v "${num_nodes}" \
-  --o "${testnet_dir}" \
-  --populate-persistent-peers \
-  --starting-ip-address "$(node_ip 0)"
-
-echo "Applying master Tendermint config: ${master_config}"
-
-for ((i = 0; i < num_nodes; i++)); do
-  config_file="${testnet_dir}/node${i}/config/config.toml"
-  if [[ ! -f "${config_file}" ]]; then
-    echo "Missing config file: ${config_file}" >&2
-    exit 1
-  fi
-  apply_master_config "${master_config}" "${config_file}"
-  for ((j = 1; j < num_nodes; j++)); do
-    sed -i "s|@$(node_ip "${j}"):26656|@$(node_ip "${j}"):$(p2p_port "${j}")|g" "${config_file}"
-  done
-  if (( learning_agent_enabled == 1 )); then
-    agent_p="$(agent_port "${i}")"
-    sed -i "s|adaptive_timer_addr = \".*\"|adaptive_timer_addr = \"$(node_ip "${i}"):${agent_p}\"|" "${config_file}"
-    sed -i "s|adaptive_timer_node_index = .*|adaptive_timer_node_index = ${i}|" "${config_file}"
-  else
-    sed -i "s|adaptive_timer_addr = \".*\"|adaptive_timer_addr = \"\"|" "${config_file}"
-    sed -i "s|adaptive_timer_node_index = .*|adaptive_timer_node_index = 0|" "${config_file}"
-  fi
-done
-
-if (( learning_agent_enabled == 1 )); then
-  if [[ "${mode}" == "sharing" ]]; then
-    : > "${sharing_hosts_config}"
-    for ((i = 0; i < num_nodes; i++)); do
-      # report-chain ids are 1-based: node_id host report_port agent_port consensus_port
-      echo "$((i + 1)) $(node_ip "${i}") $(sharing_report_port "${i}") $(agent_port "${i}") $(sharing_consensus_port "${i}")" \
-        >> "${sharing_hosts_config}"
-    done
-  fi
-  : > "${agent_hosts_config}"
-  for ((i = 0; i < num_nodes; i++)); do
-    echo "${i} $(node_ip "${i}") 0 0 $(agent_port "${i}") $(sharing_consensus_port "${i}")" >> "${agent_hosts_config}"
-  done
-fi
-echo "Starting ${num_nodes} kvstore and CometBFT nodes in tmux..."
-kill_run_sessions
-if (( learning_agent_enabled == 1 )); then
-  agent_mode_args=""
-  if [[ "${mode}" == "sharing" ]]; then
-    agent_mode_args="--sharing true --model-type ${agent_model_type} --collect-wait-ms 100"
-  elif [[ "${mode}" == "learning" ]]; then
-    agent_mode_args="--model-type ${agent_model_type}"
-  elif [[ "${mode}" == "scheduled" ]]; then
-    agent_mode_args="--model-type scheduled --schedule-file \"${schedule_file}\""
-  fi
-  # The reward shaping applies to every agent mode that trains, including the
-  # scheduled replay, whose CSV records the reward each fixed timeout earned.
-  if [[ "${agent_mode_args}" != "" ]]; then
-    agent_mode_args="${agent_mode_args} --reward-design ${reward_design}"
-  fi
-  # The floor is a constraint on the action space, so it only means anything
-  # where the agent is choosing the timeout at all.
-  if [[ "${agent_mode_args}" != "" && "${latency_floor_k}" != "0" ]]; then
-    agent_mode_args="${agent_mode_args} --latency-floor-k ${latency_floor_k}"
-  fi
-  for ((i = 0; i < num_nodes; i++)); do
-    agent_session="tm_tendermint_agent_${i}"
-    ns="$(ns_name "${i}")"
-    agent_log="${logs_dir}/agent_${i}.log"
-    dataset_args=""
-    if (( dataset_enabled == 1 )); then
-      rm -f "${run_root}/agent${i}.csv"
-      dataset_args="--dataset-csv \"${run_root}/agent${i}.csv\""
-    fi
-    tmux new-session -d -s "${agent_session}" \
-      "sudo -n ip netns exec ${ns} sudo -n -u ${run_as_user} env HOME=${run_as_home} PATH=${run_as_home}/go/bin:${PATH} PYTHONDONTWRITEBYTECODE=1 bash -lc 'cd \"${run_root}\" && exec \"${learning_agent_python}\" \"${learning_agent_dir}/main.py\" --node-id \"${i}\" --protocol tendermint --hosts-config \"${agent_hosts_config}\" --failure-spec \"${failure_spec}\" --injection-start-unix-ms \"${start_unix_ms}\" ${agent_mode_args} ${dataset_args}' > \"${agent_log}\" 2>&1"
-  done
-  sleep 1
-  for ((i = 0; i < num_nodes; i++)); do
-    agent_session="tm_tendermint_agent_${i}"
-    if ! tmux has-session -t "${agent_session}" 2>/dev/null; then
-      echo "Learning-agent session exited early: ${agent_session}" >&2
-      tail -n 80 "${logs_dir}/agent_${i}.log" >&2 || true
+phase_prepare() {
+  for cmd in go tmux curl python3 tar awk sed ip sudo; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+      echo "Required command not found on $(hostname): ${cmd}" >&2
       exit 1
     fi
   done
 
-  if [[ "${mode}" == "sharing" ]]; then
-    echo "Starting report-chain (sharing) nodes..."
-    for ((i = 0; i < num_nodes; i++)); do
-      sharing_session="tm_sharing_${i}"
-      ns="$(ns_name "${i}")"
-      sharing_log="${logs_dir}/sharing_${i}.log"
-      rm -rf "${run_root}/sharing_wal_${i}"
-      # The report chain orders report batches with SmartBFT regardless of the
-      # protocol being learned, so the same binary serves Tendermint runs.
-      tmux new-session -d -s "${sharing_session}" \
-        "sudo -n ip netns exec ${ns} sudo -n -u ${run_as_user} env HOME=${run_as_home} PATH=${run_as_home}/go/bin:${PATH} bash -lc 'cd \"${run_root}\" && exec \"${sharing_bin}\" --role server --node-id $((i + 1)) --protocol tendermint --hosts-config \"${sharing_hosts_config}\" --data-dir \"${run_root}/sharing_wal_${i}\" --keep-data' > \"${sharing_log}\" 2>&1"
+  rm -rf "${run_root}"
+  mkdir -p "${run_root}" "${logs_dir}"
+  if (( is_client == 1 )); then
+    # Ensure the caller can always fetch a run log, even on early failures.
+    {
+      echo "==> remote run initialized"
+      echo "==> mode=${mode}"
+      echo "==> f=${fault_tolerance} n=${num_nodes}"
+      echo "==> duration=${experiment_time_s}s"
+    } > "${output_file}"
+  fi
+  tar --warning=no-unknown-keyword -xzf "${payload_path}" -C "${run_root}"
+  cp -a "${applier_path}" "${applier_script}"
+  chmod +x "${applier_script}"
+  rm -f "${payload_path}" "${applier_path}"
+
+  if [[ ! -d "${src_dir}" ]]; then
+    echo "Extracted cometbft directory missing: ${src_dir}" >&2
+    exit 1
+  fi
+  if [[ ! -f "${master_config}" ]]; then
+    echo "Extracted master config missing: ${master_config}" >&2
+    exit 1
+  fi
+  if [[ ! -f "${failure_spec}" ]]; then
+    echo "Missing failure spec: ${failure_spec}" >&2
+    exit 1
+  fi
+  if (( machine_idx >= 0 && learning_agent_enabled == 1 )); then
+    if [[ ! -f "${learning_agent_dir}/main.py" ]]; then
+      echo "Extracted learning_agent missing: ${learning_agent_dir}/main.py" >&2
+      exit 1
+    fi
+    if [[ ! -f "${schedule_file}" ]]; then
+      echo "Missing Tendermint schedule file: ${schedule_file}" >&2
+      exit 1
+    fi
+    if [[ ! -x "${learning_agent_python}" ]]; then
+      echo "Learning-agent virtual environment not found: ${learning_agent_python}" >&2
+      echo "Run scripts/cloudlab/setup.sh first." >&2
+      exit 1
+    fi
+    if ! "${learning_agent_python}" -c "import cryptography, grpc, sklearn" >/dev/null 2>&1; then
+      echo "Learning-agent dependencies are unavailable in ${learning_agent_python}." >&2
+      echo "Run scripts/cloudlab/setup.sh first." >&2
+      exit 1
+    fi
+  fi
+  if (( replicas_per_machine > max_overlay_nodes )); then
+    echo "Too many replicas per machine (${replicas_per_machine}) for overlay host offset ${overlay_host_offset} in a /24 subnet." >&2
+    exit 1
+  fi
+
+  cd "${src_dir}"
+  echo "Installing required CLIs (abci-cli/load/report)..."
+  go install "${buildvcs_flag}" ./abci/cmd/abci-cli
+  go install "${buildvcs_flag}" ./test/loadtime/cmd/load
+  go install "${buildvcs_flag}" ./test/loadtime/cmd/report
+
+  echo "Building cometbft binary..."
+  GOFLAGS="${GOFLAGS:-} ${buildvcs_flag}" make build
+  if [[ ! -x "${cometbft_bin}" ]]; then
+    echo "Missing built cometbft binary: ${cometbft_bin}" >&2
+    exit 1
+  fi
+
+  if [[ "${mode}" == "sharing" && "${machine_idx}" -ge 0 ]]; then
+    echo "Building report-chain (sharing) binary..."
+    if [[ ! -d "${sharing_src_dir}" ]]; then
+      echo "Sharing mode requires the SmartBFT sources in the payload: ${sharing_src_dir}" >&2
+      exit 1
+    fi
+    mkdir -p "${run_root}/bin"
+    (cd "${sharing_src_dir}" && GOCACHE="${run_root}/gocache" go build "${buildvcs_flag}" -o "${sharing_bin}" ./examples/sharing)
+  fi
+}
+
+phase_testnet() {
+  echo "Generating testnet config (n=${num_nodes})..."
+  "${cometbft_bin}" testnet \
+    --v "${num_nodes}" \
+    --o "${testnet_dir}" \
+    --populate-persistent-peers \
+    --starting-ip-address "$(testnet_ip 0)"
+
+  echo "Applying master Tendermint config: ${master_config}"
+  local i j config_file
+  for ((i = 0; i < num_nodes; i++)); do
+    config_file="${testnet_dir}/node${i}/config/config.toml"
+    if [[ ! -f "${config_file}" ]]; then
+      echo "Missing config file: ${config_file}" >&2
+      exit 1
+    fi
+    apply_master_config "${master_config}" "${config_file}"
+    # Peers get each replica's own address and port: testnet assigns consecutive
+    # addresses on port 26656.
+    for ((j = 0; j < num_nodes; j++)); do
+      sed -i "s|@$(testnet_ip "${j}"):26656|@$(node_ip "${j}"):$(p2p_port "${j}")|g" "${config_file}"
     done
-    sleep 2
+    if (( learning_agent_enabled == 1 )); then
+      sed -i "s|adaptive_timer_addr = \".*\"|adaptive_timer_addr = \"$(node_ip "${i}"):$(agent_port "${i}")\"|" "${config_file}"
+      sed -i "s|adaptive_timer_node_index = .*|adaptive_timer_node_index = ${i}|" "${config_file}"
+    else
+      sed -i "s|adaptive_timer_addr = \".*\"|adaptive_timer_addr = \"\"|" "${config_file}"
+      sed -i "s|adaptive_timer_node_index = .*|adaptive_timer_node_index = 0|" "${config_file}"
+    fi
+  done
+  tar -czf "${testnet_tar}" -C "${run_root}" mytestnet
+}
+
+phase_install_testnet() {
+  rm -rf "${testnet_dir}"
+  tar -xzf "${testnet_tar}" -C "${run_root}"
+  rm -f "${testnet_tar}"
+}
+
+phase_start() {
+  echo "Setting up namespaces for replicas ${first_local_replica}-${last_local_replica} on $(hostname)..."
+  setup_network_namespaces
+
+  local i
+  if (( learning_agent_enabled == 1 )); then
+    if [[ "${mode}" == "sharing" ]]; then
+      : > "${sharing_hosts_config}"
+      for ((i = 0; i < num_nodes; i++)); do
+        # report-chain ids are 1-based: node_id host report_port agent_port consensus_port
+        echo "$((i + 1)) $(node_ip "${i}") $(sharing_report_port "${i}") $(agent_port "${i}") $(sharing_consensus_port "${i}")" \
+          >> "${sharing_hosts_config}"
+      done
+    fi
+    : > "${agent_hosts_config}"
     for ((i = 0; i < num_nodes; i++)); do
-      if ! tmux has-session -t "tm_sharing_${i}" 2>/dev/null; then
-        echo "Sharing session exited early: tm_sharing_${i}" >&2
-        tail -n 80 "${logs_dir}/sharing_${i}.log" >&2 || true
+      echo "${i} $(node_ip "${i}") 0 0 $(agent_port "${i}") $(sharing_consensus_port "${i}")" >> "${agent_hosts_config}"
+    done
+  fi
+  echo "Starting replicas ${first_local_replica}-${last_local_replica} (kvstore and CometBFT) in tmux..."
+  kill_run_sessions
+  if (( learning_agent_enabled == 1 )); then
+    local agent_mode_args=""
+    if [[ "${mode}" == "sharing" ]]; then
+      agent_mode_args="--sharing true --model-type ${agent_model_type} --collect-wait-ms 100"
+    elif [[ "${mode}" == "learning" ]]; then
+      agent_mode_args="--model-type ${agent_model_type}"
+    elif [[ "${mode}" == "scheduled" ]]; then
+      agent_mode_args="--model-type scheduled --schedule-file \"${schedule_file}\""
+    fi
+    # The reward shaping applies to every agent mode that trains, including the
+    # scheduled replay, whose CSV records the reward each fixed timeout earned.
+    if [[ "${agent_mode_args}" != "" ]]; then
+      agent_mode_args="${agent_mode_args} --reward-design ${reward_design}"
+    fi
+    # The floor is a constraint on the action space, so it only means anything
+    # where the agent is choosing the timeout at all.
+    if [[ "${agent_mode_args}" != "" && "${latency_floor_k}" != "0" ]]; then
+      agent_mode_args="${agent_mode_args} --latency-floor-k ${latency_floor_k}"
+    fi
+    local agent_session ns agent_log dataset_args
+    for ((i = first_local_replica; i <= last_local_replica; i++)); do
+      agent_session="tm_tendermint_agent_${i}"
+      ns="$(ns_name "${i}")"
+      agent_log="${logs_dir}/agent_${i}.log"
+      dataset_args=""
+      if (( dataset_enabled == 1 )); then
+        rm -f "${run_root}/agent${i}.csv"
+        dataset_args="--dataset-csv \"${run_root}/agent${i}.csv\""
+      fi
+      tmux new-session -d -s "${agent_session}" \
+        "sudo -n ip netns exec ${ns} sudo -n -u ${run_as_user} env HOME=${run_as_home} PATH=${run_as_home}/go/bin:${PATH} PYTHONDONTWRITEBYTECODE=1 bash -lc 'cd \"${run_root}\" && exec \"${learning_agent_python}\" \"${learning_agent_dir}/main.py\" --node-id \"${i}\" --protocol tendermint --hosts-config \"${agent_hosts_config}\" --failure-spec \"${failure_spec}\" --injection-start-unix-ms \"${start_unix_ms}\" ${agent_mode_args} ${dataset_args}' > \"${agent_log}\" 2>&1"
+    done
+    sleep 1
+    for ((i = first_local_replica; i <= last_local_replica; i++)); do
+      agent_session="tm_tendermint_agent_${i}"
+      if ! tmux has-session -t "${agent_session}" 2>/dev/null; then
+        echo "Learning-agent session exited early: ${agent_session}" >&2
+        tail -n 80 "${logs_dir}/agent_${i}.log" >&2 || true
         exit 1
       fi
     done
+
+    if [[ "${mode}" == "sharing" ]]; then
+      echo "Starting report-chain (sharing) nodes..."
+      local sharing_session sharing_log
+      for ((i = first_local_replica; i <= last_local_replica; i++)); do
+        sharing_session="tm_sharing_${i}"
+        ns="$(ns_name "${i}")"
+        sharing_log="${logs_dir}/sharing_${i}.log"
+        rm -rf "${run_root}/sharing_wal_${i}"
+        # The report chain orders report batches with SmartBFT regardless of the
+        # protocol being learned, so the same binary serves Tendermint runs.
+        tmux new-session -d -s "${sharing_session}" \
+          "sudo -n ip netns exec ${ns} sudo -n -u ${run_as_user} env HOME=${run_as_home} PATH=${run_as_home}/go/bin:${PATH} bash -lc 'cd \"${run_root}\" && exec \"${sharing_bin}\" --node-id $((i + 1)) --protocol tendermint --hosts-config \"${sharing_hosts_config}\" --data-dir \"${run_root}/sharing_wal_${i}\"' > \"${sharing_log}\" 2>&1"
+      done
+      sleep 2
+      for ((i = first_local_replica; i <= last_local_replica; i++)); do
+        if ! tmux has-session -t "tm_sharing_${i}" 2>/dev/null; then
+          echo "Sharing session exited early: tm_sharing_${i}" >&2
+          tail -n 80 "${logs_dir}/sharing_${i}.log" >&2 || true
+          exit 1
+        fi
+      done
+    fi
   fi
-fi
-for ((i = 0; i < num_nodes; i++)); do
-  abci_session="tm_abci_${i}"
-  node_session="tm_tendermint_node_${i}"
-  ns="$(ns_name "${i}")"
-  abci_log="${logs_dir}/abci_${i}.log"
-  node_log="${logs_dir}/node_${i}.log"
-  abci_p="$(abci_port "${i}")"
-  p2p_p="$(p2p_port "${i}")"
-  rpc_p="$(rpc_port "${i}")"
-  node_home="${testnet_dir}/node${i}"
+  local abci_session node_session abci_log node_log abci_p p2p_p rpc_p node_home
+  for ((i = first_local_replica; i <= last_local_replica; i++)); do
+    abci_session="tm_abci_${i}"
+    node_session="tm_tendermint_node_${i}"
+    ns="$(ns_name "${i}")"
+    abci_log="${logs_dir}/abci_${i}.log"
+    node_log="${logs_dir}/node_${i}.log"
+    abci_p="$(abci_port "${i}")"
+    p2p_p="$(p2p_port "${i}")"
+    rpc_p="$(rpc_port "${i}")"
+    node_home="${testnet_dir}/node${i}"
 
-  tmux new-session -d -s "${abci_session}" \
-    "sudo -n ip netns exec ${ns} sudo -n -u ${run_as_user} env HOME=${run_as_home} PATH=${run_as_home}/go/bin:${PATH} bash -lc 'cd \"${src_dir}\" && exec abci-cli kvstore --address tcp://127.0.0.1:${abci_p}' > \"${abci_log}\" 2>&1"
-  tmux new-session -d -s "${node_session}" \
-    "sudo -n ip netns exec ${ns} sudo -n -u ${run_as_user} env HOME=${run_as_home} PATH=${run_as_home}/go/bin:${PATH} COMETBFT_NODE_INDEX=${i} COMETBFT_PROPOSE_DELAY_FAILURE_SPEC=\"${failure_spec}\" COMETBFT_PROPOSE_DELAY_FAULTY_NODES=${fault_tolerance} COMETBFT_PROPOSE_DELAY_START_UNIX_MS=${start_unix_ms} bash -lc 'cd \"${src_dir}\" && exec \"${cometbft_bin}\" node --home \"${node_home}\" --proxy_app tcp://127.0.0.1:${abci_p} --p2p.laddr tcp://0.0.0.0:${p2p_p} --rpc.laddr tcp://0.0.0.0:${rpc_p}' > \"${node_log}\" 2>&1"
-done
+    tmux new-session -d -s "${abci_session}" \
+      "sudo -n ip netns exec ${ns} sudo -n -u ${run_as_user} env HOME=${run_as_home} PATH=${run_as_home}/go/bin:${PATH} bash -lc 'cd \"${src_dir}\" && exec abci-cli kvstore --address tcp://127.0.0.1:${abci_p}' > \"${abci_log}\" 2>&1"
+    tmux new-session -d -s "${node_session}" \
+      "sudo -n ip netns exec ${ns} sudo -n -u ${run_as_user} env HOME=${run_as_home} PATH=${run_as_home}/go/bin:${PATH} COMETBFT_NODE_INDEX=${i} COMETBFT_PROPOSE_DELAY_FAILURE_SPEC=\"${failure_spec}\" COMETBFT_PROPOSE_DELAY_FAULTY_NODES=${fault_tolerance} COMETBFT_PROPOSE_DELAY_START_UNIX_MS=${start_unix_ms} bash -lc 'cd \"${src_dir}\" && exec \"${cometbft_bin}\" node --home \"${node_home}\" --proxy_app tcp://127.0.0.1:${abci_p} --p2p.laddr tcp://0.0.0.0:${p2p_p} --rpc.laddr tcp://0.0.0.0:${rpc_p}' > \"${node_log}\" 2>&1"
+  done
 
-write_applier_hosts_config
-echo "Starting per-replica network failure appliers in tmux..."
-start_network_appliers
+  write_applier_hosts_config
+  echo "Starting per-replica network failure appliers in tmux..."
+  start_network_appliers
 
-for ((i = 0; i < num_nodes; i++)); do
-  ip="$(node_ip "${i}")"
-  rpc_p="$(rpc_port "${i}")"
-  ready=0
-  for attempt in $(seq 1 60); do
-    if curl -sf "http://${ip}:${rpc_p}/status" >/dev/null 2>&1; then
-      ready=1
+  local ready attempt
+  for ((i = first_local_replica; i <= last_local_replica; i++)); do
+    rpc_p="$(rpc_port "${i}")"
+    ready=0
+    for attempt in $(seq 1 60); do
+      if curl -sf "http://$(node_ip "${i}"):${rpc_p}/status" >/dev/null 2>&1; then
+        ready=1
+        break
+      fi
+      sleep 1
+    done
+    if (( ready == 0 )); then
+      echo "Node ${i} failed to become ready on RPC port ${rpc_p}." >&2
+      exit 1
+    fi
+  done
+}
+
+phase_client() {
+  if (( machine_idx < 0 )); then
+    echo "Configuring client routes to the replica subnets..."
+    setup_client_routes
+  fi
+  trap stop_progress_reporter EXIT
+
+  local expected_peers=$((num_nodes - 1))
+  local rpc0 rpc0_ip load_endpoints experiment_end_epoch_s peers attempt
+  rpc0="$(rpc_port 0)"
+  rpc0_ip="$(node_ip 0)"
+  load_endpoints="$(load_endpoints_csv)"
+  experiment_end_epoch_s="$(((start_unix_ms + experiment_time_s * 1000) / 1000))"
+  for attempt in $(seq 1 30); do
+    peers="$(curl -sf "http://${rpc0_ip}:${rpc0}/net_info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["n_peers"])' 2>/dev/null || echo "0")"
+    if [[ "${peers}" =~ ^[0-9]+$ ]] && (( peers >= expected_peers )); then
       break
     fi
-    sleep 1
+    sleep 2
   done
-  if (( ready == 0 )); then
-    echo "Node ${i} failed to become ready on RPC port ${rpc_p}." >&2
-    exit 1
+
+  if (( post_peer_connect_delay > 0 )); then
+    sleep "${post_peer_connect_delay}"
   fi
-done
 
-expected_peers=$((num_nodes - 1))
-rpc0="$(rpc_port 0)"
-rpc0_ip="$(node_ip 0)"
-load_endpoints="$(load_endpoints_csv)"
-experiment_end_epoch_s="$(((start_unix_ms + experiment_time_s * 1000) / 1000))"
-for attempt in $(seq 1 30); do
-  peers="$(curl -sf "http://${rpc0_ip}:${rpc0}/net_info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["n_peers"])' 2>/dev/null || echo "0")"
-  if [[ "${peers}" =~ ^[0-9]+$ ]] && (( peers >= expected_peers )); then
-    break
-  fi
-  sleep 2
-done
+  {
+    echo "==> mode=${mode}"
+    echo "==> f=${fault_tolerance} n=${num_nodes} server_machines=${server_machine_count} replicas_per_machine=${replicas_per_machine}"
+    echo "==> post-peer-connect wait: ${post_peer_connect_delay}s"
+    echo "==> synced start-unix-ms: ${start_unix_ms}"
+    echo "==> load: duration=${experiment_time_s}s, connections=${load_connections}, rate=${load_rate}, send-period=${load_send_period_ms}ms, size=${load_size}B"
+    echo "==> client log: ${client_log}"
+  } > "${output_file}"
 
-if (( post_peer_connect_delay > 0 )); then
-  sleep "${post_peer_connect_delay}"
-fi
+  echo "Experiment deadline unix_ms=$((start_unix_ms + experiment_time_s * 1000)) (start_unix_ms + ${experiment_time_s}s)"
+  report_time_remaining "${experiment_end_epoch_s}" &
+  progress_reporter_pid=$!
 
-{
-  echo "==> mode=${mode}"
-  echo "==> f=${fault_tolerance} n=${num_nodes}"
-  echo "==> post-peer-connect wait: ${post_peer_connect_delay}s"
-  echo "==> synced start-unix-ms: ${start_unix_ms}"
-  echo "==> load: duration=${experiment_time_s}s, connections=${load_connections}, rate=${load_rate}, send-period=${load_send_period_ms}ms, size=${load_size}B"
-  echo "==> client log: ${client_log}"
-} > "${output_file}"
+  load \
+    --endpoints "${load_endpoints}" \
+    --start-unix-ms "${start_unix_ms}" \
+    --connections "${load_connections}" \
+    --rate "${load_rate}" \
+    --send-period "${load_send_period_ms}ms" \
+    --time "${experiment_time_s}" \
+    --size "${load_size}" 2>&1 | tee "${client_log}" | awk '
+      # As in the other harnesses: everything up to the first Monitor line (which
+      # carries the benchmark start line), then the Monitor lines and their errors.
+      /Monitor (duration=|error:)/ { seen_monitor = 1; print; fflush(); next }
+      seen_monitor == 0 { print; fflush() }
+    ' >> "${output_file}"
+  stop_progress_reporter
+}
 
-echo "Experiment deadline unix_ms=$((start_unix_ms + experiment_time_s * 1000)) (start_unix_ms + ${experiment_time_s}s)"
-report_time_remaining "${experiment_end_epoch_s}" &
-progress_reporter_pid=$!
+phase_stop() {
+  kill_run_sessions
+  force_stop_run_processes
+}
 
-load \
-  --endpoints "${load_endpoints}" \
-  --start-unix-ms "${start_unix_ms}" \
-  --connections "${load_connections}" \
-  --rate "${load_rate}" \
-  --send-period "${load_send_period_ms}ms" \
-  --time "${experiment_time_s}" \
-  --size "${load_size}" 2>&1 | tee "${client_log}" | awk '/^-- Monitor / { print }' >> "${output_file}"
-stop_progress_reporter
-
-echo "" >> "${output_file}"
-echo "==> Stopping nodes..." >> "${output_file}"
-kill_run_sessions
-force_stop_run_processes
-sleep 2
-
-{
+phase_report() {
   echo ""
   echo "==> Latency report:"
   if [[ -f "${report_state_log}" ]]; then
@@ -1253,69 +1340,211 @@ sleep 2
     }
   ' "${results_csv}"
   echo ""
-  append_tendermint_phase_report \
-    "${output_file}" \
-    "${logs_dir}" \
-    "${failure_spec}" \
-    "${start_unix_ms}" \
-    "${run_root}/scripts/tendermint_phase_report.py"
-} >> "${output_file}" 2>&1
+  python3 "${run_root}/scripts/tendermint_phase_report.py" \
+    --logs-dir "${logs_dir}" \
+    --failure-spec "${failure_spec}" \
+    --start-unix-ms "${start_unix_ms}"
+  if (( log_enabled == 0 )); then
+    rm -f "${results_csv}"
+  fi
+}
 
-if (( log_enabled == 0 )); then
-  rm -f "${results_csv}"
+phase_teardown() {
+  teardown_network_namespaces
+  if (( machine_idx < 0 )); then
+    local peer
+    for ((peer = 0; peer < server_machine_count; peer++)); do
+      sudo -n ip route del "$(machine_subnet "${peer}")" >/dev/null 2>&1 || true
+    done
+  else
+    delete_peer_routes
+  fi
+  rm -f "${payload_path}" "${applier_path}" "${testnet_tar}"
+}
+
+case "${phase}" in
+  prepare) phase_prepare ;;
+  testnet) phase_testnet ;;
+  install_testnet) phase_install_testnet ;;
+  start) phase_start ;;
+  client) phase_client ;;
+  stop) phase_stop ;;
+  report) phase_report ;;
+  teardown) phase_teardown ;;
+  *) echo "Unknown remote phase: ${phase}" >&2; exit 2 ;;
+esac
+REMOTE
+
+# Run one remote phase: remote_phase <user> <host> <phase> <server machine index or -1> <is client>
+remote_phase() {
+  local user="$1" host="$2" phase="$3" machine_idx="$4" is_client="$5"
+  ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- \
+    "${phase}" "${REMOTE_PAYLOAD}" "${REMOTE_APPLIER}" "${F}" "${EXPERIMENT_TIME_S}" "${MODE}" \
+    "${LOG_ENABLED}" "${DATASET_ENABLED}" "${LOAD_CONNECTIONS}" "${LOAD_RATE}" "${LOAD_SEND_PERIOD_MS}" \
+    "${AGENT_MODEL_TYPE}" "${REWARD_DESIGN}" "${LATENCY_FLOOR_K}" "${SCHEDULE_FILE}" \
+    "${machine_idx}" "${is_client}" "${server_machine_count}" "${replicas_per_machine}" \
+    "${START_UNIX_MS}" "${GATEWAY_IPS_CSV}" "${SERVER_ROUTE_NAMES_CSV}" "${SERVER_ROUTE_HOSTS_CSV}" \
+    "${REMOTE_TESTNET}" <<< "${REMOTE_SCRIPT}"
+}
+
+# A machine's role arguments: its server machine index (or -1) and whether it runs the client.
+client_is_server=0
+(( machine_count == 1 )) && client_is_server=1
+server_phase() {
+  local m="$1" phase="$2"
+  remote_phase "${server_users[$m]}" "${server_hosts[$m]}" "${phase}" "${m}" "${client_is_server}" 2>&1 \
+    | while IFS= read -r line; do printf '  [%s] %s\n' "${server_names[$m]}" "${line}"; done
+  return "${PIPESTATUS[0]}"
+}
+
+# Run a phase on every server machine (and, with with_client=1, a separate client
+# machine) in parallel; fail if any of them fails.
+parallel_phase() {
+  local phase="$1" with_client="${2:-0}"
+  local m failed=0
+  local pids=()
+  for m in "${!server_hosts[@]}"; do
+    server_phase "${m}" "${phase}" &
+    pids+=("$!")
+  done
+  if (( with_client == 1 && client_is_server == 0 )); then
+    (
+      remote_phase "${client_user}" "${client_host}" "${phase}" -1 1 2>&1 \
+        | while IFS= read -r line; do printf '  [node0] %s\n' "${line}"; done
+      exit "${PIPESTATUS[0]}"
+    ) &
+    pids+=("$!")
+  fi
+  for m in "${!pids[@]}"; do
+    wait "${pids[$m]}" || failed=1
+  done
+  return "${failed}"
+}
+
+all_hosts=("${server_hosts[@]}")
+all_users=("${server_users[@]}")
+if (( client_is_server == 0 )); then
+  all_hosts+=("${client_host}")
+  all_users+=("${client_user}")
 fi
 
-echo "Done. Output written to ${output_file}"
-REMOTE
-then
+echo "Copying payload to ${#all_hosts[@]} machine(s) (servers: ${server_names[*]}; client: node0)..."
+copy_pids=()
+for i in "${!all_hosts[@]}"; do
+  (
+    scp -q "${SSH_OPTS[@]}" "${LOCAL_PAYLOAD}" "${all_users[$i]}@${all_hosts[$i]}:${REMOTE_PAYLOAD}" &&
+      scp -q "${SSH_OPTS[@]}" "${APPLIER_LOCAL_PATH}" "${all_users[$i]}@${all_hosts[$i]}:${REMOTE_APPLIER}"
+  ) &
+  copy_pids+=("$!")
+done
+for pid in "${copy_pids[@]}"; do
+  if ! wait "${pid}"; then
+    echo "Failed to copy the payload to every machine." >&2
+    exit 1
+  fi
+done
+rm -f "${LOCAL_PAYLOAD}"
+
+teardown_started=0
+teardown_all() {
+  (( teardown_started == 1 )) && return 0
+  teardown_started=1
+  parallel_phase stop || true
+  parallel_phase teardown 1 || true
+}
+
+echo "Running CometBFT experiment (mode=${MODE}, f=${F}, t=${EXPERIMENT_TIME_S}s, ${server_machine_count} server machine(s), ${replicas_per_machine} replica(s) each)..."
+remote_failed=0
+echo "Preparing machines (unpack and build)..."
+if ! parallel_phase prepare 1; then
   remote_failed=1
+fi
+if (( remote_failed == 0 )); then
+  echo "Generating the testnet on ${server_names[0]}..."
+  if ! server_phase 0 testnet; then
+    remote_failed=1
+  elif (( server_machine_count > 1 )); then
+    local_testnet="${ARTIFACT_DIR}/${REMOTE_TESTNET}"
+    if ! scp -q "${SSH_OPTS[@]}" "${server_users[0]}@${server_hosts[0]}:${REMOTE_TESTNET}" "${local_testnet}"; then
+      remote_failed=1
+    else
+      for ((m = 1; m < server_machine_count; m++)); do
+        if ! scp -q "${SSH_OPTS[@]}" "${local_testnet}" "${server_users[$m]}@${server_hosts[$m]}:${REMOTE_TESTNET}" ||
+          ! server_phase "${m}" install_testnet; then
+          remote_failed=1
+        fi
+      done
+    fi
+    rm -f "${local_testnet}"
+  fi
+fi
+if (( remote_failed == 0 )); then
+  START_UNIX_MS="$(( ($(date +%s) + START_DELAY_S) * 1000 ))"
+  echo "Using shared start_unix_ms=${START_UNIX_MS}"
+  printf 'start_unix_ms=%q\n' "${START_UNIX_MS}" >> "${ARTIFACT_DIR}/run.env"
+  trap 'teardown_all; cleanup_local_run_locks' EXIT
+  echo "Starting replicas..."
+  if ! parallel_phase start; then
+    remote_failed=1
+  fi
+fi
+if (( remote_failed == 0 )); then
+  echo "Running the load client on node0..."
+  if ! remote_phase "${client_user}" "${client_host}" client "$(( client_is_server == 1 ? 0 : -1 ))" 1; then
+    remote_failed=1
+  fi
+fi
+REPORT_LOCAL="${ARTIFACT_DIR}/.tendermint_report.txt"
+rm -f "${REPORT_LOCAL}"
+if (( START_UNIX_MS > 0 )); then
+  echo "Stopping replicas..."
+  parallel_phase stop || true
+  if (( remote_failed == 0 )); then
+    echo "Building the latency and phase reports on ${server_names[0]}..."
+    if ! remote_phase "${server_users[0]}" "${server_hosts[0]}" report 0 "${client_is_server}" > "${REPORT_LOCAL}" 2>&1; then
+      echo "Report phase failed on ${server_names[0]}; its output is appended to ${OUTPUT_LOCAL}." >&2
+      remote_failed=1
+    fi
+  fi
 fi
 
 echo "Fetching tendermint output to ${OUTPUT_LOCAL}..."
-fetched_output=0
-for remote_output_path in \
-  "tendermint_output.txt" \
-  "~/tendermint_output.txt" \
-  "/home/${remote_user}/tendermint_output.txt" \
-  "tendermint_cloudlab/tendermint_output.txt"; do
-  if scp "${SSH_OPTS[@]}" "${remote_user}@${remote_host}:${remote_output_path}" "${OUTPUT_LOCAL}" >/dev/null 2>&1; then
-    fetched_output=1
-    break
-  fi
-done
-if (( fetched_output == 0 )); then
+if ! scp "${SSH_OPTS[@]}" "${client_user}@${client_host}:tendermint_output.txt" "${OUTPUT_LOCAL}" >/dev/null 2>&1; then
   {
-    echo "Failed to fetch remote output file from ${remote_host}."
-    echo "Tried: tendermint_output.txt, ~/tendermint_output.txt, /home/${remote_user}/tendermint_output.txt, tendermint_cloudlab/tendermint_output.txt"
+    echo "Failed to fetch remote output file from ${client_host}."
     echo "remote_failed=${remote_failed}"
   } > "${OUTPUT_LOCAL}"
   if (( remote_failed == 0 )); then
-    echo "Failed to fetch tendermint output from ${remote_host}." >&2
+    echo "Failed to fetch tendermint output from ${client_host}." >&2
     exit 1
   fi
+fi
+if [[ -f "${REPORT_LOCAL}" ]]; then
+  cat "${REPORT_LOCAL}" >> "${OUTPUT_LOCAL}"
+  rm -f "${REPORT_LOCAL}"
 fi
 
 if (( LOG_ENABLED == 1 )); then
   echo "Fetching logs in parallel to ${LOGS_LOCAL_DIR}..."
-  if ! fetch_tendermint_logs_parallel \
-    "${remote_user}@${remote_host}" \
-    "tendermint_cloudlab/logs" \
-    "${LOGS_LOCAL_DIR}" \
-    "${LOCAL_NUM_NODES}" \
-    "${LEARNING_AGENT_ENABLED}" \
-    "$([[ "${MODE}" == "sharing" ]] && echo 1 || echo 0)"; then
-    echo "Failed to fetch some/all logs from ${remote_host}." >&2
+  if ! fetch_tendermint_logs_parallel "${LOGS_LOCAL_DIR}"; then
+    echo "Failed to fetch some/all logs." >&2
   fi
 fi
 if (( DATASET_ENABLED == 1 )); then
   echo "Fetching learning-agent datasets to ${ARTIFACT_DIR}..."
   for ((i = 0; i < LOCAL_NUM_NODES; i++)); do
+    m=$((i / replicas_per_machine))
     local_csv="${ARTIFACT_DIR}/agent${i}.csv"
     rm -f "${local_csv}"
-    if ! scp "${SSH_OPTS[@]}" "${remote_user}@${remote_host}:tendermint_cloudlab/agent${i}.csv" "${local_csv}"; then
-      echo "Missing or failed to fetch agent${i}.csv from ${remote_host}." >&2
+    if ! scp "${SSH_OPTS[@]}" "${server_users[$m]}@${server_hosts[$m]}:tendermint_cloudlab/agent${i}.csv" "${local_csv}"; then
+      echo "Missing or failed to fetch agent${i}.csv from ${server_hosts[$m]}." >&2
     fi
   done
+fi
+
+if (( START_UNIX_MS > 0 )); then
+  echo "Tearing down namespaces and routes..."
+  teardown_all
 fi
 
 if (( remote_failed == 1 )); then
@@ -1325,7 +1554,7 @@ fi
 
 echo "Done. Client output saved to ${OUTPUT_LOCAL}."
 if (( LOG_ENABLED == 1 )); then
-  echo "Logs saved to ${LOGS_LOCAL_DIR} (including client.log)."
+  echo "Logs saved to ${LOGS_LOCAL_DIR} (client.log in ${ARTIFACT_DIR})."
 fi
 if (( DATASET_ENABLED == 1 )); then
   echo "Datasets saved to ${ARTIFACT_DIR}/agentN.csv."

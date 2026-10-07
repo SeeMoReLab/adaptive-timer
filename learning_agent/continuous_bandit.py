@@ -44,6 +44,7 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
             agent_pb2.PROTOCOL_SMARTBFT,
             agent_pb2.PROTOCOL_TENDERMINT,
             agent_pb2.PROTOCOL_HOTSTUFF,
+            agent_pb2.PROTOCOL_AUTOBAHN,
         ):
             if wait_bounds_ms is not None:
                 raise ValueError(
@@ -66,7 +67,7 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
         else:
             raise ValueError(
                 "Continuous timeout actions currently support only PBFT, "
-                "SmartBFT, SBFT, Tendermint and HotStuff"
+                "SmartBFT, SBFT, Tendermint, HotStuff and Autobahn"
             )
 
     @property
@@ -152,6 +153,14 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
                     timeout_delay_milliseconds=timeout_values[0]
                 )
             )
+        if self._protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+            return agent_pb2.Timeout(
+                autobahn=agent_pb2.AutobahnTimeout(
+                    timeout_delay_milliseconds=timeout_values[0]
+                )
+            )
+        if self._protocol != agent_pb2.PROTOCOL_TENDERMINT:
+            raise ValueError(f"Unsupported protocol {self._protocol}")
         propose_timeout_ms, prevote_timeout_ms, precommit_timeout_ms = (
             tendermint_timeouts_from_propose(timeout_values[0])
         )
@@ -173,8 +182,12 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
                 action = action.sbft
             elif self._protocol == agent_pb2.PROTOCOL_HOTSTUFF:
                 action = action.hotstuff
-            else:
+            elif self._protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+                action = action.autobahn
+            elif self._protocol == agent_pb2.PROTOCOL_TENDERMINT:
                 action = action.tendermint
+            else:
+                raise ValueError(f"Unsupported protocol {self._protocol}")
 
         if self._protocol in (
             agent_pb2.PROTOCOL_PBFT,
@@ -188,7 +201,10 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
                 int(getattr(action, "election_timeout_milliseconds")),
                 int(getattr(action, "slow_path_timeout_milliseconds")),
             ]
-        elif self._protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        elif self._protocol in (
+            agent_pb2.PROTOCOL_HOTSTUFF,
+            agent_pb2.PROTOCOL_AUTOBAHN,
+        ):
             timeout_values = [int(getattr(action, "timeout_delay_milliseconds"))]
         else:
             propose_timeout_ms = int(
@@ -227,8 +243,8 @@ class DerivedWaitActionCodec(ActionCodec[agent_pb2.Timeout]):
     """A two-dimensional codec presented as one, the second derived from the first.
 
     SBFT's action is an election timeout T and a fast-path wait W.
-    ContinuousHeuristicTimeoutModel, LatencyFloorHeuristic, ContinuousLinUCB
-    and ContinuousPPO each place one timeout on a line and refuse a 2-D codec,
+    ContinuousHeuristicTimeoutModel, ContinuousLinUCB and ContinuousPPO each
+    place one timeout on a line and refuse a 2-D codec,
     so without this they cannot run on SBFT at all.
 
     W = clamp(T / divisor, wait bounds). The two are not independent the way
@@ -386,15 +402,34 @@ class NormalizedLatencyFloor:
 
 
 DEFAULT_PROPORTIONAL_K = 1.0
-class ContinuousHeuristicTimeoutModel(TensorModel):
-    """Proportional rule over the reported consensus latency.
-        timeout_ms = clamp(k * avg_consensus_latency_ms, lower_ms, upper_ms)
+# Reports the heuristic's latency estimate is taken over, and the quantile of
+# them. One report is the latest committing window's latency, as before.
+DEFAULT_HEURISTIC_WINDOW = 1
+DEFAULT_HEURISTIC_QUANTILE = 0.5
 
-    The mean rather than the p95: the p95 of a window is dominated by the
-    rounds the current timer already mishandled, so it reports the arm's own
-    thrashing back to the rule that chose it. The mean moves with the delay
-    environment and is the field the latency floor reads, so the rule and the
-    constraint are driven by one measurement.
+
+class ContinuousHeuristicTimeoutModel(TensorModel):
+    """Proportional rule over recent consensus latency.
+
+        timeout_ms = clamp(k * estimate_ms, lower_ms, upper_ms)
+
+    ``estimate_ms`` is the ``quantile`` of avg_consensus_latency_ms over the
+    last ``window`` windows that committed something. With ``window = 1`` that
+    is the latest committing window, so a single degraded window moves the
+    timeout; a longer window with a low quantile is slower to follow a regime
+    change and much harder for one bad window to carry.
+
+    The mean latency rather than the p95: the p95 of a window is dominated by
+    the rounds the current timer already mishandled, so it reports the arm's
+    own thrashing back to the rule that chose it.
+
+    ``latency_floor`` is the optional constraint every model takes
+    (--latency-floor-multiplier): the timeout played is never below it. It is a
+    separate estimate with its own window and quantile, so a smoothed rule can
+    sit on a fast floor.
+
+    Not a bandit: nothing is explored or learned. Until a window commits, and
+    while none does, the last timeout is held.
     """
 
     def __init__(
@@ -402,21 +437,21 @@ class ContinuousHeuristicTimeoutModel(TensorModel):
         action_codec: ContinuousTimeoutActionCodec,
         n_features: int,
         latency_index: int,
-        transactions_index: int,
+        instances_index: Optional[int],
         multiplier: float = DEFAULT_PROPORTIONAL_K,
+        window: int = DEFAULT_HEURISTIC_WINDOW,
+        quantile: float = DEFAULT_HEURISTIC_QUANTILE,
         clamp_ms: Optional[Tuple[int, int]] = None,
         initial_timeout_ms: Optional[int] = None,
+        latency_floor: Optional[NormalizedLatencyFloor] = None,
     ):
         if n_features <= 0:
             raise ValueError(f"n_features must be > 0, got {n_features}")
-        for name, index in (
-            ("latency_index", latency_index),
-            ("transactions_index", transactions_index),
-        ):
-            if not 0 <= index < n_features:
-                raise ValueError(
-                    f"{name} must be in [0, {n_features}), got {index}"
-                )
+        if action_codec.action_dim != 1:
+            raise ValueError(
+                "ContinuousHeuristicTimeoutModel scales a single timeout, so it "
+                f"needs a 1-dimensional codec, got {action_codec.action_dim}"
+            )
         if not math.isfinite(multiplier) or multiplier <= 0.0:
             raise ValueError(f"multiplier must be > 0, got {multiplier}")
 
@@ -431,16 +466,23 @@ class ContinuousHeuristicTimeoutModel(TensorModel):
                 f"Clamp bounds {lower_ms}..{upper_ms}ms fall outside the codec "
                 f"bounds {codec_lower_ms}..{codec_upper_ms}ms"
             )
-
         if initial_timeout_ms is None:
             initial_timeout_ms = int(round(math.sqrt(lower_ms * upper_ms)))
         initial_timeout_ms = min(upper_ms, max(lower_ms, int(initial_timeout_ms)))
 
         self._action_codec = action_codec
         self._obs_dim = int(n_features)
-        self._latency_index = int(latency_index)
-        self._transactions_index = int(transactions_index)
         self._multiplier = float(multiplier)
+        # The estimator is a LatencyFloor at multiplier 1: the same "quantile
+        # over recent committing windows", read here as the rule's input.
+        self._estimate = NormalizedLatencyFloor(
+            action_codec=action_codec,
+            latency_index=latency_index,
+            n_features=n_features,
+            instances_index=instances_index,
+            latency_floor=LatencyFloor(multiplier=1.0, window=window, quantile=quantile),
+        )
+        self._latency_floor = latency_floor
         self._lower_ms = lower_ms
         self._upper_ms = upper_ms
         self._initial_timeout_ms = initial_timeout_ms
@@ -449,16 +491,24 @@ class ContinuousHeuristicTimeoutModel(TensorModel):
 
     @property
     def timeout_ms(self) -> int:
+        """Milliseconds behind the most recent decision."""
         return self._held_timeout_ms
 
     def _timeout_for(self, features: np.ndarray) -> int:
-        latency_ms = float(features[self._latency_index])
-        transactions = float(features[self._transactions_index])
-        if transactions <= 0.0 or not math.isfinite(latency_ms) or latency_ms <= 0.0:
-            return self._held_timeout_ms
-
-        timeout_ms = int(round(self._multiplier * latency_ms))
-        return min(self._upper_ms, max(self._lower_ms, timeout_ms))
+        self._estimate.observe_features(features)
+        estimate_ms = float(self._estimate.floor_ms)
+        if estimate_ms > 0.0:
+            timeout_ms = int(round(self._multiplier * estimate_ms))
+            timeout_ms = min(self._upper_ms, max(self._lower_ms, timeout_ms))
+        else:
+            # No committing window yet (cold start or a stall): hold.
+            timeout_ms = self._held_timeout_ms
+        if self._latency_floor is not None:
+            self._latency_floor.observe_features(features)
+            floor_ms = float(self._latency_floor.floor_ms)
+            if floor_ms > timeout_ms:
+                timeout_ms = min(self._upper_ms, int(math.ceil(floor_ms)))
+        return timeout_ms
 
     def predict_action(self, features: np.ndarray) -> np.ndarray:
         features_np = np.asarray(features, dtype=float)
@@ -485,9 +535,14 @@ class ContinuousHeuristicTimeoutModel(TensorModel):
         rewards: np.ndarray | float,
         backward: bool = True,
     ) -> float:
+        """No-op: the rule has no parameters to move. The reward still reaches
+        the agent's CSV, so a run is comparable with a learned one."""
         return 0.0
 
     def reset_model(self) -> None:
+        self._estimate.reset()
+        if self._latency_floor is not None:
+            self._latency_floor.reset()
         self._held_timeout_ms = self._initial_timeout_ms
 
 
@@ -495,23 +550,24 @@ class ContinuousHeuristicTimeoutModel(TensorModel):
 
 _PRIOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pretrained_models")
 
-# Action range of --model-type=continuous_pretrained_gp on Tendermint, and where its prior ships.
+# Action range of --model-type=continuous_gp on Tendermint, and where its simulator writes the prior.
 CONTINUOUS_TENDERMINT_BOUNDS_MS: Tuple[int, int] = (100, 3000)
 DEFAULT_TENDERMINT_PRIOR_PATH = os.path.join(_PRIOR_DIR, "continuous_tendermint_prior.npz")
 
 
 @dataclass(frozen=True)
 class ContextSpec:
-    """What --model-type=continuous_pretrained_gp reads and plays on one protocol.
+    """What --model-type=continuous_gp reads and plays on one protocol.
 
     The context vector is log1p of ``log_fields`` followed by ``raw_fields``
     verbatim, in that order; ``length_scales`` has one GP length scale per
     context dimension (inf drops the field from the kernel; the prior still
     reads it). ``bounds_ms`` is the codec's action range (SBFT's election
     timeout), ``wait_bounds_ms`` SBFT's fast-path wait range (None on the
-    one-dimensional protocols), ``prior_path`` where the simulator-trained
-    prior ships (input_dim = context_dim + action_dim, trained on the agent's
-    reward design) and ``simulator`` the script that trains it.
+    one-dimensional protocols), ``prior_path`` where the simulator writes the
+    GP prior by default (input_dim = context_dim + action_dim, trained on the
+    agent's reward design; the agent never loads it implicitly, only a path
+    given with --prior-path) and ``simulator`` the script that trains it.
     """
 
     log_fields: Tuple[str, ...]
@@ -676,6 +732,17 @@ CONTEXT_SPECS: Dict[int, ContextSpec] = {
         prior_path=os.path.join(_PRIOR_DIR, "continuous_hotstuff_prior.npz"),
         simulator="hotstuff_sim.py",
     ),
+    # Autobahn's report is HotStuff's without regency_change_count, so the
+    # PBFT context fields all exist. Healthy Autobahn has no floor; under vote
+    # withholding 5+150 needs about 1000 ms, and 3000 is three times that.
+    agent_pb2.PROTOCOL_AUTOBAHN: ContextSpec(
+        log_fields=_PBFT_CONTEXT_LOG_FIELDS,
+        raw_fields=(),
+        length_scales=_PBFT_CONTEXT_LENGTH_SCALES,
+        bounds_ms=(100, 3000),
+        prior_path=os.path.join(_PRIOR_DIR, "continuous_autobahn_prior.npz"),
+        simulator="autobahn_sim.py",
+    ),
 }
 
 
@@ -683,9 +750,9 @@ def context_spec(protocol: int) -> ContextSpec:
     spec = CONTEXT_SPECS.get(int(protocol))
     if spec is None:
         raise ValueError(
-            "--model-type=continuous_pretrained_gp has no context spec for "
+            "--model-type=continuous_gp has no context spec for "
             f"{agent_pb2.Protocol.Name(int(protocol))}; it runs on PBFT, SmartBFT, "
-            "SBFT, Tendermint and HotStuff"
+            "SBFT, Tendermint, HotStuff and Autobahn"
         )
     return spec
 
@@ -837,6 +904,7 @@ class SimPriorGPModel(TensorModel):
         confidence: float = 1.0,
         level_std: float = 0.2,
         wait_grid_size: int = 16,
+        latency_floor: Optional[NormalizedLatencyFloor] = None,
     ):
         action_dim = int(action_codec.action_dim)
         if action_dim not in (1, 2):
@@ -862,6 +930,9 @@ class SimPriorGPModel(TensorModel):
 
         self._codec = action_codec
         self._action_dim = action_dim
+        # The optional constraint every model takes: grid points whose
+        # election timeout is under it are not scored (see _feasible_mask).
+        self._latency_floor = latency_floor
         self._spec = context_spec(action_codec.protocol)
         self._field_names = tuple(field_names)
         self._obs_dim = len(self._field_names)
@@ -968,8 +1039,8 @@ class SimPriorGPModel(TensorModel):
             # pick index 0, the shortest timeout, on every protocol. Nothing in
             # the model prefers it, so open in the middle of the range instead.
             if float(np.ptp(prior)) == 0.0:
-                return self._grid[self._mid_index]
-            return self._grid[int(np.argmax(prior))]
+                return self._grid[self._opening_index()]
+            return self._grid[self._best_feasible(prior)]
 
         x = np.asarray(self._inputs_seen, dtype=float)
         y = np.asarray(self._residuals, dtype=float)
@@ -989,12 +1060,37 @@ class SimPriorGPModel(TensorModel):
         mean = k_xg.T @ alpha
         prior_var = self._level_var + self._signal_var
         sd = np.sqrt(np.clip(prior_var - np.sum(v * v, axis=0), 0.0, None))
-        return self._grid[int(np.argmax(prior + mean - self._confidence * sd))]
+        return self._grid[self._best_feasible(prior + mean - self._confidence * sd)]
+
+    def _feasible_mask(self) -> np.ndarray:
+        """Grid rows the latency floor permits: election timeout at or above
+        its lower bound. A floor above the whole range leaves the longest
+        timeout, as feasible_timeout_mask does on the discrete ladder."""
+        timeouts = self._grid if self._action_dim == 1 else self._grid[:, 0]
+        if self._latency_floor is None:
+            return np.ones(len(timeouts), dtype=bool)
+        mask = timeouts >= self._latency_floor.lower_bound() - 1e-12
+        if not mask.any():
+            mask = timeouts >= timeouts.max()
+        return mask
+
+    def _best_feasible(self, scores: np.ndarray) -> int:
+        return int(np.argmax(np.where(self._feasible, scores, -np.inf)))
+
+    def _opening_index(self) -> int:
+        """Where a flat prior opens: the middle of the range, or the shortest
+        permitted timeout when the floor rules the middle out."""
+        if self._feasible[self._mid_index]:
+            return self._mid_index
+        return int(np.flatnonzero(self._feasible)[0])
 
     def predict_action(self, features: np.ndarray) -> np.ndarray:
         row = np.asarray(features, dtype=float).reshape(-1)
         if row.size != self._obs_dim:
             raise ValueError(f"Expected {self._obs_dim} features, got {row.size}")
+        if self._latency_floor is not None:
+            self._latency_floor.observe_features(row)
+        self._feasible = self._feasible_mask()
         action = self._choose(report_context(self._spec, self._field_names, row))
         # A copy, never a view of the grid.
         return np.array(action, dtype=float).reshape(-1)
@@ -1024,32 +1120,9 @@ class SimPriorGPModel(TensorModel):
     def reset_model(self) -> None:
         self._inputs_seen: deque[np.ndarray] = deque(maxlen=self._memory_size)
         self._residuals: deque[float] = deque(maxlen=self._memory_size)
-
-
-def return_prior_path(protocol: int) -> str:
-    """Prior file of SimReturnGPModel for ``protocol``: the protocol's prior path
-    with ``_return`` before the extension (continuous_tendermint_return_prior.npz)."""
-    base, ext = os.path.splitext(context_spec(protocol).prior_path)
-    if not base.endswith("_prior"):
-        raise ValueError(f"Unexpected prior path {context_spec(protocol).prior_path}")
-    return f"{base[:-len('_prior')]}_return_prior{ext}"
-
-
-def resolve_prior_path(protocol: int, selection: str) -> Optional[str]:
-    """Which prior --model-type=continuous_pretrained_gp loads, from --prior-path.
-
-    ``""`` is the protocol's shipped return prior, ``"none"`` is untrained (a
-    zero prior, so the GP fits the reward itself), and anything else is taken
-    as a path to an ablation prior - one trained by that protocol's simulator
-    with, for example, ``--no-proposal-faults``. These three are the
-    pretraining ablation: pretrained, blind-pretrained and untrained.
-    """
-    value = (selection or "").strip()
-    if value == "none":
-        return None
-    if value:
-        return value
-    return return_prior_path(protocol)
+        if self._latency_floor is not None:
+            self._latency_floor.reset()
+        self._feasible = self._feasible_mask()
 
 
 class SimReturnGPModel(SimPriorGPModel):
@@ -1101,6 +1174,7 @@ class SimReturnGPModel(SimPriorGPModel):
         confidence: float = 1.0,
         level_std: float = 0.5,
         wait_grid_size: int = 16,
+        latency_floor: Optional[NormalizedLatencyFloor] = None,
     ):
         super().__init__(
             action_codec,
@@ -1115,6 +1189,7 @@ class SimReturnGPModel(SimPriorGPModel):
             confidence=confidence,
             level_std=level_std,
             wait_grid_size=wait_grid_size,
+            latency_floor=latency_floor,
         )
         if not math.isfinite(self._prior.target_floor):
             raise ValueError(
@@ -1151,8 +1226,8 @@ class SimReturnGPModel(SimPriorGPModel):
             # See SimPriorGPModel._choose: a flat prior carries no preference,
             # so open in the middle of the range rather than at index 0.
             if float(np.ptp(prior)) == 0.0:
-                return self._grid[self._mid_index]
-            return self._grid[int(np.argmax(prior))]
+                return self._grid[self._opening_index()]
+            return self._grid[self._best_feasible(prior)]
         x = np.asarray(self._inputs_seen, dtype=float)
         y = np.asarray(self._residuals, dtype=float)
         k_xx = self._kernel(x, x) + self._noise_var * np.eye(len(x))
@@ -1171,7 +1246,7 @@ class SimReturnGPModel(SimPriorGPModel):
         mean = k_xg.T @ alpha
         prior_var = self._level_var + self._signal_var
         sd = np.sqrt(np.clip(prior_var - np.sum(v * v, axis=0), 0.0, None))
-        return self._grid[int(np.argmax(prior + mean - self._confidence * sd))]
+        return self._grid[self._best_feasible(prior + mean - self._confidence * sd)]
 
     def update_model(
         self,
@@ -1206,154 +1281,6 @@ class SimReturnGPModel(SimPriorGPModel):
         self._inputs_seen.append(oldest)
         self._residuals.append(residual)
         return residual
-
-
-# The floor already carries its own multiplier - LatencyFloor's k, set by
-# --latency-floor-k - so this rule adds nothing on top of it by default: the
-# timeout it plays is the floor value itself.
-DEFAULT_FLOOR_MULTIPLIER = 1.0
-
-
-class LatencyFloorHeuristic(TensorModel):
-    """Plays the latency floor as the timeout.
-
-        timeout_ms = clamp(multiplier * floor_ms, clamp_ms)
-
-    ``clamp_ms`` defaults to the codec's own bounds, but the agent passes the
-    discrete arm range, as it does for ContinuousHeuristicTimeoutModel: the
-    codec's lower bound is 100ms, well under the shortest arm any of these
-    protocols ships, so a floor measured in a healthy phase would otherwise
-    pin the timeout at a value no discrete baseline can play and the
-    comparison would be against a different action space.
-
-    Not a bandit: nothing is explored, nothing is learned, and the same
-    measurement produces the same timeout every time. Where
-    :class:`~latency_floor.LatencyFloorPolicy` uses the floor to rule arms out
-    and leaves a learner to choose among what is left, this takes the floor as
-    the answer, so the constraint and the decision are one number.
-
-    Its difference from :class:`ContinuousHeuristicTimeoutModel` is the
-    estimator, not the shape of the rule. That model multiplies the current
-    window's mean latency, so a single degraded window moves the timeout;
-    this one multiplies a low quantile over the last several committing
-    windows, which is the same estimate the floor constraint bounds with -
-    slower to follow a regime change, and much harder for one bad window to
-    carry.
-    """
-
-    def __init__(
-        self,
-        action_codec: ContinuousTimeoutActionCodec,
-        n_features: int,
-        latency_floor: NormalizedLatencyFloor,
-        multiplier: float = DEFAULT_FLOOR_MULTIPLIER,
-        clamp_ms: Optional[Tuple[int, int]] = None,
-        initial_timeout_ms: Optional[int] = None,
-    ):
-        if n_features <= 0:
-            raise ValueError(f"n_features must be > 0, got {n_features}")
-        if latency_floor is None:
-            raise ValueError(
-                "LatencyFloorHeuristic requires a NormalizedLatencyFloor: the "
-                "floor is the rule, not an optional constraint on one"
-            )
-        if action_codec.action_dim != 1:
-            raise ValueError(
-                "LatencyFloorHeuristic scales a single timeout, so it needs a "
-                f"1-dimensional codec, got {action_codec.action_dim}"
-            )
-        if not math.isfinite(multiplier) or multiplier <= 0.0:
-            raise ValueError(f"multiplier must be > 0, got {multiplier}")
-
-        codec_lower_ms, codec_upper_ms = action_codec.bounds_ms[0]
-        if clamp_ms is None:
-            clamp_ms = (codec_lower_ms, codec_upper_ms)
-        lower_ms, upper_ms = (int(clamp_ms[0]), int(clamp_ms[1]))
-        if upper_ms <= lower_ms:
-            raise ValueError(f"Invalid clamp bounds: {lower_ms}..{upper_ms}ms")
-        if lower_ms < codec_lower_ms or upper_ms > codec_upper_ms:
-            raise ValueError(
-                f"Clamp bounds {lower_ms}..{upper_ms}ms fall outside the codec "
-                f"bounds {codec_lower_ms}..{codec_upper_ms}ms"
-            )
-
-        if initial_timeout_ms is None:
-            # Nothing has been measured yet, so there is nothing to scale. The
-            # middle discrete arm is the same cold start
-            # ContinuousHeuristicTimeoutModel takes, and it lasts until the
-            # first window that commits something.
-            arms_ms = sorted(get_timeout_values_ms(action_codec.protocol))
-            initial_timeout_ms = arms_ms[len(arms_ms) // 2]
-        initial_timeout_ms = min(upper_ms, max(lower_ms, int(initial_timeout_ms)))
-
-        self._action_codec = action_codec
-        self._obs_dim = int(n_features)
-        self._latency_floor = latency_floor
-        self._multiplier = float(multiplier)
-        self._lower_ms = lower_ms
-        self._upper_ms = upper_ms
-        self._initial_timeout_ms = initial_timeout_ms
-
-        self.reset_model()
-
-    @property
-    def multiplier(self) -> float:
-        return self._multiplier
-
-    @property
-    def floor_ms(self) -> float:
-        return float(self._latency_floor.floor_ms)
-
-    @property
-    def timeout_ms(self) -> int:
-        """Milliseconds behind the most recent decision."""
-        return self._held_timeout_ms
-
-    def _timeout_for(self, features: np.ndarray) -> int:
-        self._latency_floor.observe_features(features)
-        floor_ms = float(self._latency_floor.floor_ms)
-        if floor_ms <= 0.0:
-            # No committing window has been seen yet - a cold start, or a
-            # stalled one. Hold the last timeout rather than inventing a floor.
-            return self._held_timeout_ms
-        timeout_ms = int(round(self._multiplier * floor_ms))
-        return min(self._upper_ms, max(self._lower_ms, timeout_ms))
-
-    def predict_action(self, features: np.ndarray) -> np.ndarray:
-        features_np = np.asarray(features, dtype=float)
-        single = features_np.ndim == 1
-        if single:
-            features_np = features_np.reshape(1, -1)
-        if features_np.shape[1] != self._obs_dim:
-            raise ValueError(
-                f"Expected {self._obs_dim} features, got {features_np.shape[1]}"
-            )
-
-        actions = []
-        for row in features_np:
-            self._held_timeout_ms = self._timeout_for(row)
-            actions.append([self._action_codec.normalize_ms(self._held_timeout_ms)])
-
-        result = np.asarray(actions, dtype=float)
-        return result[0] if single else result
-
-    def update_model(
-        self,
-        features: np.ndarray,
-        actions: np.ndarray,
-        rewards: np.ndarray | float,
-        backward: bool = True,
-    ) -> float:
-        """No-op: the rule has no parameters to move.
-
-        The reward still reaches the agent's CSV, so a run of this model is
-        directly comparable with a learned one on the same episodes.
-        """
-        return 0.0
-
-    def reset_model(self) -> None:
-        self._latency_floor.reset()
-        self._held_timeout_ms = self._initial_timeout_ms
 
 
 # Candidate timeouts scored at each decision. Spread over the arm range in the
@@ -1484,9 +1411,9 @@ class ContinuousLinUCB(TensorModel):
     are the two things that would change that; neither is done here.
 
     The action space is the arm range, not the codec's 100..10000ms bounds, for
-    the reason :class:`LatencyFloorHeuristic` gives: a timeout no discrete
-    baseline can play makes the comparison against those baselines a comparison
-    of two different action spaces. A latency floor, when one is configured,
+    the reason the agent clamps ContinuousHeuristicTimeoutModel to it: a
+    timeout no discrete baseline can play makes the comparison against those
+    baselines a comparison of two different action spaces. A latency floor, when one is configured,
     trims the bottom of that range exactly as ``feasible_timeout_mask`` trims
     the ladder - the model is not otherwise aware of it, and with no floor
     configured it is a bandit over the range and nothing else.
@@ -1507,6 +1434,7 @@ class ContinuousLinUCB(TensorModel):
         center_rewards: bool = True,
         latency_floor: Optional[NormalizedLatencyFloor] = None,
         seed: Optional[int] = None,
+        prior_theta: Optional[np.ndarray] = None,
     ) -> None:
         if n_features <= 0:
             raise ValueError(f"n_features must be > 0, got {n_features}")
@@ -1602,6 +1530,21 @@ class ContinuousLinUCB(TensorModel):
         self._positions = np.linspace(
             0.0, 1.0, self._candidate_count, dtype=np.float64
         )
+        # Prior mean of the coefficients, in the _joint layout and in the
+        # units of the update's target (centred if center_rewards, over
+        # reward_scale): b starts at ridge * theta0 and the discount pulls it
+        # back there. Zeros (None) is the plain ridge prior.
+        if prior_theta is None:
+            self._prior_theta = np.zeros(self._feature_dim, dtype=np.float64)
+        else:
+            self._prior_theta = np.array(prior_theta, dtype=np.float64)
+            if self._prior_theta.shape != (self._feature_dim,):
+                raise ValueError(
+                    f"prior_theta must have shape ({self._feature_dim},), "
+                    f"got {self._prior_theta.shape}"
+                )
+            if not np.all(np.isfinite(self._prior_theta)):
+                raise ValueError("prior_theta must contain only finite values")
 
         self.reset_model()
 
@@ -1622,6 +1565,56 @@ class ContinuousLinUCB(TensorModel):
     def baseline_reward(self) -> float:
         """The reward level an untried timeout is credited with."""
         return self._baseline()
+
+    def fit_prior_theta(
+        self, features: np.ndarray, actions: np.ndarray, rewards: np.ndarray
+    ) -> np.ndarray:
+        """Undiscounted ridge fit, for use as ``prior_theta``.
+
+        ``actions`` are codec-normalised, as update_model takes them, and the
+        inputs are built exactly as update_model builds them. With
+        center_rewards the target is the reward minus the mean of ``rewards``,
+        the level the online baseline settles at, over reward_scale.
+        """
+        rows = np.asarray(features, dtype=float)
+        if rows.ndim == 1:
+            rows = rows.reshape(1, -1)
+        action_values = np.asarray(actions, dtype=np.float64).reshape(-1)
+        reward_values = np.asarray(rewards, dtype=np.float64).reshape(-1)
+        if action_values.size != len(rows) or reward_values.size != len(rows):
+            raise ValueError(
+                f"{len(rows)} feature rows, {action_values.size} actions "
+                f"and {reward_values.size} rewards"
+            )
+        if not np.all(np.isfinite(action_values)):
+            raise ValueError("actions must contain only finite values")
+        if np.any(action_values < 0.0) or np.any(action_values > 1.0):
+            raise ValueError("Continuous actions must be normalized to [0, 1]")
+        if not np.all(np.isfinite(reward_values)):
+            raise ValueError("rewards must contain only finite values")
+        inputs = np.vstack(
+            [
+                self._joint(
+                    self._context(row),
+                    np.asarray(
+                        [
+                            self._position_of(
+                                self._action_codec.denormalize_ms(float(action))
+                            )
+                        ]
+                    ),
+                ).reshape(-1)
+                for row, action in zip(rows, action_values)
+            ]
+        )
+        targets = reward_values
+        if self._center_rewards:
+            targets = targets - float(np.mean(reward_values))
+        targets = targets / self._reward_scale
+        identity = np.eye(self._feature_dim, dtype=np.float64)
+        return np.linalg.solve(
+            self._ridge * identity + inputs.T @ inputs, inputs.T @ targets
+        )
 
     def _position_of(self, timeout_ms: float) -> float:
         """Where a timeout sits in the action range, in [0, 1] log-space."""
@@ -1789,6 +1782,7 @@ class ContinuousLinUCB(TensorModel):
         if covariance_prior_weight > 0.0:
             self._covariance += covariance_prior_weight * identity
         self._reward_vector *= self._discount_factor
+        self._reward_vector += prior_weight * self._prior_theta
 
     def update_model(
         self,
@@ -1857,7 +1851,7 @@ class ContinuousLinUCB(TensorModel):
         identity = np.eye(self._feature_dim, dtype=np.float64)
         self._precision = self._ridge * identity
         self._covariance = self._precision.copy()
-        self._reward_vector = np.zeros(self._feature_dim, dtype=np.float64)
+        self._reward_vector = self._ridge * self._prior_theta
         self._observation_count = 0
         self._design_index = 0
         self._baseline_total = 0.0
@@ -1895,7 +1889,7 @@ class ContinuousPPO(PPOBase):
     by, so the long timeouts get tried inside the phases that pay for them.
 
     **The action space is the arm range, not the codec's 100..10000ms.** Same
-    reason :class:`ContinuousLinUCB` and :class:`LatencyFloorHeuristic` give: a
+    reason :class:`ContinuousLinUCB` gives: a
     timeout no discrete baseline can reach turns a comparison against those
     baselines into a comparison of two different action spaces. A latency
     floor, when configured, raises the bottom of the range; the sampled

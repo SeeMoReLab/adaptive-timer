@@ -392,9 +392,15 @@ def run_agent(
     episodes: int,
     predict: Callable[[np.ndarray], float],
     update: Optional[Callable[[np.ndarray, float, float], None]],
+    spec_warmup: bool = True,
 ) -> List[Tuple[int, float, Dict[str, float]]]:
     """Drive ``sim`` like LearningAgentServicer: predict at the feature deadline,
-    reward from the reward window, no update for warm-up episodes."""
+    reward from the reward window, no update for warm-up episodes.
+
+    ``spec_warmup``: the schedule opens with spec_schedule's warm-up phase, so
+    spec phase k is sim phase k + 1. False for a sample_schedule run, whose
+    phase 0 is a real phase and is updated on."""
+    shift = 1 if spec_warmup else 0
     rows = []
     for _ in range(episodes):
         decision_s = sim.episode_start_s + FEATURE_S
@@ -405,25 +411,16 @@ def run_agent(
             return predict(holder["x"])
 
         _, timeout_ms, reward_report, phase_idx = sim.run_episode(choose)
-        phase = phase_idx - 1 if decision_s >= SPEC_WARMUP_S else -1
+        phase = phase_idx - shift if decision_s >= SPEC_WARMUP_S else -1
         if update is not None and phase != -1:
             update(holder["x"], timeout_ms, episode_reward(reward_report))
         rows.append((phase, timeout_ms, reward_report))
     return rows
 
 
-def _generate_one(args: Tuple[int, str, int]) -> Tuple[np.ndarray, np.ndarray]:
-    from reward_utils import set_reward_design
-
-    seed, design, hold = args
-    set_reward_design(design)
-    from continuous_bandit import ContinuousTimeoutActionCodec, report_context
-    from models import HOTSTUFF_REPORT_FEATURE_FIELD_NAMES
-
-    spec = CONTEXT_SPECS[agent_pb2.PROTOCOL_HOTSTUFF]
-    lower_ms, upper_ms = spec.bounds_ms
-    rng = np.random.default_rng(seed)
-    codec = ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_HOTSTUFF, bounds_ms=spec.bounds_ms)
+def training_sim(rng: np.random.Generator, seed: int) -> Tuple[HotstuffSim, int]:
+    """One randomized training run: (simulator, episodes)."""
+    lower_ms, upper_ms = CONTEXT_SPECS[agent_pb2.PROTOCOL_HOTSTUFF].bounds_ms
     episodes = int(rng.integers(40, 120))
     # A quarter of the runs start on the parameters.json default, as a real
     # run does before its first decision.
@@ -438,6 +435,22 @@ def _generate_one(args: Tuple[int, str, int]) -> Tuple[np.ndarray, np.ndarray]:
         start_offset_s=float(rng.uniform(0.0, 20.0)),
         initial_timeout_ms=initial,
     )
+    return sim, episodes
+
+
+def _generate_one(args: Tuple[int, str, int]) -> Tuple[np.ndarray, np.ndarray]:
+    from reward_utils import set_reward_design
+
+    seed, design, hold = args
+    set_reward_design(design)
+    from continuous_bandit import ContinuousTimeoutActionCodec, report_context
+    from models import HOTSTUFF_REPORT_FEATURE_FIELD_NAMES
+
+    spec = CONTEXT_SPECS[agent_pb2.PROTOCOL_HOTSTUFF]
+    lower_ms, upper_ms = spec.bounds_ms
+    rng = np.random.default_rng(seed)
+    codec = ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_HOTSTUFF, bounds_ms=spec.bounds_ms)
+    sim, episodes = training_sim(rng, seed)
     prev = codec.normalize_ms(int(round(min(max(sim.timeout_ms, lower_ms), upper_ms))))
     xs, ys = [], []
     # hold > 1: an action is drawn at the start of a hold and kept for h
@@ -594,6 +607,48 @@ def evaluate_spec(kind: str, constants: SimConstants, seed: int, **kwargs) -> np
             np.mean([episode_reward(r[2]) for r in whole]),
         )
     return out
+
+
+def pretrain_adapter():
+    """This simulator as pretrain.py drives it: training runs as train draws
+    them, spec runs as evaluate_spec builds them (SPEC_EPISODES), and the
+    oracle evaluate_spec plays: the rung of the phase in force when the
+    timeout is applied."""
+    from functools import partial
+
+    from pretrain import SimAdapter, timeout_message
+
+    def to_timeout(timeout_ms: float) -> agent_pb2.Timeout:
+        return agent_pb2.Timeout(hotstuff=agent_pb2.HotstuffTimeout(
+            timeout_delay_milliseconds=int(round(timeout_ms))))
+
+    def from_timeout(timeout: agent_pb2.Timeout) -> float:
+        return float(timeout_message(timeout, "hotstuff").timeout_delay_milliseconds)
+
+    def oracle(sim: HotstuffSim) -> Callable[[np.ndarray], float]:
+        def predict(x: np.ndarray) -> float:
+            idx, _ = sim.phase_at(sim.episode_start_s + FEATURE_S + REPLY_S)
+            return SPEC_ORACLE_MS[max(0, idx - 1)]
+
+        return predict
+
+    return SimAdapter(
+        protocol=agent_pb2.PROTOCOL_HOTSTUFF,
+        simulator="hotstuff_sim",
+        training_run=lambda seed: training_sim(np.random.default_rng(seed), seed),
+        spec_run=lambda seed: (
+            HotstuffSim(SimConstants(), spec_schedule(), seed=seed, start_offset_s=0.2),
+            SPEC_EPISODES,
+        ),
+        run_agent=run_agent,
+        run_training=partial(run_agent, spec_warmup=False),
+        to_timeout=to_timeout,
+        from_timeout=from_timeout,
+        row_phase=lambda row: row[0],
+        row_reward=lambda row: episode_reward(row[2]),
+        spec_phase_count=len(SPEC_PHASES),
+        oracle=oracle,
+    )
 
 
 def main() -> None:

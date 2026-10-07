@@ -24,46 +24,24 @@ import agent_pb2_grpc
 from aggregator import BaseAggregator, MedianAggregator, WeightedMedianAggregator
 from continuous_bandit import (
     DEFAULT_PROPORTIONAL_K,
-    ContinuousHeuristicTimeoutModel,
-    ContinuousLinUCB,
-    ContinuousPPO,
-    ContinuousTimeoutActionCodec,
+    DEFAULT_HEURISTIC_QUANTILE,
+    DEFAULT_HEURISTIC_WINDOW,
     DEFAULT_WAIT_DIVISOR,
-    DerivedWaitActionCodec,
-    LatencyFloorHeuristic,
-    NormalizedLatencyFloor,
-    SimPriorGPModel,
-    SimReturnGPModel,
-    context_spec,
-    resolve_prior_path,
 )
 from latency_floor import (
-    DEFAULT_LATENCY_FLOOR_K,
+    DEFAULT_LATENCY_FLOOR_MULTIPLIER,
     DEFAULT_LATENCY_FLOOR_QUANTILE,
+    DEFAULT_LATENCY_FLOOR_WINDOW,
     LatencyFloor,
-    LatencyFloorPolicy,
-    latency_feature_indices,
 )
+from model_builder import PRETRAINABLE_MODEL_TYPES, build_model
 from models import (
     ActionCodec,
-    BlockedTreeBandit,
-    DiscountedLinUCB,
-    DiscretePPO,
     FeatureExtractor,
-    LinearModel,
-    PavlovTimeoutModel,
-    ThompsonSamplingModel,
     ProtocolReportFeatureExtractor,
-    ProtocolTimeoutActionCodec,
-    RandomTimeoutModel,
-    ScheduledTimeoutActionCodec,
     ScheduledTimeoutModel,
     TensorModel,
-    get_action_space_size,
-    get_report_feature_dim,
     get_report_feature_field_names,
-    get_arm_timeout_values_ms,
-    get_timeout_values_ms,
     reject_renamed_model_type,
     report_to_feature_values,
 )
@@ -76,7 +54,6 @@ from reward_utils import (
     calculate_sbft_reward,
     calculate_smartbft_reward,
     calculate_tendermint_reward,
-    get_reward_design,
     set_reward_design,
 )
 
@@ -369,7 +346,11 @@ def _copy_state(state: object) -> object:
 
 
 # Protocols whose agents give an empty report window its own length as latency.
-EMPTY_WINDOW_PROTOCOLS = (agent_pb2.PROTOCOL_SBFT, agent_pb2.PROTOCOL_HOTSTUFF)
+EMPTY_WINDOW_PROTOCOLS = (
+    agent_pb2.PROTOCOL_SBFT,
+    agent_pb2.PROTOCOL_HOTSTUFF,
+    agent_pb2.PROTOCOL_AUTOBAHN,
+)
 
 
 def _fill_empty_window_latency(state: object, window_ms: int) -> bool:
@@ -378,8 +359,10 @@ def _fill_empty_window_latency(state: object, window_ms: int) -> bool:
     CppBedrock reports 0 for a window without a latency sample (AgentClient.h),
     so reward_tps_latency scored a full stall at 0, above every storm. The
     oldest request still pending has waited at least the window whenever one
-    was pending at its start. SBFT (Kevin, 2026-10-01) and HotStuff, whose
-    report also gives 0 for an empty window (Kevin, 2026-10-02). Applied to the
+    was pending at its start. SBFT (Kevin, 2026-10-01), HotStuff, whose
+    report also gives 0 for an empty window (Kevin, 2026-10-02), and Autobahn
+    (Kevin, 2026-10-07: its tps term is ~0.004, so a stall scored 0 against
+    about -0.6 at 5+50 and a simulator-pretrained prior learned to stall). Applied to the
     report the model reads - the 2f+1 median in sharing mode - so it marks a
     stall of the cluster; a lone replica that executed nothing while the
     others served keeps its 0 in the median. Returns whether the window was
@@ -725,7 +708,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             empty_window_latency_ms is not None
         ):
             raise ValueError(
-                "empty_window_latency_ms is required for SBFT and HotStuff and only for them"
+                "empty_window_latency_ms is required for SBFT, HotStuff and Autobahn and only for them"
             )
         self._empty_window_latency_ms = empty_window_latency_ms
         self._collect_wait_s = collect_wait_s
@@ -1923,9 +1906,12 @@ def serve(
     aggregate_weight: int,
     schedule_file: Optional[Path],
     heuristic_multiplier: float,
-    latency_floor_k: float,
+    heuristic_window: int,
+    heuristic_quantile: float,
+    latency_floor_multiplier: float,
+    latency_floor_window: int,
     latency_floor_quantile: float,
-    prior_path: str,
+    prior_path: Optional[str],
     wait_divisor: float,
     dataset_csv: Optional[Path],
     failure_spec: Optional[Path],
@@ -1970,269 +1956,46 @@ def serve(
         )
         consensus_stub = agent_pb2_grpc.ConsensusStub(consensus_channel)
 
-    # Domain constraint on the action space, shared by whichever model is
-    # built below: a timeout under the consensus latency the replicas are
-    # already achieving cannot be met, so it is not worth a decision. The
-    # field is the window mean, avg_consensus_latency_ms, matching what
-    # continuous_heuristic reads below, so the constraint and the heuristic
-    # are compared on the same measurement.
-    latency_index, instances_index = latency_feature_indices(
-        get_report_feature_field_names(protocol)
-    )
     latency_floor = (
         None
-        if latency_floor_k <= 0.0
+        if latency_floor_multiplier <= 0.0
         else LatencyFloor(
-            multiplier=latency_floor_k, quantile=latency_floor_quantile
+            multiplier=latency_floor_multiplier,
+            window=latency_floor_window,
+            quantile=latency_floor_quantile,
         )
     )
-
-
-
-    # SBFT's action is two-dimensional. The models below each place one
-    # timeout on a line and refuse a 2-D codec, so on SBFT they get the
-    # election timeout and the fast-path wait is derived from it,
-    # W = T / --wait-divisor; everywhere else this is the ordinary codec.
-    # continuous searches both dimensions and does not use this.
-    def one_dimensional_codec() -> ActionCodec:
-        if protocol != agent_pb2.PROTOCOL_SBFT:
-            return ContinuousTimeoutActionCodec(protocol)
-        sbft_spec = context_spec(protocol)
-        return DerivedWaitActionCodec(
-            ContinuousTimeoutActionCodec(
-                protocol,
-                bounds_ms=sbft_spec.bounds_ms,
-                wait_bounds_ms=sbft_spec.wait_bounds_ms,
-            ),
-            divisor=wait_divisor,
-        )
-
-    if model_type == "continuous_heuristic":
-        action_codec = one_dimensional_codec()
-        feature_fields = get_report_feature_field_names(protocol)
-        arms_ms = get_timeout_values_ms(protocol)
-        model = ContinuousHeuristicTimeoutModel(
-            action_codec=action_codec,
-            n_features=get_report_feature_dim(protocol),
-            latency_index=feature_fields.index("avg_consensus_latency_ms"),
-            transactions_index=feature_fields.index("total_transactions"),
-            multiplier=heuristic_multiplier,
-            clamp_ms=(min(arms_ms), max(arms_ms)),
-            initial_timeout_ms=sorted(arms_ms)[len(arms_ms) // 2],
-        )
-    elif model_type == "continuous_pretrained_gp":
-        # Fully learned: the floor is a guard on the action, so it is refused
-        # rather than silently dropped.
-        if latency_floor is not None:
-            raise ValueError(
-                "--model-type=continuous_pretrained_gp is fully learned and takes no "
-                "--latency-floor-k; pass 0"
-            )
-        # Refuses a protocol without a context spec or without its return
-        # prior; wait_bounds_ms is SBFT's fast-path wait (None elsewhere).
-        # SimPriorGPModel (H18, spec.prior_path) stays in the code, unwired.
-        spec = context_spec(protocol)
-        action_codec = ContinuousTimeoutActionCodec(
-            protocol, bounds_ms=spec.bounds_ms, wait_bounds_ms=spec.wait_bounds_ms
-        )
-        selected_prior = resolve_prior_path(protocol, prior_path)
-        model = SimReturnGPModel(
-            action_codec=action_codec,
-            field_names=get_report_feature_field_names(protocol),
-            prior_path=selected_prior,
-            reward_design=get_reward_design(),
-        )
-        print(
-            "[continuous_pretrained_gp] prior: "
-            + ("untrained (zero prior)" if selected_prior is None else selected_prior)
-        )
+    built = build_model(
+        protocol,
+        model_type,
+        prior_path=prior_path,
+        latency_floor=latency_floor,
+        schedule_file=schedule_file,
+        start_monotonic=start_mono,
+        heuristic_multiplier=heuristic_multiplier,
+        heuristic_window=heuristic_window,
+        heuristic_quantile=heuristic_quantile,
+        wait_divisor=wait_divisor,
+    )
+    model = built.model
+    action_codec = built.action_codec
+    for line in built.description:
+        print(line)
+    if model_type == "continuous_gp":
         # A decision is small dense linear algebra (on SBFT the GP over 1,024 grid
         # points). OpenBLAS starts one thread per core; on the 64-core CloudLab host,
         # with four agents beside the replicas, those threads oversubscribe: an SBFT
         # decision took 114 ms there and 17 ms on one thread (Tendermint 37 and 6).
         # The limit holds for the rest of the process.
         threadpool_limits(limits=1, user_api="blas")
-    elif model_type == "discrete_random":
-        # Seeded like the other models so that, in sharing mode, every node
-        # draws the same action from the same agreed features. Reward
-        # aggregation is only meaningful when the fleet explores in lockstep.
-        model = RandomTimeoutModel(
-            action_dim=get_action_space_size(protocol),
-            seed=42,
-        )
-    elif model_type == "discrete_linear":
-        model = LinearModel(
-            action_dim=get_action_space_size(protocol),
-            n_features=get_report_feature_dim(protocol),
-            lr=0.05,
-        )
-    elif model_type == "discrete_pavlov":
-        # Win-stay/lose-shift baseline: no context and no learning, so it takes
-        # neither n_features nor a seed. protocol only fixes the arm ordering.
-        model = PavlovTimeoutModel(
-            action_dim=get_action_space_size(protocol),
-            protocol=protocol,
-        )
-    elif model_type == "discrete_tree_ts":
-        model = ThompsonSamplingModel(
-            action_dim=get_action_space_size(protocol),
-            n_features=get_report_feature_dim(protocol),
-            seed=42,
-        )
-    elif model_type == "discrete_tree_blocks":
-        model = BlockedTreeBandit(
-            action_dim=get_action_space_size(protocol),
-            n_features=get_report_feature_dim(protocol),
-            seed=42,
-        )
-    elif model_type == "discrete_linucb":
-        model = DiscountedLinUCB(
-            action_dim=get_action_space_size(protocol),
-            n_features=get_report_feature_dim(protocol),
-            seed=42,
-        )
-    elif model_type == "continuous_latency_floor":
-        action_codec = one_dimensional_codec()
-        # The floor is this model's rule rather than a constraint on top of
-        # one, so it is built here whether or not --latency-floor-k asked for
-        # the constraint. k then means what it means everywhere else, and is
-        # the only scaling there is: the timeout played is k times the
-        # measured round time.
-        heuristic_floor = (
-            LatencyFloor(quantile=latency_floor_quantile)
-            if latency_floor is None
-            else latency_floor
-        )
-        arms_ms = get_timeout_values_ms(protocol)
-        model = LatencyFloorHeuristic(
-            action_codec=action_codec,
-            n_features=get_report_feature_dim(protocol),
-            clamp_ms=(min(arms_ms), max(arms_ms)),
-            latency_floor=NormalizedLatencyFloor(
-                action_codec=action_codec,
-                latency_index=latency_index,
-                n_features=get_report_feature_dim(protocol),
-                instances_index=instances_index,
-                latency_floor=heuristic_floor,
-            ),
-        )
-        print(
-            "[continuous_latency_floor] playing the floor itself, clamped to "
-            f"{min(arms_ms)}..{max(arms_ms)}ms "
-            f"(k={heuristic_floor.multiplier:g}, "
-            f"quantile={latency_floor_quantile:g}); no learning"
-        )
-    elif model_type == "discrete_ppo":
-        model = DiscretePPO(
-            action_dim=get_action_space_size(protocol),
-            n_features=get_report_feature_dim(protocol),
-            seed=42,
-        )
-        print(
-            "[discrete_ppo] softmax policy over "
-            f"{tuple(sorted(get_timeout_values_ms(protocol)))}, "
-            "linear actor + value baseline, on-policy from scratch"
-        )
-    elif model_type == "continuous_linucb":
-        action_codec = one_dimensional_codec()
-        arms_ms = get_timeout_values_ms(protocol)
-        model = ContinuousLinUCB(
-            action_codec=action_codec,
-            n_features=get_report_feature_dim(protocol),
-            seed=42,
-            latency_floor=(
-                None
-                if latency_floor is None
-                else NormalizedLatencyFloor(
-                    action_codec=action_codec,
-                    latency_index=latency_index,
-                    n_features=get_report_feature_dim(protocol),
-                    instances_index=instances_index,
-                    latency_floor=latency_floor,
-                )
-            ),
-        )
-        print(
-            "[continuous_linucb] discounted LinUCB over "
-            f"{min(arms_ms)}..{max(arms_ms)}ms, basis centred on the arms "
-            f"{tuple(sorted(arms_ms))}"
-        )
-    elif model_type == "continuous_ppo":
-        action_codec = one_dimensional_codec()
-        arms_ms = get_timeout_values_ms(protocol)
-        model = ContinuousPPO(
-            action_codec=action_codec,
-            n_features=get_report_feature_dim(protocol),
-            seed=42,
-            latency_floor=(
-                None
-                if latency_floor is None
-                else NormalizedLatencyFloor(
-                    action_codec=action_codec,
-                    latency_index=latency_index,
-                    n_features=get_report_feature_dim(protocol),
-                    instances_index=instances_index,
-                    latency_floor=latency_floor,
-                )
-            ),
-        )
-        print(
-            "[continuous_ppo] Beta policy over "
-            f"{min(arms_ms)}..{max(arms_ms)}ms, linear actor + value baseline, "
-            "on-policy from scratch"
-        )
-    elif model_type == "scheduled":
-        if schedule_file is None:
-            raise ValueError("--schedule-file is required when --model-type=scheduled")
-        model = ScheduledTimeoutModel.from_csv(
-            protocol,
-            schedule_file,
-            start_monotonic=start_mono,
-        )
-    else:
-        raise ValueError(f"Unsupported model type: {model_type}")
-
-    # continuous refuses the floor outright, above.
-    # continuous_heuristic is already a multiple of the same latency, and
-    # scheduled is a fixed-baseline replay that must not be overridden.
-    #
-    # In sharing mode the floor stays identical on every replica for free: it
-    # is estimated from the consensus-agreed feature vector, which is the same
-    # on all of them, so constraining the action space does not break the
-    # lockstep the aggregated reward depends on.
-    floor_exempt = ("continuous_heuristic", "continuous_latency_floor", "scheduled")
-    if latency_floor is not None and model_type not in (
-        ("continuous_pretrained_gp", "continuous_linucb", "continuous_ppo") + floor_exempt
-    ):
-        model = LatencyFloorPolicy(
-            model=model,
-            # Per arm, not the distinct ladder: SBFT has 6 arms over a 3-rung
-            # ladder, and the shorter vector left arms 3-5 - both 1100 rungs -
-            # unreachable.
-            timeouts_ms=get_arm_timeout_values_ms(protocol),
-            latency_index=latency_index,
-            n_features=get_report_feature_dim(protocol),
-            instances_index=instances_index,
-            latency_floor=latency_floor,
-        )
     if latency_floor is not None:
-        applied = "not applied (latency rule already)" if model_type in floor_exempt else "applied"
         print(
-            f"[latency_floor] k={latency_floor_k} "
-            f"quantile={latency_floor_quantile} {applied} to {model_type}"
+            f"[latency_floor] multiplier={latency_floor_multiplier:g} "
+            f"window={latency_floor_window} quantile={latency_floor_quantile:g} "
+            f"applied to {model_type}"
         )
 
     feature_extractor = ProtocolReportFeatureExtractor(protocol)
-    if model_type == "scheduled":
-        action_codec = ScheduledTimeoutActionCodec(protocol)
-    elif model_type not in (
-        "continuous_pretrained_gp",
-        "continuous_linucb",
-        "continuous_heuristic",
-        "continuous_ppo",
-        "continuous_latency_floor",
-    ):
-        action_codec = ProtocolTimeoutActionCodec(protocol)
     if aggregate_function == "median":
         aggregator: BaseAggregator = MedianAggregator(protocol=protocol)
     elif aggregate_function == "weighted_median":
@@ -2285,6 +2048,16 @@ def serve(
         f"{host}:{bind_port} (node_id={node_id}, threshold={servicer._threshold})"
     )
     server.wait_for_termination()
+
+
+def _retired_flag(replacement: str):
+    """argparse ``type`` for a retired flag: any value is an error naming the
+    flag that replaced it."""
+
+    def reject(_value: str) -> None:
+        raise argparse.ArgumentTypeError(f"this flag was renamed to {replacement}")
+
+    return reject
 
 
 def main():
@@ -2375,11 +2148,10 @@ def main():
             "discrete_tree_ts",
             "discrete_tree_blocks",
             "discrete_linucb",
-            "continuous_pretrained_gp",
+            "continuous_gp",
             "continuous_linucb",
             "continuous_heuristic",
             "continuous_ppo",
-            "continuous_latency_floor",
             "discrete_ppo",
             "scheduled",
         ),
@@ -2396,21 +2168,20 @@ def main():
             "discrete_ppo: clipped-objective PPO with a softmax policy over the "
             "discrete arms, linear actor plus value baseline, on-policy from "
             "scratch; "
-            "continuous_pretrained_gp: the election timeout (PBFT 100-3000 ms, "
+            "continuous_gp: the election timeout (PBFT 100-3000 ms, "
             "SmartBFT 100-4000 ms), SBFT's election timeout (100-3000 ms) and "
             "fast-path wait (10-500 ms), or Tendermint propose timeout "
-            "(100-3000 ms) from a simulator-pretrained reward prior plus an "
-            "online Gaussian-process residual, lower-confidence-bound choice "
-            "(no floor); needs pretrained_models/continuous_<protocol>_prior.npz, "
-            "trained by that protocol's *_sim.py on the agent's --reward-design; "
+            "(100-3000 ms) from a reward prior plus an online Gaussian-process "
+            "residual, lower-confidence-bound choice; the prior is zero unless "
+            "--prior-path names one trained by that protocol's *_sim.py on the "
+            "agent's --reward-design; "
             "continuous_linucb: discrete_linucb over a continuous timeout - the "
             "same discounted LinUCB scored on a 65-point grid across the arm "
             "range rather than on the arms alone; "
-            "continuous_heuristic: k * avg_consensus_latency_ms, clamped to "
-            "the arm range; no learning; "
-            "continuous_latency_floor: plays the latency floor itself - a "
-            "quantile over recent committing windows, times k - as the "
-            "timeout, clamped to the arm range; no learning; "
+            "continuous_heuristic: --heuristic-multiplier times a quantile of "
+            "recent committing windows' avg_consensus_latency_ms "
+            "(--heuristic-window, --heuristic-quantile), clamped to the arm "
+            "range; no learning; "
             "continuous_ppo: discrete_ppo with a Beta policy over the "
             "continuous timeout range instead of the arm set; "
             "scheduled: timeout from a time-based schedule CSV."
@@ -2438,9 +2209,29 @@ def main():
         default=DEFAULT_PROPORTIONAL_K,
         help=(
             "Multiplier k for --model-type=continuous_heuristic: "
-            "timeout_ms = clamp(k * avg_consensus_latency_ms, arm range). "
-            f"Fit it with learning_agent/fit_proportional.py (default: "
-            f"{DEFAULT_PROPORTIONAL_K})."
+            "timeout_ms = clamp(k * latency estimate, arm range) "
+            f"(default: {DEFAULT_PROPORTIONAL_K})."
+        ),
+    )
+    parser.add_argument(
+        "--heuristic-window",
+        type=int,
+        default=DEFAULT_HEURISTIC_WINDOW,
+        help=(
+            "Committing windows continuous_heuristic's latency estimate is "
+            "taken over. 1 is the latest window; more smooths over single bad "
+            "windows and follows a real change more slowly "
+            f"(default: {DEFAULT_HEURISTIC_WINDOW})."
+        ),
+    )
+    parser.add_argument(
+        "--heuristic-quantile",
+        type=float,
+        default=DEFAULT_HEURISTIC_QUANTILE,
+        help=(
+            "Quantile of those windows' latencies continuous_heuristic uses; "
+            "no effect at --heuristic-window 1 "
+            f"(default: {DEFAULT_HEURISTIC_QUANTILE})."
         ),
     )
 
@@ -2461,17 +2252,32 @@ def main():
         ),
     )
     parser.add_argument(
-        "--latency-floor-k",
+        "--latency-floor-multiplier",
         type=float,
         default=0.0,
         help=(
-            "Domain constraint: never apply a timeout below k * the consensus "
-            "latency the replicas are already achieving, estimated as a low "
-            "quantile over recent committing windows. A timeout under that "
+            "Domain constraint for every model except scheduled: never apply a "
+            "timeout below this multiplier times the consensus latency the "
+            "replicas are already achieving (a quantile over the last "
+            "--latency-floor-window committing windows). A timeout under that "
             "latency cannot be met, so it buys view changes and stalls "
-            "throughput; excluding it costs the learner nothing it could have "
-            "won. 0 disables the constraint (default: 0; try "
-            f"{DEFAULT_LATENCY_FLOOR_K})."
+            "throughput. 0 disables the constraint (default: 0; try "
+            f"{DEFAULT_LATENCY_FLOOR_MULTIPLIER})."
+        ),
+    )
+    parser.add_argument(
+        "--latency-floor-k",
+        type=_retired_flag("--latency-floor-multiplier"),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--latency-floor-window",
+        type=int,
+        default=DEFAULT_LATENCY_FLOOR_WINDOW,
+        help=(
+            "Committing windows the latency floor is estimated over; 1 is the "
+            "latest window, where --latency-floor-quantile has no effect "
+            f"(default: {DEFAULT_LATENCY_FLOOR_WINDOW})."
         ),
     )
     parser.add_argument(
@@ -2480,31 +2286,31 @@ def main():
         default=DEFAULT_WAIT_DIVISOR,
         help=(
             "SBFT only: the models that control one timeout - "
-            "continuous_heuristic, continuous_latency_floor, continuous_linucb "
-            "and continuous_ppo - pair their election timeout T with a "
+            "continuous_heuristic, continuous_linucb and continuous_ppo - pair their election timeout T with a "
             "fast-path wait W = clamp(T / this, 10..500 ms). Both quantities "
             "carry the same one-way-delay term, so a T that has tracked the "
             "delay drags W with it. Measured on sbft_sim: holding the phase's "
             "best T, 8 costs a mean 0.038 reward against the best W at that T "
-            "(12 costs 0.084, 5 costs 0.289). --model-type=continuous_pretrained_gp searches "
+            "(12 costs 0.084, 5 costs 0.289). --model-type=continuous_gp searches "
             f"both dimensions and ignores this (default: {DEFAULT_WAIT_DIVISOR:g})."
         ),
     )
     parser.add_argument(
         "--prior-path",
         type=str,
-        default="",
+        default=None,
         help=(
-            "Which pretrained prior --model-type=continuous_pretrained_gp loads. Empty (the "
-            "default) is the protocol's shipped return prior, "
-            "pretrained_models/continuous_<protocol>_return_prior.npz. A path "
-            "selects another .npz - a prior trained with an ablation, e.g. "
-            "<protocol>_sim.py train --no-proposal-faults for one that never "
-            "saw a delayed or silent proposer. The literal value 'none' runs "
-            "the model untrained: same grid, kernel and confidence bound, but "
-            "a zero prior, so the GP fits the reward itself and everything the "
-            "model knows it learned online. The three settings are the "
-            "pretraining ablation; the value is recorded in run.env."
+            "Prior the model starts from; omitted (the default) or empty, the "
+            "model starts untrained. Accepted only with --model-type "
+            + ", ".join(PRETRAINABLE_MODEL_TYPES)
+            + ". For continuous_gp it is a reward prior written by "
+            "<protocol>_sim.py train (without one the GP fits the reward "
+            "itself from a zero prior); for discrete_linucb and "
+            "continuous_linucb a checkpoint of the prior mean of the "
+            "coefficients, for discrete_ppo and continuous_ppo one of the actor "
+            "and critic weights. A checkpoint is refused unless its protocol, "
+            "reward design, features, action space and hyperparameters match "
+            "this agent's. The value is recorded in run.env."
         ),
     )
     parser.add_argument(
@@ -2530,8 +2336,8 @@ def main():
         help=(
             "Length of the replicas' feature window in ms (CppBedrock "
             "--learning-feature-duration). Required for --protocol sbft, "
-            "where a window in which no batch executed takes its length as "
-            "its consensus latency; refused for other protocols."
+            "hotstuff and autobahn, where a window in which nothing committed "
+            "takes its length as its consensus latency; refused for other protocols."
         ),
     )
     parser.add_argument(
@@ -2596,7 +2402,7 @@ def main():
     if args.protocol in EMPTY_WINDOW_PROTOCOLS:
         if None in windows or min(windows) <= 0:
             parser.error(
-                "--protocol sbft and hotstuff require positive --feature-window-ms "
+                "--protocol sbft, hotstuff and autobahn require positive --feature-window-ms "
                 "and --reward-window-ms"
             )
         empty_window_latency_ms = windows
@@ -2604,9 +2410,19 @@ def main():
         if windows != (None, None):
             parser.error(
                 "--feature-window-ms/--reward-window-ms apply to --protocol "
-                "sbft and hotstuff only"
+                "sbft, hotstuff and autobahn only"
             )
         empty_window_latency_ms = None
+
+    prior_path = args.prior_path or None
+    if prior_path is not None:
+        if args.model_type not in PRETRAINABLE_MODEL_TYPES:
+            parser.error(
+                f"--prior-path is not supported with --model-type={args.model_type}; "
+                f"it applies to {', '.join(PRETRAINABLE_MODEL_TYPES)}"
+            )
+        if not Path(prior_path).is_file():
+            parser.error(f"--prior-path {prior_path} does not exist")
 
     # Process-wide, before any report is scored; see reward_utils.
     set_reward_design(args.reward_design)
@@ -2629,9 +2445,12 @@ def main():
         aggregate_weight=args.function_weight,
         schedule_file=args.schedule_file,
         heuristic_multiplier=args.heuristic_multiplier,
-        latency_floor_k=args.latency_floor_k,
+        heuristic_window=args.heuristic_window,
+        heuristic_quantile=args.heuristic_quantile,
+        latency_floor_multiplier=args.latency_floor_multiplier,
+        latency_floor_window=args.latency_floor_window,
         latency_floor_quantile=args.latency_floor_quantile,
-        prior_path=args.prior_path,
+        prior_path=prior_path,
         wait_divisor=args.wait_divisor,
         dataset_csv=args.dataset_csv,
         failure_spec=args.failure_spec,

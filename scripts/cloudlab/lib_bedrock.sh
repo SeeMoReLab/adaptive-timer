@@ -66,8 +66,8 @@ VERBOSE_ENABLED=0
 AGENT_MODEL_TYPE="discrete_random"
 AGENT_MODEL_SET=0
 REWARD_DESIGN="reward_tps"
-LATENCY_FLOOR_K="0"
-# --model-type=continuous_pretrained_gp prior: "" the shipped one, "none" untrained, else a path.
+LATENCY_FLOOR_MULTIPLIER="0"
+# Prior file the model loads, repo-relative after validation; "" (omitted) is untrained.
 PRIOR_PATH=""
 
 TX_RATE="${TX_RATE:-40000}"
@@ -185,15 +185,15 @@ Flags:
   --verbose                         Enable per-message debug logs on server replicas.
   --reward-design <reward_tps|reward_mixed|reward_tps_latency>
                                     Reward the agent learns from (default: reward_tps).
-  --model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_pretrained_gp|continuous_linucb|continuous_heuristic|continuous_ppo|continuous_latency_floor>
+  --model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo>
                                      Learning-agent model for learning mode (default: discrete_random).
-  --latency-floor-k <float>          Never apply a timeout below k x the recent consensus latency
-                                     (LatencyFloorPolicy; 0 disables it; default: 0).
-  --prior-path <path|none>           Which pretrained prior --model continuous_pretrained_gp loads.
-                                     Empty (default) is the protocol's shipped
-                                     return prior; a path is an ablation prior
-                                     (<protocol>_sim.py train --no-proposal-faults);
-                                     "none" runs it untrained, with a zero prior.
+  --latency-floor-multiplier <float> Never apply a timeout below this multiplier x the recent
+                                     consensus latency; any model except scheduled (0 disables it;
+                                     default: 0).
+  --prior-path <path>                Prior file the model loads, for continuous_gp, discrete_linucb,
+                                     continuous_linucb, discrete_ppo or continuous_ppo in learning or
+                                     sharing mode. It must be under learning_agent/, the only tree
+                                     shipped to the nodes. Omitted (default): the model starts untrained.
   -f <int>                          Fault tolerance f; nodes defaults to 3f+1 (default: 1).
   -t <int>                          Seconds to run after benchmark start (default: 300).
 
@@ -259,9 +259,9 @@ renamed_model_type() {
     cmab|thompson) printf '%s\n' "discrete_tree_ts" ;;
     cmab_reset) printf '%s\n' "discrete_tree_blocks" ;;
     codex|codex_v1) printf '%s\n' "discrete_linucb" ;;
-    continuous) printf '%s\n' "continuous_pretrained_gp" ;;
+    continuous_pretrained_gp|continuous) printf '%s\n' "continuous_gp" ;;
     continuous_codex) printf '%s\n' "continuous_linucb" ;;
-    latency_floor_heuristic) printf '%s\n' "continuous_latency_floor" ;;
+    latency_floor_heuristic|continuous_latency_floor) printf '%s\n' "continuous_heuristic" ;;
     *) return 1 ;;
   esac
 }
@@ -270,7 +270,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_pretrained_gp|continuous_linucb|continuous_heuristic|continuous_ppo|continuous_latency_floor) printf '%s\n' "${model_lower}" ;;
+    discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo) printf '%s\n' "${model_lower}" ;;
     *)
       local renamed
       if renamed="$(renamed_model_type "${model_lower}")"; then
@@ -279,6 +279,35 @@ normalize_agent_model_type() {
       return 1
       ;;
   esac
+}
+
+# --prior-path: only learning_agent/ is shipped to the nodes and the agent runs
+# from the extracted tree, so the prior must live under it. Prints the path
+# relative to the repo root (learning_agent/...), or fails with the reason.
+repo_relative_prior_path() {
+  local path="$1"
+  local repo
+  local dir
+  local rel
+  if [[ ! -f "${path}" ]]; then
+    echo "--prior-path file not found: ${path}" >&2
+    return 1
+  fi
+  repo="$(cd "${REPO_ROOT}" && pwd -P)"
+  dir="$(cd "$(dirname "${path}")" && pwd -P)"
+  case "${dir}/" in
+    "${repo}/learning_agent/"*) rel="${dir#"${repo}/"}/$(basename "${path}")" ;;
+    *)
+      echo "--prior-path ${path} is outside ${repo}/learning_agent/: only learning_agent/ is shipped to the nodes; put the prior under learning_agent/pretrained_models/." >&2
+      return 1
+      ;;
+  esac
+  # The remote agent command line carries it unquoted.
+  if ! [[ "${rel}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+    echo "--prior-path ${rel} has characters other than [A-Za-z0-9._/-], which the remote agent command cannot carry." >&2
+    return 1
+  fi
+  printf '%s\n' "${rel}"
 }
 
 absolute_path() {
@@ -431,8 +460,17 @@ bedrock_main() {
       --verbose) VERBOSE_ENABLED=1; shift ;;
       --model) AGENT_MODEL_TYPE="${2:-}"; AGENT_MODEL_SET=1; shift 2 ;;
       --reward-design) REWARD_DESIGN="${2:-}"; shift 2 ;;
-      --latency-floor-k) LATENCY_FLOOR_K="${2:-}"; shift 2 ;;
-      --prior-path) PRIOR_PATH="${2:-}"; shift 2 ;;
+      --latency-floor-multiplier) LATENCY_FLOOR_MULTIPLIER="${2:-}"; shift 2 ;;
+      --latency-floor-k) echo "--latency-floor-k was renamed to --latency-floor-multiplier." >&2; exit 2 ;;
+      --prior-path)
+        if [[ $# -lt 2 || -z "${2}" ]]; then
+          echo "Missing value for --prior-path." >&2
+          usage >&2
+          exit 2
+        fi
+        PRIOR_PATH="${2}"
+        shift 2
+        ;;
       --nodes) NODES="${2:-}"; NODES_SET=1; shift 2 ;;
       --failure-spec) FAILURE_SPEC_PATH="${2:-}"; FAILURE_SPEC_ENABLED=1; shift 2 ;;
       --no-failure-spec) FAILURE_SPEC_ENABLED=0; shift ;;
@@ -545,19 +583,32 @@ bedrock_main() {
     exit 2
   fi
   if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-    echo "Invalid --model value. Use one of discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_pretrained_gp|continuous_linucb|continuous_heuristic|continuous_ppo|continuous_latency_floor." >&2
+    echo "Invalid --model value. Use one of discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo." >&2
     exit 2
   fi
   if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
     echo "--model is only supported with learning or sharing mode." >&2
     exit 2
   fi
+  if [[ -n "${PRIOR_PATH}" ]]; then
+    if [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
+      echo "--prior-path is only supported with learning or sharing mode." >&2
+      exit 2
+    fi
+    case "${AGENT_MODEL_TYPE}" in
+      continuous_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo) ;;
+      *) echo "--prior-path is not supported with --model ${AGENT_MODEL_TYPE}. Use one of continuous_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo." >&2; exit 2 ;;
+    esac
+    if ! PRIOR_PATH="$(repo_relative_prior_path "${PRIOR_PATH}")"; then
+      exit 2
+    fi
+  fi
   case "${REWARD_DESIGN}" in
     reward_tps|reward_mixed|reward_tps_latency) ;;
     *) echo "Invalid --reward-design: ${REWARD_DESIGN}. Expected reward_tps|reward_mixed|reward_tps_latency." >&2; exit 2 ;;
   esac
-  if ! [[ "${LATENCY_FLOOR_K}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-    echo "Invalid --latency-floor-k: ${LATENCY_FLOOR_K}. Expected a non-negative number (0 disables the constraint)." >&2
+  if ! [[ "${LATENCY_FLOOR_MULTIPLIER}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "Invalid --latency-floor-multiplier: ${LATENCY_FLOOR_MULTIPLIER}. Expected a non-negative number (0 disables the constraint)." >&2
     exit 2
   fi
   if ! mode_enables_learning_agent "${MODE}"; then
@@ -683,7 +734,7 @@ bedrock_main() {
     printf 'initial_slow_path_timeout_ms=%q\n' "${INITIAL_SLOW_PATH_TIMEOUT_MS:-from-config}"
     printf 'agent_model=%q\n' "${AGENT_MODEL_TYPE}"
     printf 'reward_design=%q\n' "${REWARD_DESIGN}"
-    printf 'latency_floor_k=%q\n' "${LATENCY_FLOOR_K}"
+    printf 'latency_floor_multiplier=%q\n' "${LATENCY_FLOOR_MULTIPLIER}"
     printf 'prior_path=%q\n' "${PRIOR_PATH:-}"
     printf 'learning_window_mode=%q\n' "${LEARNING_WINDOW_MODE}"
     printf 'learning_feature_duration_ms=%q\n' "${LEARNING_FEATURE_DURATION_MS}"
@@ -1273,7 +1324,7 @@ REMOTE
           "${FAILURE_SPEC_ENABLED}" \
           "${SHARING_COLLECT_WAIT_MS}" \
           "${REWARD_DESIGN}" \
-          "${LATENCY_FLOOR_K}" \
+          "${LATENCY_FLOOR_MULTIPLIER}" \
           "${LEARNING_FEATURE_DURATION_MS}" \
           "${LEARNING_REWARD_DURATION_MS}" \
           "${PRIOR_PATH}" <<'REMOTE'
@@ -1294,7 +1345,7 @@ schedule_file_rel="${12}"
 failure_spec_enabled="${13}"
 sharing_collect_wait_ms="${14}"
 reward_design="${15}"
-latency_floor_k="${16}"
+latency_floor_multiplier="${16}"
 feature_window_ms="${17}"
 reward_window_ms="${18}"
 prior_path="${19:-}"
@@ -1322,17 +1373,16 @@ fi
 agent_model_args="${agent_model_args} --reward-design ${reward_design}"
 # The floor is a constraint on the action space, so it only means anything where the
 # agent is choosing the timeout at all (learning or sharing), as in run_smartbft.sh.
-if [[ "${mode}" == "learning" || "${mode}" == "sharing" ]] && [[ "${latency_floor_k}" != "0" ]]; then
-  agent_model_args="${agent_model_args} --latency-floor-k ${latency_floor_k}"
+if [[ "${mode}" == "learning" || "${mode}" == "sharing" ]] && [[ "${latency_floor_multiplier}" != "0" ]]; then
+  agent_model_args="${agent_model_args} --latency-floor-multiplier ${latency_floor_multiplier}"
 fi
 
 # SBFT agents give a window in which no batch executed its own length as its
 # latency, so they need the windows the replicas measure (main.py refuses
 # these flags for other protocols).
-# Which pretrained prior the continuous model loads: "" the shipped return
-# prior, "none" untrained, else a path to an ablation prior. main.py ignores it
-# for every other model type, so only pass it where it means something.
-if [[ "${model_type}" == "continuous_pretrained_gp" && -n "${prior_path}" ]]; then
+# The prior file the model loads, relative to run_root; "" leaves it untrained.
+# The model and mode were checked locally.
+if [[ -n "${prior_path}" ]]; then
   agent_model_args="${agent_model_args} --prior-path ${prior_path}"
 fi
 

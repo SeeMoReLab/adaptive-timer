@@ -606,18 +606,9 @@ def run_agent(
     return rows
 
 
-def _generate_one(args: Tuple[int, str]) -> Tuple[np.ndarray, np.ndarray]:
-    from reward_utils import set_reward_design
-
-    seed, design = args
-    set_reward_design(design)
-    from continuous_bandit import ContinuousTimeoutActionCodec, report_context
-    from models import PBFT_REPORT_FEATURE_FIELD_NAMES
-
-    spec = CONTEXT_SPECS[agent_pb2.PROTOCOL_PBFT]
-    lower_ms, upper_ms = spec.bounds_ms
-    rng = np.random.default_rng(seed)
-    codec = ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT, bounds_ms=spec.bounds_ms)
+def training_sim(rng: np.random.Generator, seed: int) -> Tuple[PbftSim, int]:
+    """One randomized training run: (simulator, episodes)."""
+    lower_ms, upper_ms = CONTEXT_SPECS[agent_pb2.PROTOCOL_PBFT].bounds_ms
     episodes = int(rng.integers(40, 120))
     # A quarter of the runs start on the CppBedrock default, as a real run
     # does before its first decision.
@@ -632,6 +623,22 @@ def _generate_one(args: Tuple[int, str]) -> Tuple[np.ndarray, np.ndarray]:
         start_offset_s=float(rng.uniform(0.0, 20.0)),
         initial_timeout_ms=initial,
     )
+    return sim, episodes
+
+
+def _generate_one(args: Tuple[int, str]) -> Tuple[np.ndarray, np.ndarray]:
+    from reward_utils import set_reward_design
+
+    seed, design = args
+    set_reward_design(design)
+    from continuous_bandit import ContinuousTimeoutActionCodec, report_context
+    from models import PBFT_REPORT_FEATURE_FIELD_NAMES
+
+    spec = CONTEXT_SPECS[agent_pb2.PROTOCOL_PBFT]
+    lower_ms, upper_ms = spec.bounds_ms
+    rng = np.random.default_rng(seed)
+    codec = ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT, bounds_ms=spec.bounds_ms)
+    sim, episodes = training_sim(rng, seed)
     prev = codec.normalize_ms(int(round(min(max(sim.timeout_ms, lower_ms), upper_ms))))
     xs, ys = [], []
     for _ in range(episodes):
@@ -740,7 +747,7 @@ def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
             action_codec=codec,
             n_features=len(names),
             latency_index=names.index("avg_consensus_latency_ms"),
-            transactions_index=names.index("total_transactions"),
+            instances_index=names.index("total_consensus_instances"),
             multiplier=1.0,
             clamp_ms=(min(arms), max(arms)),
             initial_timeout_ms=sorted(arms)[len(arms) // 2],
@@ -801,6 +808,38 @@ def evaluate_spec(kind: str, constants: SimConstants, seed: int, **kwargs) -> np
             np.median([r[1] for r in sel]),
         )
     return out
+
+
+def pretrain_adapter():
+    """This simulator as pretrain.py drives it: training runs as train draws
+    them, spec runs as evaluate_spec builds them (host constants, 105
+    episodes); the spec phase is run_agent's, and there is no oracle."""
+    from pretrain import SimAdapter, timeout_message
+
+    def to_timeout(timeout_ms: float) -> agent_pb2.Timeout:
+        return agent_pb2.Timeout(pbft=agent_pb2.PbftTimeout(
+            election_timeout_milliseconds=int(round(timeout_ms))))
+
+    def from_timeout(timeout: agent_pb2.Timeout) -> float:
+        return float(timeout_message(timeout, "pbft").election_timeout_milliseconds)
+
+    return SimAdapter(
+        protocol=agent_pb2.PROTOCOL_PBFT,
+        simulator="pbft_sim",
+        training_run=lambda seed: training_sim(np.random.default_rng(seed), seed),
+        spec_run=lambda seed: (
+            PbftSim(SimConstants(), spec_schedule(), seed=seed, start_offset_s=0.2), 105),
+        run_agent=run_agent,
+        # A training schedule's phase 0 is a real phase, so run_agent already
+        # updates every decision from 10 s.
+        run_training=run_agent,
+        to_timeout=to_timeout,
+        from_timeout=from_timeout,
+        row_phase=lambda row: row[0],
+        row_reward=lambda row: episode_reward(row[2]),
+        spec_phase_count=7,
+        oracle=None,
+    )
 
 
 def main() -> None:

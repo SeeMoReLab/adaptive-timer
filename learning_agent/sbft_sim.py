@@ -1597,15 +1597,8 @@ def run_agent(
 # --- Training data and prior ---------------------------------------------------------
 
 
-def _generate_one(args: Tuple[int, str, int]) -> Tuple[np.ndarray, np.ndarray]:
-    """One randomized run. Every ``hold`` episodes an action is drawn and held for
-    ``hold`` episodes; a sample is (context at the hold's first decision, action) ->
-    the mean reward over the hold (hold 1 = per episode)."""
-    from reward_utils import set_reward_design
-
-    seed, design, hold = args
-    set_reward_design(design)
-    rng = np.random.default_rng(seed)
+def training_sim(rng: np.random.Generator, seed: int) -> Tuple[SbftSim, int]:
+    """One randomized training run: (simulator, episodes)."""
     episodes = int(rng.integers(40, 120))
     if rng.random() < 0.25:
         t0, w0 = DEFAULT_ELECTION_TIMEOUT_MS, DEFAULT_SLOW_PATH_TIMEOUT_MS
@@ -1620,9 +1613,22 @@ def _generate_one(args: Tuple[int, str, int]) -> Tuple[np.ndarray, np.ndarray]:
         initial_timeout_ms=t0,
         initial_wait_ms=w0,
     )
+    return sim, episodes
+
+
+def _generate_one(args: Tuple[int, str, int]) -> Tuple[np.ndarray, np.ndarray]:
+    """One randomized run. Every ``hold`` episodes an action is drawn and held for
+    ``hold`` episodes; a sample is (context at the hold's first decision, action) ->
+    the mean reward over the hold (hold 1 = per episode)."""
+    from reward_utils import set_reward_design
+
+    seed, design, hold = args
+    set_reward_design(design)
+    rng = np.random.default_rng(seed)
+    sim, episodes = training_sim(rng, seed)
     prev = np.array([
-        normalize_ms(min(max(t0, T_BOUNDS_MS[0]), T_BOUNDS_MS[1]), T_BOUNDS_MS),
-        normalize_ms(min(max(w0, W_BOUNDS_MS[0]), W_BOUNDS_MS[1]), W_BOUNDS_MS),
+        normalize_ms(min(max(sim.T, T_BOUNDS_MS[0]), T_BOUNDS_MS[1]), T_BOUNDS_MS),
+        normalize_ms(min(max(sim.W, W_BOUNDS_MS[0]), W_BOUNDS_MS[1]), W_BOUNDS_MS),
     ])
     xs, ys = [], []
     for _ in range(episodes // hold):
@@ -2010,6 +2016,55 @@ def run_eval(seeds: int, prior: str, rate_tps: float = SPEC_RATE_TPS) -> str:
                          f"{orc[0]:5.0f}/{orc[1]:5.0f}/{orc[2]:+.3f}")
         lines.append(f"seed {s}: " + " ; ".join(parts))
     return "\n".join(lines)
+
+
+def pretrain_adapter():
+    """This simulator as pretrain.py drives it: training runs as train draws
+    them (at TRAIN_RATE_TPS), spec runs and the oracle as eval builds them (host
+    constants at SPEC_RATE_TPS, SPEC_RUN_S). Sim phase p + 1 is spec phase p."""
+    import agent_pb2
+    from pretrain import SimAdapter, timeout_message
+
+    def to_timeout(pair: Tuple[float, float]) -> agent_pb2.Timeout:
+        return agent_pb2.Timeout(sbft=agent_pb2.SbftTimeout(
+            election_timeout_milliseconds=int(round(pair[0])),
+            slow_path_timeout_milliseconds=int(round(pair[1])),
+        ))
+
+    def from_timeout(timeout: agent_pb2.Timeout) -> Tuple[float, float]:
+        t = timeout_message(timeout, "sbft")
+        return float(t.election_timeout_milliseconds), float(t.slow_path_timeout_milliseconds)
+
+    def spec_run(seed: int) -> Tuple[SbftSim, int]:
+        c = SimConstants()
+        c.load_tps = SPEC_RATE_TPS
+        sim = SbftSim(c, spec_schedule(), seed=seed, start_offset_s=0.2)
+        return sim, int(SPEC_RUN_S // EPISODE_S)
+
+    def oracle(sim: SbftSim) -> Callable[[np.ndarray], Tuple[float, float]]:
+        def predict(x: np.ndarray) -> Tuple[float, float]:
+            p = max(0, sim.phase_index(sim.t / 1000.0) - 1)
+            return tuple(float(v) for v in ORACLE_ROWS[p])
+
+        return predict
+
+    return SimAdapter(
+        protocol=agent_pb2.PROTOCOL_SBFT,
+        simulator="sbft_sim",
+        training_run=lambda seed: training_sim(np.random.default_rng(seed), seed),
+        spec_run=spec_run,
+        run_agent=run_agent,
+        # run_agent's phase is the sim's, so a training schedule's phase 0 is
+        # updated on; only decisions before 10 s are not.
+        run_training=run_agent,
+        to_timeout=to_timeout,
+        from_timeout=from_timeout,
+        # Sim phase 0 is the spec's clean warm-up.
+        row_phase=lambda row: row[0] - 1 if row[0] >= 1 else -1,
+        row_reward=lambda row: row[3],
+        spec_phase_count=len(spec_phases()),
+        oracle=oracle,
+    )
 
 
 def main() -> None:

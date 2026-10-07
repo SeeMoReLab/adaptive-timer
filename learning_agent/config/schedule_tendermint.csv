@@ -3,7 +3,8 @@
 # prevote_timeout_ms and precommit_timeout_ms are derived as propose_timeout_ms / 3
 #
 # Hindsight-optimal arm per phase of config/tendermint/failure_spec.xml.
-# Arms are {300, 700, 1100} (learning_agent/models.py).
+# Arms are {150, 450, 750} (learning_agent/models.py), calibrated in
+# runs/2026-09-29-tendermint-arms/report.md (score per phase, one draw per rung).
 #
 # Timing: the agent, the network applier and the CometBFT propose-delay
 # controller all anchor on the same --start-unix-ms, and both appliers fire a
@@ -12,13 +13,16 @@
 # a switch written at T fires at warmUpTime + T. Writing the atTime value here
 # therefore lands the switch exactly on the phase boundary.
 #
-#   p0 @0    no fault              300  control; arm-independent, no switch needed
-#   p1 @300  proposalDelay 600ms   300  short arm escapes, long arms wait it out
-#   p2 @600  proposalDelay 20s     700  every arm escapes; cost scales with arm
-#   p3 @900  net 150ms sustained  1100  not escapable, ride it out
-#   p4 @1200 proposalDelay 600ms   300  back down to the short arm
--10,300
-0,300
-590,700
-1190,1100
-1490,300
+#   p0 @0    no fault                        150  all rungs tie (+0.333)
+#   p1 @300  proposalDelay 10s               150  lowest escape wins (+0.228 vs 450 -0.033)
+#   p2 @600  net +50ms                       750  450 -0.028, 750 -0.014 (within the tie band)
+#   p3 @900  net +50ms + proposalDelay 10s   450  lowest value that clears the links (-0.349)
+#   p4 @1200 net +150ms                      750  450 collapses (-2.977), 750 -0.702
+#   p5 @1500 no fault                        150  all rungs tie
+-10,150
+0,150
+300,150
+600,750
+900,450
+1200,750
+1500,150

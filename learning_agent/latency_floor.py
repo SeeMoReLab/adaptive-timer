@@ -11,10 +11,13 @@ from models import TensorModel
 # Multiplier applied to the estimated latency. 1.0 is the constraint as stated:
 # do not go below what the protocol is already achieving. Above 1.0 it buys
 # headroom for the jitter around that estimate.
-DEFAULT_LATENCY_FLOOR_K = 1.0
+DEFAULT_LATENCY_FLOOR_MULTIPLIER = 1.0
 
-# Windows kept for the quantile. Long enough that a burst of degraded windows
-# cannot carry the quantile on its own, short enough to follow a regime change.
+# Windows kept for the quantile (--latency-floor-window). At 1 the floor is the
+# latest committing window's latency and the quantile has no effect. A longer
+# window (it was 16 until 2026-10-07) keeps a burst of degraded windows from
+# carrying the quantile on its own, at the cost of following a regime change
+# more slowly.
 DEFAULT_LATENCY_FLOOR_WINDOW = 1
 
 # Two pressures push this in opposite directions.
@@ -45,7 +48,11 @@ DEFAULT_LATENCY_FLOOR_WINDOW = 1
 # per-arm windows, floor = the minimum across arms of each arm's own low
 # quantile - is not implemented. Re-check the exclusion count on any new spec
 # rather than assuming this transfers.
-DEFAULT_LATENCY_FLOOR_QUANTILE = 0.75
+#
+# Those measurements were taken with a 16-window floor. At the 1-window default
+# the quantile has no effect; it starts to matter with a longer
+# --latency-floor-window, where 0.50 is the value measured above.
+DEFAULT_LATENCY_FLOOR_QUANTILE = 0.50
 
 
 class LatencyFloor:
@@ -57,7 +64,7 @@ class LatencyFloor:
 
     def __init__(
         self,
-        multiplier: float = DEFAULT_LATENCY_FLOOR_K,
+        multiplier: float = DEFAULT_LATENCY_FLOOR_MULTIPLIER,
         window: int = DEFAULT_LATENCY_FLOOR_WINDOW,
         quantile: float = DEFAULT_LATENCY_FLOOR_QUANTILE,
         max_floor_ms: Optional[float] = None,

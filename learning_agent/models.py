@@ -28,9 +28,11 @@ RENAMED_MODEL_TYPES: Dict[str, str] = {
     "codex_v1": "discrete_linucb",
     "codex": "discrete_linucb",
     "ppo": "discrete_ppo",
-    "continuous": "continuous_pretrained_gp",
+    "continuous": "continuous_gp",
+    "continuous_pretrained_gp": "continuous_gp",
     "continuous_codex": "continuous_linucb",
-    "latency_floor_heuristic": "continuous_latency_floor",
+    "latency_floor_heuristic": "continuous_heuristic",
+    "continuous_latency_floor": "continuous_heuristic",
 }
 
 
@@ -1186,6 +1188,7 @@ class DiscountedLinUCB(TensorModel):
         ridge: float = 1.0,
         reward_scale: float = 1.0,
         seed: Optional[int] = None,
+        prior_theta: Optional[np.ndarray] = None,
     ) -> None:
         if action_dim <= 0:
             raise ValueError(f"action_dim must be > 0, got {action_dim}")
@@ -1217,7 +1220,61 @@ class DiscountedLinUCB(TensorModel):
         self._ridge = float(ridge)
         self._reward_scale = float(reward_scale)
         self._seed = seed
+        # Prior mean of each arm's coefficients, in the _contexts space and in
+        # reward / reward_scale units: b starts at ridge * theta0 and the
+        # discount pulls it back there, so an unplayed arm's mean decays to
+        # theta0 instead of to 0. Zeros (None) is the plain ridge prior.
+        expected_shape = (self._action_dim, self._context_dim)
+        if prior_theta is None:
+            self._prior_theta = np.zeros(expected_shape, dtype=np.float64)
+        else:
+            self._prior_theta = np.array(prior_theta, dtype=np.float64)
+            if self._prior_theta.shape != expected_shape:
+                raise ValueError(
+                    f"prior_theta must have shape {expected_shape}, "
+                    f"got {self._prior_theta.shape}"
+                )
+            if not np.all(np.isfinite(self._prior_theta)):
+                raise ValueError("prior_theta must contain only finite values")
         self.reset_model()
+
+    def fit_prior_theta(
+        self, features: np.ndarray, actions: np.ndarray, rewards: np.ndarray
+    ) -> np.ndarray:
+        """Undiscounted per-arm ridge fit, for use as ``prior_theta``.
+
+        ``actions`` are arm indices, as update_model takes them. Each arm's
+        coefficients solve ``(ridge I + X^T X) theta = X^T y`` with X the
+        _contexts rows of that arm and y the rewards over reward_scale.
+        """
+        contexts = self._contexts(features)
+        action_values = np.asarray(actions, dtype=np.float64).reshape(-1)
+        reward_values = np.asarray(rewards, dtype=np.float64).reshape(-1)
+        if action_values.size != len(contexts) or reward_values.size != len(contexts):
+            raise ValueError(
+                f"{len(contexts)} feature rows, {action_values.size} actions "
+                f"and {reward_values.size} rewards"
+            )
+        if not np.all(np.isfinite(reward_values)):
+            raise ValueError("rewards must contain only finite values")
+        rounded_actions = np.rint(action_values)
+        if not np.allclose(action_values, rounded_actions, rtol=0.0, atol=1e-9):
+            raise ValueError("actions must be integer arm indices")
+        action_indices = rounded_actions.astype(int)
+        if np.any(action_indices < 0) or np.any(action_indices >= self._action_dim):
+            raise ValueError(
+                f"actions must be between 0 and {self._action_dim - 1}"
+            )
+        identity = np.eye(self._context_dim, dtype=np.float64)
+        theta = np.empty((self._action_dim, self._context_dim), dtype=np.float64)
+        for arm in range(self._action_dim):
+            selected = action_indices == arm
+            if not np.any(selected):
+                raise ValueError(f"arm {arm} has no samples to fit a prior on")
+            x = contexts[selected]
+            y = reward_values[selected] / self._reward_scale
+            theta[arm] = np.linalg.solve(self._ridge * identity + x.T @ x, x.T @ y)
+        return theta
 
     def _contexts(self, features: np.ndarray) -> np.ndarray:
         rows = np.asarray(features, dtype=np.float64)
@@ -1340,6 +1397,7 @@ class DiscountedLinUCB(TensorModel):
                     covariance_prior_weight * identity[None, :, :]
                 )
             self._reward_vectors *= self._discount_factor
+            self._reward_vectors += prior_weight * self._prior_theta
 
             observation = np.outer(context, context)
             self._precision[arm] += observation
@@ -1360,9 +1418,7 @@ class DiscountedLinUCB(TensorModel):
             axis=0,
         )
         self._covariance = self._precision.copy()
-        self._reward_vectors = np.zeros(
-            (self._action_dim, self._context_dim), dtype=np.float64
-        )
+        self._reward_vectors = self._ridge * self._prior_theta
         self._observation_counts = np.zeros(self._action_dim, dtype=np.int64)
 
 class RandomTimeoutModel(TensorModel):
@@ -2814,6 +2870,53 @@ class PPOBase(TensorModel):
     def _store_action(self, action: float) -> float:
         """Map a reported action to the form the head's log-density takes."""
         return float(action)
+
+    # -- checkpoint ---------------------------------------------------------
+
+    def _named_parameters(self) -> Dict[str, np.ndarray]:
+        named: Dict[str, np.ndarray] = {}
+        for prefix, network in (("actor", self._actor), ("critic", self._critic)):
+            for index, (weight, bias) in enumerate(
+                zip(network.weights, network.biases)
+            ):
+                named[f"{prefix}_w{index}"] = weight
+                named[f"{prefix}_b{index}"] = bias
+        return named
+
+    def state_arrays(self) -> Dict[str, np.ndarray]:
+        """Copies of the actor and critic weights and biases.
+
+        Optimizer moments, the rollout buffer and the RNG are not included: a
+        loaded model starts with fresh Adam state and an empty buffer.
+        """
+        return {name: value.copy() for name, value in self._named_parameters().items()}
+
+    def load_state_arrays(self, arrays: Dict[str, np.ndarray]) -> None:
+        """Write :meth:`state_arrays` output into this model's parameters.
+
+        In place, so the arrays Adam holds stay the network's. Every key and
+        shape must match exactly.
+        """
+        named = self._named_parameters()
+        missing = sorted(set(named) - set(arrays))
+        extra = sorted(set(arrays) - set(named))
+        if missing or extra:
+            raise ValueError(
+                f"PPO state keys do not match: missing {missing}, unexpected {extra}"
+            )
+        loaded = {}
+        for name, target in named.items():
+            value = np.asarray(arrays[name], dtype=np.float64)
+            if value.shape != target.shape:
+                raise ValueError(
+                    f"PPO state {name} has shape {value.shape}, "
+                    f"the model needs {target.shape}"
+                )
+            if not np.all(np.isfinite(value)):
+                raise ValueError(f"PPO state {name} contains non-finite values")
+            loaded[name] = value
+        for name, target in named.items():
+            target[...] = loaded[name]
 
     def reset_model(self) -> None:
         self._rng = np.random.default_rng(self._seed)

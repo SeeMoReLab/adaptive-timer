@@ -532,6 +532,24 @@ def run_agent(
     return rows
 
 
+def training_sim(rng: np.random.Generator, seed: int) -> Tuple[SmartbftSim, int]:
+    """One randomized training run: (simulator, episodes)."""
+    from continuous_bandit import context_spec
+
+    import agent_pb2
+
+    lo, hi = context_spec(agent_pb2.PROTOCOL_SMARTBFT).bounds_ms
+    episodes = int(rng.integers(40, 120))
+    sim = SmartbftSim(
+        sample_constants(rng),
+        sample_schedule(rng, episodes * EPISODE_S),
+        seed=seed,
+        start_offset_s=float(rng.uniform(0.0, 20.0)),
+        initial_timeout_ms=float(math.exp(rng.uniform(math.log(lo), math.log(hi)))),
+    )
+    return sim, episodes
+
+
 def _generate_one(args: Tuple[int, str]) -> Tuple[np.ndarray, np.ndarray]:
     from reward_utils import set_reward_design
 
@@ -545,15 +563,7 @@ def _generate_one(args: Tuple[int, str]) -> Tuple[np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
     spec = context_spec(agent_pb2.PROTOCOL_SMARTBFT)
     codec = ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_SMARTBFT, bounds_ms=spec.bounds_ms)
-    lo, hi = spec.bounds_ms
-    episodes = int(rng.integers(40, 120))
-    sim = SmartbftSim(
-        sample_constants(rng),
-        sample_schedule(rng, episodes * EPISODE_S),
-        seed=seed,
-        start_offset_s=float(rng.uniform(0.0, 20.0)),
-        initial_timeout_ms=float(math.exp(rng.uniform(math.log(lo), math.log(hi)))),
-    )
+    sim, episodes = training_sim(rng, seed)
     prev = codec.normalize_ms(int(round(sim.timeout_ms)))
     xs, ys = [], []
     for _ in range(episodes):
@@ -678,7 +688,7 @@ def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
             action_codec=codec,
             n_features=len(names),
             latency_index=names.index("avg_consensus_latency_ms"),
-            transactions_index=names.index("total_transactions"),
+            instances_index=names.index("total_consensus_instances"),
             multiplier=1.0,
             clamp_ms=(min(arms), max(arms)),
             initial_timeout_ms=sorted(arms)[len(arms) // 2],
@@ -744,6 +754,38 @@ def evaluate_spec(kind: str, constants: SimConstants, seed: int, **kwargs) -> np
             np.median([r[1] for r in sel]),
         )
     return out
+
+
+def pretrain_adapter():
+    """This simulator as pretrain.py drives it: training runs as train draws
+    them, spec runs as evaluate_spec builds them (host constants, 105
+    episodes); the spec phase is run_agent's, and there is no oracle."""
+    from pretrain import SimAdapter, timeout_message
+
+    def to_timeout(timeout_ms: float) -> agent_pb2.Timeout:
+        return agent_pb2.Timeout(smartbft=agent_pb2.SmartbftTimeout(
+            election_timeout_milliseconds=int(round(timeout_ms))))
+
+    def from_timeout(timeout: agent_pb2.Timeout) -> float:
+        return float(timeout_message(timeout, "smartbft").election_timeout_milliseconds)
+
+    return SimAdapter(
+        protocol=agent_pb2.PROTOCOL_SMARTBFT,
+        simulator="smartbft_sim",
+        training_run=lambda seed: training_sim(np.random.default_rng(seed), seed),
+        spec_run=lambda seed: (
+            SmartbftSim(SimConstants(), spec_schedule(), seed=seed, start_offset_s=5.0), 105),
+        run_agent=run_agent,
+        # A training schedule's phase 0 is a real phase, so run_agent already
+        # updates every decision from 10 s.
+        run_training=run_agent,
+        to_timeout=to_timeout,
+        from_timeout=from_timeout,
+        row_phase=lambda row: row[0],
+        row_reward=lambda row: episode_reward(row[2]),
+        spec_phase_count=N_SPEC_PHASES,
+        oracle=None,
+    )
 
 
 def main() -> None:

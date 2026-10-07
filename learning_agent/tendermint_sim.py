@@ -437,6 +437,27 @@ def run_agent(
     return rows
 
 
+def training_sim(
+    rng: np.random.Generator, seed: int, peer_spread: float = 0.0
+) -> Tuple[TendermintSim, int]:
+    """One randomized training run: (simulator, episodes)."""
+    episodes = int(rng.integers(40, 120))
+    # --peer-spread s > 0: the peers' timeouts are node 0's times fixed per-run
+    # lognormal factors with sigma drawn from [0, s], so training covers the
+    # lockstep case and the dispersed one the four independent learners make.
+    sigma = float(rng.uniform(0.0, peer_spread)) if peer_spread > 0.0 else 0.0
+    peer_factors = np.exp(rng.normal(0.0, sigma, N_NODES - 1)) if sigma > 0.0 else None
+    sim = TendermintSim(
+        sample_constants(rng),
+        sample_schedule(rng, episodes * EPISODE_S),
+        seed=seed,
+        start_offset_s=float(rng.uniform(0.0, 20.0)),
+        initial_timeout_ms=float(math.exp(rng.uniform(math.log(100), math.log(3000)))),
+        peer_factors=peer_factors,
+    )
+    return sim, episodes
+
+
 def _generate_one(args: Tuple[int, str, int, float]) -> Tuple[np.ndarray, np.ndarray]:
     from reward_utils import set_reward_design
 
@@ -455,20 +476,7 @@ def _generate_one(args: Tuple[int, str, int, float]) -> Tuple[np.ndarray, np.nda
     codec = ContinuousTimeoutActionCodec(
         agent_pb2.PROTOCOL_TENDERMINT, bounds_ms=CONTINUOUS_TENDERMINT_BOUNDS_MS
     )
-    episodes = int(rng.integers(40, 120))
-    # --peer-spread s > 0: the peers' timeouts are node 0's times fixed per-run
-    # lognormal factors with sigma drawn from [0, s], so training covers the
-    # lockstep case and the dispersed one the four independent learners make.
-    sigma = float(rng.uniform(0.0, peer_spread)) if peer_spread > 0.0 else 0.0
-    peer_factors = np.exp(rng.normal(0.0, sigma, N_NODES - 1)) if sigma > 0.0 else None
-    sim = TendermintSim(
-        sample_constants(rng),
-        sample_schedule(rng, episodes * EPISODE_S),
-        seed=seed,
-        start_offset_s=float(rng.uniform(0.0, 20.0)),
-        initial_timeout_ms=float(math.exp(rng.uniform(math.log(100), math.log(3000)))),
-        peer_factors=peer_factors,
-    )
+    sim, episodes = training_sim(rng, seed, peer_spread)
     prev = codec.normalize_ms(int(round(sim.timeout_ms)))
     xs, ys = [], []
     # --hold-episodes h > 1: an action is drawn at the start of a hold and kept for
@@ -603,7 +611,7 @@ def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
             action_codec=codec,
             n_features=len(names),
             latency_index=names.index("avg_consensus_latency_ms"),
-            transactions_index=names.index("total_transactions"),
+            instances_index=names.index("total_consensus_instances"),
             multiplier=1.0,
             clamp_ms=(min(arms), max(arms)),
             initial_timeout_ms=sorted(arms)[len(arms) // 2],
@@ -674,6 +682,48 @@ def evaluate_spec(kind: str, constants: SimConstants, seed: int, **kwargs) -> np
             np.median([r[1] for r in sel]),
         )
     return out
+
+
+def pretrain_adapter(peer_spread: float = 0.0):
+    """This simulator as pretrain.py drives it: training runs as train draws
+    them (peer factors only for ``peer_spread`` > 0, as train --peer-spread),
+    spec runs as evaluate_spec builds them (host constants, lockstep peers, 90
+    episodes); the spec phase is run_agent's, and there is no oracle."""
+    import agent_pb2
+    from models import tendermint_timeouts_from_propose
+    from pretrain import SimAdapter, timeout_message
+
+    if not math.isfinite(peer_spread) or peer_spread < 0.0:
+        raise ValueError(f"peer_spread must be >= 0, got {peer_spread}")
+
+    def to_timeout(timeout_ms: float) -> agent_pb2.Timeout:
+        p, v, c = tendermint_timeouts_from_propose(int(round(timeout_ms)))
+        return agent_pb2.Timeout(tendermint=agent_pb2.TendermintTimeout(
+            propose_timeout_milliseconds=p,
+            prevote_timeout_milliseconds=v,
+            precommit_timeout_milliseconds=c,
+        ))
+
+    def from_timeout(timeout: agent_pb2.Timeout) -> float:
+        return float(timeout_message(timeout, "tendermint").propose_timeout_milliseconds)
+
+    return SimAdapter(
+        protocol=agent_pb2.PROTOCOL_TENDERMINT,
+        simulator="tendermint_sim",
+        training_run=lambda seed: training_sim(np.random.default_rng(seed), seed, peer_spread),
+        spec_run=lambda seed: (
+            TendermintSim(SimConstants(), spec_schedule(), seed=seed, start_offset_s=14.5), 90),
+        run_agent=run_agent,
+        # A training schedule's phase 0 is a real phase, so run_agent already
+        # updates every decision from 10 s.
+        run_training=run_agent,
+        to_timeout=to_timeout,
+        from_timeout=from_timeout,
+        row_phase=lambda row: row[0],
+        row_reward=lambda row: episode_reward(row[2], row[1]),
+        spec_phase_count=6,
+        oracle=None,
+    )
 
 
 def main() -> None:

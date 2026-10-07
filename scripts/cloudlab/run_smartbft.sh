@@ -34,8 +34,8 @@ AGENT_MODEL_SET=0
 REWARD_DESIGN="reward_tps"
 # Domain constraint on the action space: never apply a timeout below k times
 # the consensus latency the replicas are already achieving. 0 disables it.
-LATENCY_FLOOR_K=0
-# --model-type=continuous_pretrained_gp prior: "" the shipped one, "none" untrained, else a path.
+LATENCY_FLOOR_MULTIPLIER=0
+# Prior file the model loads, repo-relative after validation; "" (omitted) is untrained.
 PRIOR_PATH=""
 SCHEDULE_FILE="learning_agent/config/schedule_smartbft.csv"
 
@@ -107,7 +107,7 @@ trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_pretrained_gp|continuous_linucb|continuous_heuristic|continuous_ppo|continuous_latency_floor>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -119,23 +119,22 @@ Flags:
   --log                             Download client, server, applier, and agent logs.
   --output-dir <path>               Store artifacts here instead of creating a timestamped run directory.
   --verbose                         Enable SmartBFT debug logs on server replicas.
-  --model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_pretrained_gp|continuous_linucb|continuous_heuristic|continuous_ppo|continuous_latency_floor>
+  --model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo>
                                      Learning-agent model for learning mode (default: discrete_random).
-  --reward-design <reward_tps|reward_mixed>
+  --reward-design <reward_tps|reward_mixed|reward_tps_latency>
                                      Reward the agent learns from (default: reward_tps).
                                      reward_tps is throughput alone, concave past a 1000 tps knee.
                                      reward_mixed also discounts it by the share of the window one
                                      fault would cost (applied timeout + one consensus latency),
                                      so a longer timer has to earn the detection delay it buys.
-  --latency-floor-k <float>          Never apply a timeout below k * the consensus latency the
-                                     replicas are already achieving, estimated as a low quantile
-                                     over recent committing windows. Such a timeout cannot be met,
-                                     so it only buys view changes. 0 disables it (default: 0).
-  --prior-path <path|none>           Which pretrained prior --model continuous_pretrained_gp loads.
-                                     Empty (default) is the protocol's shipped
-                                     return prior; a path is an ablation prior
-                                     (<protocol>_sim.py train --no-proposal-faults);
-                                     "none" runs it untrained, with a zero prior.
+  --latency-floor-multiplier <float> Never apply a timeout below this multiplier x the consensus latency the
+                                     replicas are already achieving (by default, the latest committing
+                                     window's). Such a timeout cannot be met, so it only buys view
+                                     changes. Any model except scheduled; 0 disables it (default: 0).
+  --prior-path <path>                Prior file the model loads, for continuous_gp, discrete_linucb,
+                                     continuous_linucb, discrete_ppo or continuous_ppo in learning or
+                                     sharing mode. It must be under learning_agent/, the only tree
+                                     shipped to the nodes. Omitted (default): the model starts untrained.
   --schedule-file <repo-rel-path>    scheduled-mode oracle CSV, relative to the repo root
                                      (default: learning_agent/config/schedule_smartbft.csv).
                                      It must be inside the deployed payload to exist on the remote.
@@ -183,9 +182,9 @@ renamed_model_type() {
     cmab|thompson) printf '%s\n' "discrete_tree_ts" ;;
     cmab_reset) printf '%s\n' "discrete_tree_blocks" ;;
     codex|codex_v1) printf '%s\n' "discrete_linucb" ;;
-    continuous) printf '%s\n' "continuous_pretrained_gp" ;;
+    continuous_pretrained_gp|continuous) printf '%s\n' "continuous_gp" ;;
     continuous_codex) printf '%s\n' "continuous_linucb" ;;
-    latency_floor_heuristic) printf '%s\n' "continuous_latency_floor" ;;
+    latency_floor_heuristic|continuous_latency_floor) printf '%s\n' "continuous_heuristic" ;;
     *) return 1 ;;
   esac
 }
@@ -194,7 +193,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_pretrained_gp|continuous_linucb|continuous_heuristic|continuous_ppo|continuous_latency_floor) printf '%s\n' "${model_lower}" ;;
+    discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo) printf '%s\n' "${model_lower}" ;;
     *)
       local renamed
       if renamed="$(renamed_model_type "${model_lower}")"; then
@@ -203,6 +202,35 @@ normalize_agent_model_type() {
       return 1
       ;;
   esac
+}
+
+# --prior-path: only learning_agent/ is shipped to the nodes and the agent runs
+# from the extracted tree, so the prior must live under it. Prints the path
+# relative to the repo root (learning_agent/...), or fails with the reason.
+repo_relative_prior_path() {
+  local path="$1"
+  local repo
+  local dir
+  local rel
+  if [[ ! -f "${path}" ]]; then
+    echo "--prior-path file not found: ${path}" >&2
+    return 1
+  fi
+  repo="$(cd "${REPO_ROOT}" && pwd -P)"
+  dir="$(cd "$(dirname "${path}")" && pwd -P)"
+  case "${dir}/" in
+    "${repo}/learning_agent/"*) rel="${dir#"${repo}/"}/$(basename "${path}")" ;;
+    *)
+      echo "--prior-path ${path} is outside ${repo}/learning_agent/: only learning_agent/ is shipped to the nodes; put the prior under learning_agent/pretrained_models/." >&2
+      return 1
+      ;;
+  esac
+  # The remote agent command line carries it unquoted.
+  if ! [[ "${rel}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+    echo "--prior-path ${rel} has characters other than [A-Za-z0-9._/-], which the remote agent command cannot carry." >&2
+    return 1
+  fi
+  printf '%s\n' "${rel}"
 }
 
 absolute_path() {
@@ -393,9 +421,13 @@ while [[ $# -gt 0 ]]; do
       PRIOR_PATH="${2}"
       shift 2
       ;;
-    --latency-floor-k)
-      LATENCY_FLOOR_K="${2:-}"
+    --latency-floor-multiplier)
+      LATENCY_FLOOR_MULTIPLIER="${2:-}"
       shift 2
+      ;;
+    --latency-floor-k)
+      echo "--latency-floor-k was renamed to --latency-floor-multiplier." >&2
+      exit 2
       ;;
     --schedule-file)
       SCHEDULE_FILE="${2:-}"
@@ -526,20 +558,33 @@ if [[ -n "${CREATE_WORKERS}" ]] && (! [[ "${CREATE_WORKERS}" =~ ^[0-9]+$ ]] || (
   exit 2
 fi
 case "${REWARD_DESIGN}" in
-  reward_tps|reward_mixed) ;;
-  *) echo "Invalid --reward-design: ${REWARD_DESIGN}. Expected reward_tps|reward_mixed." >&2; exit 2 ;;
+  reward_tps|reward_mixed|reward_tps_latency) ;;
+  *) echo "Invalid --reward-design: ${REWARD_DESIGN}. Expected reward_tps|reward_mixed|reward_tps_latency." >&2; exit 2 ;;
 esac
-if ! [[ "${LATENCY_FLOOR_K}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-  echo "Invalid --latency-floor-k: ${LATENCY_FLOOR_K}. Expected a non-negative number (0 disables the constraint)." >&2
+if ! [[ "${LATENCY_FLOOR_MULTIPLIER}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "Invalid --latency-floor-multiplier: ${LATENCY_FLOOR_MULTIPLIER}. Expected a non-negative number (0 disables the constraint)." >&2
   exit 2
 fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_pretrained_gp|continuous_linucb|continuous_heuristic|continuous_ppo|continuous_latency_floor." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
   echo "--model is only supported with learning or sharing mode for SmartBFT CloudLab runs." >&2
   exit 2
+fi
+if [[ -n "${PRIOR_PATH}" ]]; then
+  if [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
+    echo "--prior-path is only supported with learning or sharing mode for SmartBFT CloudLab runs." >&2
+    exit 2
+  fi
+  case "${AGENT_MODEL_TYPE}" in
+    continuous_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo) ;;
+    *) echo "--prior-path is not supported with --model ${AGENT_MODEL_TYPE}. Use one of continuous_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo." >&2; exit 2 ;;
+  esac
+  if ! PRIOR_PATH="$(repo_relative_prior_path "${PRIOR_PATH}")"; then
+    exit 2
+  fi
 fi
 if ! mode_enables_learning_agent "${MODE}"; then
   LEARNING_AGENT_ENABLED=0
@@ -655,7 +700,7 @@ fi
   printf 'request_timeout=%q\n' "${REQUEST_TIMEOUT}"
   printf 'agent_model=%q\n' "${AGENT_MODEL_TYPE}"
   printf 'reward_design=%q\n' "${REWARD_DESIGN}"
-  printf 'latency_floor_k=%q\n' "${LATENCY_FLOOR_K}"
+  printf 'latency_floor_multiplier=%q\n' "${LATENCY_FLOOR_MULTIPLIER}"
   printf 'prior_path=%q\n' "${PRIOR_PATH:-}"
   printf 'schedule_file=%q\n' "${SCHEDULE_FILE}"
   printf 'learning_window_mode=wall-clock\n'
@@ -1174,7 +1219,7 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
         "${AGENT_PORT}" \
         "${SHARING_ENABLED}" \
         "${SHARING_COLLECT_WAIT_MS}" \
-        "${LATENCY_FLOOR_K}" \
+        "${LATENCY_FLOOR_MULTIPLIER}" \
         "${REWARD_DESIGN}" \
         "${SCHEDULE_FILE}" \
         "${PRIOR_PATH}" <<'REMOTE'
@@ -1189,7 +1234,7 @@ model_type="$6"
 agent_port="$7"
 sharing_enabled="$8"
 sharing_collect_wait_ms="$9"
-latency_floor_k="${10}"
+latency_floor_multiplier="${10}"
 reward_design="${11}"
 schedule_file="${12}"
 prior_path="${13:-}"
@@ -1210,18 +1255,17 @@ elif [[ "${mode}" == "scheduled" ]]; then
 fi
 # The floor is a constraint on the action space, so it only means anything
 # where the agent is choosing the timeout at all.
-if [[ "${agent_model_args}" != "" && "${latency_floor_k}" != "0" ]]; then
-  agent_model_args="${agent_model_args} --latency-floor-k ${latency_floor_k}"
+if [[ "${agent_model_args}" != "" && "${latency_floor_multiplier}" != "0" ]]; then
+  agent_model_args="${agent_model_args} --latency-floor-multiplier ${latency_floor_multiplier}"
 fi
 # The reward shaping applies to every agent mode that trains, including the
 # scheduled replay, whose CSV records the reward each fixed timeout earned.
 if [[ "${agent_model_args}" != "" ]]; then
   agent_model_args="${agent_model_args} --reward-design ${reward_design}"
 fi
-# Which pretrained prior the continuous model loads: "" the shipped return
-# prior, "none" untrained, else a path to an ablation prior. main.py ignores it
-# for every other model type, so only pass it where it means something.
-if [[ "${model_type}" == "continuous_pretrained_gp" && -n "${prior_path}" ]]; then
+# The prior file the model loads, relative to run_root; "" leaves it untrained.
+# The model and mode were checked locally.
+if [[ -n "${prior_path}" ]]; then
   agent_model_args="${agent_model_args} --prior-path ${prior_path}"
 fi
 

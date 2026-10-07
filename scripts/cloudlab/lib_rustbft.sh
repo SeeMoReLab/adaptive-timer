@@ -170,7 +170,7 @@ Flags:
   --log                             Download client, server, applier, and agent logs.
   --output-dir <path>               Store artifacts here instead of a timestamped run directory.
   --verbose                         Enable debug logs on server replicas.
-  --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous>
+  --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_ppo|ppo>
                                      Learning-agent model for learning mode (default: random).
   -f <int>                          Fault tolerance f; nodes defaults to 3f+1 (default: 1).
   -t <int>                          Seconds to run after benchmark start (default: 300).
@@ -230,7 +230,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|pavlov|linear|cmab|cmab_reset|continuous) printf '%s\n' "${model_lower}" ;;
+    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_ppo|ppo) printf '%s\n' "${model_lower}" ;;
     claude) printf '%s\n' "claude_v2" ;;
     codex) printf '%s\n' "codex_v1" ;;
     *) return 1 ;;
@@ -514,12 +514,24 @@ rustbft_main() {
     exit 2
   fi
   if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-    echo "Invalid --model value. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous." >&2
+    echo "Invalid --model value. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_ppo|ppo." >&2
     exit 2
   fi
   if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
     echo "--model is only supported with learning or sharing mode." >&2
     exit 2
+  fi
+  # Every continuous model places its action on a line through
+  # ContinuousTimeoutActionCodec, which has no bounds for Autobahn and raises
+  # on construction. Catch it here rather than after the payload is deployed
+  # and every replica's agent exits at startup.
+  if [[ "${AGENT_PROTOCOL}" == "autobahn" ]]; then
+    case "${AGENT_MODEL_TYPE}" in
+      continuous|continuous_ppo)
+        echo "--model ${AGENT_MODEL_TYPE} needs continuous timeout bounds, which ${PROTOCOL_NAME} does not define yet. Use ppo for the discrete arms." >&2
+        exit 2
+        ;;
+    esac
   fi
   if ! mode_enables_learning_agent "${MODE}"; then
     LEARNING_AGENT_ENABLED=0

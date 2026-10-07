@@ -56,6 +56,7 @@ from models import (
     get_action_space_size,
     get_report_feature_dim,
     get_report_feature_field_names,
+    get_arm_timeout_values_ms,
     get_timeout_values_ms,
     timeout_index_to_ms_for_protocol,
 )
@@ -887,7 +888,7 @@ def main() -> None:
         )
         model = LatencyFloorPolicy(
             model=model,
-            timeouts_ms=get_timeout_values_ms(protocol_id),
+            timeouts_ms=get_arm_timeout_values_ms(protocol_id),
             latency_index=latency_index,
             n_features=get_report_feature_dim(protocol_id),
             instances_index=instances_index,

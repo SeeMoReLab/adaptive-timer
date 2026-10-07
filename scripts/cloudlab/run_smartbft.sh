@@ -35,6 +35,8 @@ REWARD_DESIGN="reward_tps"
 # Domain constraint on the action space: never apply a timeout below k times
 # the consensus latency the replicas are already achieving. 0 disables it.
 LATENCY_FLOOR_K=0
+# --model-type=continuous prior: "" the shipped one, "none" untrained, else a path.
+PRIOR_PATH=""
 SCHEDULE_FILE="learning_agent/config/schedule_smartbft.csv"
 
 BATCH_SIZE=256
@@ -105,7 +107,7 @@ trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -117,7 +119,7 @@ Flags:
   --log                             Download client, server, applier, and agent logs.
   --output-dir <path>               Store artifacts here instead of creating a timestamped run directory.
   --verbose                         Enable SmartBFT debug logs on server replicas.
-  --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic>
+  --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo>
                                      Learning-agent model for learning mode (default: random).
                                      claude and codex select claude_v2 and codex_v1.
   --reward-design <reward_tps|reward_mixed>
@@ -130,6 +132,11 @@ Flags:
                                      replicas are already achieving, estimated as a low quantile
                                      over recent committing windows. Such a timeout cannot be met,
                                      so it only buys view changes. 0 disables it (default: 0).
+  --prior-path <path|none>           Which pretrained prior --model continuous loads.
+                                     Empty (default) is the protocol's shipped
+                                     return prior; a path is an ablation prior
+                                     (<protocol>_sim.py train --no-proposal-faults);
+                                     "none" runs it untrained, with a zero prior.
   --schedule-file <repo-rel-path>    scheduled-mode oracle CSV, relative to the repo root
                                      (default: learning_agent/config/schedule_smartbft.csv).
                                      It must be inside the deployed payload to exist on the remote.
@@ -173,7 +180,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_heuristic) printf '%s\n' "${model_lower}" ;;
+    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo) printf '%s\n' "${model_lower}" ;;
     # Short names for the two newest bandits. main.py knows them by their
     # versioned names, so translate here and let everything downstream - the
     # remote validation included - carry the name main.py accepts.
@@ -363,6 +370,14 @@ while [[ $# -gt 0 ]]; do
       REWARD_DESIGN="${2:-}"
       shift 2
       ;;
+    --prior-path)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --prior-path." >&2
+        exit 2
+      fi
+      PRIOR_PATH="${2}"
+      shift 2
+      ;;
     --latency-floor-k)
       LATENCY_FLOOR_K="${2:-}"
       shift 2
@@ -504,7 +519,7 @@ if ! [[ "${LATENCY_FLOOR_K}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   exit 2
 fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -626,6 +641,7 @@ fi
   printf 'agent_model=%q\n' "${AGENT_MODEL_TYPE}"
   printf 'reward_design=%q\n' "${REWARD_DESIGN}"
   printf 'latency_floor_k=%q\n' "${LATENCY_FLOOR_K}"
+  printf 'prior_path=%q\n' "${PRIOR_PATH:-}"
   printf 'schedule_file=%q\n' "${SCHEDULE_FILE}"
   printf 'learning_window_mode=wall-clock\n'
   printf 'dataset_enabled=%q\n' "${DATASET_ENABLED}"
@@ -1145,7 +1161,8 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
         "${SHARING_COLLECT_WAIT_MS}" \
         "${LATENCY_FLOOR_K}" \
         "${REWARD_DESIGN}" \
-        "${SCHEDULE_FILE}" <<'REMOTE'
+        "${SCHEDULE_FILE}" \
+        "${PRIOR_PATH}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
@@ -1160,6 +1177,7 @@ sharing_collect_wait_ms="$9"
 latency_floor_k="${10}"
 reward_design="${11}"
 schedule_file="${12}"
+prior_path="${13:-}"
 run_root="$HOME/smartbft_cloudlab"
 learning_agent_python="${HOME}/.venvs/adaptive-timer-learning-agent/bin/python"
 
@@ -1184,6 +1202,12 @@ fi
 # scheduled replay, whose CSV records the reward each fixed timeout earned.
 if [[ "${agent_model_args}" != "" ]]; then
   agent_model_args="${agent_model_args} --reward-design ${reward_design}"
+fi
+# Which pretrained prior the continuous model loads: "" the shipped return
+# prior, "none" untrained, else a path to an ablation prior. main.py ignores it
+# for every other model type, so only pass it where it means something.
+if [[ "${model_type}" == "continuous" && -n "${prior_path}" ]]; then
+  agent_model_args="${agent_model_args} --prior-path ${prior_path}"
 fi
 
 for ((n = 0; n < replicas_per_machine; n++)); do

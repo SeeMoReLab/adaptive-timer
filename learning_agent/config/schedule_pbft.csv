@@ -5,14 +5,18 @@
 # 20,000 requests/s on CloudLab with the consensus window at 16 batches in
 # flight; see CppBedrock/adaptive_timers.MD.
 #
-# Election timeouts: 250 (low), 600 (medium), 1200 (high).
+# Election timeouts: 250 (low), 550 (medium), 1200 (high).
+#
+# The medium rung was moved from 600 to 550. The measurements quoted
+# below, and the tables in CppBedrock/adaptive_timers.MD, were taken at
+# 600; nothing here has been re-measured at 550.
 #
 #   phase                        acceptable      labelled  why
 #   t=0    base                  all three       250       nothing elects; low is no worse
 #   t=60   base + delay 120      low             250       250 escapes at p50 169; 600 and 1200 pay 295
-#   t=180  base + delay 400      medium          600       250 escapes too but pays for it; 1200 pays 860
-#   t=300  5+50                  medium or high  600       250 is under the 335 ms tail and storms
-#   t=420  5+50 + delay 500      medium          600       600 escapes at p50 320; 1200 pays 841
+#   t=180  base + delay 400      medium          550       250 escapes too but pays for it; 1200 pays 860
+#   t=300  5+50                  medium or high  550       250 is under the 335 ms tail and storms
+#   t=420  5+50 + delay 500      medium          550       600 escapes at p50 320; 1200 pays 841
 #   t=540  5+150                 high            1200      250 and 600 are under the 630 ms tail
 #   t=660  base, recovery        all three       250       the fault is gone; low is no worse
 #
@@ -41,6 +45,6 @@
 # would spend its last seconds in the phase that punishes it hardest.
 -10,250
 0,250
-890,600
+890,550
 1490,1200
 1790,250

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 import time
 from pathlib import Path
-from typing import Dict, Generic, List, Optional, Tuple, TypeVar, Any
+from typing import Any, Dict, Generic, List, Optional, Sequence, Tuple, TypeVar
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.tree import  DecisionTreeClassifier, DecisionTreeRegressor
 from collections import deque
@@ -388,6 +388,26 @@ def get_timeout_values_ms(protocol: int) -> Tuple[int, ...]:
     if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
         return AUTOBAHN_TIMEOUT_DELAY_VALUES_MS
     return TIMEOUT_VALUES_MS
+
+
+def get_arm_timeout_values_ms(protocol: int) -> Tuple[int, ...]:
+    """The election timeout of each action index, one entry per arm.
+
+    ``get_timeout_values_ms`` returns the distinct ladder, which is the same
+    thing for every protocol whose action is one timeout. SBFT's action is the
+    (election timeout, fast-path wait) pair, so its ladder is 3 long while its
+    action space is 6; anything indexing a per-arm structure by action index -
+    ``LatencyFloorPolicy``'s feasibility mask above all - needs this instead,
+    or it silently truncates the arm set to the first ``len(ladder)`` arms and
+    makes the long timeouts unplayable.
+    """
+    protocol = _validate_protocol(protocol)
+    if protocol == agent_pb2.PROTOCOL_SBFT:
+        return tuple(
+            _sbft_index_to_pair(index)[0]
+            for index in range(get_action_space_size(protocol))
+        )
+    return get_timeout_values_ms(protocol)
 
 
 def timeout_ms_to_index(timeout_ms: int) -> int:
@@ -4607,3 +4627,597 @@ class SurvivalGatedThompsonSamplingModel(TensorModel):
         # Pull clock for the staleness escape.
         self._pulls = 0
         self._last_pull = [0] * self._act_dim
+
+
+# ---------------------------------------------------------------------------
+# PPO
+#
+# Policy gradient rather than a bandit: the models above all estimate a reward
+# per arm and then argmax it, which needs a correct reward model everywhere in
+# the action space. PPO never estimates the reward - it moves the probability
+# of an action up or down by the sign of its advantage, so a misordering it
+# never samples costs nothing, and the per-arm staleness that strands an arm in
+# a per-arm ridge model has no equivalent here: one shared network means every
+# update moves every arm's logit.
+#
+# What it pays for that is sample efficiency, and this environment is poor in
+# samples: a 2160 s run at a 5 s reward window is about 107 decisions, roughly
+# 15 per failure phase. That number drives every default below - a linear
+# policy head by default (51 parameters for PBFT, the same count as codex_v1),
+# a 8-decision update, and a uniform-mixture exploration floor carried over
+# from codex_v1 so that no arm's probability can reach zero and strand it.
+#
+# No torch. learning_agent's numeric dependencies are numpy, scipy and
+# sklearn, and this code runs on the cluster nodes; a network this small does
+# not need an autograd engine, and the gradients below are written out.
+# ---------------------------------------------------------------------------
+
+
+def signed_log_context(rows: np.ndarray, n_features: int) -> np.ndarray:
+    """DiscountedLinUCB's context transform, as a function.
+
+    Raw report fields span several orders of magnitude - transaction counts in
+    the hundreds of thousands beside view-change counts of 0 or 1 - so a
+    network on raw rows would see one input dominate. Signed-log compresses the
+    scale, the row norm removes the overall level (which is mostly the offered
+    load), and the leading 1 is the bias column.
+
+    Deliberately the same transform codex_v1 uses, so that a PPO-versus-codex_v1
+    comparison is a comparison of the two learning rules and not of two
+    different featurizations.
+    """
+    values = np.asarray(rows, dtype=np.float64)
+    if values.ndim == 1:
+        values = values.reshape(1, -1)
+    if values.ndim != 2 or values.shape[1] != n_features:
+        actual = values.shape[1] if values.ndim == 2 else values.shape
+        raise ValueError(f"Expected {n_features} features, got {actual}")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("features must contain only finite values")
+    transformed = np.sign(values) * np.log1p(np.abs(values))
+    norms = np.linalg.norm(transformed, axis=1, keepdims=True)
+    transformed = transformed / np.maximum(norms, 1.0)
+    return np.hstack((np.ones((len(transformed), 1)), transformed))
+
+
+class _TinyMLP:
+    """tanh MLP with hand-written backprop, seeded from a numpy generator.
+
+    ``sizes`` is (input, *hidden, output); with no hidden sizes this is a
+    single affine map, which is the default both PPO models use. Weights are
+    drawn from the caller's generator rather than a global one so that every
+    replica in sharing mode builds bit-identical parameters.
+    """
+
+    def __init__(
+        self,
+        sizes: Sequence[int],
+        rng: np.random.Generator,
+        output_scale: float = 0.01,
+        output_bias: float = 0.0,
+    ) -> None:
+        self.sizes = tuple(int(size) for size in sizes)
+        if len(self.sizes) < 2 or any(size <= 0 for size in self.sizes):
+            raise ValueError(f"invalid layer sizes {self.sizes}")
+        self.weights: List[np.ndarray] = []
+        self.biases: List[np.ndarray] = []
+        last = len(self.sizes) - 2
+        for index in range(len(self.sizes) - 1):
+            fan_in, fan_out = self.sizes[index], self.sizes[index + 1]
+            # The output layer starts near zero so the initial policy is close
+            # to uniform: a run has ~107 decisions and cannot afford to spend
+            # its first phase walking back a random initial preference.
+            scale = output_scale if index == last else math.sqrt(1.0 / fan_in)
+            self.weights.append(
+                rng.normal(0.0, scale, size=(fan_in, fan_out)).astype(np.float64)
+            )
+            bias = np.zeros(fan_out, dtype=np.float64)
+            if index == last:
+                bias += float(output_bias)
+            self.biases.append(bias)
+
+    @property
+    def parameters(self) -> List[np.ndarray]:
+        return self.weights + self.biases
+
+    def forward(self, inputs: np.ndarray) -> Tuple[np.ndarray, List[np.ndarray]]:
+        """(output, per-layer inputs) - the second is what backward() needs."""
+        layer_inputs = [np.asarray(inputs, dtype=np.float64)]
+        last = len(self.weights) - 1
+        output = layer_inputs[0]
+        for index, (weight, bias) in enumerate(zip(self.weights, self.biases)):
+            output = layer_inputs[index] @ weight + bias
+            if index < last:
+                layer_inputs.append(np.tanh(output))
+        return output, layer_inputs
+
+    def backward(
+        self, layer_inputs: List[np.ndarray], delta: np.ndarray
+    ) -> List[np.ndarray]:
+        """Gradients for :attr:`parameters`, given dLoss/dOutput."""
+        weight_grads: List[Optional[np.ndarray]] = [None] * len(self.weights)
+        bias_grads: List[Optional[np.ndarray]] = [None] * len(self.biases)
+        for index in range(len(self.weights) - 1, -1, -1):
+            inputs = layer_inputs[index]
+            weight_grads[index] = inputs.T @ delta
+            bias_grads[index] = delta.sum(axis=0)
+            if index > 0:
+                # tanh' = 1 - tanh^2, and layer_inputs[index] is that tanh.
+                delta = (delta @ self.weights[index].T) * (1.0 - inputs * inputs)
+        return list(weight_grads) + list(bias_grads)
+
+
+class _Adam:
+    """Adam over a fixed list of numpy arrays, updated in place."""
+
+    def __init__(
+        self,
+        parameters: Sequence[np.ndarray],
+        lr: float,
+        beta1: float = 0.9,
+        beta2: float = 0.999,
+        eps: float = 1e-8,
+    ) -> None:
+        self._lr = float(lr)
+        self._beta1 = float(beta1)
+        self._beta2 = float(beta2)
+        self._eps = float(eps)
+        self._step_count = 0
+        self._first = [np.zeros_like(value) for value in parameters]
+        self._second = [np.zeros_like(value) for value in parameters]
+
+    def step(
+        self, parameters: Sequence[np.ndarray], gradients: Sequence[np.ndarray]
+    ) -> None:
+        self._step_count += 1
+        bias1 = 1.0 - self._beta1**self._step_count
+        bias2 = 1.0 - self._beta2**self._step_count
+        for index, (value, grad) in enumerate(zip(parameters, gradients)):
+            self._first[index] *= self._beta1
+            self._first[index] += (1.0 - self._beta1) * grad
+            self._second[index] *= self._beta2
+            self._second[index] += (1.0 - self._beta2) * grad * grad
+            step = (self._first[index] / bias1) / (
+                np.sqrt(self._second[index] / bias2) + self._eps
+            )
+            value -= self._lr * step
+
+
+def _clip_global_norm(
+    gradients: List[np.ndarray], max_norm: float
+) -> List[np.ndarray]:
+    if max_norm <= 0.0:
+        return gradients
+    total = math.sqrt(sum(float(np.sum(g * g)) for g in gradients))
+    if total <= max_norm or total == 0.0:
+        return gradients
+    factor = max_norm / total
+    return [g * factor for g in gradients]
+
+
+class PPOBase(TensorModel):
+    """Clipped-objective PPO shared by the discrete and continuous policies.
+
+    Subclasses supply the policy head: how many numbers the actor emits, how to
+    sample from them, and the log-density, entropy and their derivatives with
+    respect to those numbers. Everything structural lives here - the rollout
+    buffer, the advantage estimate, the clipped surrogate, the value loss, the
+    KL early stop and Adam.
+
+    **One decision is one step, and the default discount is zero.** The reward
+    an episode receives is measured over the window that follows its action, so
+    the immediate reward already contains that action's effect and the natural
+    estimator is ``A = r - V(s)``. ``gamma > 0`` and GAE are implemented and
+    reachable, but a longer horizon is not free here: a phase is about 15
+    decisions, so a discount with a memory longer than that mixes two regimes'
+    rewards into one return. codex_v1's knob ablation found discounting to be
+    its single worst-performing knob, which is the same effect seen from the
+    other side.
+
+    **Old log-probabilities are recomputed at flush, not stored at sampling.**
+    The parameters only change inside :meth:`_flush`, so when a flush begins the
+    live parameters *are* the ones every buffered decision was drawn under, and
+    evaluating them there is exact rather than an approximation. It also means
+    the interface does not have to carry a log-probability from
+    ``predict_action`` to ``update_model``, which it has no slot for.
+
+    **The defaults are tuned for 107 decisions, and two of them are unusual.**
+    ``update_every=4`` rather than a few thousand steps: there is no large
+    rollout to collect, and four decisions is the smallest batch an advantage
+    can be standardized over. ``entropy_coef=0.3`` is some thirty times the
+    textbook value, and it is doing a different job here - with a regime that
+    changes every ~15 decisions, a policy that commits is a policy that is
+    wrong for the whole of the next phase. On a seven-phase synthetic built
+    from the measured per-(phase, arm) throughputs of
+    local/pbft_c6525100g_utah_2 (10 seeds), raising it from 0.0 to 0.3 moved
+    mean throughput 24084 -> 24840 at 15 decisions per phase and per-phase
+    accuracy 0.546 -> 0.615 at 150, and cost nothing at either. Entropy is the
+    only thing in PPO that answers non-stationarity: there is no discount on
+    past evidence the way codex_v1 has one, so a collapsed policy would never
+    find out the regime had moved.
+
+    **The action trained on is the action that ran.** A latency floor, or any
+    other constraint layered on top, can replace the sampled action before it
+    reaches the cluster, and the agent reports back what was applied. That
+    action is what enters the buffer, so the ratio is taken between the new and
+    old policy *at the action the environment actually saw*. The behaviour
+    density in that case is the constrained one rather than the policy's own,
+    which this does not attempt to correct for; the constraint is treated as
+    part of the environment.
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        head_dim: int,
+        hidden_sizes: Sequence[int] = (),
+        actor_lr: float = 0.05,
+        critic_lr: float = 0.05,
+        clip_ratio: float = 0.2,
+        epochs: int = 10,
+        update_every: int = 4,
+        gamma: float = 0.0,
+        gae_lambda: float = 0.95,
+        entropy_coef: float = 0.3,
+        max_grad_norm: float = 0.5,
+        target_kl: float = 0.02,
+        exploration_floor: float = 0.05,
+        seed: Optional[int] = None,
+    ) -> None:
+        if n_features <= 0:
+            raise ValueError(f"n_features must be > 0, got {n_features}")
+        if head_dim <= 0:
+            raise ValueError(f"head_dim must be > 0, got {head_dim}")
+        if not 0.0 < clip_ratio < 1.0:
+            raise ValueError(f"clip_ratio must be in (0, 1), got {clip_ratio}")
+        if epochs <= 0:
+            raise ValueError(f"epochs must be > 0, got {epochs}")
+        if update_every <= 0:
+            raise ValueError(f"update_every must be > 0, got {update_every}")
+        if not 0.0 <= gamma <= 1.0:
+            raise ValueError(f"gamma must be in [0, 1], got {gamma}")
+        if not 0.0 <= gae_lambda <= 1.0:
+            raise ValueError(f"gae_lambda must be in [0, 1], got {gae_lambda}")
+        if entropy_coef < 0.0:
+            raise ValueError(f"entropy_coef must be >= 0, got {entropy_coef}")
+        if not 0.0 <= exploration_floor < 1.0:
+            raise ValueError(
+                f"exploration_floor must be in [0, 1), got {exploration_floor}"
+            )
+        if target_kl < 0.0:
+            raise ValueError(f"target_kl must be >= 0, got {target_kl}")
+
+        self._n_features = int(n_features)
+        self._context_dim = self._n_features + 1
+        self._head_dim = int(head_dim)
+        self._hidden_sizes = tuple(int(size) for size in hidden_sizes)
+        self._actor_lr = float(actor_lr)
+        self._critic_lr = float(critic_lr)
+        self._clip_ratio = float(clip_ratio)
+        self._epochs = int(epochs)
+        self._update_every = int(update_every)
+        self._gamma = float(gamma)
+        self._gae_lambda = float(gae_lambda)
+        self._entropy_coef = float(entropy_coef)
+        self._max_grad_norm = float(max_grad_norm)
+        self._target_kl = float(target_kl)
+        self._exploration_floor = float(exploration_floor)
+        self._seed = seed
+        self.reset_model()
+
+    # -- head interface -----------------------------------------------------
+
+    def _sample_head(self, head: np.ndarray) -> float:
+        """Draw one action from one row of actor output. Returns the stored form."""
+        raise NotImplementedError
+
+    def _head_terms(
+        self, head: np.ndarray, actions: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """(log_prob, entropy, d log_prob / d head, d entropy / d head)."""
+        raise NotImplementedError
+
+    @property
+    def _output_bias(self) -> float:
+        return 0.0
+
+    # -- diagnostics --------------------------------------------------------
+
+    @property
+    def observation_count(self) -> int:
+        return int(self._observation_count)
+
+    @property
+    def update_count(self) -> int:
+        """How many PPO updates have run. Zero means still at initialization."""
+        return int(self._update_count)
+
+    @property
+    def last_entropy(self) -> float:
+        """Policy entropy at the most recent update; the collapse warning."""
+        return float(self._last_entropy)
+
+    # -- plumbing -----------------------------------------------------------
+
+    def _contexts(self, features: np.ndarray) -> np.ndarray:
+        return signed_log_context(features, self._n_features)
+
+    def _actor_head(self, contexts: np.ndarray) -> np.ndarray:
+        head, _ = self._actor.forward(contexts)
+        return head
+
+    def _values(self, contexts: np.ndarray) -> np.ndarray:
+        values, _ = self._critic.forward(contexts)
+        return values.reshape(-1)
+
+    def _advantages(
+        self, rewards: np.ndarray, values: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """GAE(lambda). At the default gamma=0 this is exactly r - V(s).
+
+        The buffer is a slice out of a continuing stream, not an episode, so
+        the final decision has no successor to bootstrap from and is treated as
+        terminal. With gamma=0 that choice is inert; with gamma>0 it makes the
+        last entry of each flush slightly pessimistic.
+        """
+        count = len(rewards)
+        advantages = np.zeros(count, dtype=np.float64)
+        running = 0.0
+        for index in range(count - 1, -1, -1):
+            next_value = values[index + 1] if index + 1 < count else 0.0
+            delta = rewards[index] + self._gamma * next_value - values[index]
+            running = delta + self._gamma * self._gae_lambda * running
+            advantages[index] = running
+        return advantages, advantages + values
+
+    def _flush(self) -> None:
+        contexts = np.vstack(self._buffer_contexts)
+        actions = np.asarray(self._buffer_actions, dtype=np.float64)
+        rewards = np.asarray(self._buffer_rewards, dtype=np.float64)
+        self._buffer_contexts.clear()
+        self._buffer_actions.clear()
+        self._buffer_rewards.clear()
+
+        values = self._values(contexts)
+        advantages, returns = self._advantages(rewards, values)
+        spread = float(advantages.std())
+        if spread > 1e-8:
+            advantages = (advantages - advantages.mean()) / spread
+        else:
+            # Every decision in this batch did equally well. Nothing to learn
+            # about the policy from it; the critic still gets the batch.
+            advantages = np.zeros_like(advantages)
+
+        # Exact, not an approximation: parameters have not moved since these
+        # decisions were drawn. See the class docstring.
+        old_log_probs, _, _, _ = self._head_terms(
+            self._actor_head(contexts), actions
+        )
+
+        batch = float(len(rewards))
+        for _ in range(self._epochs):
+            head, layer_inputs = self._actor.forward(contexts)
+            log_probs, entropy, d_log_probs, d_entropy = self._head_terms(
+                head, actions
+            )
+            ratios = np.exp(np.clip(log_probs - old_log_probs, -20.0, 20.0))
+            unclipped = ratios * advantages
+            clipped = (
+                np.clip(ratios, 1.0 - self._clip_ratio, 1.0 + self._clip_ratio)
+                * advantages
+            )
+            # d(-min(unclipped, clipped))/d log_prob. The clipped branch has
+            # zero gradient only where the ratio is actually outside the band;
+            # inside it the two branches are the same number.
+            inside = (ratios > 1.0 - self._clip_ratio) & (
+                ratios < 1.0 + self._clip_ratio
+            )
+            active = (unclipped <= clipped) | inside
+            surrogate_grad = -(advantages * ratios) * active / batch
+            delta = (
+                surrogate_grad[:, None] * d_log_probs
+                - (self._entropy_coef / batch) * d_entropy
+            )
+            actor_grads = self._actor.backward(layer_inputs, delta)
+            self._actor_optimizer.step(
+                self._actor.parameters,
+                _clip_global_norm(actor_grads, self._max_grad_norm),
+            )
+
+            predicted, critic_inputs = self._critic.forward(contexts)
+            critic_delta = (predicted.reshape(-1) - returns)[:, None] / batch
+            critic_grads = self._critic.backward(critic_inputs, critic_delta)
+            self._critic_optimizer.step(
+                self._critic.parameters,
+                _clip_global_norm(critic_grads, self._max_grad_norm),
+            )
+
+            self._last_entropy = float(entropy.mean())
+            # Sample KL(old || new). Positive and roughly the reverse of the
+            # usual estimator, but it is the one that is cheap here.
+            approx_kl = float(np.mean(old_log_probs - log_probs))
+            if self._target_kl > 0.0 and approx_kl > self._target_kl:
+                break
+
+        self._update_count += 1
+
+    # -- TensorModel --------------------------------------------------------
+
+    def update_model(
+        self,
+        features: np.ndarray,
+        actions: np.ndarray,
+        rewards: "np.ndarray | float",
+        backward: bool = True,
+    ) -> float:
+        if not backward:
+            return 0.0
+
+        contexts = self._contexts(features)
+        action_values = np.asarray(actions, dtype=np.float64).reshape(-1)
+        reward_values = np.asarray(rewards, dtype=np.float64).reshape(-1)
+        batch_size = len(contexts)
+        if action_values.size == 1 and batch_size > 1:
+            action_values = np.repeat(action_values, batch_size)
+        if reward_values.size == 1 and batch_size > 1:
+            reward_values = np.repeat(reward_values, batch_size)
+        if action_values.size != batch_size:
+            raise ValueError(
+                f"actions batch size mismatch: expected {batch_size}, "
+                f"got {action_values.size}"
+            )
+        if reward_values.size != batch_size:
+            raise ValueError(
+                f"rewards batch size mismatch: expected {batch_size}, "
+                f"got {reward_values.size}"
+            )
+        if not np.all(np.isfinite(action_values)):
+            raise ValueError("actions must contain only finite values")
+        if not np.all(np.isfinite(reward_values)):
+            raise ValueError("rewards must contain only finite values")
+
+        for context, action, reward in zip(contexts, action_values, reward_values):
+            self._buffer_contexts.append(context.reshape(1, -1))
+            self._buffer_actions.append(self._store_action(float(action)))
+            self._buffer_rewards.append(float(reward))
+            self._observation_count += 1
+            if len(self._buffer_rewards) >= self._update_every:
+                self._flush()
+        return 0.0
+
+    def _store_action(self, action: float) -> float:
+        """Map a reported action to the form the head's log-density takes."""
+        return float(action)
+
+    def reset_model(self) -> None:
+        self._rng = np.random.default_rng(self._seed)
+        sizes = (self._context_dim,) + self._hidden_sizes
+        self._actor = _TinyMLP(
+            sizes + (self._head_dim,),
+            self._rng,
+            output_bias=self._output_bias,
+        )
+        self._critic = _TinyMLP(sizes + (1,), self._rng)
+        self._actor_optimizer = _Adam(self._actor.parameters, self._actor_lr)
+        self._critic_optimizer = _Adam(self._critic.parameters, self._critic_lr)
+        self._buffer_contexts: List[np.ndarray] = []
+        self._buffer_actions: List[float] = []
+        self._buffer_rewards: List[float] = []
+        self._observation_count = 0
+        self._update_count = 0
+        self._last_entropy = float("nan")
+
+
+class DiscretePPO(PPOBase):
+    """PPO with a softmax policy over the discrete timeout ladder.
+
+    The actor emits one logit per arm; the arm is sampled, not argmaxed, so
+    exploration is the policy's own entropy rather than a bolted-on rule. The
+    critic is a state-value baseline over the same context, which is what makes
+    the update a comparison between "this arm" and "this context's average arm"
+    instead of between arms whose rewards were measured under different load.
+
+    **Why this is not another bandit.** Every model above learns a reward per
+    arm and plays the argmax, so an arm that has not been pulled lately holds a
+    stale estimate and comes back only on a confidence bonus - the starvation
+    that has repeatedly stranded the long arm in this codebase. A softmax
+    policy has no per-arm memory to go stale: one shared network means a single
+    update moves every logit, and the floor below guarantees the probability of
+    any arm is bounded away from zero no matter what the logits do.
+
+    **The exploration floor is mixed into the distribution, not applied on top
+    of it.** ``p = (1 - e) * softmax(z) + e / K`` is the behaviour policy, and
+    it is also the density the ratio and the entropy are computed from, so the
+    importance weights stay exact. Bolting an epsilon-greedy branch on after
+    sampling - which is what codex_v1 does - would make the behaviour policy
+    something the update does not know about. At the default ``e = 0.05`` and
+    three arms no arm can fall below a 1.7% chance of being tried.
+
+    Sampled rather than greedy also means the reported score row has to carry
+    the *sampled* arm as its maximum, since the codec argmaxes it. The row is
+    the mixed probability vector with the sampled entry raised by one
+    representable step, the same device DiscountedLinUCB uses to break ties.
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        n_features: int,
+        hidden_sizes: Sequence[int] = (),
+        **kwargs: Any,
+    ) -> None:
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        self._action_dim = int(action_dim)
+        super().__init__(
+            n_features=n_features,
+            head_dim=self._action_dim,
+            hidden_sizes=hidden_sizes,
+            **kwargs,
+        )
+
+    def _probabilities(
+        self, head: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """(softmax, softmax mixed with uniform at the exploration floor)."""
+        shifted = head - np.max(head, axis=1, keepdims=True)
+        exponentials = np.exp(shifted)
+        soft = exponentials / np.sum(exponentials, axis=1, keepdims=True)
+        if self._exploration_floor <= 0.0:
+            return soft, soft
+        mixed = (1.0 - self._exploration_floor) * soft + (
+            self._exploration_floor / self._action_dim
+        )
+        return soft, mixed
+
+    def _head_terms(
+        self, head: np.ndarray, actions: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        soft, mixed = self._probabilities(head)
+        indices = np.rint(actions).astype(int)
+        rows = np.arange(len(indices))
+        chosen = mixed[rows, indices]
+        log_probs = np.log(np.maximum(chosen, 1e-12))
+
+        # d mixed / d logit = (1 - e) * (diag(soft) - soft soft^T), so
+        # d log mixed_a / d logit = (1 - e) * soft_a / mixed_a * (onehot - soft).
+        one_hot = np.zeros_like(soft)
+        one_hot[rows, indices] = 1.0
+        scale = (1.0 - self._exploration_floor) * soft[rows, indices] / np.maximum(
+            chosen, 1e-12
+        )
+        d_log_probs = scale[:, None] * (one_hot - soft)
+
+        log_mixed = np.log(np.maximum(mixed, 1e-12))
+        entropy = -np.sum(mixed * log_mixed, axis=1)
+        # dH/dz_j = -(1 - e) * soft_j * (c_j - sum_k c_k soft_k), c = 1 + log p.
+        coefficients = 1.0 + log_mixed
+        weighted = np.sum(coefficients * soft, axis=1, keepdims=True)
+        d_entropy = (
+            -(1.0 - self._exploration_floor) * soft * (coefficients - weighted)
+        )
+        return log_probs, entropy, d_log_probs, d_entropy
+
+    def predict_action(self, features: np.ndarray) -> np.ndarray:
+        contexts = self._contexts(features)
+        _, mixed = self._probabilities(self._actor_head(contexts))
+        scores = np.array(mixed, dtype=np.float64, copy=True)
+        for row in scores:
+            selected = int(self._rng.choice(self._action_dim, p=row / row.sum()))
+            best = float(np.max(row))
+            # The codec argmaxes this row, so the sample has to be its maximum.
+            row[selected] = np.nextafter(best, np.inf)
+        return scores
+
+    def _store_action(self, action: float) -> float:
+        index = int(round(action))
+        if index < 0 or index >= self._action_dim:
+            raise ValueError(
+                f"actions must be between 0 and {self._action_dim - 1}, got {action}"
+            )
+        return float(index)
+
+    def action_probabilities(self, features: np.ndarray) -> np.ndarray:
+        """The behaviour distribution, for logging what the policy believes."""
+        _, mixed = self._probabilities(self._actor_head(self._contexts(features)))
+        return mixed

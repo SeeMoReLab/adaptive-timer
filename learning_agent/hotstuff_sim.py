@@ -302,6 +302,12 @@ def sample_constants(rng: np.random.Generator) -> SimConstants:
     )
 
 
+# train --no-proposal-faults: a prior that never saw a delayed or silent
+# proposer, so its pretraining covers the network-delay regimes only. The
+# "blind pretrained" arm of the ablation - see main.py --prior-path.
+NO_PROPOSAL_FAULTS = False
+
+
 def sample_phase(rng: np.random.Generator, start_s: float) -> Phase:
     one_way = float(math.exp(rng.uniform(math.log(2.0), math.log(250.0))))
     kind = rng.random()
@@ -312,6 +318,8 @@ def sample_phase(rng: np.random.Generator, start_s: float) -> Phase:
         offset = float(math.exp(rng.uniform(math.log(10.0), math.log(2000.0))))
     else:
         hold = float(math.exp(rng.uniform(math.log(10.0), math.log(2000.0))))
+    if NO_PROPOSAL_FAULTS:
+        offset = hold = None
     return Phase(start_s=start_s, one_way_ms=one_way, hold_offset_ms=offset, hold_ms=hold)
 
 
@@ -597,6 +605,9 @@ def main() -> None:
     t.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     t.add_argument("--out", default=DEFAULT_PRIOR_PATH)
     t.add_argument("--reward-design", default="reward_tps_latency")
+    t.add_argument("--no-proposal-faults", action="store_true",
+                   help="train on network-delay phases only; the prior never "
+                        "sees a delayed or silent proposer")
     t.add_argument("--hold-episodes", type=int, default=1)
     t.add_argument("--target-floor", type=float, default=-2.0)
     t.add_argument("--hidden", default="128,128,64", help="MLP hidden layer sizes")
@@ -611,6 +622,8 @@ def main() -> None:
 
     set_reward_design(args.reward_design)
     if args.cmd == "train":
+        global NO_PROPOSAL_FAULTS
+        NO_PROPOSAL_FAULTS = bool(args.no_proposal_faults)  # inherited by the forked workers
         x, y = generate(args.runs, args.seed, args.workers, args.reward_design, args.hold_episodes)
         rmse = train_prior(x, y, args.out, args.seed, args.reward_design, args.hold_episodes,
                            args.target_floor, tuple(int(v) for v in args.hidden.split(",")))

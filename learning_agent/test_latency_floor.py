@@ -4,8 +4,18 @@ import numpy as np
 
 import agent_pb2
 from continuous_bandit import (
+    ContinuousHeuristicTimeoutModel,
+    ContinuousLinUCB,
+    ContinuousPPO,
+    DerivedWaitActionCodec,
+    SimReturnGPModel,
+    context_spec,
+    resolve_prior_path,
+    return_prior_path,
+    _refined_ladder_ms,
     ContinuousThompsonSamplingModel,
     ContinuousTimeoutActionCodec,
+    LatencyFloorHeuristic,
     NormalizedLatencyFloor,
 )
 from latency_floor import (
@@ -15,7 +25,10 @@ from latency_floor import (
     latency_feature_indices,
 )
 from models import (
+    DiscountedLinUCB,
     TensorModel,
+    get_action_space_size,
+    get_arm_timeout_values_ms,
     get_report_feature_dim,
     get_report_feature_field_names,
     get_timeout_values_ms,
@@ -67,6 +80,63 @@ class FixedArmModel(TensorModel):
 
     def reset_model(self) -> None:
         self.was_reset = True
+
+
+
+class ArmIndexedTimeoutsTest(unittest.TestCase):
+    """LatencyFloorPolicy indexes its mask by action index, so the timeout
+    vector it is built with has to have one entry per arm. SBFT's action is a
+    (timeout, wait) pair, so the distinct 3-rung ladder is half as long as its
+    6-arm space; built with the ladder, the wrapper emitted a 3-wide one-hot
+    and arms 3-5 - both 1100 ms rungs - could never be played."""
+
+    def test_one_timeout_per_arm_for_every_protocol(self):
+        for protocol in (
+            agent_pb2.PROTOCOL_PBFT,
+            agent_pb2.PROTOCOL_SMARTBFT,
+            agent_pb2.PROTOCOL_SBFT,
+            agent_pb2.PROTOCOL_TENDERMINT,
+            agent_pb2.PROTOCOL_HOTSTUFF,
+            agent_pb2.PROTOCOL_AUTOBAHN,
+        ):
+            with self.subTest(protocol=protocol):
+                self.assertEqual(
+                    len(get_arm_timeout_values_ms(protocol)),
+                    get_action_space_size(protocol),
+                )
+
+    def test_sbft_floor_can_reach_every_arm(self):
+        protocol = agent_pb2.PROTOCOL_SBFT
+        n_arms = get_action_space_size(protocol)
+        n_features = get_report_feature_dim(protocol)
+        latency_index, instances_index = latency_feature_indices(
+            get_report_feature_field_names(protocol)
+        )
+        policy = LatencyFloorPolicy(
+            model=DiscountedLinUCB(
+                action_dim=n_arms, n_features=n_features, seed=42
+            ),
+            timeouts_ms=get_arm_timeout_values_ms(protocol),
+            latency_index=latency_index,
+            n_features=n_features,
+            instances_index=instances_index,
+            latency_floor=LatencyFloor(multiplier=1.0, quantile=0.5),
+        )
+        row = np.full(n_features, 100.0)
+        row[latency_index] = 10.0  # floor below every rung: nothing is masked
+        row[instances_index] = 500.0
+        self.assertEqual(np.asarray(policy.predict_action(row)).size, n_arms)
+
+        # The +inf initialization sweeps the arms in index order; every one of
+        # the six has to come up, the 1100 ms rungs included.
+        played = set()
+        for _ in range(n_arms):
+            scores = np.asarray(policy.predict_action(row))
+            arm = int(np.argmax(scores))
+            played.add(arm)
+            # DiscountedLinUCB learns from arm indices, not one-hot rows.
+            policy.update_model(row, np.asarray([arm], dtype=float), 1.0)
+        self.assertEqual(played, set(range(n_arms)))
 
 
 class ScoreModel(TensorModel):
@@ -364,6 +434,129 @@ class ContinuousModelFloorTest(unittest.TestCase):
         self.assertTrue(any(value < 900 for value in timeouts), timeouts)
 
 
+class LatencyFloorHeuristicTest(unittest.TestCase):
+    def build_model(self, **kwargs) -> tuple:
+        codec = ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT)
+        names = get_report_feature_field_names(agent_pb2.PROTOCOL_PBFT)
+        latency_index, instances_index = latency_feature_indices(names)
+        floor_kwargs = {"multiplier": kwargs.pop("floor_k", 1.0), "quantile": 0.0}
+        model = LatencyFloorHeuristic(
+            action_codec=codec,
+            n_features=len(names),
+            latency_floor=NormalizedLatencyFloor(
+                action_codec=codec,
+                latency_index=latency_index,
+                n_features=len(names),
+                instances_index=instances_index,
+                latency_floor=LatencyFloor(**floor_kwargs),
+            ),
+            **kwargs,
+        )
+        return codec, model
+
+    def timeout_for(self, codec, model, latency_ms: float, **kwargs) -> int:
+        action = model.predict_action(pbft_features(latency_ms, **kwargs))
+        return codec.decode(action).pbft.election_timeout_milliseconds
+
+    def test_plays_the_floor_itself(self) -> None:
+        codec, model = self.build_model()
+
+        timeout_ms = self.timeout_for(codec, model, 640.0)
+
+        self.assertEqual(model.floor_ms, 640.0)
+        self.assertEqual(timeout_ms, 640)
+
+    def test_multiplier_defaults_to_one(self) -> None:
+        _, model = self.build_model()
+
+        self.assertEqual(model.multiplier, 1.0)
+
+    def test_floor_k_scales_the_timeout(self) -> None:
+        codec, model = self.build_model(floor_k=2.0)
+
+        self.assertEqual(self.timeout_for(codec, model, 640.0), 1280)
+
+    def test_cold_start_holds_the_middle_arm(self) -> None:
+        codec, model = self.build_model()
+
+        timeout_ms = self.timeout_for(codec, model, 0.0, instances=0.0)
+
+        self.assertEqual(model.floor_ms, 0.0)
+        self.assertEqual(
+            timeout_ms, sorted(get_timeout_values_ms(agent_pb2.PROTOCOL_PBFT))[1]
+        )
+
+    def test_a_stalled_window_holds_the_last_timeout(self) -> None:
+        codec, model = self.build_model()
+
+        measured = self.timeout_for(codec, model, 640.0)
+        stalled = self.timeout_for(codec, model, 0.0, instances=0.0)
+
+        self.assertEqual(stalled, measured)
+
+    def test_the_decision_is_deterministic(self) -> None:
+        codec, model = self.build_model()
+
+        first = self.timeout_for(codec, model, 640.0)
+        repeats = [self.timeout_for(codec, model, 640.0) for _ in range(5)]
+
+        self.assertEqual(repeats, [first] * 5)
+
+    def test_arm_family_clamps_the_floor(self) -> None:
+        arms = sorted(get_timeout_values_ms(agent_pb2.PROTOCOL_PBFT))
+        codec, model = self.build_model(clamp_ms=(arms[0], arms[-1]))
+
+        # A healthy floor is far under the shortest arm, and a stalled one far
+        # over the longest; both land on the arm range the discrete baselines
+        # are measured on rather than on the codec's wider bounds.
+        self.assertEqual(self.timeout_for(codec, model, 37.0), arms[0])
+        model.reset_model()
+        self.assertEqual(self.timeout_for(codec, model, 50_000.0), arms[-1])
+
+    def test_clamp_outside_the_codec_bounds_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self.build_model(clamp_ms=(10, 1800))
+
+    def test_codec_bounds_clamp_the_floor_by_default(self) -> None:
+        codec, model = self.build_model()
+
+        self.assertEqual(self.timeout_for(codec, model, 20.0), 100)
+        model.reset_model()
+        self.assertEqual(self.timeout_for(codec, model, 50_000.0), 10_000)
+
+    def test_updates_do_not_move_the_rule(self) -> None:
+        codec, model = self.build_model()
+        features = pbft_features(640.0)
+        action = model.predict_action(features)
+
+        loss = model.update_model(features, action, 9999.0)
+
+        self.assertEqual(loss, 0.0)
+        self.assertEqual(self.timeout_for(codec, model, 640.0), 640)
+
+    def test_reset_clears_the_floor_and_the_held_timeout(self) -> None:
+        codec, model = self.build_model()
+        self.timeout_for(codec, model, 640.0)
+
+        model.reset_model()
+
+        self.assertEqual(model.floor_ms, 0.0)
+        self.assertEqual(
+            model.timeout_ms,
+            sorted(get_timeout_values_ms(agent_pb2.PROTOCOL_PBFT))[1],
+        )
+
+    def test_rejects_a_missing_floor(self) -> None:
+        codec = ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT)
+
+        with self.assertRaises(ValueError):
+            LatencyFloorHeuristic(
+                action_codec=codec,
+                n_features=PBFT_FEATURE_DIM,
+                latency_floor=None,
+            )
+
+
 class ProtocolWiringTest(unittest.TestCase):
     def test_pbft_feature_indices(self) -> None:
         names = get_report_feature_field_names(agent_pb2.PROTOCOL_PBFT)
@@ -384,5 +577,468 @@ class ProtocolWiringTest(unittest.TestCase):
         self.assertEqual(list(arms), sorted(arms))
 
 
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContinuousLinUCBTest(unittest.TestCase):
+    """codex_v1's estimator over a continuous timeout, and the floor on top."""
+
+    def build_model(self, floor_k: float = 0.0, **kwargs) -> tuple:
+        codec = ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT)
+        names = get_report_feature_field_names(agent_pb2.PROTOCOL_PBFT)
+        latency_index, instances_index = latency_feature_indices(names)
+        latency_floor = None
+        if floor_k > 0.0:
+            latency_floor = NormalizedLatencyFloor(
+                action_codec=codec,
+                latency_index=latency_index,
+                n_features=len(names),
+                instances_index=instances_index,
+                latency_floor=LatencyFloor(multiplier=floor_k, quantile=0.0),
+            )
+        model = ContinuousLinUCB(
+            action_codec=codec,
+            n_features=len(names),
+            latency_floor=latency_floor,
+            seed=7,
+            **kwargs,
+        )
+        return codec, model
+
+    def timeout_for(self, codec, model, latency_ms: float, **kwargs) -> int:
+        action = model.predict_action(pbft_features(latency_ms, **kwargs))
+        return codec.decode(action).pbft.election_timeout_milliseconds
+
+    def play(self, codec, model, latency_ms: float, reward_for) -> int:
+        """One decision and the reward it earns, as the agent applies them."""
+        features = pbft_features(latency_ms)
+        action = model.predict_action(features)
+        timeout_ms = codec.decode(action).pbft.election_timeout_milliseconds
+        model.update_model(features, action, float(reward_for(timeout_ms)))
+        return timeout_ms
+
+    def test_the_action_space_is_the_arm_range(self) -> None:
+        codec, model = self.build_model(exploration_floor=1.0)
+
+        timeouts = [
+            self.play(codec, model, 100.0, lambda _: 1.0) for _ in range(40)
+        ]
+
+        arms_ms = get_timeout_values_ms(agent_pb2.PROTOCOL_PBFT)
+        self.assertTrue(
+            all(min(arms_ms) <= value <= max(arms_ms) for value in timeouts),
+            timeouts,
+        )
+
+    def test_every_basis_centre_is_played_before_anything_is_fitted(
+        self,
+    ) -> None:
+        codec, model = self.build_model()
+
+        centers_ms = list(
+            _refined_ladder_ms(get_timeout_values_ms(agent_pb2.PROTOCOL_PBFT))
+        )
+        opening = [
+            self.play(codec, model, 100.0, lambda _: 1.0)
+            for _ in range(len(centers_ms))
+        ]
+
+        # codex_v1 scores an unpulled arm at +inf, so it opens by playing each
+        # arm once. Here the same rule sweeps the centres, which are the arms
+        # with the midpoint of each pair inserted.
+        self.assertEqual(opening, centers_ms)
+        self.assertTrue(
+            set(get_timeout_values_ms(agent_pb2.PROTOCOL_PBFT)).issubset(
+                set(centers_ms)
+            ),
+            centers_ms,
+        )
+
+    def test_a_reward_between_two_arms_is_reachable(self) -> None:
+        # What the continuous action space is for: with centres only on the
+        # ladder an average over them is maximised at an arm, and a reward
+        # that only pays between two arms could never be collected.
+        codec, model = self.build_model(exploration_floor=0.0)
+
+        for _ in range(40):
+            timeout_ms = self.play(
+                codec,
+                model,
+                100.0,
+                lambda value: 1.0 if 700 <= value <= 900 else 0.0,
+            )
+
+        self.assertTrue(700 <= timeout_ms <= 900, timeout_ms)
+
+    def test_floor_trims_the_bottom_of_the_range(self) -> None:
+        codec, model = self.build_model(floor_k=1.0, exploration_floor=1.0)
+
+        # 5+175 in config/pbft/failure_spec.xml: a ~705ms healthy tail puts
+        # both 250 and 550 out of reach, as feasible_timeout_mask would.
+        timeouts = [
+            self.play(codec, model, 705.0, lambda _: 1.0) for _ in range(30)
+        ]
+
+        self.assertEqual(model.floor_ms, 705.0)
+        self.assertTrue(all(value >= 705 for value in timeouts), timeouts)
+
+    def test_no_floor_leaves_the_shortest_arm_reachable(self) -> None:
+        codec, model = self.build_model(exploration_floor=1.0)
+
+        timeouts = [
+            self.play(codec, model, 705.0, lambda _: 1.0) for _ in range(30)
+        ]
+
+        self.assertEqual(model.floor_ms, 0.0)
+        self.assertTrue(any(value < 705 for value in timeouts), timeouts)
+
+    def test_floor_above_the_range_keeps_the_longest_arm(self) -> None:
+        codec, model = self.build_model(floor_k=1.0, exploration_floor=1.0)
+
+        timeouts = [
+            self.play(codec, model, 50_000.0, lambda _: 1.0) for _ in range(10)
+        ]
+
+        self.assertEqual(set(timeouts), {1200})
+
+    def test_reward_moves_the_choice_toward_what_paid(self) -> None:
+        codec, model = self.build_model(exploration_floor=0.0)
+
+        def middle_pays(timeout_ms: int) -> float:
+            return 1.0 if 450 <= timeout_ms <= 700 else 0.0
+
+        for _ in range(20):
+            timeout_ms = self.play(codec, model, 100.0, middle_pays)
+
+        self.assertGreater(model.observation_count, 0)
+        self.assertTrue(400 <= timeout_ms <= 800, timeout_ms)
+
+    def test_a_long_reward_is_not_pulled_short_by_the_basis(self) -> None:
+        # Unnormalized bumps peak inside the range when the reward is earned
+        # at its end; the partition-of-unity basis has to reach 1200.
+        codec, model = self.build_model(exploration_floor=0.0)
+
+        for _ in range(20):
+            timeout_ms = self.play(
+                codec, model, 100.0, lambda value: 1.0 if value >= 1000 else 0.0
+            )
+
+        self.assertGreaterEqual(timeout_ms, 1000)
+
+    def test_neighbouring_timeouts_share_evidence(self) -> None:
+        # The property the ladder does not have: a reward earned at one
+        # timeout has to move the estimate at the timeout next to it.
+        codec, model = self.build_model(exploration_floor=0.0)
+        features = pbft_features(100.0)
+        row = model._context(features)
+        near = model._position_of(600)
+        far = model._position_of(1200)
+        before = model._scores(row, np.asarray([near, far]))
+
+        model.update_model(features, np.asarray([codec.normalize_ms(550)]), 4.0)
+
+        after = model._scores(row, np.asarray([near, far]))
+        self.assertGreater(after[0] - before[0], after[1] - before[1])
+
+    def test_reward_follows_the_timeout_that_was_applied(self) -> None:
+        # The replicas can run with a timeout this agent did not ask for; the
+        # update lands on that timeout, not on the one this model chose.
+        # Greedy on the fitted mean: with the bonus on, the regions this loop
+        # never updates would rightly be explored instead.
+        codec, model = self.build_model(
+            exploration_floor=0.0, confidence_scale=0.0
+        )
+        features = pbft_features(100.0)
+        applied = np.asarray([codec.normalize_ms(1150)])
+
+        for _ in range(20):
+            model.predict_action(features)
+            model.update_model(features, applied, 1.0)
+
+        self.assertGreaterEqual(self.timeout_for(codec, model, 100.0), 1000)
+
+    def test_an_unlearned_region_keeps_its_confidence_bonus(self) -> None:
+        # The discount is what lets an avoided region come back: with the
+        # bonus switched off the model would sit on its first good reading.
+        codec, model = self.build_model(exploration_floor=0.0)
+        features = pbft_features(100.0)
+
+        for _ in range(30):
+            model.predict_action(features)
+            model.update_model(
+                features, np.asarray([codec.normalize_ms(250)]), 1.0
+            )
+
+        row = model._context(features)
+        scores = model._scores(row, np.asarray([0.0, 1.0]))
+        self.assertGreater(scores[1], 0.0)
+
+    def _moving_optimum_regret(self, **kwargs) -> tuple:
+        """Seven phases whose paying timeout moves under the agent.
+
+        The reward is a bump around the phase's best timeout, on the 2..10
+        scale reward_tps produces at this cluster's throughput - the scale is
+        the point, because it is what the ridge prior is or is not centred on.
+        """
+        import math
+
+        codec, model = self.build_model(**kwargs)
+        best_by_phase = (250, 250, 250, 550, 550, 1200, 250)
+
+        def pays(phase: int, timeout_ms: int) -> float:
+            ratio = math.log(timeout_ms / best_by_phase[phase]) / 0.35
+            return 9.0 * math.exp(-0.5 * ratio * ratio) + 1.0
+
+        chosen, regret = [], 0.0
+        for phase, best in enumerate(best_by_phase):
+            for _ in range(15):
+                features = pbft_features(100.0 + 80 * phase)
+                action = model.predict_action(features)
+                timeout_ms = codec.decode(action).pbft.election_timeout_milliseconds
+                model.update_model(features, action, pays(phase, timeout_ms))
+                regret += pays(phase, best) - pays(phase, timeout_ms)
+                chosen.append((phase, timeout_ms))
+        finals = sorted(t for p, t in chosen if p == len(best_by_phase) - 1)
+        return regret, finals[len(finals) // 2]
+
+    def test_centring_the_reward_is_what_lets_it_follow_a_phase(self) -> None:
+        # Uncentred, an unplayed timeout's estimate decays toward the ridge
+        # prior of 0, which on this reward scale is worse than anything ever
+        # measured, so the confidence bonus can never bring it back.
+        centred, _ = self._moving_optimum_regret(center_rewards=True)
+        codex_like, _ = self._moving_optimum_regret(center_rewards=False)
+
+        self.assertLess(centred, codex_like)
+
+    def test_it_comes_back_down_when_the_phase_does(self) -> None:
+        _, final_median = self._moving_optimum_regret()
+
+        # The last phase pays at the shortest timeout again, after a phase
+        # that paid at the longest: staying long is the failure this catches.
+        self.assertLess(final_median, 550)
+
+    def test_reset_replays_the_same_decisions(self) -> None:
+        codec, model = self.build_model(floor_k=1.0)
+
+        first = [self.play(codec, model, 405.0, lambda _: 1.0) for _ in range(8)]
+        model.reset_model()
+        second = [self.play(codec, model, 405.0, lambda _: 1.0) for _ in range(8)]
+
+        self.assertEqual(first, second)
+
+    def test_rejects_centres_outside_the_action_range(self) -> None:
+        codec = ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT)
+        with self.assertRaises(ValueError):
+            ContinuousLinUCB(
+                action_codec=codec,
+                n_features=get_report_feature_dim(agent_pb2.PROTOCOL_PBFT),
+                basis_centers_ms=(250, 9000),
+            )
+
+
+class PretrainingAblationTest(unittest.TestCase):
+    """The three --prior-path settings the Full RL blocks run."""
+
+    def test_empty_selects_the_protocols_shipped_return_prior(self) -> None:
+        for protocol in (
+            agent_pb2.PROTOCOL_PBFT,
+            agent_pb2.PROTOCOL_SMARTBFT,
+            agent_pb2.PROTOCOL_TENDERMINT,
+            agent_pb2.PROTOCOL_SBFT,
+        ):
+            with self.subTest(protocol=protocol):
+                self.assertEqual(
+                    resolve_prior_path(protocol, ""),
+                    return_prior_path(protocol),
+                )
+
+    def test_none_is_untrained(self) -> None:
+        self.assertIsNone(resolve_prior_path(agent_pb2.PROTOCOL_PBFT, "none"))
+
+    def test_a_path_is_taken_as_the_ablation_prior(self) -> None:
+        self.assertEqual(
+            resolve_prior_path(agent_pb2.PROTOCOL_PBFT, "a/blind_prior.npz"),
+            "a/blind_prior.npz",
+        )
+
+    def test_untrained_model_opens_mid_range_and_learns_online(self) -> None:
+        protocol = agent_pb2.PROTOCOL_PBFT
+        spec = context_spec(protocol)
+        codec = ContinuousTimeoutActionCodec(
+            protocol, bounds_ms=spec.bounds_ms, wait_bounds_ms=spec.wait_bounds_ms
+        )
+        model = SimReturnGPModel(
+            action_codec=codec,
+            field_names=get_report_feature_field_names(protocol),
+            prior_path=None,
+            reward_design="reward_tps_latency",
+        )
+        features = np.zeros(get_report_feature_dim(protocol))
+        features[0], features[1], features[2], features[5] = 200000, 100, 80.0, 40000
+        opening = codec.denormalize_ms(float(np.atleast_1d(model.predict_action(features))[0]))
+        lower_ms, upper_ms = spec.bounds_ms
+        # Nothing in a zero prior prefers an end of the range, so it must not
+        # open at one: argmax over a flat grid would otherwise pick index 0.
+        self.assertGreater(opening, lower_ms)
+        self.assertLess(opening, upper_ms)
+        # And the GP still takes an online update, fitting the reward itself.
+        action = model.predict_action(features)
+        model.update_model(features, action, 5.0)
+        self.assertIsNotNone(model.predict_action(features))
+
+    def test_untrained_sbft_opens_inside_both_dimensions(self) -> None:
+        protocol = agent_pb2.PROTOCOL_SBFT
+        spec = context_spec(protocol)
+        codec = ContinuousTimeoutActionCodec(
+            protocol, bounds_ms=spec.bounds_ms, wait_bounds_ms=spec.wait_bounds_ms
+        )
+        model = SimReturnGPModel(
+            action_codec=codec,
+            field_names=get_report_feature_field_names(protocol),
+            prior_path=None,
+            reward_design="reward_tps_latency",
+        )
+        features = np.zeros(get_report_feature_dim(protocol))
+        features[0], features[1], features[2], features[5] = 200000, 100, 80.0, 40000
+        action = np.atleast_1d(model.predict_action(features))
+        self.assertEqual(action.size, 2)
+        for dimension, (lower_ms, upper_ms) in enumerate(
+            (spec.bounds_ms, spec.wait_bounds_ms)
+        ):
+            value = codec.denormalize_ms(float(action[dimension]), dimension)
+            with self.subTest(dimension=dimension):
+                self.assertGreater(value, lower_ms)
+                self.assertLess(value, upper_ms)
+
+
+class DerivedWaitActionCodecTest(unittest.TestCase):
+    """SBFT's fast-path wait derived from the election timeout, W = T / k."""
+
+    def _inner(self) -> ContinuousTimeoutActionCodec:
+        spec = context_spec(agent_pb2.PROTOCOL_SBFT)
+        return ContinuousTimeoutActionCodec(
+            agent_pb2.PROTOCOL_SBFT,
+            bounds_ms=spec.bounds_ms,
+            wait_bounds_ms=spec.wait_bounds_ms,
+        )
+
+    def test_presents_one_dimension(self) -> None:
+        codec = DerivedWaitActionCodec(self._inner())
+        self.assertEqual(codec.action_dim, 1)
+        self.assertEqual(codec.bounds_ms, (self._inner().bounds_ms[0],))
+        self.assertEqual(codec.protocol, agent_pb2.PROTOCOL_SBFT)
+
+    def test_wait_is_the_timeout_over_the_divisor(self) -> None:
+        codec = DerivedWaitActionCodec(self._inner(), divisor=8.0)
+        for timeout_ms, wait_ms in ((250, 31), (525, 66), (1100, 138), (2000, 250)):
+            with self.subTest(timeout_ms=timeout_ms):
+                self.assertEqual(codec.wait_for_timeout_ms(timeout_ms), wait_ms)
+
+    def test_wait_is_clamped_to_the_codecs_wait_bounds(self) -> None:
+        wait_lower_ms, wait_upper_ms = self._inner().bounds_ms[1]
+        # A divisor large enough to push the wait under the floor, and one
+        # small enough to push it over the ceiling.
+        self.assertEqual(
+            DerivedWaitActionCodec(self._inner(), divisor=1000.0).wait_for_timeout_ms(100),
+            wait_lower_ms,
+        )
+        self.assertEqual(
+            DerivedWaitActionCodec(self._inner(), divisor=1.0).wait_for_timeout_ms(3000),
+            wait_upper_ms,
+        )
+
+    def test_decode_pairs_the_derived_wait_with_the_chosen_timeout(self) -> None:
+        codec = DerivedWaitActionCodec(self._inner(), divisor=8.0)
+        for timeout_ms in (250, 525, 1100):
+            with self.subTest(timeout_ms=timeout_ms):
+                timeout = codec.decode(np.array([codec.normalize_ms(timeout_ms)]))
+                self.assertEqual(
+                    timeout.sbft.election_timeout_milliseconds, timeout_ms
+                )
+                self.assertEqual(
+                    timeout.sbft.slow_path_timeout_milliseconds,
+                    codec.wait_for_timeout_ms(timeout_ms),
+                )
+
+    def test_the_wait_moves_with_the_timeout(self) -> None:
+        codec = DerivedWaitActionCodec(self._inner(), divisor=8.0)
+        waits = [
+            codec.decode(
+                np.array([codec.normalize_ms(timeout_ms)])
+            ).sbft.slow_path_timeout_milliseconds
+            for timeout_ms in (250, 525, 1100)
+        ]
+        self.assertEqual(waits, sorted(waits))
+        self.assertLess(waits[0], waits[-1])
+
+    def test_rejects_a_one_dimensional_codec_and_a_bad_divisor(self) -> None:
+        with self.assertRaisesRegex(ValueError, "two dimensions"):
+            DerivedWaitActionCodec(
+                ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT)
+            )
+        with self.assertRaisesRegex(ValueError, "divisor must be > 0"):
+            DerivedWaitActionCodec(self._inner(), divisor=0.0)
+
+    def test_the_one_timeout_models_run_on_sbft_through_it(self) -> None:
+        protocol = agent_pb2.PROTOCOL_SBFT
+        names = get_report_feature_field_names(protocol)
+        n_features = get_report_feature_dim(protocol)
+        latency_index, instances_index = latency_feature_indices(names)
+        arms_ms = get_timeout_values_ms(protocol)
+        features = np.zeros(n_features)
+        features[0], features[1], features[2], features[5] = 75000, 100, 90.0, 15000
+
+        def codec() -> DerivedWaitActionCodec:
+            return DerivedWaitActionCodec(self._inner())
+
+        builders = {
+            "continuous_heuristic": lambda: ContinuousHeuristicTimeoutModel(
+                action_codec=codec(),
+                n_features=n_features,
+                latency_index=names.index("avg_consensus_latency_ms"),
+                transactions_index=names.index("total_transactions"),
+                multiplier=2.0,
+                clamp_ms=(min(arms_ms), max(arms_ms)),
+                initial_timeout_ms=sorted(arms_ms)[len(arms_ms) // 2],
+            ),
+            "latency_floor_heuristic": lambda: LatencyFloorHeuristic(
+                action_codec=codec(),
+                n_features=n_features,
+                clamp_ms=(min(arms_ms), max(arms_ms)),
+                latency_floor=NormalizedLatencyFloor(
+                    action_codec=codec(),
+                    latency_index=latency_index,
+                    n_features=n_features,
+                    instances_index=instances_index,
+                    latency_floor=LatencyFloor(),
+                ),
+            ),
+            "continuous_codex": lambda: ContinuousLinUCB(
+                action_codec=codec(), n_features=n_features, seed=42, latency_floor=None
+            ),
+            "continuous_ppo": lambda: ContinuousPPO(
+                action_codec=codec(), n_features=n_features, seed=42, latency_floor=None
+            ),
+        }
+        wait_lower_ms, wait_upper_ms = self._inner().bounds_ms[1]
+        for name, build in builders.items():
+            with self.subTest(model=name):
+                action = np.atleast_1d(
+                    np.asarray(build().predict_action(features), dtype=float)
+                ).ravel()[:1]
+                timeout = codec().decode(action).sbft
+                self.assertEqual(
+                    timeout.slow_path_timeout_milliseconds,
+                    codec().wait_for_timeout_ms(
+                        timeout.election_timeout_milliseconds
+                    ),
+                )
+                self.assertGreaterEqual(
+                    timeout.slow_path_timeout_milliseconds, wait_lower_ms
+                )
+                self.assertLessEqual(
+                    timeout.slow_path_timeout_milliseconds, wait_upper_ms
+                )

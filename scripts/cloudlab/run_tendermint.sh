@@ -21,6 +21,8 @@ REWARD_DESIGN="reward_tps"
 # Domain constraint on the action space: never apply a timeout below k times
 # the consensus latency the replicas are already achieving. 0 disables it.
 LATENCY_FLOOR_K=0
+# --model-type=continuous prior: "" the shipped one, "none" untrained, else a path.
+PRIOR_PATH=""
 SCHEDULE_FILE="learning_agent/config/schedule_tendermint.csv"
 LOAD_CONNECTIONS=5
 LOAD_RATE=20
@@ -75,7 +77,7 @@ trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -89,7 +91,7 @@ Flags:
   --log             Fetch remote Tendermint, ABCI, and client logs into the run artifact directory.
   --output-dir <path>
                     Store artifacts here instead of creating a timestamped run directory.
-  --model           Learning-agent model for learning/sharing modes: random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic (default: random).
+  --model           Learning-agent model for learning/sharing modes: random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo (default: random).
                     claude and codex select claude_v2 and codex_v1.
   --reward-design   Reward the agent learns from: reward_tps|reward_mixed|reward_tps_latency (default: reward_tps).
                     reward_tps is throughput alone, concave past a 1000 tps knee. reward_mixed
@@ -98,6 +100,11 @@ Flags:
                     Never apply a timeout below k * the consensus latency the replicas are
                     already achieving, estimated as a low quantile over recent committing
                     windows. 0 disables it (default: 0).
+  --prior-path <path|none>           Which pretrained prior --model continuous loads.
+                                     Empty (default) is the protocol's shipped
+                                     return prior; a path is an ablation prior
+                                     (<protocol>_sim.py train --no-proposal-faults);
+                                     "none" runs it untrained, with a zero prior.
   --schedule-file <repo-rel-path>
                     scheduled-mode oracle CSV, relative to the repo root
                     (default: learning_agent/config/schedule_tendermint.csv). It must be inside
@@ -122,7 +129,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_heuristic)
+    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo)
       printf '%s\n' "${model_lower}"
       ;;
     # Short names for the two newest bandits. main.py knows them by their
@@ -280,6 +287,14 @@ while [[ $# -gt 0 ]]; do
       LATENCY_FLOOR_K="${2}"
       shift 2
       ;;
+    --prior-path)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --prior-path." >&2
+        exit 2
+      fi
+      PRIOR_PATH="${2}"
+      shift 2
+      ;;
     --schedule-file)
       if [[ $# -lt 2 || -z "${2}" ]]; then
         echo "Missing value for --schedule-file." >&2
@@ -346,7 +361,7 @@ if ! [[ "${LATENCY_FLOOR_K}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   exit 2
 fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -505,6 +520,7 @@ fi
   printf 'agent_model=%q\n' "${AGENT_MODEL_TYPE}"
   printf 'reward_design=%q\n' "${REWARD_DESIGN}"
   printf 'latency_floor_k=%q\n' "${LATENCY_FLOOR_K}"
+  printf 'prior_path=%q\n' "${PRIOR_PATH:-}"
   printf 'schedule_file=%q\n' "${SCHEDULE_FILE}"
   printf 'dataset_enabled=%q\n' "${DATASET_ENABLED}"
   printf 'log_enabled=%q\n' "${LOG_ENABLED}"
@@ -623,6 +639,7 @@ gateway_ips_csv="${21}"
 server_route_names_csv="${22}"
 server_route_hosts_csv="${23}"
 testnet_tar="$HOME/${24}"
+prior_path="${25:-}"
 
 num_nodes=$((fault_tolerance * 3 + 1))
 learning_agent_enabled=0
@@ -1168,6 +1185,11 @@ phase_start() {
     if [[ "${agent_mode_args}" != "" && "${latency_floor_k}" != "0" ]]; then
       agent_mode_args="${agent_mode_args} --latency-floor-k ${latency_floor_k}"
     fi
+    # Which pretrained prior the continuous model loads: "" the shipped return
+    # prior, "none" untrained, else a path to an ablation prior.
+    if [[ "${agent_model_type}" == "continuous" && -n "${prior_path}" ]]; then
+      agent_mode_args="${agent_mode_args} --prior-path ${prior_path}"
+    fi
     local agent_session ns agent_log dataset_args
     for ((i = first_local_replica; i <= last_local_replica; i++)); do
       agent_session="tm_tendermint_agent_${i}"
@@ -1384,7 +1406,7 @@ remote_phase() {
     "${AGENT_MODEL_TYPE}" "${REWARD_DESIGN}" "${LATENCY_FLOOR_K}" "${SCHEDULE_FILE}" \
     "${machine_idx}" "${is_client}" "${server_machine_count}" "${replicas_per_machine}" \
     "${START_UNIX_MS}" "${GATEWAY_IPS_CSV}" "${SERVER_ROUTE_NAMES_CSV}" "${SERVER_ROUTE_HOSTS_CSV}" \
-    "${REMOTE_TESTNET}" <<< "${REMOTE_SCRIPT}"
+    "${REMOTE_TESTNET}" "${PRIOR_PATH}" <<< "${REMOTE_SCRIPT}"
 }
 
 # A machine's role arguments: its server machine index (or -1) and whether it runs the client.

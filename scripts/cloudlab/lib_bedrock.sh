@@ -67,6 +67,8 @@ AGENT_MODEL_TYPE="random"
 AGENT_MODEL_SET=0
 REWARD_DESIGN="reward_tps"
 LATENCY_FLOOR_K="0"
+# --model-type=continuous prior: "" the shipped one, "none" untrained, else a path.
+PRIOR_PATH=""
 
 TX_RATE="${TX_RATE:-40000}"
 REQUEST_TIMEOUT_MS=10000
@@ -183,10 +185,15 @@ Flags:
   --verbose                         Enable per-message debug logs on server replicas.
   --reward-design <reward_tps|reward_mixed|reward_tps_latency>
                                     Reward the agent learns from (default: reward_tps).
-  --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic>
+  --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo>
                                      Learning-agent model for learning mode (default: random).
   --latency-floor-k <float>          Never apply a timeout below k x the recent consensus latency
                                      (LatencyFloorPolicy; 0 disables it; default: 0).
+  --prior-path <path|none>           Which pretrained prior --model continuous loads.
+                                     Empty (default) is the protocol's shipped
+                                     return prior; a path is an ablation prior
+                                     (<protocol>_sim.py train --no-proposal-faults);
+                                     "none" runs it untrained, with a zero prior.
   -f <int>                          Fault tolerance f; nodes defaults to 3f+1 (default: 1).
   -t <int>                          Seconds to run after benchmark start (default: 300).
 
@@ -248,7 +255,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_heuristic) printf '%s\n' "${model_lower}" ;;
+    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo) printf '%s\n' "${model_lower}" ;;
     claude) printf '%s\n' "claude_v2" ;;
     codex) printf '%s\n' "codex_v1" ;;
     *) return 1 ;;
@@ -406,6 +413,7 @@ bedrock_main() {
       --model) AGENT_MODEL_TYPE="${2:-}"; AGENT_MODEL_SET=1; shift 2 ;;
       --reward-design) REWARD_DESIGN="${2:-}"; shift 2 ;;
       --latency-floor-k) LATENCY_FLOOR_K="${2:-}"; shift 2 ;;
+      --prior-path) PRIOR_PATH="${2:-}"; shift 2 ;;
       --nodes) NODES="${2:-}"; NODES_SET=1; shift 2 ;;
       --failure-spec) FAILURE_SPEC_PATH="${2:-}"; FAILURE_SPEC_ENABLED=1; shift 2 ;;
       --no-failure-spec) FAILURE_SPEC_ENABLED=0; shift ;;
@@ -518,7 +526,7 @@ bedrock_main() {
     exit 2
   fi
   if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-    echo "Invalid --model value. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_heuristic." >&2
+    echo "Invalid --model value. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo." >&2
     exit 2
   fi
   if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -657,6 +665,7 @@ bedrock_main() {
     printf 'agent_model=%q\n' "${AGENT_MODEL_TYPE}"
     printf 'reward_design=%q\n' "${REWARD_DESIGN}"
     printf 'latency_floor_k=%q\n' "${LATENCY_FLOOR_K}"
+    printf 'prior_path=%q\n' "${PRIOR_PATH:-}"
     printf 'learning_window_mode=%q\n' "${LEARNING_WINDOW_MODE}"
     printf 'learning_feature_duration_ms=%q\n' "${LEARNING_FEATURE_DURATION_MS}"
     printf 'learning_reply_wait_ms=%q\n' "${LEARNING_REPLY_WAIT_MS}"
@@ -1247,7 +1256,8 @@ REMOTE
           "${REWARD_DESIGN}" \
           "${LATENCY_FLOOR_K}" \
           "${LEARNING_FEATURE_DURATION_MS}" \
-          "${LEARNING_REWARD_DURATION_MS}" <<'REMOTE'
+          "${LEARNING_REWARD_DURATION_MS}" \
+          "${PRIOR_PATH}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
@@ -1268,6 +1278,7 @@ reward_design="${15}"
 latency_floor_k="${16}"
 feature_window_ms="${17}"
 reward_window_ms="${18}"
+prior_path="${19:-}"
 learning_agent_python="${HOME}/.venvs/adaptive-timer-learning-agent/bin/python"
 
 if [[ ! -x "${learning_agent_python}" ]]; then
@@ -1299,6 +1310,13 @@ fi
 # SBFT agents give a window in which no batch executed its own length as its
 # latency, so they need the windows the replicas measure (main.py refuses
 # these flags for other protocols).
+# Which pretrained prior the continuous model loads: "" the shipped return
+# prior, "none" untrained, else a path to an ablation prior. main.py ignores it
+# for every other model type, so only pass it where it means something.
+if [[ "${model_type}" == "continuous" && -n "${prior_path}" ]]; then
+  agent_model_args="${agent_model_args} --prior-path ${prior_path}"
+fi
+
 if [[ "${agent_protocol}" == "sbft" ]]; then
   agent_model_args="${agent_model_args} --feature-window-ms ${feature_window_ms} --reward-window-ms ${reward_window_ms}"
 fi

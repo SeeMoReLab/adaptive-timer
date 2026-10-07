@@ -46,16 +46,13 @@ from latency_floor import (
 )
 from models import (
     ActionCodec,
-    CMAB,
+    BlockedTreeBandit,
     DiscountedLinUCB,
     DiscretePPO,
     FeatureExtractor,
     LinearModel,
     PavlovTimeoutModel,
-    StarvationFreeThompsonSamplingModel,
-    SurvivalGatedThompsonSamplingModel,
     ThompsonSamplingModel,
-    ThompsonSamplingModelV2,
     ProtocolReportFeatureExtractor,
     ProtocolTimeoutActionCodec,
     RandomTimeoutModel,
@@ -67,6 +64,7 @@ from models import (
     get_report_feature_field_names,
     get_arm_timeout_values_ms,
     get_timeout_values_ms,
+    reject_renamed_model_type,
     report_to_feature_values,
 )
 from reward_utils import (
@@ -2022,12 +2020,12 @@ def serve(
             clamp_ms=(min(arms_ms), max(arms_ms)),
             initial_timeout_ms=sorted(arms_ms)[len(arms_ms) // 2],
         )
-    elif model_type == "continuous":
+    elif model_type == "continuous_pretrained_gp":
         # Fully learned: the floor is a guard on the action, so it is refused
         # rather than silently dropped.
         if latency_floor is not None:
             raise ValueError(
-                "--model-type=continuous is fully learned and takes no "
+                "--model-type=continuous_pretrained_gp is fully learned and takes no "
                 "--latency-floor-k; pass 0"
             )
         # Refuses a protocol without a context spec or without its return
@@ -2045,7 +2043,7 @@ def serve(
             reward_design=get_reward_design(),
         )
         print(
-            "[continuous] prior: "
+            "[continuous_pretrained_gp] prior: "
             + ("untrained (zero prior)" if selected_prior is None else selected_prior)
         )
         # A decision is small dense linear algebra (on SBFT the GP over 1,024 grid
@@ -2054,7 +2052,7 @@ def serve(
         # decision took 114 ms there and 17 ms on one thread (Tendermint 37 and 6).
         # The limit holds for the rest of the process.
         threadpool_limits(limits=1, user_api="blas")
-    elif model_type == "random":
+    elif model_type == "discrete_random":
         # Seeded like the other models so that, in sharing mode, every node
         # draws the same action from the same agreed features. Reward
         # aggregation is only meaningful when the fleet explores in lockstep.
@@ -2062,69 +2060,38 @@ def serve(
             action_dim=get_action_space_size(protocol),
             seed=42,
         )
-    elif model_type == "linear":
+    elif model_type == "discrete_linear":
         model = LinearModel(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
             lr=0.05,
         )
-    elif model_type == "pavlov":
+    elif model_type == "discrete_pavlov":
         # Win-stay/lose-shift baseline: no context and no learning, so it takes
         # neither n_features nor a seed. protocol only fixes the arm ordering.
         model = PavlovTimeoutModel(
             action_dim=get_action_space_size(protocol),
             protocol=protocol,
         )
-    elif model_type in ("cmab", "thompson"):
+    elif model_type == "discrete_tree_ts":
         model = ThompsonSamplingModel(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
             seed=42,
         )
-    elif model_type == "cmab_v2":
-        # Earlier CMAB iteration, previously simulator-only. Kept reachable
-        # from the agent so a phase-change response can be compared against
-        # the current cmab on hardware rather than only on resampled data.
-        model = ThompsonSamplingModelV2(
+    elif model_type == "discrete_tree_blocks":
+        model = BlockedTreeBandit(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
             seed=42,
         )
-    elif model_type == "cmab_reset":
-        model = CMAB(
-            action_dim=get_action_space_size(protocol),
-            n_features=get_report_feature_dim(protocol),
-            seed=42,
-        )
-    elif model_type == "cmab_v4":
-        model = SurvivalGatedThompsonSamplingModel(
-            action_dim=get_action_space_size(protocol),
-            n_features=get_report_feature_dim(protocol),
-            seed=42,
-        )
-        print("[cmab_v4] survival-gated: liveness gate + reward ranking")
-    elif model_type == "claude_v2":
-        # bucket_size 32 rather than the class default of 8. The exploit branch
-        # is only contextual if its trees can split, and the inherited
-        # min_samples_leaf=6 needs two leaves of 6, so a window of 8 can never
-        # split: fitting the run's own rows gives a single leaf on 40 of 40
-        # draws at 8, versus 2.0 leaves at 16 and 3.5 at 32. At 8 the model
-        # falls back to a bootstrap mean of the window, which is the flat,
-        # context-free estimate it was written to replace.
-        model = StarvationFreeThompsonSamplingModel(
-            action_dim=get_action_space_size(protocol),
-            n_features=get_report_feature_dim(protocol),
-            bucket_size=32,
-            seed=42,
-        )
-        print("[claude_v2] bucket_size=32 (class default 8)")
-    elif model_type == "codex_v1":
+    elif model_type == "discrete_linucb":
         model = DiscountedLinUCB(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
             seed=42,
         )
-    elif model_type == "latency_floor_heuristic":
+    elif model_type == "continuous_latency_floor":
         action_codec = one_dimensional_codec()
         # The floor is this model's rule rather than a constraint on top of
         # one, so it is built here whether or not --latency-floor-k asked for
@@ -2150,23 +2117,23 @@ def serve(
             ),
         )
         print(
-            "[latency_floor_heuristic] playing the floor itself, clamped to "
+            "[continuous_latency_floor] playing the floor itself, clamped to "
             f"{min(arms_ms)}..{max(arms_ms)}ms "
             f"(k={heuristic_floor.multiplier:g}, "
             f"quantile={latency_floor_quantile:g}); no learning"
         )
-    elif model_type == "ppo":
+    elif model_type == "discrete_ppo":
         model = DiscretePPO(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
             seed=42,
         )
         print(
-            "[ppo] softmax policy over "
+            "[discrete_ppo] softmax policy over "
             f"{tuple(sorted(get_timeout_values_ms(protocol)))}, "
             "linear actor + value baseline, on-policy from scratch"
         )
-    elif model_type == "continuous_codex":
+    elif model_type == "continuous_linucb":
         action_codec = one_dimensional_codec()
         arms_ms = get_timeout_values_ms(protocol)
         model = ContinuousLinUCB(
@@ -2186,7 +2153,7 @@ def serve(
             ),
         )
         print(
-            "[continuous_codex] discounted LinUCB over "
+            "[continuous_linucb] discounted LinUCB over "
             f"{min(arms_ms)}..{max(arms_ms)}ms, basis centred on the arms "
             f"{tuple(sorted(arms_ms))}"
         )
@@ -2233,9 +2200,9 @@ def serve(
     # is estimated from the consensus-agreed feature vector, which is the same
     # on all of them, so constraining the action space does not break the
     # lockstep the aggregated reward depends on.
-    floor_exempt = ("continuous_heuristic", "latency_floor_heuristic", "scheduled")
+    floor_exempt = ("continuous_heuristic", "continuous_latency_floor", "scheduled")
     if latency_floor is not None and model_type not in (
-        ("continuous", "continuous_codex", "continuous_ppo") + floor_exempt
+        ("continuous_pretrained_gp", "continuous_linucb", "continuous_ppo") + floor_exempt
     ):
         model = LatencyFloorPolicy(
             model=model,
@@ -2259,11 +2226,11 @@ def serve(
     if model_type == "scheduled":
         action_codec = ScheduledTimeoutActionCodec(protocol)
     elif model_type not in (
-        "continuous",
-        "continuous_codex",
+        "continuous_pretrained_gp",
+        "continuous_linucb",
         "continuous_heuristic",
         "continuous_ppo",
-        "latency_floor_heuristic",
+        "continuous_latency_floor",
     ):
         action_codec = ProtocolTimeoutActionCodec(protocol)
     if aggregate_function == "median":
@@ -2400,68 +2367,53 @@ def main():
     )
     parser.add_argument(
         "--model-type",
-        type=str,
+        type=reject_renamed_model_type,
         choices=(
-            "random",
-            "pavlov",
-            "linear",
-            "cmab",
-            "cmab_reset",
-            "cmab_v2",
-            "cmab_v4",
-            "claude_v2",
-            "codex_v1",
-            "continuous",
-            "continuous_codex",
+            "discrete_random",
+            "discrete_pavlov",
+            "discrete_linear",
+            "discrete_tree_ts",
+            "discrete_tree_blocks",
+            "discrete_linucb",
+            "continuous_pretrained_gp",
+            "continuous_linucb",
             "continuous_heuristic",
             "continuous_ppo",
-            "latency_floor_heuristic",
-            "ppo",
+            "continuous_latency_floor",
+            "discrete_ppo",
             "scheduled",
-            "thompson",
         ),
-        default="random",
+        default="discrete_random",
         help=(
-            "random: random timeout selection; "
-            "pavlov: win-stay/lose-shift heuristic vs the last reward (no "
-            "learning); linear: learned linear model; "
-            "cmab: bootstrapped ensemble contextual multi-armed bandit; "
-            "cmab_reset: blocked CMAB with replay-triggered resets "
-            "(requires xgboost); "
-            "claude_v2: cmab with the staleness bonus and contextual exploit "
-            "that stop an arm being starved after a bad phase, with a 32-deep "
-            "per-arm window so those trees can actually split; "
-            "codex_v1: discounted LinUCB, one ridge model per arm; "
-            "cmab_v2: the earlier CMAB iteration, one bootstrapped tree "
-            "ensemble over (context, arm) with per-head fitting; "
-            "cmab_v4: survival-gated - factorises reward into "
-            "P(alive | context, arm) times performance, gates on the first and "
-            "ranks on the second, so a timeout that stalls is ruled out from a "
-            "handful of samples instead of averaged into a conditional mean; "
-            "continuous: the election timeout (PBFT 100-3000 ms, SmartBFT "
-            "100-4000 ms), SBFT's election timeout (100-3000 ms) and fast-path "
-            "wait (10-500 ms), or Tendermint propose timeout (100-3000 ms) from a "
-            "simulator-pretrained reward prior plus an online Gaussian-process "
-            "residual, lower-confidence-bound choice (no floor); needs "
-            "pretrained_models/continuous_<protocol>_prior.npz, trained by "
-            "that protocol's *_sim.py on the agent's --reward-design; "
-            "continuous_codex: codex_v1 over a continuous timeout - the same "
-            "discounted LinUCB scored on a 65-point grid across the arm "
+            "discrete_random: random timeout selection; "
+            "discrete_pavlov: win-stay/lose-shift heuristic vs the last reward "
+            "(no learning); discrete_linear: learned linear model; "
+            "discrete_tree_ts: Thompson sampling over per-arm bootstrapped tree "
+            "ensembles; "
+            "discrete_tree_blocks: epsilon-greedy blocks over one regression "
+            "tree on (context, arm), with replay-triggered resets; "
+            "discrete_linucb: discounted LinUCB, one ridge model per arm; "
+            "discrete_ppo: clipped-objective PPO with a softmax policy over the "
+            "discrete arms, linear actor plus value baseline, on-policy from "
+            "scratch; "
+            "continuous_pretrained_gp: the election timeout (PBFT 100-3000 ms, "
+            "SmartBFT 100-4000 ms), SBFT's election timeout (100-3000 ms) and "
+            "fast-path wait (10-500 ms), or Tendermint propose timeout "
+            "(100-3000 ms) from a simulator-pretrained reward prior plus an "
+            "online Gaussian-process residual, lower-confidence-bound choice "
+            "(no floor); needs pretrained_models/continuous_<protocol>_prior.npz, "
+            "trained by that protocol's *_sim.py on the agent's --reward-design; "
+            "continuous_linucb: discrete_linucb over a continuous timeout - the "
+            "same discounted LinUCB scored on a 65-point grid across the arm "
             "range rather than on the arms alone; "
             "continuous_heuristic: k * avg_consensus_latency_ms, clamped to "
             "the arm range; no learning; "
-            "latency_floor_heuristic: plays the latency floor itself - a low "
+            "continuous_latency_floor: plays the latency floor itself - a "
             "quantile over recent committing windows, times k - as the "
             "timeout, clamped to the arm range; no learning; "
-            "ppo: clipped-objective PPO with a softmax policy over the "
-            "discrete arms, linear actor plus value baseline, on-policy from "
-            "scratch; "
-            "continuous_ppo: the same PPO with a Beta policy over the "
+            "continuous_ppo: discrete_ppo with a Beta policy over the "
             "continuous timeout range instead of the arm set; "
-            "thompson: deprecated alias for cmab; "
-            "scheduled: timeout from a time-based schedule CSV. "
-            "The remaining CMAB iterations (v1, v3) are simulator-only; see "
-            "simulator.py --model."
+            "scheduled: timeout from a time-based schedule CSV."
         ),
     )
 
@@ -2528,13 +2480,13 @@ def main():
         default=DEFAULT_WAIT_DIVISOR,
         help=(
             "SBFT only: the models that control one timeout - "
-            "continuous_heuristic, latency_floor_heuristic, continuous_codex "
+            "continuous_heuristic, continuous_latency_floor, continuous_linucb "
             "and continuous_ppo - pair their election timeout T with a "
             "fast-path wait W = clamp(T / this, 10..500 ms). Both quantities "
             "carry the same one-way-delay term, so a T that has tracked the "
             "delay drags W with it. Measured on sbft_sim: holding the phase's "
             "best T, 8 costs a mean 0.038 reward against the best W at that T "
-            "(12 costs 0.084, 5 costs 0.289). --model-type=continuous searches "
+            "(12 costs 0.084, 5 costs 0.289). --model-type=continuous_pretrained_gp searches "
             f"both dimensions and ignores this (default: {DEFAULT_WAIT_DIVISOR:g})."
         ),
     )
@@ -2543,7 +2495,7 @@ def main():
         type=str,
         default="",
         help=(
-            "Which pretrained prior --model-type=continuous loads. Empty (the "
+            "Which pretrained prior --model-type=continuous_pretrained_gp loads. Empty (the "
             "default) is the protocol's shipped return prior, "
             "pretrained_models/continuous_<protocol>_return_prior.npz. A path "
             "selects another .npz - a prior trained with an ablation, e.g. "
@@ -2640,8 +2592,6 @@ def main():
         ),
     )
     args = parser.parse_args()
-    if args.model_type == "thompson":
-        args.model_type = "cmab"
     windows = (args.feature_window_ms, args.reward_window_ms)
     if args.protocol in EMPTY_WINDOW_PROTOCOLS:
         if None in windows or min(windows) <= 0:

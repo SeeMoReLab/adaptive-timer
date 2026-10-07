@@ -122,7 +122,7 @@ REWARD_S = 5.0
 EPISODE_S = FEATURE_S + REPLY_S + WARMUP_S + REWARD_S
 WARMUP_PHASE_S = 10.0  # failure_spec warmUpTime: decisions before it are phase -1
 
-# Action bounds of --model-type=continuous on SBFT (design_model.md), per dimension.
+# Action bounds of --model-type=continuous_pretrained_gp on SBFT (design_model.md), per dimension.
 T_BOUNDS_MS: Tuple[int, int] = (100, 3000)
 W_BOUNDS_MS: Tuple[int, int] = (10, 500)
 
@@ -1947,7 +1947,7 @@ ORACLE_ROWS = [(250, 50), (525, 150), (525, 50), (1100, 150), (1100, 50)]
 
 def make_candidate(prior_path: str):
     """(predict, update) around continuous_bandit.SimReturnGPModel on SBFT, built as
-    main.serve builds --model-type continuous (codec with wait_bounds_ms)."""
+    main.serve builds --model-type continuous_pretrained_gp (codec with wait_bounds_ms)."""
     import agent_pb2
     from continuous_bandit import ContinuousTimeoutActionCodec, SimReturnGPModel
     from models import SBFT_REPORT_FEATURE_FIELD_NAMES as names

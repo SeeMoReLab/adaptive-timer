@@ -13,7 +13,6 @@ from continuous_bandit import (
     resolve_prior_path,
     return_prior_path,
     _refined_ladder_ms,
-    ContinuousThompsonSamplingModel,
     ContinuousTimeoutActionCodec,
     LatencyFloorHeuristic,
     NormalizedLatencyFloor,
@@ -360,80 +359,6 @@ class NormalizedLatencyFloorTest(unittest.TestCase):
         self.assertEqual(floor.lower_bound(), 1.0)
 
 
-class ContinuousModelFloorTest(unittest.TestCase):
-    def build_model(self, multiplier: float = 1.0):
-        codec = ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT)
-        names = get_report_feature_field_names(agent_pb2.PROTOCOL_PBFT)
-        latency_index, instances_index = latency_feature_indices(names)
-        model = ContinuousThompsonSamplingModel(
-            action_dim=codec.action_dim,
-            n_features=len(names),
-            anchor_actions=codec.anchor_actions(),
-            initial_design_size=4,
-            memory_size=64,
-            n_heads=4,
-            candidate_count=64,
-            seed=7,
-            latency_floor=NormalizedLatencyFloor(
-                action_codec=codec,
-                latency_index=latency_index,
-                n_features=len(names),
-                instances_index=instances_index,
-                latency_floor=LatencyFloor(multiplier=multiplier, quantile=0.0),
-            ),
-        )
-        return codec, model
-
-    def timeouts_for(self, codec, model, latency_ms: float, draws: int):
-        features = pbft_features(latency_ms)
-        timeouts = []
-        for _ in range(draws):
-            action = model.predict_action(features)
-            timeouts.append(
-                codec.decode(action).pbft.election_timeout_milliseconds
-            )
-            model.update_model(features, action, 1.0)
-        return timeouts
-
-    def test_initial_design_stays_above_the_floor(self) -> None:
-        codec, model = self.build_model()
-
-        timeouts = self.timeouts_for(codec, model, 900.0, draws=4)
-
-        self.assertTrue(all(value >= 900 for value in timeouts), timeouts)
-
-    def test_fitted_search_stays_above_the_floor(self) -> None:
-        codec, model = self.build_model()
-
-        timeouts = self.timeouts_for(codec, model, 900.0, draws=20)
-
-        self.assertTrue(all(value >= 900 for value in timeouts), timeouts)
-
-    def test_design_is_not_piled_onto_the_bound(self) -> None:
-        codec, model = self.build_model()
-
-        timeouts = self.timeouts_for(codec, model, 900.0, draws=4)
-
-        self.assertGreater(len(set(timeouts)), 1, timeouts)
-
-    def test_no_floor_reaches_the_short_end_of_the_range(self) -> None:
-        codec = ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT)
-        model = ContinuousThompsonSamplingModel(
-            action_dim=codec.action_dim,
-            n_features=PBFT_FEATURE_DIM,
-            anchor_actions=codec.anchor_actions(),
-            initial_design_size=16,
-            memory_size=64,
-            n_heads=4,
-            candidate_count=64,
-            seed=7,
-        )
-
-        timeouts = self.timeouts_for(codec, model, 900.0, draws=16)
-
-        self.assertTrue(any(value < 900 for value in timeouts), timeouts)
-
-
 class LatencyFloorHeuristicTest(unittest.TestCase):
     def build_model(self, **kwargs) -> tuple:
         codec = ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT)
@@ -584,7 +509,7 @@ if __name__ == "__main__":
 
 
 class ContinuousLinUCBTest(unittest.TestCase):
-    """codex_v1's estimator over a continuous timeout, and the floor on top."""
+    """discrete_linucb's estimator over a continuous timeout, and the floor on top."""
 
     def build_model(self, floor_k: float = 0.0, **kwargs) -> tuple:
         codec = ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT)
@@ -646,7 +571,7 @@ class ContinuousLinUCBTest(unittest.TestCase):
             for _ in range(len(centers_ms))
         ]
 
-        # codex_v1 scores an unpulled arm at +inf, so it opens by playing each
+        # discrete_linucb scores an unpulled arm at +inf, so it opens by playing each
         # arm once. Here the same rule sweeps the centres, which are the arms
         # with the midpoint of each pair inserted.
         self.assertEqual(opening, centers_ms)
@@ -1004,7 +929,7 @@ class DerivedWaitActionCodecTest(unittest.TestCase):
                 clamp_ms=(min(arms_ms), max(arms_ms)),
                 initial_timeout_ms=sorted(arms_ms)[len(arms_ms) // 2],
             ),
-            "latency_floor_heuristic": lambda: LatencyFloorHeuristic(
+            "continuous_latency_floor": lambda: LatencyFloorHeuristic(
                 action_codec=codec(),
                 n_features=n_features,
                 clamp_ms=(min(arms_ms), max(arms_ms)),
@@ -1016,7 +941,7 @@ class DerivedWaitActionCodecTest(unittest.TestCase):
                     latency_floor=LatencyFloor(),
                 ),
             ),
-            "continuous_codex": lambda: ContinuousLinUCB(
+            "continuous_linucb": lambda: ContinuousLinUCB(
                 action_codec=codec(), n_features=n_features, seed=42, latency_floor=None
             ),
             "continuous_ppo": lambda: ContinuousPPO(

@@ -683,7 +683,7 @@ def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
             clamp_ms=(min(arms), max(arms)),
             initial_timeout_ms=sorted(arms)[len(arms) // 2],
         )
-    elif kind == "codex":
+    elif kind == "discrete_linucb":
         codec = ProtocolTimeoutActionCodec(protocol)
         latency_index, instances_index = latency_feature_indices(names)
         model = LatencyFloorPolicy(
@@ -785,22 +785,22 @@ def main() -> None:
         if args.randomize:
             constants.terminals = 512
         res = {}
-        for k in ("codex", "heuristic", "candidate"):
+        for k in ("discrete_linucb", "heuristic", "candidate"):
             set_reward_design(args.reward_design if k == "candidate" else "reward_mixed")
             res[k] = evaluate_spec(k, constants, s, **({"prior_path": args.prior} if k == "candidate" else {}))
         wins = 0
         line = []
         for ph in range(N_SPEC_PHASES):
             # Rule 3 of the port spec: strict latency where T decides it.
-            bt = max(res["codex"][ph, 0], res["heuristic"][ph, 0])
-            bl = min(res["codex"][ph, 1], res["heuristic"][ph, 1])
+            bt = max(res["discrete_linucb"][ph, 0], res["heuristic"][ph, 0])
+            bl = min(res["discrete_linucb"][ph, 1], res["heuristic"][ph, 1])
             ct, cl = res["candidate"][ph, 0], res["candidate"][ph, 1]
             ok = ct >= 0.95 * bt and (cl < bl if ph in STRICT_LATENCY_PHASES else cl <= 1.05 * bl)
             wins += ok
             line.append(
                 f"p{ph} {ct:5.0f}/{cl:5.0f}@{res['candidate'][ph,2]:4.0f} "
                 f"[{res['heuristic'][ph,0]:5.0f}/{res['heuristic'][ph,1]:5.0f}@{res['heuristic'][ph,2]:4.0f} "
-                f"{res['codex'][ph,0]:5.0f}/{res['codex'][ph,1]:5.0f}@{res['codex'][ph,2]:4.0f}]{'+' if ok else '-'}"
+                f"{res['discrete_linucb'][ph,0]:5.0f}/{res['discrete_linucb'][ph,1]:5.0f}@{res['discrete_linucb'][ph,2]:4.0f}]{'+' if ok else '-'}"
             )
         print(f"seed {s} phases_ok={wins}/{N_SPEC_PHASES} terminals={constants.terminals} | " + " | ".join(line))
 

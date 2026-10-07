@@ -29,13 +29,13 @@ START_OFFSET_AFTER_CLIENT_LAUNCH_S=10
 DATASET_ENABLED=0
 LOG_ENABLED=0
 VERBOSE_ENABLED=0
-AGENT_MODEL_TYPE="random"
+AGENT_MODEL_TYPE="discrete_random"
 AGENT_MODEL_SET=0
 REWARD_DESIGN="reward_tps"
 # Domain constraint on the action space: never apply a timeout below k times
 # the consensus latency the replicas are already achieving. 0 disables it.
 LATENCY_FLOOR_K=0
-# --model-type=continuous prior: "" the shipped one, "none" untrained, else a path.
+# --model-type=continuous_pretrained_gp prior: "" the shipped one, "none" untrained, else a path.
 PRIOR_PATH=""
 SCHEDULE_FILE="learning_agent/config/schedule_smartbft.csv"
 
@@ -107,7 +107,7 @@ trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_pretrained_gp|continuous_linucb|continuous_heuristic|continuous_ppo|continuous_latency_floor>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -119,9 +119,8 @@ Flags:
   --log                             Download client, server, applier, and agent logs.
   --output-dir <path>               Store artifacts here instead of creating a timestamped run directory.
   --verbose                         Enable SmartBFT debug logs on server replicas.
-  --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo>
-                                     Learning-agent model for learning mode (default: random).
-                                     claude and codex select claude_v2 and codex_v1.
+  --model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_pretrained_gp|continuous_linucb|continuous_heuristic|continuous_ppo|continuous_latency_floor>
+                                     Learning-agent model for learning mode (default: discrete_random).
   --reward-design <reward_tps|reward_mixed>
                                      Reward the agent learns from (default: reward_tps).
                                      reward_tps is throughput alone, concave past a 1000 tps knee.
@@ -132,7 +131,7 @@ Flags:
                                      replicas are already achieving, estimated as a low quantile
                                      over recent committing windows. Such a timeout cannot be met,
                                      so it only buys view changes. 0 disables it (default: 0).
-  --prior-path <path|none>           Which pretrained prior --model continuous loads.
+  --prior-path <path|none>           Which pretrained prior --model continuous_pretrained_gp loads.
                                      Empty (default) is the protocol's shipped
                                      return prior; a path is an ablation prior
                                      (<protocol>_sim.py train --no-proposal-faults);
@@ -176,17 +175,33 @@ mode_enables_learning_agent() {
   esac
 }
 
+# Model types retired on 2026-10-07 (RENAMED_MODEL_TYPES in
+# learning_agent/models.py): prints the replacement, or fails for any other name.
+renamed_model_type() {
+  case "$1" in
+    random|pavlov|linear|ppo) printf 'discrete_%s\n' "$1" ;;
+    cmab|thompson) printf '%s\n' "discrete_tree_ts" ;;
+    cmab_reset) printf '%s\n' "discrete_tree_blocks" ;;
+    codex|codex_v1) printf '%s\n' "discrete_linucb" ;;
+    continuous) printf '%s\n' "continuous_pretrained_gp" ;;
+    continuous_codex) printf '%s\n' "continuous_linucb" ;;
+    latency_floor_heuristic) printf '%s\n' "continuous_latency_floor" ;;
+    *) return 1 ;;
+  esac
+}
+
 normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo) printf '%s\n' "${model_lower}" ;;
-    # Short names for the two newest bandits. main.py knows them by their
-    # versioned names, so translate here and let everything downstream - the
-    # remote validation included - carry the name main.py accepts.
-    claude) printf '%s\n' "claude_v2" ;;
-    codex) printf '%s\n' "codex_v1" ;;
-    *) return 1 ;;
+    discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_pretrained_gp|continuous_linucb|continuous_heuristic|continuous_ppo|continuous_latency_floor) printf '%s\n' "${model_lower}" ;;
+    *)
+      local renamed
+      if renamed="$(renamed_model_type "${model_lower}")"; then
+        echo "--model ${model_lower} was renamed to ${renamed}." >&2
+      fi
+      return 1
+      ;;
   esac
 }
 
@@ -519,7 +534,7 @@ if ! [[ "${LATENCY_FLOOR_K}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   exit 2
 fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_codex|continuous_heuristic|continuous_ppo|latency_floor_heuristic|ppo." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_pretrained_gp|continuous_linucb|continuous_heuristic|continuous_ppo|continuous_latency_floor." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -1206,7 +1221,7 @@ fi
 # Which pretrained prior the continuous model loads: "" the shipped return
 # prior, "none" untrained, else a path to an ablation prior. main.py ignores it
 # for every other model type, so only pass it where it means something.
-if [[ "${model_type}" == "continuous" && -n "${prior_path}" ]]; then
+if [[ "${model_type}" == "continuous_pretrained_gp" && -n "${prior_path}" ]]; then
   agent_model_args="${agent_model_args} --prior-path ${prior_path}"
 fi
 

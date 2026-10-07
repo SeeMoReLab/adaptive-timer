@@ -8,8 +8,6 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 import numpy as np
 from scipy.linalg import solve_triangular
 from scipy.special import betaln, digamma, polygamma
-from scipy.stats import qmc
-from sklearn.tree import DecisionTreeRegressor
 
 import agent_pb2
 from latency_floor import LatencyFloor
@@ -215,19 +213,6 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
         ]
         return np.asarray(normalized, dtype=float)
 
-    def anchor_actions(self) -> np.ndarray:
-        timeout_values = get_timeout_values_ms(self._protocol)
-        timeout_tuples = [(value,) for value in timeout_values]
-        normalized = [
-            [
-                self._normalize_value(int(timeout_ms), index)
-                for index, timeout_ms in enumerate(timeout_tuple)
-            ]
-            for timeout_tuple in timeout_tuples
-        ]
-        return np.asarray(normalized, dtype=float)
-
-
 
 # Divisor for the fast-path wait derived from the election timeout, W = T / k.
 # Measured on sbft_sim check --mode cal (5 seeds, W swept 20..400 ms at each
@@ -400,236 +385,6 @@ class NormalizedLatencyFloor:
         self._latency_floor.reset()
 
 
-class ContinuousThompsonSamplingModel(TensorModel):
-    """Bootstrapped-tree contextual bandit over a continuous action domain."""
-
-    def __init__(
-        self,
-        action_dim: int,
-        n_features: int,
-        anchor_actions: np.ndarray,
-        initial_design_size: int,
-        memory_size: int,
-        n_heads: int = 100,
-        candidate_count: int = 1024,
-        exploration_probability: float = 0.5,
-        seed: Optional[int] = None,
-        latency_floor: Optional["NormalizedLatencyFloor"] = None,
-    ):
-        if action_dim <= 0:
-            raise ValueError(f"action_dim must be > 0, got {action_dim}")
-        if n_features <= 0:
-            raise ValueError(f"n_features must be > 0, got {n_features}")
-        if n_heads <= 0:
-            raise ValueError(f"n_heads must be > 0, got {n_heads}")
-        if candidate_count <= 0:
-            raise ValueError(
-                f"candidate_count must be > 0, got {candidate_count}"
-            )
-        if initial_design_size <= 0:
-            raise ValueError(
-                f"initial_design_size must be > 0, got {initial_design_size}"
-            )
-        if memory_size <= 0:
-            raise ValueError(f"memory_size must be > 0, got {memory_size}")
-        if not 0.0 <= exploration_probability <= 1.0:
-            raise ValueError(
-                "exploration_probability must be between 0 and 1, got "
-                f"{exploration_probability}"
-            )
-
-        anchors = np.asarray(anchor_actions, dtype=float)
-        if anchors.ndim != 2 or anchors.shape[1] != action_dim:
-            raise ValueError(
-                "anchor_actions must have shape "
-                f"(N, {action_dim}), got {tuple(anchors.shape)}"
-            )
-
-        self._action_dim = int(action_dim)
-        self._obs_dim = int(n_features)
-        self._n_heads = int(n_heads)
-        self._candidate_count = int(candidate_count)
-        self._initial_design_size = int(initial_design_size)
-        self._memory_size = int(memory_size)
-        self._exploration_probability = float(exploration_probability)
-        self._anchor_actions = np.asarray(anchors, dtype=float).astype(float)
-        self._latency_floor = latency_floor
-        self._seed = (
-            int(time.time_ns() & 0x7FFFFFFF) if seed is None else int(seed)
-        )
-
-        self.reset_model()
-
-    def _new_tree(self, head_index: int) -> DecisionTreeRegressor:
-        return DecisionTreeRegressor(
-            criterion="squared_error",
-            max_depth=6,
-            min_samples_leaf=6,
-            min_impurity_decrease=0.01,
-            random_state=self._seed + head_index,
-        )
-
-    def _lower_bound(self) -> float:
-        """Normalized floor under which the action space is not searched."""
-        if self._latency_floor is None:
-            return 0.0
-        return float(self._latency_floor.lower_bound())
-
-    def _candidate_actions(self, lower_bound: float = 0.0) -> np.ndarray:
-        sampled = self._candidate_engine.random(self._candidate_count)
-        candidate_parts = [sampled, self._anchor_actions]
-        if self.memory["actions"]:
-            candidate_parts.append(np.asarray(self.memory["actions"], dtype=float))
-        candidates = np.vstack(candidate_parts)
-        candidates = np.unique(np.clip(candidates, 0.0, 1.0), axis=0)
-        if lower_bound <= 0.0:
-            return candidates
-        feasible = candidates[np.all(candidates >= lower_bound, axis=1)]
-        if len(feasible) == 0:
-            # Everything the sampler offered is below the floor; the bound
-            # itself is still a legal action, so play that rather than nothing.
-            return np.full((1, self._action_dim), lower_bound, dtype=float)
-        return feasible
-
-    def _predict_one(self, features: np.ndarray) -> np.ndarray:
-        if self._latency_floor is not None:
-            self._latency_floor.observe_features(features)
-        lower_bound = self._lower_bound()
-
-        if self._design_count < self._initial_design_size:
-            self._design_count += 1
-            design = self._design_engine.random(1)[0].astype(float)
-            # Rescale rather than clip, so the initial design still spreads
-            # over the feasible range instead of piling up on the bound.
-            return lower_bound + (1.0 - lower_bound) * design
-
-        candidates = self._candidate_actions(lower_bound)
-        if not self.is_fitted:
-            return candidates[int(self._rng.integers(0, len(candidates)))]
-
-        inputs = np.hstack(
-            (np.repeat(features.reshape(1, -1), len(candidates), axis=0), candidates)
-        )
-        if self._rng.random() < self._exploration_probability:
-            head_index = int(self._rng.integers(0, self._n_heads))
-            predictions = self.models[head_index].predict(inputs)
-        else:
-            predictions = np.mean(
-                np.vstack([model.predict(inputs) for model in self.models]), axis=0
-            )
-
-        maximum = float(np.max(predictions))
-        best_indices = np.flatnonzero(np.isclose(predictions, maximum))
-        selected = int(self._rng.choice(best_indices))
-        return candidates[selected]
-
-    def predict_action(self, features: np.ndarray) -> np.ndarray:
-        features_np = np.asarray(features, dtype=float)
-        single = features_np.ndim == 1
-        if single:
-            features_np = features_np.reshape(1, -1)
-        if features_np.shape[1] != self._obs_dim:
-            raise ValueError(
-                f"Expected {self._obs_dim} features, got {features_np.shape[1]}"
-            )
-
-        actions = np.vstack([self._predict_one(row) for row in features_np])
-        result = np.asarray(actions, dtype=float)
-        return result[0] if single else result
-
-    def _action_rows(self, actions: np.ndarray, batch_size: int) -> np.ndarray:
-        actions_np = np.asarray(actions, dtype=float)
-        if actions_np.ndim == 0:
-            actions_np = actions_np.reshape(1, 1)
-        elif actions_np.ndim == 1:
-            if batch_size == 1 and actions_np.size == self._action_dim:
-                actions_np = actions_np.reshape(1, self._action_dim)
-            elif self._action_dim == 1 and actions_np.size == batch_size:
-                actions_np = actions_np.reshape(batch_size, 1)
-            else:
-                raise ValueError(
-                    "Continuous action batch shape mismatch: "
-                    f"actions={actions_np.shape}, batch_size={batch_size}"
-                )
-        if actions_np.shape != (batch_size, self._action_dim):
-            raise ValueError(
-                "Continuous action batch shape mismatch: "
-                f"expected {(batch_size, self._action_dim)}, got {actions_np.shape}"
-            )
-        if np.any(actions_np < 0.0) or np.any(actions_np > 1.0):
-            raise ValueError("Continuous actions must be normalized to [0, 1]")
-        return actions_np
-
-    def update_model(
-        self,
-        features: np.ndarray,
-        actions: np.ndarray,
-        rewards: np.ndarray | float,
-        backward: bool = True,
-    ) -> float:
-        features_np = np.asarray(features, dtype=float)
-        if features_np.ndim == 1:
-            features_np = features_np.reshape(1, -1)
-        if features_np.shape[1] != self._obs_dim:
-            raise ValueError(
-                f"Expected {self._obs_dim} features, got {features_np.shape[1]}"
-            )
-
-        actions_np = self._action_rows(actions, features_np.shape[0])
-        rewards_np = np.asarray(rewards, dtype=float).reshape(-1)
-        if rewards_np.size == 1 and features_np.shape[0] > 1:
-            rewards_np = np.repeat(rewards_np, features_np.shape[0])
-        if rewards_np.size != features_np.shape[0]:
-            raise ValueError(
-                "rewards batch size mismatch: "
-                f"expected {features_np.shape[0]}, got {rewards_np.size}"
-            )
-
-        for row, action, reward in zip(features_np, actions_np, rewards_np):
-            self.memory["features"].append(row.copy())
-            self.memory["actions"].append(action.copy())
-            self.memory["rewards"].append(float(reward))
-
-        if backward:
-            context = np.asarray(self.memory["features"], dtype=float)
-            action_values = np.asarray(self.memory["actions"], dtype=float)
-            inputs = np.hstack((context, action_values))
-            targets = np.asarray(self.memory["rewards"], dtype=float)
-            for model in self.models:
-                sample_indices = self._rng.choice(
-                    len(inputs), size=len(inputs), replace=True
-                )
-                model.fit(inputs[sample_indices], targets[sample_indices])
-            self.is_fitted = True
-
-        return 0.0
-
-    def reset_model(self) -> None:
-        if self._latency_floor is not None:
-            self._latency_floor.reset()
-        self._rng = np.random.default_rng(self._seed)
-        # Owen-scrambled Sobol, as torch.quasirandom.SobolEngine provided
-        # before. Both use Joe-Kuo direction numbers, so the sequences are
-        # equivalent in distribution but not point-for-point identical: a run
-        # seeded the same as one from the torch version will explore the same
-        # space in a different order.
-        self._design_engine = qmc.Sobol(
-            d=self._action_dim, scramble=True, seed=self._seed
-        )
-        self._candidate_engine = qmc.Sobol(
-            d=self._action_dim, scramble=True, seed=self._seed + 1
-        )
-        self._design_count = 0
-        self.models = [self._new_tree(index) for index in range(self._n_heads)]
-        self.is_fitted = False
-        self.memory: Dict[str, deque[Any]] = {
-            "features": deque(maxlen=self._memory_size),
-            "actions": deque(maxlen=self._memory_size),
-            "rewards": deque(maxlen=self._memory_size),
-        }
-
-
-
 DEFAULT_PROPORTIONAL_K = 1.0
 class ContinuousHeuristicTimeoutModel(TensorModel):
     """Proportional rule over the reported consensus latency.
@@ -740,14 +495,14 @@ class ContinuousHeuristicTimeoutModel(TensorModel):
 
 _PRIOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pretrained_models")
 
-# Action range of --model-type=continuous on Tendermint, and where its prior ships.
+# Action range of --model-type=continuous_pretrained_gp on Tendermint, and where its prior ships.
 CONTINUOUS_TENDERMINT_BOUNDS_MS: Tuple[int, int] = (100, 3000)
 DEFAULT_TENDERMINT_PRIOR_PATH = os.path.join(_PRIOR_DIR, "continuous_tendermint_prior.npz")
 
 
 @dataclass(frozen=True)
 class ContextSpec:
-    """What --model-type=continuous reads and plays on one protocol.
+    """What --model-type=continuous_pretrained_gp reads and plays on one protocol.
 
     The context vector is log1p of ``log_fields`` followed by ``raw_fields``
     verbatim, in that order; ``length_scales`` has one GP length scale per
@@ -928,7 +683,7 @@ def context_spec(protocol: int) -> ContextSpec:
     spec = CONTEXT_SPECS.get(int(protocol))
     if spec is None:
         raise ValueError(
-            "--model-type=continuous has no context spec for "
+            "--model-type=continuous_pretrained_gp has no context spec for "
             f"{agent_pb2.Protocol.Name(int(protocol))}; it runs on PBFT, SmartBFT, "
             "SBFT, Tendermint and HotStuff"
         )
@@ -1281,7 +1036,7 @@ def return_prior_path(protocol: int) -> str:
 
 
 def resolve_prior_path(protocol: int, selection: str) -> Optional[str]:
-    """Which prior --model-type=continuous loads, from --prior-path.
+    """Which prior --model-type=continuous_pretrained_gp loads, from --prior-path.
 
     ``""`` is the protocol's shipped return prior, ``"none"`` is untrained (a
     zero prior, so the GP fits the reward itself), and anything else is taken
@@ -1627,7 +1382,7 @@ def _refined_ladder_ms(arms_ms: Sequence[int]) -> Tuple[int, ...]:
 class ContinuousLinUCB(TensorModel):
     """Discounted LinUCB over a continuous timeout.
 
-    ``DiscountedLinUCB`` (``codex_v1``) fits one ridge model per arm, which is
+    ``DiscountedLinUCB`` (``discrete_linucb``) fits one ridge model per arm, which is
     the same thing as one shared model over ``one_hot(arm)`` outer-product the
     context. This is that model with the one-hot replaced by a smooth basis
     over the log-timeout::
@@ -1638,7 +1393,7 @@ class ContinuousLinUCB(TensorModel):
     context, the ridge prior, the discount on every statistic, the UCB
     half-width from the discounted covariance sandwich, the random exploration
     floor, and playing each basis centre once before anything is fitted, which
-    is what codex_v1's ``+inf`` score for an unpulled arm amounts to. Place the
+    is what discrete_linucb's ``+inf`` score for an unpulled arm amounts to. Place the
     centres at the arms and shrink their width to zero and the two models are
     the same model; the parameter count is already identical, ``len(centres) *
     (n_features + 1)``.
@@ -1671,13 +1426,13 @@ class ContinuousLinUCB(TensorModel):
     is (measured on a synthetic reward paying only in 700-900ms: 90% of
     decisions inside it with the midpoints, 0% without). Each centre costs
     ``n_features + 1`` coefficients, which is what limits how fine the ladder
-    can get: five centres is 85 against codex_v1's 51.
+    can get: five centres is 85 against discrete_linucb's 51.
 
     The bumps are half a centre-spacing wide, so neighbours overlap at about
     14%: wide enough to share evidence, narrow enough that adjacent centres
     still say different things.
 
-    **The one departure from codex_v1: rewards are centred.** The ridge prior
+    **The one departure from discrete_linucb: rewards are centred.** The ridge prior
     is zero, and the discount pulls an unplayed timeout's estimate toward it,
     so zero is what an untried timeout is assumed to be worth. That is only
     sane if the rewards are centred on zero, and they are not: reward_tps is
@@ -1691,21 +1446,21 @@ class ContinuousLinUCB(TensorModel):
     phase change. Subtracting a discounted mean of recent rewards makes the
     prior mean "average", which is what optimism in the face of uncertainty
     assumes: a timeout not tried lately is worth finding out about, not
-    written off. codex_v1 has the same pathology and is deliberately left
+    written off. discrete_linucb has the same pathology and is deliberately left
     alone, so the ladder it plays is the one it has always played; pass
     ``center_rewards=False`` to reproduce it here.
 
-    Centring is also why the discount is 0.90 rather than codex_v1's 0.95.
+    Centring is also why the discount is 0.90 rather than discrete_linucb's 0.95.
     The effective memory is ``1 / (1 - gamma)`` observations, and a phase of
     this spec is about 15 episodes at a 5s window, so 0.95 remembers 20 - it
     cannot forget a phase inside that phase. 0.95 was nonetheless right for
-    codex_v1, and measurably so: with an uncentred reward, forgetting decays
+    discrete_linucb, and measurably so: with an uncentred reward, forgetting decays
     an estimate toward "worthless", so faster forgetting buries the arm it was
     supposed to free. Once the prior means "average", the two pull the same
     way. On a seven-phase benchmark whose paying timeout moves under the agent
     (3 seeds, 15 episodes per phase, rewards on this hardware's 2..10 scale),
     total regret: uncentred 434 at 0.95 and 456 at 0.85 - the ordering the
-    hardware showed for codex_v1 - against centred 320 at 0.95 and 184 at
+    hardware showed for discrete_linucb - against centred 320 at 0.95 and 184 at
     0.90.
 
     **Neither of those two fixes answers how the agent got short in the first
@@ -1943,7 +1698,7 @@ class ContinuousLinUCB(TensorModel):
             directions = np.linalg.solve(self._precision, inputs.T).T
         except np.linalg.LinAlgError as exc:
             raise RuntimeError(
-                "continuous_codex precision matrix is singular"
+                "continuous_linucb precision matrix is singular"
             ) from exc
         predicted = inputs @ theta
         variances = np.einsum(
@@ -1958,7 +1713,7 @@ class ContinuousLinUCB(TensorModel):
     ) -> float:
         if self._design_index < self._n_basis:
             # One decision per basis centre before anything is fitted: the
-            # continuous form of codex_v1 scoring an unpulled arm at +inf, and
+            # continuous form of discrete_linucb scoring an unpulled arm at +inf, and
             # deterministic, so replicas sharing a feature vector still draw
             # the same action.
             position = float(self._centers[self._design_index])
@@ -2003,7 +1758,7 @@ class ContinuousLinUCB(TensorModel):
         """What an unmeasured timeout is assumed to be worth.
 
         Zero - the ridge prior itself - when centring is off, which is what
-        codex_v1 does.
+        discrete_linucb does.
         """
         if not self._center_rewards or self._baseline_weight <= 0.0:
             return 0.0

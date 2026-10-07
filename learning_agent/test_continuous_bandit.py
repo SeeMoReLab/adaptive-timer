@@ -11,7 +11,6 @@ from continuous_bandit import (
     CONTEXT_SPECS,
     CONTINUOUS_TENDERMINT_BOUNDS_MS,
     DEFAULT_TENDERMINT_PRIOR_PATH,
-    ContinuousThompsonSamplingModel,
     NumpyMLP,
     ContinuousTimeoutActionCodec,
     SimPriorGPModel,
@@ -291,64 +290,6 @@ class ContinuousTimeoutActionCodecTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             ContinuousTimeoutActionCodec(
                 agent_pb2.PROTOCOL_SBFT, bounds_ms=(100, 3000), wait_bounds_ms=(50, 50)
-            )
-
-
-class ContinuousThompsonSamplingModelTest(unittest.TestCase):
-    def _new_model(
-        self, codec: ContinuousTimeoutActionCodec
-    ) -> ContinuousThompsonSamplingModel:
-        return ContinuousThompsonSamplingModel(
-            action_dim=codec.action_dim,
-            n_features=2,
-            anchor_actions=codec.anchor_actions(),
-            initial_design_size=3,
-            memory_size=32,
-            n_heads=4,
-            candidate_count=32,
-            seed=7,
-        )
-
-    def test_reset_replays_deterministic_initial_design(self) -> None:
-        codec = ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_PBFT)
-        model = self._new_model(codec)
-        features = np.asarray([1.0, 2.0])
-
-        first = model.predict_action(features)
-        second = model.predict_action(features)
-        model.reset_model()
-
-        self.assertTrue(np.array_equal(first, model.predict_action(features)))
-        self.assertTrue(np.array_equal(second, model.predict_action(features)))
-
-    def test_tendermint_update_and_prediction_stay_in_bounds(self) -> None:
-        codec = ContinuousTimeoutActionCodec(agent_pb2.PROTOCOL_TENDERMINT)
-        model = self._new_model(codec)
-        features = np.asarray([10.0, 20.0])
-        action = codec.encode(
-            agent_pb2.TendermintTimeout(
-                propose_timeout_milliseconds=437,
-                prevote_timeout_milliseconds=146,
-                precommit_timeout_milliseconds=146,
-            )
-        )
-
-        model.update_model(features, action, 1234.0)
-        for _ in range(5):
-            predicted = model.predict_action(features)
-            self.assertEqual(tuple(predicted.shape), (1,))
-            self.assertTrue(bool(np.all(predicted >= 0.0)))
-            self.assertTrue(bool(np.all(predicted <= 1.0)))
-            timeout = codec.decode(predicted).tendermint
-            self.assertGreaterEqual(timeout.propose_timeout_milliseconds, 150)
-            self.assertLessEqual(timeout.propose_timeout_milliseconds, 600)
-            self.assertEqual(
-                timeout.prevote_timeout_milliseconds,
-                (timeout.propose_timeout_milliseconds + 1) // 3,
-            )
-            self.assertEqual(
-                timeout.precommit_timeout_milliseconds,
-                (timeout.propose_timeout_milliseconds + 1) // 3,
             )
 
 

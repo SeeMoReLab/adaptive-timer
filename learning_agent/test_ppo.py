@@ -421,7 +421,7 @@ class PPOBaseTest(unittest.TestCase):
         self.assertTrue(issubclass(DiscretePPO, PPOBase))
         self.assertTrue(issubclass(ContinuousPPO, PPOBase))
 
-    def test_parameter_count_matches_codex_v1(self):
+    def test_parameter_count_matches_discrete_linucb(self):
         # A linear actor over (bias + features) for each arm: the point of the
         # default is that PPO is not given more capacity than the bandit it is
         # being compared against.

@@ -70,7 +70,7 @@ START_OFFSET_AFTER_CLIENT_LAUNCH_S=10
 DATASET_ENABLED=0
 LOG_ENABLED=0
 VERBOSE_ENABLED=0
-AGENT_MODEL_TYPE="random"
+AGENT_MODEL_TYPE="discrete_random"
 AGENT_MODEL_SET=0
 
 TX_RATE=60000
@@ -167,8 +167,8 @@ Flags:
   --log                             Download client, server, applier, and agent logs.
   --output-dir <path>               Store artifacts here instead of a timestamped run directory.
   --verbose                         Enable debug logs on server replicas.
-  --model <random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_ppo|ppo>
-                                     Learning-agent model for learning mode (default: random).
+  --model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_pretrained_gp|continuous_ppo>
+                                     Learning-agent model for learning mode (default: discrete_random).
   -f <int>                          Fault tolerance f; nodes defaults to 3f+1 (default: 1).
   -t <int>                          Seconds to run after benchmark start (default: 300).
 
@@ -216,14 +216,33 @@ mode_is_supported() {
   return 1
 }
 
+# Model types retired on 2026-10-07 (RENAMED_MODEL_TYPES in
+# learning_agent/models.py): prints the replacement, or fails for any other name.
+renamed_model_type() {
+  case "$1" in
+    random|pavlov|linear|ppo) printf 'discrete_%s\n' "$1" ;;
+    cmab|thompson) printf '%s\n' "discrete_tree_ts" ;;
+    cmab_reset) printf '%s\n' "discrete_tree_blocks" ;;
+    codex|codex_v1) printf '%s\n' "discrete_linucb" ;;
+    continuous) printf '%s\n' "continuous_pretrained_gp" ;;
+    continuous_codex) printf '%s\n' "continuous_linucb" ;;
+    latency_floor_heuristic) printf '%s\n' "continuous_latency_floor" ;;
+    *) return 1 ;;
+  esac
+}
+
 normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    random|pavlov|linear|cmab|cmab_reset|continuous|continuous_ppo|ppo) printf '%s\n' "${model_lower}" ;;
-    claude) printf '%s\n' "claude_v2" ;;
-    codex) printf '%s\n' "codex_v1" ;;
-    *) return 1 ;;
+    discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_pretrained_gp|continuous_ppo) printf '%s\n' "${model_lower}" ;;
+    *)
+      local renamed
+      if renamed="$(renamed_model_type "${model_lower}")"; then
+        echo "--model ${model_lower} was renamed to ${renamed}." >&2
+      fi
+      return 1
+      ;;
   esac
 }
 
@@ -491,7 +510,7 @@ rustbft_main() {
     exit 2
   fi
   if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-    echo "Invalid --model value. Use one of random|pavlov|linear|cmab|cmab_reset|claude|codex|continuous|continuous_ppo|ppo." >&2
+    echo "Invalid --model value. Use one of discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_pretrained_gp|continuous_ppo." >&2
     exit 2
   fi
   if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -504,8 +523,8 @@ rustbft_main() {
   # and every replica's agent exits at startup.
   if [[ "${AGENT_PROTOCOL}" == "autobahn" ]]; then
     case "${AGENT_MODEL_TYPE}" in
-      continuous|continuous_ppo)
-        echo "--model ${AGENT_MODEL_TYPE} needs continuous timeout bounds, which ${PROTOCOL_NAME} does not define yet. Use ppo for the discrete arms." >&2
+      continuous_pretrained_gp|continuous_ppo)
+        echo "--model ${AGENT_MODEL_TYPE} needs continuous timeout bounds, which ${PROTOCOL_NAME} does not define yet. Use discrete_ppo for the discrete arms." >&2
         exit 2
         ;;
     esac

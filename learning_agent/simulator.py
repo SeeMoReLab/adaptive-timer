@@ -34,22 +34,14 @@ from latency_floor import (
 )
 
 from models import (
-    CMAB,
+    BlockedTreeBandit,
     DiscountedLinUCB,
     LinearModel,
-    MultiRF,
-    NeighborhoodRobustBandit,
     PBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE,
     SMARTBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE,
     PavlovTimeoutModel,
-    QuadraticRF,
-    SingleRF,
-    StarvationFreeThompsonSamplingModel,
-    SurvivalGatedThompsonSamplingModel,
+    RENAMED_MODEL_TYPES,
     ThompsonSamplingModel,
-    ThompsonSamplingModelV1,
-    ThompsonSamplingModelV2,
-    ThompsonSamplingModelV3,
     TensorModel,
     QuadraticRewardScaler,
     RewardTransformer,
@@ -78,55 +70,26 @@ PROTOCOL_NAME_TO_ENUM = {
     "smartbft": agent_pb2.PROTOCOL_SMARTBFT,
 }
 
+# The same names main.py's --model-type uses.
 MODEL_NAME_TO_TENSORMODEL = {
-    "linear": LinearModel,
-    "codex_v1": DiscountedLinUCB,
-    # Contextual multi-armed bandits, oldest to newest. "cmab" is the current
-    # model; v1 through v3 are its predecessors, kept so a run can be compared
-    # against the iteration it came from.
-    "cmab": ThompsonSamplingModel,
-    "cmab_v1": ThompsonSamplingModelV1,
-    "cmab_v2": ThompsonSamplingModelV2,
-    "cmab_v3": ThompsonSamplingModelV3,
-    # Blocked CMAB with replay-triggered resets. Not an iteration of "cmab" -
-    # a separate line, boosted-tree based, so it needs xgboost installed.
-    "cmab_reset": CMAB,
-    # Contextual bandit with local commitment and a region-level prior
-    # for ties that reward evidence cannot resolve.
-    "claude_v1": NeighborhoodRobustBandit,
-    # "cmab" with its two starvation defects fixed: a staleness bonus so an arm
-    # abandoned during a bad phase can be reconsidered, and an exploit branch
-    # that scores the current context instead of the arm's flat window mean.
-    "claude_v2": StarvationFreeThompsonSamplingModel,
-    # Factorises reward into liveness x performance: a gate on
-    # P(alive | context, arm) and a ranking over the arms that pass it. Named
-    # v4 because cmab_v3 is already ThompsonSamplingModelV3, one of the
-    # historical iterations above.
-    "cmab_v4": SurvivalGatedThompsonSamplingModel,
+    "discrete_linear": LinearModel,
+    "discrete_linucb": DiscountedLinUCB,
+    # Thompson sampling over per-arm bootstrapped tree ensembles.
+    "discrete_tree_ts": ThompsonSamplingModel,
+    # Epsilon-greedy blocks over one regression tree, with replay-triggered
+    # resets.
+    "discrete_tree_blocks": BlockedTreeBandit,
     # Win-stay/lose-shift heuristic. Context-free and non-learning, so it is a
     # floor to beat rather than an iteration of the bandits above.
-    "pavlov": PavlovTimeoutModel,
-    # BFTBrain random-forest baselines, named after its --num-models values.
-    "quadratic_rf": QuadraticRF,
-    "multi_rf": MultiRF,
-    "single_rf": SingleRF,
+    "discrete_pavlov": PavlovTimeoutModel,
 }
 
 # Models whose constructor takes a seed, so a run is reproducible from --seed
-# alone rather than from the global RNG state. ThompsonSamplingModelV1 is
-# absent because it has no seed parameter - it draws from the global numpy RNG.
+# alone rather than from the global RNG state.
 SEEDED_MODELS = (
     DiscountedLinUCB,
     ThompsonSamplingModel,
-    ThompsonSamplingModelV2,
-    ThompsonSamplingModelV3,
-    CMAB,
-    QuadraticRF,
-    MultiRF,
-    SingleRF,
-    NeighborhoodRobustBandit,
-    StarvationFreeThompsonSamplingModel,
-    SurvivalGatedThompsonSamplingModel,
+    BlockedTreeBandit,
 )
 
 # Heuristics with no contextual model, so no n_features and no seed. The
@@ -157,7 +120,12 @@ def _parse_protocol(value: str) -> int:
     return protocol
 
 def _parse_model(value: str) -> TensorModel:
-    model = MODEL_NAME_TO_TENSORMODEL.get(value.strip().lower())
+    name = value.strip().lower()
+    if name in RENAMED_MODEL_TYPES:
+        raise argparse.ArgumentTypeError(
+            f"model {name!r} was renamed to {RENAMED_MODEL_TYPES[name]!r}"
+        )
+    model = MODEL_NAME_TO_TENSORMODEL.get(name)
     if model is None:
         valid = ", ".join(sorted(MODEL_NAME_TO_TENSORMODEL))
         raise argparse.ArgumentTypeError(
@@ -380,7 +348,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         type=_parse_model,
-        default='linear',
+        default='discrete_linear',
         # Listed from the registry so a new model never has to be named twice.
         help="Model: " + " | ".join(sorted(MODEL_NAME_TO_TENSORMODEL)),
     )

@@ -16,8 +16,8 @@ from reward_utils import reward_tps
 
 
 # Model-type names retired on 2026-10-07, mapped to their replacements. The
-# agent, the simulator and the run scripts reject an old name with this hint
-# instead of accepting it.
+# agent and the run scripts reject an old name with this hint instead of
+# accepting it.
 RENAMED_MODEL_TYPES: Dict[str, str] = {
     "random": "discrete_random",
     "pavlov": "discrete_pavlov",

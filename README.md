@@ -69,24 +69,6 @@ If you change `proto/agent.proto`, regenerate Python stubs:
 bash compile_proto.sh
 ```
 
-### Run Agent Simulation
-
-To generate synthetic dataset from the observed environment dataset:
-
-```bash
-python learning_agent/simulator.py \
-  --protocol smartbft \
-  --model cmab \
-  --data-dir learning_agent/data/smartbft_wallclock \
-  --num-episodes 500 \
-  --phases "5;0;0;5;1;2;3;4;5;3;0;5;0;3;4;2;1;5;4;0" \
-  --experiment-name full-sequence \
-  --verbose \
-  --reward-scaler quadratic \
-```
-
-With $N$ agent observations located in ./data/smartbft_wallclock, each agent will have 1,000 episodes for each phase.
-
 ## CppBedrock (PBFT, SBFT) Run
 
 The CppBedrock replicas (`CppBedrock/` submodule) run under the same CloudLab harness shape as SmartBFT and the Rust protocols: per-replica network namespaces, one network fault applier per replica, one learning agent per replica, a synchronized start time, and a benchmark client on node0 that prints per-second Monitor lines. `scripts/cloudlab/setup.sh` installs the build dependencies (cmake, gRPC, protobuf, yaml-cpp, nlohmann-json, OpenSSL).

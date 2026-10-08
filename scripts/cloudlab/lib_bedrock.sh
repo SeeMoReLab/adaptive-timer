@@ -42,7 +42,6 @@ TARGETS_FILE_DEFAULT="${REPO_ROOT}/scripts/cloudlab/tmp/cloudlab_ssh_targets.txt
 BEDROCK_SRC="${REPO_ROOT}/CppBedrock"
 LEARNING_AGENT_SRC_DIR="${REPO_ROOT}/learning_agent"
 APPLIER_LOCAL_PATH="${REPO_ROOT}/scripts/apply_network_failures.py"
-GEN_COMMITTEE_LOCAL_PATH="${REPO_ROOT}/scripts/cloudlab/gen_committee.py"
 FAILURE_SPEC_DEFAULT="${REPO_ROOT}/${FAILURE_SPEC_DEFAULT_REL}"
 PROTOCOL_CONFIG_LOCAL="${REPO_ROOT}/${BEDROCK_PROTOCOL_CONFIG_REL}"
 LOCAL_TMP_DIR="${REPO_ROOT}/scripts/cloudlab/tmp"
@@ -60,24 +59,20 @@ TARGETS_FILE="${TARGETS_FILE_DEFAULT}"
 EXPERIMENT_TIME_S=300
 CLIENT_START_DELAY_S=10
 START_OFFSET_AFTER_CLIENT_LAUNCH_S=10
-DATASET_ENABLED=0
 LOG_ENABLED=0
 VERBOSE_ENABLED=0
 AGENT_MODEL_TYPE="discrete_random"
 AGENT_MODEL_SET=0
-REWARD_DESIGN="reward_tps"
+REWARD_DESIGN="reward_tps_latency"
 LATENCY_FLOOR_MULTIPLIER="0"
 # Prior file the model loads, repo-relative after validation; "" (omitted) is untrained.
 PRIOR_PATH=""
 
 TX_RATE="${TX_RATE:-40000}"
 REQUEST_TIMEOUT_MS=10000
-# Resolved after parsing: broadcast unless given explicitly.
-CLIENT_TARGET_MODE=""
 # Parallel client streams (independent sender lanes) per replica.
 CLIENT_CONNECTIONS_PER_TARGET=4
 CLIENT_SIGN="false"
-PROPOSAL_SIGNING="true"
 PROPOSAL_INTERVAL_MS=100
 BATCH_MAX_REQUESTS=8192
 BATCH_MAX_BYTES=524288
@@ -99,7 +94,6 @@ SHARING_CONSENSUS_PORT=15701
 SHARING_COLLECT_WAIT_MS=100
 INITIAL_TIMEOUT_MS=""
 INITIAL_SLOW_PATH_TIMEOUT_MS=""
-LEARNING_WINDOW_MODE="wall-clock"
 LEARNING_FEATURE_DURATION_MS=10000
 LEARNING_REPLY_WAIT_MS=2000
 LEARNING_WARMUP_DURATION_MS=3000
@@ -171,7 +165,7 @@ trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [${SUPPORTED_MODES// /|}] [--dataset] [--log] [--output-dir <path>] [--model <name>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [${SUPPORTED_MODES// /|}] [--log] [--output-dir <path>] [--model <name>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -179,12 +173,11 @@ Arguments:
   targets_file      Optional path to cloudlab SSH targets file.
 
 Flags:
-  --dataset                         Agent modes collect the agent CSV automatically.
   --log                             Download client, server, applier, and agent logs.
   --output-dir <path>               Store artifacts here instead of a timestamped run directory.
   --verbose                         Enable per-message debug logs on server replicas.
   --reward-design <reward_tps|reward_mixed|reward_tps_latency>
-                                    Reward the agent learns from (default: reward_tps).
+                                    Reward the agent learns from (default: reward_tps_latency).
   --model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo>
                                      Learning-agent model for learning mode (default: discrete_random).
   --latency-floor-multiplier <float> Never apply a timeout below this multiplier x the recent
@@ -212,13 +205,8 @@ ${PROTOCOL_NAME} options:
                                      trades rejection for queueing delay; measured worse at 40k.
   --max-pending-bytes <int>         Bound each ingress/pending queue (default: 16777216).
   --request-timeout <ms>            Client per-request timeout in ms (default: 10000).
-  --client-target-mode <mode>       broadcast: every request to every replica, so every replica
-                                     runs the PBFT request timer over it (default); leader: every
-                                     request goes to the current leader, following leader hints.
   --client-connections <int>        Client streams (independent sender lanes) per replica (default: 4).
   --client-sign <true|false>        RSA-sign every client request (default: false).
-  --proposal-signing <true|false>   Must be true for PBFT/SBFT (default: true). Replica messages
-                                     and quorum certificates are signed and verified.
   --client-start-delay <seconds>    Wait after servers are ready before launching client (default: 10).
   --start-offset <seconds>          Delay from client launch to benchmark/failure start (default: 10).
   --replica-port <port>             gRPC port of every replica on its overlay IP (default: 15000).
@@ -227,7 +215,6 @@ Learning-agent options:
   --agent-port <port>               Learning-agent port inside each replica namespace (default: 15501).
   --initial-timeout <ms>            Initial election (view-change) timeout (default: from ${BEDROCK_PROTOCOL_CONFIG_REL}).
   --initial-slow-path-timeout <ms>  Initial SBFT slow-path timeout (default: from the protocol config).
-  --learning-window-mode <mode>     wall-clock only for CppBedrock protocols (default: wall-clock).
   --learning-feature-duration <ms>  Feature window (default: 10000).
   --learning-reply-wait <ms>        Recommendation wait (default: 2000).
   --learning-warmup-duration <ms>   Post-apply warm-up (default: 3000).
@@ -446,7 +433,6 @@ bedrock_main() {
     case "$1" in
       -f) F="${2:-}"; shift 2 ;;
       -t) EXPERIMENT_TIME_S="${2:-}"; shift 2 ;;
-      --dataset) DATASET_ENABLED=1; shift ;;
       --log) LOG_ENABLED=1; shift ;;
       --output-dir)
         if [[ $# -lt 2 || -z "${2}" ]]; then
@@ -461,7 +447,6 @@ bedrock_main() {
       --model) AGENT_MODEL_TYPE="${2:-}"; AGENT_MODEL_SET=1; shift 2 ;;
       --reward-design) REWARD_DESIGN="${2:-}"; shift 2 ;;
       --latency-floor-multiplier) LATENCY_FLOOR_MULTIPLIER="${2:-}"; shift 2 ;;
-      --latency-floor-k) echo "--latency-floor-k was renamed to --latency-floor-multiplier." >&2; exit 2 ;;
       --prior-path)
         if [[ $# -lt 2 || -z "${2}" ]]; then
           echo "Missing value for --prior-path." >&2
@@ -482,17 +467,14 @@ bedrock_main() {
       --max-pending-requests) MAX_PENDING_REQUESTS="${2:-}"; shift 2 ;;
       --max-pending-bytes) MAX_PENDING_BYTES="${2:-}"; shift 2 ;;
       --request-timeout) REQUEST_TIMEOUT_MS="${2:-}"; shift 2 ;;
-      --client-target-mode) CLIENT_TARGET_MODE="${2:-}"; shift 2 ;;
       --client-connections) CLIENT_CONNECTIONS_PER_TARGET="${2:-}"; shift 2 ;;
       --client-sign) CLIENT_SIGN="${2:-}"; shift 2 ;;
-      --proposal-signing) PROPOSAL_SIGNING="${2:-}"; shift 2 ;;
       --client-start-delay) CLIENT_START_DELAY_S="${2:-}"; shift 2 ;;
       --start-offset) START_OFFSET_AFTER_CLIENT_LAUNCH_S="${2:-}"; shift 2 ;;
       --replica-port) REPLICA_PORT="${2:-}"; shift 2 ;;
       --agent-port) AGENT_PORT="${2:-}"; shift 2 ;;
       --initial-timeout) INITIAL_TIMEOUT_MS="${2:-}"; shift 2 ;;
       --initial-slow-path-timeout) INITIAL_SLOW_PATH_TIMEOUT_MS="${2:-}"; shift 2 ;;
-      --learning-window-mode) LEARNING_WINDOW_MODE="${2:-}"; shift 2 ;;
       --learning-feature-duration) LEARNING_FEATURE_DURATION_MS="${2:-}"; shift 2 ;;
       --learning-reply-wait) LEARNING_REPLY_WAIT_MS="${2:-}"; shift 2 ;;
       --learning-warmup-duration) LEARNING_WARMUP_DURATION_MS="${2:-}"; shift 2 ;;
@@ -559,24 +541,9 @@ bedrock_main() {
     echo "Invalid node count: ${NODES}. bedrock_client tracks replies for at most 64 replicas." >&2
     exit 2
   fi
-  case "${LEARNING_WINDOW_MODE}" in
-    wall-clock) ;;
-    *) echo "Invalid --learning-window-mode value: ${LEARNING_WINDOW_MODE}. CppBedrock protocols support wall-clock only." >&2; exit 2 ;;
-  esac
-  if [[ -z "${CLIENT_TARGET_MODE}" ]]; then
-    CLIENT_TARGET_MODE="broadcast"
-  fi
-  case "${CLIENT_TARGET_MODE}" in
-    leader|broadcast) ;;
-    *) echo "Invalid --client-target-mode value: ${CLIENT_TARGET_MODE}. Use leader or broadcast." >&2; exit 2 ;;
-  esac
   case "${CLIENT_SIGN}" in
     true|false) ;;
     *) echo "Invalid --client-sign value: ${CLIENT_SIGN}. Use true or false." >&2; exit 2 ;;
-  esac
-  case "${PROPOSAL_SIGNING}" in
-    true) ;;
-    *) echo "PBFT/SBFT require --proposal-signing true so replica messages and certificates can be verified." >&2; exit 2 ;;
   esac
   if ! [[ "${CLIENT_CONNECTIONS_PER_TARGET}" =~ ^[1-9][0-9]*$ ]]; then
     echo "Invalid --client-connections value: ${CLIENT_CONNECTIONS_PER_TARGET}. Use a positive integer." >&2
@@ -611,17 +578,14 @@ bedrock_main() {
     echo "Invalid --latency-floor-multiplier: ${LATENCY_FLOOR_MULTIPLIER}. Expected a non-negative number (0 disables the constraint)." >&2
     exit 2
   fi
+  if [[ "${MODE}" == "scheduled" && "${LATENCY_FLOOR_MULTIPLIER}" =~ [1-9] ]]; then
+    echo "--latency-floor-multiplier is only supported with learning or sharing mode; scheduled mode applies the schedule as written." >&2
+    exit 2
+  fi
   if ! mode_enables_learning_agent "${MODE}"; then
     LEARNING_AGENT_ENABLED=0
   else
     LEARNING_AGENT_ENABLED=1
-  fi
-  if (( DATASET_ENABLED == 1 )) && (( LEARNING_AGENT_ENABLED == 0 )); then
-    echo "--dataset requires an agent mode (${SUPPORTED_MODES/normal /})." >&2
-    exit 2
-  fi
-  if (( LEARNING_AGENT_ENABLED == 1 )); then
-    DATASET_ENABLED=1
   fi
 
   LOCAL_SSH_KEY_PATH="${LOCAL_SSH_KEY_PATH/#\~/$HOME}"
@@ -725,10 +689,9 @@ bedrock_main() {
     printf 'max_pending_requests=%q\n' "${MAX_PENDING_REQUESTS}"
     printf 'max_pending_bytes=%q\n' "${MAX_PENDING_BYTES}"
     printf 'request_timeout_ms=%q\n' "${REQUEST_TIMEOUT_MS}"
-    printf 'client_target_mode=%q\n' "${CLIENT_TARGET_MODE}"
     printf 'client_connections_per_target=%q\n' "${CLIENT_CONNECTIONS_PER_TARGET}"
     printf 'client_sign=%q\n' "${CLIENT_SIGN}"
-    printf 'proposal_signing=%q\n' "${PROPOSAL_SIGNING}"
+    printf 'proposal_signing=true\n'
     printf 'replica_port=%q\n' "${REPLICA_PORT}"
     printf 'initial_timeout_ms=%q\n' "${INITIAL_TIMEOUT_MS:-from-config}"
     printf 'initial_slow_path_timeout_ms=%q\n' "${INITIAL_SLOW_PATH_TIMEOUT_MS:-from-config}"
@@ -736,12 +699,11 @@ bedrock_main() {
     printf 'reward_design=%q\n' "${REWARD_DESIGN}"
     printf 'latency_floor_multiplier=%q\n' "${LATENCY_FLOOR_MULTIPLIER}"
     printf 'prior_path=%q\n' "${PRIOR_PATH:-}"
-    printf 'learning_window_mode=%q\n' "${LEARNING_WINDOW_MODE}"
+    printf 'learning_window_mode=wall-clock\n'
     printf 'learning_feature_duration_ms=%q\n' "${LEARNING_FEATURE_DURATION_MS}"
     printf 'learning_reply_wait_ms=%q\n' "${LEARNING_REPLY_WAIT_MS}"
     printf 'learning_warmup_duration_ms=%q\n' "${LEARNING_WARMUP_DURATION_MS}"
     printf 'learning_reward_duration_ms=%q\n' "${LEARNING_REWARD_DURATION_MS}"
-    printf 'dataset_enabled=%q\n' "${DATASET_ENABLED}"
     printf 'log_enabled=%q\n' "${LOG_ENABLED}"
     printf 'failure_spec_enabled=%q\n' "${FAILURE_SPEC_ENABLED}"
     printf 'targets_file=%q\n' "${TARGETS_FILE}"
@@ -865,8 +827,8 @@ bedrock_main() {
 
   echo "Selected mode: ${MODE}"
   echo "${PROTOCOL_NAME} nodes: ${NODES} (f=${F}, replicas_per_server_machine=${replicas_per_server_machine})"
-  echo "Client rate: ${TX_RATE} req/s; request timeout: ${REQUEST_TIMEOUT_MS} ms; target mode: ${CLIENT_TARGET_MODE}; lanes: ${CLIENT_CONNECTIONS_PER_TARGET}"
-  echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (dataset=${DATASET_ENABLED}, log=${LOG_ENABLED})"
+  echo "Client rate: ${TX_RATE} req/s; request timeout: ${REQUEST_TIMEOUT_MS} ms; target mode: broadcast; lanes: ${CLIENT_CONNECTIONS_PER_TARGET}"
+  echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (log=${LOG_ENABLED})"
 
   echo "Creating ${PROTOCOL_NAME} CloudLab payload tarball..."
   rm -f "${LOCAL_TAR}"
@@ -1125,6 +1087,11 @@ fi
 
 sudo -n ip link set "${bridge_name}" down >/dev/null 2>&1 || true
 sudo -n ip link del "${bridge_name}" type bridge >/dev/null 2>&1 || true
+# Another protocol's harness, interrupted before its teardown, can leave its
+# bridge holding this same overlay address; its route then shadows ours.
+for foreign_if in $(ip -o -4 addr show | awk -v ip="${bridge_ip}/" -v own="${bridge_name}" 'index($4, ip) == 1 && $2 != own {print $2}' | sort -u); do
+  sudo -n ip link del "${foreign_if}" >/dev/null 2>&1 || true
+done
 sudo -n ip link add name "${bridge_name}" type bridge
 sudo -n ip addr replace "${bridge_ip}/${overlay_mask}" dev "${bridge_name}"
 sudo -n ip link set "${bridge_name}" up
@@ -1313,7 +1280,6 @@ REMOTE
           "${machine_idx}" \
           "${START_UNIX_MS}" \
           "${MODE}" \
-          "${DATASET_ENABLED}" \
           "${AGENT_MODEL_TYPE}" \
           "${AGENT_PORT}" \
           "${RUN_ROOT_REMOTE_NAME}" \
@@ -1334,21 +1300,20 @@ replicas_per_machine="$1"
 machine_idx="$2"
 start_unix_ms="$3"
 mode="$4"
-dataset_enabled="$5"
-model_type="$6"
-agent_port="$7"
-run_root="$HOME/$8"
-ns_prefix="$9"
-protocol="${10}"
-agent_protocol="${11}"
-schedule_file_rel="${12}"
-failure_spec_enabled="${13}"
-sharing_collect_wait_ms="${14}"
-reward_design="${15}"
-latency_floor_multiplier="${16}"
-feature_window_ms="${17}"
-reward_window_ms="${18}"
-prior_path="${19:-}"
+model_type="$5"
+agent_port="$6"
+run_root="$HOME/$7"
+ns_prefix="$8"
+protocol="$9"
+agent_protocol="${10}"
+schedule_file_rel="${11}"
+failure_spec_enabled="${12}"
+sharing_collect_wait_ms="${13}"
+reward_design="${14}"
+latency_floor_multiplier="${15}"
+feature_window_ms="${16}"
+reward_window_ms="${17}"
+prior_path="${18:-}"
 learning_agent_python="${HOME}/.venvs/adaptive-timer-learning-agent/bin/python"
 
 if [[ ! -x "${learning_agent_python}" ]]; then
@@ -1400,11 +1365,8 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   ns_name="${ns_prefix}${replica_id}"
   session_name="${protocol}_agent_${replica_id}"
   agent_log="${run_root}/logs/agent_${replica_id}.log"
-  dataset_args=""
-  if [[ "${dataset_enabled}" == "1" ]]; then
-    rm -f "${run_root}/agent${replica_id}.csv"
-    dataset_args="--dataset-csv ${run_root}/agent${replica_id}.csv"
-  fi
+  rm -f "${run_root}/agent${replica_id}.csv"
+  dataset_args="--dataset-csv ${run_root}/agent${replica_id}.csv"
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   tmux new-session -d -s "${session_name}" \
     "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec \"${learning_agent_python}\" learning_agent/main.py --node-id ${replica_id} --protocol ${agent_protocol} ${bind_args} --signing false ${agent_model_args} ${dataset_args} ${failure_args}' > \"${agent_log}\" 2>&1"
@@ -1479,7 +1441,6 @@ REMOTE
         "${BEDROCK_PROTOCOL_CONFIG_REL}" \
         "${INITIAL_TIMEOUT_MS}" \
         "${INITIAL_SLOW_PATH_TIMEOUT_MS}" \
-        "${PROPOSAL_SIGNING}" \
         "${START_UNIX_MS}" \
         "${FAILURE_SPEC_ENABLED}" \
         "${PROPOSAL_INTERVAL_MS}" "${BATCH_MAX_REQUESTS}" "${BATCH_MAX_BYTES}" \
@@ -1501,15 +1462,14 @@ learning_reward_ms="${12}"
 protocol_config_rel="${13}"
 initial_timeout_ms="${14}"
 initial_slow_path_timeout_ms="${15}"
-proposal_signing="${16}"
-start_unix_ms="${17}"
-failure_spec_enabled="${18}"
-proposal_interval="${19}"
-batch_max_requests="${20}"
-batch_max_bytes="${21}"
-max_inflight_batches="${22}"
-max_pending_requests="${23}"
-max_pending_bytes="${24}"
+start_unix_ms="${16}"
+failure_spec_enabled="${17}"
+proposal_interval="${18}"
+batch_max_requests="${19}"
+batch_max_bytes="${20}"
+max_inflight_batches="${21}"
+max_pending_requests="${22}"
+max_pending_bytes="${23}"
 
 for ((n = 0; n < replicas_per_machine; n++)); do
   replica_id=$((machine_idx * replicas_per_machine + n))
@@ -1522,7 +1482,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
     "--committee" "${run_root}/netcfg/committee.json"
     "--protocol-config" "${run_root}/${protocol_config_rel}"
     "--keys-dir" "${run_root}/netcfg/keys"
-    "--proposal-signing" "${proposal_signing}"
+    "--proposal-signing" "true"
     "--proposal-interval" "${proposal_interval}"
     "--batch-max-requests" "${batch_max_requests}"
     "--batch-max-bytes" "${batch_max_bytes}"
@@ -1603,7 +1563,6 @@ REMOTE
     "${MONITOR_INTERVAL_MS}" \
     "${RUN_ROOT_REMOTE_NAME}" \
     "${PROTOCOL_NAME}" \
-    "${CLIENT_TARGET_MODE}" \
     "${CLIENT_CONNECTIONS_PER_TARGET}" \
     "${CLIENT_SIGN}" <<'REMOTE'
 set -euo pipefail
@@ -1614,9 +1573,8 @@ request_timeout_ms="$3"
 monitor_interval_ms="$4"
 run_root="$HOME/$5"
 protocol="$6"
-client_target_mode="$7"
-client_connections_per_target="$8"
-client_sign="$9"
+client_connections_per_target="$7"
+client_sign="$8"
 
 args=(
   "${run_root}/bin/bedrock_client"
@@ -1625,7 +1583,7 @@ args=(
   "--request-timeout" "${request_timeout_ms}"
   "--monitor-interval" "${monitor_interval_ms}"
   "--start-unix-ms" "${start_unix_ms}"
-  "--target-mode" "${client_target_mode}"
+  "--target-mode" "broadcast"
   "--connections" "${client_connections_per_target}"
   "--sign" "${client_sign}"
   "--client-key" "${run_root}/netcfg/keys/client_private.pem"
@@ -1824,7 +1782,7 @@ REMOTE
     done
   fi
 
-  if (( LEARNING_AGENT_ENABLED == 1 )) && (( DATASET_ENABLED == 1 )); then
+  if (( LEARNING_AGENT_ENABLED == 1 )); then
     for i in "${!server_nodes[@]}"; do
       node="${server_nodes[$i]}"
       host="${server_hosts[$i]}"
@@ -1864,7 +1822,7 @@ REMOTE
   if (( dataset_fetch_failed != 0 )); then
     echo "Some ${PROTOCOL_NAME} dataset files could not be fetched." >&2
   fi
-  if (( LEARNING_AGENT_ENABLED == 1 )) && (( DATASET_ENABLED == 1 )); then
+  if (( LEARNING_AGENT_ENABLED == 1 )); then
     saved_agent_datasets=()
     for ((replica_id = 0; replica_id < NODES; replica_id++)); do
       agent_dataset_local="${ARTIFACT_DIR}/agent${replica_id}.csv"

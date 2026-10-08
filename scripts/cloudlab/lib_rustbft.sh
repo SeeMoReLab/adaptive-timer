@@ -50,7 +50,6 @@ else
 fi
 LEARNING_AGENT_SRC_DIR="${REPO_ROOT}/learning_agent"
 APPLIER_LOCAL_PATH="${REPO_ROOT}/scripts/apply_network_failures.py"
-GEN_COMMITTEE_LOCAL_PATH="${REPO_ROOT}/scripts/cloudlab/gen_committee.py"
 FAILURE_SPEC_DEFAULT="${REPO_ROOT}/${FAILURE_SPEC_DEFAULT_REL}"
 LOCAL_TMP_DIR="${REPO_ROOT}/scripts/cloudlab/tmp"
 RUNS_ROOT="${LOCAL_TMP_DIR}/runs/${PROTOCOL_NAME}"
@@ -67,7 +66,6 @@ TARGETS_FILE="${TARGETS_FILE_DEFAULT}"
 EXPERIMENT_TIME_S=300
 CLIENT_START_DELAY_S=10
 START_OFFSET_AFTER_CLIENT_LAUNCH_S=10
-DATASET_ENABLED=0
 LOG_ENABLED=0
 VERBOSE_ENABLED=0
 AGENT_MODEL_TYPE="discrete_random"
@@ -100,7 +98,6 @@ SHARING_CONSENSUS_PORT=15701
 SHARING_COLLECT_WAIT_MS=100
 INITIAL_TIMEOUT_MS=""
 SCHEDULE_FILE_ARG=""
-LEARNING_WINDOW_MODE="wall-clock"
 LEARNING_FEATURE_DURATION_MS=10000
 LEARNING_REPLY_WAIT_MS=2000
 LEARNING_WARMUP_DURATION_MS=3000
@@ -157,7 +154,7 @@ trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [${SUPPORTED_MODES// /|}] [--dataset] [--log] [--output-dir <path>] [--model <name>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [${SUPPORTED_MODES// /|}] [--log] [--output-dir <path>] [--model <name>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -165,7 +162,6 @@ Arguments:
   targets_file      Optional path to cloudlab SSH targets file.
 
 Flags:
-  --dataset                         Agent modes collect the agent CSV automatically.
   --log                             Download client, server, applier, and agent logs.
   --output-dir <path>               Store artifacts here instead of a timestamped run directory.
   --verbose                         Enable debug logs on server replicas.
@@ -198,7 +194,6 @@ Learning-agent options:
   --agent-port <port>               Learning-agent port inside each replica namespace (default: 15501).
   --initial-timeout <ms>            Override the initial consensus timeout_delay (default: from config/${PROTOCOL_NAME}/parameters.json).
   --schedule <path>                 Schedule CSV for scheduled mode, inside the repo (default: ${SCHEDULE_FILE_REL}).
-  --learning-window-mode <mode>     wall-clock only for Rust protocols (default: wall-clock).
   --learning-feature-duration <ms>  Feature window (default: 10000).
   --learning-reply-wait <ms>        Recommendation wait (default: 2000).
   --learning-warmup-duration <ms>   Post-apply warm-up (default: 3000).
@@ -417,7 +412,6 @@ rustbft_main() {
     case "$1" in
       -f) F="${2:-}"; shift 2 ;;
       -t) EXPERIMENT_TIME_S="${2:-}"; shift 2 ;;
-      --dataset) DATASET_ENABLED=1; shift ;;
       --log) LOG_ENABLED=1; shift ;;
       --output-dir)
         if [[ $# -lt 2 || -z "${2}" ]]; then
@@ -454,7 +448,6 @@ rustbft_main() {
       --agent-port) AGENT_PORT="${2:-}"; shift 2 ;;
       --initial-timeout) INITIAL_TIMEOUT_MS="${2:-}"; shift 2 ;;
       --schedule) SCHEDULE_FILE_ARG="${2:-}"; shift 2 ;;
-      --learning-window-mode) LEARNING_WINDOW_MODE="${2:-}"; shift 2 ;;
       --learning-feature-duration) LEARNING_FEATURE_DURATION_MS="${2:-}"; shift 2 ;;
       --learning-reply-wait) LEARNING_REPLY_WAIT_MS="${2:-}"; shift 2 ;;
       --learning-warmup-duration) LEARNING_WARMUP_DURATION_MS="${2:-}"; shift 2 ;;
@@ -545,10 +538,6 @@ rustbft_main() {
     echo "Invalid --tx-size ${TX_SIZE}; the ack header needs at least 9 bytes." >&2
     exit 2
   fi
-  case "${LEARNING_WINDOW_MODE}" in
-    wall-clock) ;;
-    *) echo "Invalid --learning-window-mode value: ${LEARNING_WINDOW_MODE}. Rust protocols support wall-clock only." >&2; exit 2 ;;
-  esac
   if ! [[ "${CLIENT_CONNECTIONS_PER_TARGET}" =~ ^[1-9][0-9]*$ ]]; then
     echo "Invalid --client-connections value: ${CLIENT_CONNECTIONS_PER_TARGET}. Use a positive integer." >&2
     exit 2
@@ -578,13 +567,6 @@ rustbft_main() {
     LEARNING_AGENT_ENABLED=0
   else
     LEARNING_AGENT_ENABLED=1
-  fi
-  if (( DATASET_ENABLED == 1 )) && (( LEARNING_AGENT_ENABLED == 0 )); then
-    echo "--dataset requires an agent mode (${SUPPORTED_MODES/normal /})." >&2
-    exit 2
-  fi
-  if (( LEARNING_AGENT_ENABLED == 1 )); then
-    DATASET_ENABLED=1
   fi
 
   LOCAL_SSH_KEY_PATH="${LOCAL_SSH_KEY_PATH/#\~/$HOME}"
@@ -686,8 +668,7 @@ rustbft_main() {
     printf 'initial_timeout_ms=%q\n' "${INITIAL_TIMEOUT_MS:-from-template}"
     printf 'agent_model=%q\n' "${AGENT_MODEL_TYPE}"
     printf 'prior_path=%q\n' "${PRIOR_PATH:-}"
-    printf 'learning_window_mode=%q\n' "${LEARNING_WINDOW_MODE}"
-    printf 'dataset_enabled=%q\n' "${DATASET_ENABLED}"
+    printf 'learning_window_mode=wall-clock\n'
     printf 'log_enabled=%q\n' "${LOG_ENABLED}"
     printf 'failure_spec_enabled=%q\n' "${FAILURE_SPEC_ENABLED}"
     printf 'targets_file=%q\n' "${TARGETS_FILE}"
@@ -813,7 +794,7 @@ rustbft_main() {
   echo "Selected mode: ${MODE}"
   echo "${PROTOCOL_NAME} nodes: ${NODES} (f=${F}, replicas_per_server_machine=${replicas_per_server_machine})"
   echo "Client rate: ${TX_RATE} tx/s; tx size: ${TX_SIZE} B; request timeout: ${REQUEST_TIMEOUT_MS} ms"
-  echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (dataset=${DATASET_ENABLED}, log=${LOG_ENABLED})"
+  echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (log=${LOG_ENABLED})"
 
   echo "Creating ${PROTOCOL_NAME} CloudLab payload tarball..."
   rm -f "${LOCAL_TAR}"
@@ -1105,6 +1086,11 @@ fi
 
 sudo -n ip link set "${bridge_name}" down >/dev/null 2>&1 || true
 sudo -n ip link del "${bridge_name}" type bridge >/dev/null 2>&1 || true
+# Another protocol's harness, interrupted before its teardown, can leave its
+# bridge holding this same overlay address; its route then shadows ours.
+for foreign_if in $(ip -o -4 addr show | awk -v ip="${bridge_ip}/" -v own="${bridge_name}" 'index($4, ip) == 1 && $2 != own {print $2}' | sort -u); do
+  sudo -n ip link del "${foreign_if}" >/dev/null 2>&1 || true
+done
 sudo -n ip link add name "${bridge_name}" type bridge
 sudo -n ip addr replace "${bridge_ip}/${overlay_mask}" dev "${bridge_name}"
 sudo -n ip link set "${bridge_name}" up
@@ -1294,7 +1280,6 @@ REMOTE
           "${machine_idx}" \
           "${START_UNIX_MS}" \
           "${MODE}" \
-          "${DATASET_ENABLED}" \
           "${AGENT_MODEL_TYPE}" \
           "${AGENT_PORT}" \
           "${RUN_ROOT_REMOTE_NAME}" \
@@ -1313,20 +1298,19 @@ replicas_per_machine="$1"
 machine_idx="$2"
 start_unix_ms="$3"
 mode="$4"
-dataset_enabled="$5"
-model_type="$6"
-agent_port="$7"
-run_root="$HOME/$8"
-ns_prefix="$9"
-protocol="${10}"
-agent_protocol="${11}"
-schedule_file_rel="${12}"
-failure_spec_enabled="${13}"
-feature_window_ms="${14}"
-reward_window_ms="${15}"
-sharing_collect_wait_ms="${16}"
+model_type="$5"
+agent_port="$6"
+run_root="$HOME/$7"
+ns_prefix="$8"
+protocol="$9"
+agent_protocol="${10}"
+schedule_file_rel="${11}"
+failure_spec_enabled="${12}"
+feature_window_ms="${13}"
+reward_window_ms="${14}"
+sharing_collect_wait_ms="${15}"
 # ssh drops an empty last argument, so an omitted prior arrives unset.
-prior_path="${17:-}"
+prior_path="${16:-}"
 learning_agent_python="${HOME}/.venvs/adaptive-timer-learning-agent/bin/python"
 
 if [[ ! -x "${learning_agent_python}" ]]; then
@@ -1371,11 +1355,8 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   ns_name="${ns_prefix}${replica_id}"
   session_name="${protocol}_agent_${replica_id}"
   agent_log="${run_root}/logs/agent_${replica_id}.log"
-  dataset_args=""
-  if [[ "${dataset_enabled}" == "1" ]]; then
-    rm -f "${run_root}/agent${replica_id}.csv"
-    dataset_args="--dataset-csv ${run_root}/agent${replica_id}.csv"
-  fi
+  rm -f "${run_root}/agent${replica_id}.csv"
+  dataset_args="--dataset-csv ${run_root}/agent${replica_id}.csv"
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   tmux new-session -d -s "${session_name}" \
     "sudo -n ip netns exec ${ns_name} bash -lc 'cd \"${run_root}\" && exec \"${learning_agent_python}\" learning_agent/main.py --node-id ${replica_id} --protocol ${agent_protocol} ${bind_args} --signing false ${agent_model_args} ${dataset_args} ${failure_args}' > \"${agent_log}\" 2>&1"
@@ -1799,7 +1780,7 @@ REMOTE
     done
   fi
 
-  if (( LEARNING_AGENT_ENABLED == 1 )) && (( DATASET_ENABLED == 1 )); then
+  if (( LEARNING_AGENT_ENABLED == 1 )); then
     for i in "${!server_nodes[@]}"; do
       node="${server_nodes[$i]}"
       host="${server_hosts[$i]}"
@@ -1839,7 +1820,7 @@ REMOTE
   if (( dataset_fetch_failed != 0 )); then
     echo "Some ${PROTOCOL_NAME} dataset files could not be fetched." >&2
   fi
-  if (( LEARNING_AGENT_ENABLED == 1 )) && (( DATASET_ENABLED == 1 )); then
+  if (( LEARNING_AGENT_ENABLED == 1 )); then
     saved_agent_datasets=()
     for ((replica_id = 0; replica_id < NODES; replica_id++)); do
       agent_dataset_local="${ARTIFACT_DIR}/agent${replica_id}.csv"

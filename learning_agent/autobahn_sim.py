@@ -24,7 +24,10 @@ measured on CloudLab in scripts/cloudlab/tmp/cal/ab (2026-10-02, cloudlab_1,
   the third vote starts F, then Confirm, votes and Commit (5 hops + F). No
   socket sets TCP_NODELAY, so every hop carries a uniform extra of up to
   ``2 nagle_frac min(h, nagle_cap_ms)``, and every view's round trips a
-  common lognormal spread (``view_sigma``). A vote is rarely late by an
+  common lognormal spread (``view_sigma``). The extra grows with h through
+  5+150: replica 3's Prepare-to-Confirm vote gap is 2h + F plus 10 / 120 /
+  260 ms at h = 5 / 55 / 155, and a view lasts T + 80 at 5+50 and T + 230
+  at 5+150 (2026-10-07 single-host runs). A vote is rarely late by an
   exponential tail.
 - Timer. Slot s's timer starts when Prepare(s-1) is processed (or slot s-4
   commits); expiry is a Timeout, and Timeouts form a TC one hop later. The
@@ -34,8 +37,18 @@ measured on CloudLab in scripts/cloudlab/tmp/cal/ab (2026-10-02, cloudlab_1,
   votes every quorum needs all three honest replicas, and a TC that reaches
   one of them before the Confirm starves the view: the slot pays the TC plus
   a new view's slow path, and below the path's need the views starve one
-  after another (the soft floors near 400 at 5+50 and 1000 at 5+150, stalls
-  further down).
+  after another (the soft floors near 400 at 5+50 and 1000 at 5+150).
+- Replica 3's own views. A leader processes its own vote locally
+  (core.rs:1586-1588); only votes sent to another leader are held
+  (core.rs:1601-1614). So a view replica 3 leads, one in four, is a healthy
+  view: any two honest votes make its quorum, all three its fast path, which
+  needs only the Prepare in before the TC (a Commit is accepted in any view).
+  Below the slow path's need a slot cycles views until replica 3's turn, so
+  a timeout far below the need costs less than one just under it, whose
+  failed views each last T + h + half the extra. Measured at 5+150 (GP run
+  pt_ab_continuous_gp_h8_20261007_180512): slots end one or two views after
+  their first replica-3 view in 72-94% at T = 100-430, client R about -1.4
+  at T = 100, -1.8 to -2.2 at 346-627, -0.8 at 915-1135.
 - Timeout traffic. A genuine timeout gives the receivers data to piggyback
   their delayed ACKs on, so recent timeouts take ``flush_ms`` off every
   hop's extra. That is what makes a timeout above the link's need cost
@@ -55,7 +68,9 @@ The replica report is synthesized as the Rust side computes it: one sample
 per committed header (about four per slot), latency from the header's first
 sighting at the reporting replica to its execution, transactions and
 throughput counted in payload digests, leader changes between consecutive
-committed headers' authors, bursty inter-commit gaps. The client-observed
+committed headers' authors, bursty inter-commit gaps (their p50 is the host's in-burst delivery gap,
+``burst_gap_ms``, drawn per run so the prior learns to ignore it). The
+client-observed
 latency (header latency plus the batch and car waits, the quantity the
 calibration cells were judged on) is kept beside it for ``check`` and
 ``eval``.
@@ -65,9 +80,10 @@ features, 2 s reply wait (applied at the deadline), 3 s warm-up, 5 s reward.
 
 Constants the mechanics do not fix (car and slot processing, the TCP extra
 per hop and what timeout traffic removes of it, the view-change delay, noise)
-were fit to the measured cells (``check``: the client R ranking within 11 of
-the 12 (link, fault) groups, mean absolute R error 0.08) and are drawn per
-simulated training run from ranges around those values. The simulator knows
+were fit to the measured cells and the 2026-10-07 single-host 5+150
+points (``check``: the client R ranking within 11 of the 12 (link, fault)
+groups, mean absolute R error 0.10) and are drawn per simulated training run
+from ranges around those values. The simulator knows
 the fault mechanisms, not the spec's values.
 """
 
@@ -115,10 +131,11 @@ DEFAULT_PRIOR_PATH = CONTEXT_SPECS[agent_pb2.PROTOCOL_AUTOBAHN].prior_path
 class SimConstants:
     """Defaults are the calibration host (cloudlab_1, 10,000 tx/s): the car
     period from the measured header rates, the rest a search over the
-    ``check`` cells (rank agreement, then R level, then the oracle report's
-    p50 and p95), starting from a TCP extra fit to the measured Prepare to
-    Confirm vote (70 / 271 / 594 ms; the search settled lower). Training
-    draws every field from sample_constants."""
+    ``check`` cells plus the single-host 5+150 withheld points at T = 100
+    and 346 (rank agreement, then R level, then the oracle report's p50 and
+    p95; scripts/cloudlab/tmp/cal/pt/absim/search3.py), with the TCP extra
+    uncapped through 5+150 as the Prepare-to-Confirm vote gaps and view
+    lengths measure it. Training draws every field from sample_constants."""
 
     # Car period max(100, car_hops * h + car_proc_ms); lanes jitter by
     # lane_sigma * C around the common tick, the tick by car_sigma.
@@ -127,23 +144,28 @@ class SimConstants:
     car_sigma: float = 0.05
     lane_sigma: float = 0.15
     # A car is certified cert_hops * h plus one hop's TCP extra after it is made.
-    cert_hops: float = 2.0
+    cert_hops: float = 1.739
     # From the third lane's newly certified car to the Prepare.
     slot_proc_ms: float = 5.0
     # TCP extra per hop: uniform on [0, 2 nagle_frac min(h, nagle_cap_ms)],
-    # nagle_common of it shared by all voters of a round.
-    nagle_frac: float = 0.56
-    nagle_cap_ms: float = 75.0
-    nagle_common: float = 0.5
+    # nagle_common of it shared by all voters of a round. It grows with h
+    # through 5+150: replica 3's Prepare-to-Confirm vote gap is 2h + F plus
+    # 10 / 120 / 260 ms at h = 5 / 55 / 155 (both 2026-10-07 single-host runs,
+    # 5-host 70 / 271 / 594), and a view lasts T + 80 at 5+50 and T + 230 at
+    # 5+150 (T + h plus half the extra), so the cap sits above the links
+    # calibrated on.
+    nagle_frac: float = 0.422
+    nagle_cap_ms: float = 216.7
+    nagle_common: float = 0.641
     # Timeout traffic gives the receivers data to piggyback their ACKs on, so
     # the delayed-ACK part of the extra goes: each hop's extra shrinks by
     # flush_ms times the recent timeouts per slot (at most one).
-    flush_ms: float = 26.0
+    flush_ms: float = 15.21
     # A new view's Prepare goes out view_change_hops * min(h, nagle_cap_ms)
     # after the replicas start its timer.
-    view_change_hops: float = 0.72
+    view_change_hops: float = 0.627
     # Lognormal spread of one view's round trips, common to its messages.
-    view_sigma: float = 0.39
+    view_sigma: float = 0.294
     # Per message processing.
     proc_ms: float = 0.8
     # A vote is late with this probability, by an exponential of mean
@@ -153,7 +175,7 @@ class SimConstants:
     tail_ms: float = 0.0
     # Client latency over the header's: a batch wait uniform on [0, 100] and a
     # car wait uniform on [0, 2 client_car_frac C], plus client_proc_ms.
-    client_car_frac: float = 0.6
+    client_car_frac: float = 0.729
     client_proc_ms: float = 0.0
     # Transactions per second; enters only the client view (the report counts
     # digests, which do not depend on the load).
@@ -161,6 +183,11 @@ class SimConstants:
     # Share of the timeouts reported as no-progress, against the measured
     # 15 / 97 at base where every slot's late timeout interleaves with commits.
     no_progress_scale: float = 0.3
+    # Gap between the headers of one slot as the executor delivers them, the
+    # report's p50 inter-commit gap: a CPU constant of the host, 0.033-0.065 ms
+    # on the 5-host layout (20261005 oracles) and 0.015-0.030 ms with all
+    # replicas on one host (20261007 runs), about 20% apart window to window.
+    burst_gap_ms: float = 0.04
 
 
 @dataclass
@@ -192,7 +219,7 @@ class _Window:
     slots: int = 0
     timeouts: int = 0
 
-    def report(self, timeout_ms: float, no_progress_scale: float) -> Dict[str, float]:
+    def report(self, timeout_ms: float, no_progress_scale: float, burst_gap_ms: float) -> Dict[str, float]:
         length_s = (self.end_ms - self.start_ms) / 1000.0
         n = len(self.latencies)
         if n:
@@ -202,8 +229,8 @@ class _Window:
             rank = lambda v, q: float(v[max(0, math.ceil(q * len(v)) - 1)])
             avg, p50, p95 = float(lat.mean()), rank(lat, 0.5), rank(lat, 0.95)
             gaps = np.diff(self.times)
-            # Headers of one slot are delivered in a burst (measured p50 gap 0.04 ms).
-            gaps = np.sort(np.where(gaps < 0.04, 0.04, gaps)) if len(gaps) else np.zeros(1)
+            # Headers of one slot are delivered in a burst, burst_gap_ms apart.
+            gaps = np.sort(np.where(gaps < burst_gap_ms, burst_gap_ms, gaps)) if len(gaps) else np.zeros(1)
             gap_avg, gap_p50, gap_p95 = float(gaps.mean()), rank(gaps, 0.5), rank(gaps, 0.95)
             tx, batch_avg, batch_p95 = float(dig.sum()), float(dig.mean()), rank(dig, 0.95)
         else:
@@ -249,19 +276,19 @@ class AutobahnSim:
         self.c = constants
         self.phases = sorted(phases, key=lambda ph: ph.start_s)
         self.rng = np.random.default_rng(seed)
+        self._gap_rng = np.random.default_rng([seed, 1])
         self.episode_start_s = float(start_offset_s)
         self.timeout_ms = float(initial_timeout_ms)
         self._ub: List[float] = []
         self._ui = 0
         self._nb: List[float] = []
         self._ni = 0
-        # Slot pipeline: the next slot, the send time of slot s-1's first
-        # delivered Prepare (its tips) and when the next leader holds it (the
-        # ticket), the commits of the last K slots, the execution frontier, and
-        # the slot being resolved [view, start, timer start, first Prepare, best
-        # commit] while its views run.
+        # Slot pipeline: the next slot, when the next leader holds slot s-1's
+        # first delivered Prepare (its tips, the ticket), the commits of the
+        # last K slots, the execution frontier, and the slot being resolved
+        # [view, start, timer start, first Prepare, best commit] while its
+        # views run.
         self._slot = 0
-        self._prev_prep = 0.0
         self._prev_ticket = 0.0
         self._commits: Deque[float] = deque([-math.inf] * K, maxlen=K)
         self._preps: Deque[Tuple[float, bool]] = deque(maxlen=K - 1)
@@ -397,7 +424,8 @@ class AutobahnSim:
         else:
             confirm = votes[2] + FAST_PATH_MS
         # A replica holding the TC refuses the Confirm (core.rs:1374-1384); with
-        # votes withheld one honest refusal starves the view, otherwise two.
+        # votes withheld one honest refusal starves the view, otherwise two
+        # (also in a view replica 3 leads, where its own vote is not held).
         confirm_u = u()
         refusals = sum(tc + extra[0] * (u() - 0.5) < confirm + h + hop(extra, confirm_u)
                        for _ in range(n))
@@ -437,7 +465,9 @@ class AutobahnSim:
             if prep + h <= tc:
                 if first_prep is None:
                     first_prep = prep
-                best = min(best, self._view_commit(prep, h, extra, ph.vote_withhold, tc))
+                # Replica 3 counts its own vote at once when it leads.
+                withheld = ph.vote_withhold and leader != ATTACKER
+                best = min(best, self._view_commit(prep, h, extra, withheld, tc))
             if best > deadline:
                 self._to_t.append(deadline)
                 self._recent_to.append(deadline)
@@ -462,7 +492,6 @@ class AutobahnSim:
                 self._to_t.append(old_prep + VOTE_HOLD_MS + timeout_ms)
         self._preps.append((first_prep, ph.vote_withhold))
         self._commits.append(commit)
-        self._prev_prep = first_prep
         self._prev_ticket = first_prep + h
         self._exec = max(self._exec, commit)
         ex = self._exec
@@ -530,7 +559,8 @@ class AutobahnSim:
     ) -> Tuple[Dict[str, float], float, Dict[str, float], int]:
         t0 = self.episode_start_s * 1000.0
         self._advance(t0 + FEATURE_S * 1000.0)
-        report = self._window(t0, t0 + FEATURE_S * 1000.0).report(self.timeout_ms, self.c.no_progress_scale)
+        report = self._window(t0, t0 + FEATURE_S * 1000.0).report(
+            self.timeout_ms, self.c.no_progress_scale, self._burst_gap())
         new_timeout = float(choose(report))
         self._advance(t0 + (FEATURE_S + REPLY_S) * 1000.0)
         self.timeout_ms = new_timeout
@@ -539,7 +569,12 @@ class AutobahnSim:
         phase_idx, _ = self.phase_at(self.episode_start_s + FEATURE_S)
         self.episode_start_s += EPISODE_S
         self._prune(t0 + EPISODE_S * 1000.0)
-        return report, new_timeout, reward.report(new_timeout, self.c.no_progress_scale), phase_idx
+        return (report, new_timeout,
+                reward.report(new_timeout, self.c.no_progress_scale, self._burst_gap()), phase_idx)
+
+    def _burst_gap(self) -> float:
+        # Its own stream, so the window-to-window spread leaves the run's draws alone.
+        return self.c.burst_gap_ms * float(self._gap_rng.uniform(0.8, 1.25))
 
     def client_score(self, start_s: float, end_s: float) -> Tuple[float, float]:
         """(R, tx-weighted p50 in ms) on the client between start_s and end_s, as
@@ -575,20 +610,21 @@ def sample_constants(rng: np.random.Generator) -> SimConstants:
         car_proc_ms=float(rng.uniform(30.0, 70.0)),
         car_sigma=float(rng.uniform(0.02, 0.1)),
         lane_sigma=float(rng.uniform(0.05, 0.3)),
-        cert_hops=float(rng.uniform(1.5, 2.5)),
+        cert_hops=float(rng.uniform(1.2, 2.2)),
         slot_proc_ms=float(rng.uniform(2.0, 15.0)),
-        nagle_frac=float(rng.uniform(0.35, 0.8)),
-        nagle_cap_ms=float(rng.uniform(50.0, 130.0)),
-        nagle_common=float(rng.uniform(0.3, 0.7)),
-        flush_ms=float(rng.uniform(10.0, 50.0)),
-        view_change_hops=float(rng.uniform(0.4, 1.1)),
-        view_sigma=float(rng.uniform(0.2, 0.5)),
+        nagle_frac=float(rng.uniform(0.3, 0.65)),
+        nagle_cap_ms=float(rng.uniform(150.0, 300.0)),
+        nagle_common=float(rng.uniform(0.45, 0.85)),
+        flush_ms=float(rng.uniform(5.0, 30.0)),
+        view_change_hops=float(rng.uniform(0.3, 0.9)),
+        view_sigma=float(rng.uniform(0.15, 0.4)),
         proc_ms=float(rng.uniform(0.4, 2.0)),
         vote_tail_prob=float(rng.uniform(0.0, 0.03)),
         tail_hops=float(rng.uniform(2.0, 6.0)),
         tail_ms=float(rng.uniform(0.0, 50.0)),
         load_tps=float(rng.uniform(4000.0, 16000.0)),
         no_progress_scale=float(rng.uniform(0.15, 0.5)),
+        burst_gap_ms=float(math.exp(rng.uniform(math.log(0.012), math.log(0.07)))),
     )
 
 

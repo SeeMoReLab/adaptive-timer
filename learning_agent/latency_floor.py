@@ -84,14 +84,6 @@ class LatencyFloor:
         self._max_floor_ms = None if max_floor_ms is None else float(max_floor_ms)
         self.reset()
 
-    @property
-    def multiplier(self) -> float:
-        return self._multiplier
-
-    @property
-    def observation_count(self) -> int:
-        return len(self._latencies)
-
     def observe(self, latency_ms: float, alive: bool = True) -> None:
         """Record one window's consensus latency.
 
@@ -118,9 +110,6 @@ class LatencyFloor:
         if self._max_floor_ms is not None:
             floor_ms = min(floor_ms, self._max_floor_ms)
         return floor_ms
-
-    def permits(self, timeout_ms: float) -> bool:
-        return float(timeout_ms) >= self.floor_ms
 
     def reset(self) -> None:
         self._latencies: Deque[float] = deque(maxlen=self._window)
@@ -196,20 +185,10 @@ class LatencyFloorPolicy(TensorModel):
         self._takes_backward = (
             "backward" in inspect.signature(model.update_model).parameters
         )
-        self._override_count = 0
 
     @property
     def model(self) -> TensorModel:
         return self._model
-
-    @property
-    def latency_floor(self) -> LatencyFloor:
-        return self._latency_floor
-
-    @property
-    def override_count(self) -> int:
-        """Decisions where the floor moved the model off its preferred arm."""
-        return self._override_count
 
     def _observe(self, row: np.ndarray) -> None:
         alive = True
@@ -262,8 +241,6 @@ class LatencyFloorPolicy(TensorModel):
         constrained = np.zeros((len(rows), len(self._timeouts)), dtype=float)
         for index, scores in enumerate(batch):
             selected = self._constrain_row(scores, mask)
-            if self._preferred_index(scores) != selected:
-                self._override_count += 1
             constrained[index, selected] = 1.0
 
         return constrained[0] if single else constrained
@@ -300,7 +277,6 @@ class LatencyFloorPolicy(TensorModel):
 
     def reset_model(self) -> None:
         self._latency_floor.reset()
-        self._override_count = 0
         self._model.reset_model()
 
 

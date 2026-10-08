@@ -298,7 +298,7 @@ class _Batch:
     __slots__ = ("seq", "view", "leader", "t0", "t_send", "size", "oldest", "mean_arr", "chunks",
                  "pp", "stamp", "send", "arr", "u_pp", "u_ret", "u_cc", "u_ack", "u_ex", "xfer", "proc",
                  "ackp", "exep",
-                 "cost", "t_dec", "fast", "t_cert", "commit", "cr", "acc_prev", "first_exec", "replies",
+                 "cost", "t_dec", "fast", "commit", "cr", "acc_prev", "first_exec", "replies",
                  "reproposed", "body", "bodyprev", "wlag", "xlag", "t3", "t4")
 
     def __init__(self):
@@ -306,7 +306,6 @@ class _Batch:
         self.t3 = INF  # the leader's 2f+1-th and n-th valid prepare (INF: none)
         self.t4 = INF
         self.fast = False
-        self.t_cert = INF
         self.commit = [INF] * N
         self.cr = [INF] * N
         self.acc_prev = [False] * N
@@ -734,7 +733,6 @@ class SbftSim:
         rl = self.reps[L]
         stop_l = rl.stopped.get(v, INF)
         b.t_dec = INF
-        b.t_cert = INF
         if b.t_send >= stop_l:
             return  # a held proposal dropped by a view change
         votes = []
@@ -778,7 +776,6 @@ class SbftSim:
             if t_dec >= stop_l:
                 return
         b.fast = fast
-        b.t_cert = t_cert
         b.t_dec = t_dec
         b.cr = cr
         for j in range(N):

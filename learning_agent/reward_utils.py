@@ -1,10 +1,5 @@
-import math
-from typing import Callable, Mapping, Optional, Tuple, Type
+from typing import Optional, Tuple
 
-import agent_pb2
-
-
-REWARD_THROUGHPUT_FIELD = "reward_throughput_tps"
 
 # Throughput reward is concave: every transaction per second up to the knee is
 # worth full credit, and everything above it is discounted. The agent should
@@ -39,24 +34,6 @@ def reward_tps_latency(throughput_tps: float, p50_consensus_latency_ms: float) -
     return float(throughput_tps) / 10000.0 - float(p50_consensus_latency_ms) / 1000.0
 
 
-# Retired latency-shaped rewards, kept for reference. Consensus latency turned
-# out to describe the delay environment rather than the timeout that was
-# chosen - under 150ms of injected network delay every arm reads as slow - so
-# a reward built on it ranks phases instead of arms. The measurement is used as
-# a feasibility constraint on the action space instead; see latency_floor.py.
-def design_1(throughput_tps: int,p95_consensus_latency_ms: float) -> float:
-    if p95_consensus_latency_ms <= 0:
-        return -1
-    return (throughput_tps/p95_consensus_latency_ms)-1
-
-def design_2(throughput_tps: int,p95_consensus_latency_ms: float) -> float:
-    return (throughput_tps - p95_consensus_latency_ms) / 1000.0
-
-def design_3(throughput_tps: int,avg_consensus_latency_ms: float) -> float:
-    if avg_consensus_latency_ms <= 0:
-        return -1
-    return (throughput_tps/avg_consensus_latency_ms)-1
-
 def reward_mixed(
     throughput_tps: float,
     timeout_ms: int,
@@ -82,7 +59,7 @@ def reward_mixed(
 
 # --- Reward design selection -------------------------------------------------
 #
-# Which of the two shapings above the calculate_*_reward functions apply. This
+# Which of the shapings above the calculate_*_reward functions apply. This
 # is one process-wide setting rather than a per-call argument because those
 # calculators are reached through signatures fixed by the protobuf report
 # layout (main.reward_engineering, simulator's CSV path, plotting scripts), and
@@ -298,17 +275,6 @@ def calculate_tendermint_reward(
     )
 
 
-def retired_tendermint_throughput_minus_latency(
-    throughput_tps: float, p90_consensus_latency_ms: float
-) -> float:
-    """The Tendermint reward before --reward-design existed, kept for reference.
-
-    Same objection as design_1..3 above: an absolute latency level reports the
-    delay environment the phase is in rather than the timeout that was chosen.
-    """
-    return (throughput_tps - p90_consensus_latency_ms) / 4000.0
-
-
 def calculate_hotstuff_reward(
     *,
     total_transactions: int,
@@ -364,116 +330,3 @@ def calculate_autobahn_reward(
         total_transactions=total_transactions,
         p50_consensus_latency_ms=p50_consensus_latency_ms,
     )
-
-
-def reward_from_report_row(
-    row: Mapping[str, Optional[str]], row_number: int
-) -> float:
-    raw_value = row.get(REWARD_THROUGHPUT_FIELD)
-    if raw_value is None or raw_value.strip() == "":
-        raise ValueError(
-            f"Missing reward report value '{REWARD_THROUGHPUT_FIELD}' "
-            f"at CSV line {row_number}."
-        )
-    try:
-        throughput_tps = float(raw_value)
-    except ValueError as exc:
-        raise ValueError(
-            f"Invalid reward report value for '{REWARD_THROUGHPUT_FIELD}' "
-            f"at CSV line {row_number}: {raw_value!r}"
-        ) from exc
-    return reward_tps(throughput_tps)
-
-
-_REPORT_TYPES: Mapping[int, Type[object]] = {
-    agent_pb2.PROTOCOL_PBFT: agent_pb2.PbftReport,
-    agent_pb2.PROTOCOL_SBFT: agent_pb2.SbftReport,
-    agent_pb2.PROTOCOL_TENDERMINT: agent_pb2.TendermintReport,
-    agent_pb2.PROTOCOL_HOTSTUFF: agent_pb2.HotstuffReport,
-    agent_pb2.PROTOCOL_AUTOBAHN: agent_pb2.AutobahnReport,
-    agent_pb2.PROTOCOL_SMARTBFT: agent_pb2.SmartbftReport,
-}
-
-_REPORT_REWARD_CALCULATORS: Mapping[int, Callable[..., float]] = {
-    agent_pb2.PROTOCOL_PBFT: calculate_pbft_reward,
-    agent_pb2.PROTOCOL_SBFT: calculate_sbft_reward,
-    agent_pb2.PROTOCOL_TENDERMINT: calculate_tendermint_reward,
-    agent_pb2.PROTOCOL_HOTSTUFF: calculate_hotstuff_reward,
-    agent_pb2.PROTOCOL_AUTOBAHN: calculate_autobahn_reward,
-    agent_pb2.PROTOCOL_SMARTBFT: calculate_smartbft_reward,
-}
-
-
-def get_reward_report_field_names(protocol: int) -> Tuple[str, ...]:
-    """Return every field expected by a protocol's reward calculator."""
-    report_type = _REPORT_TYPES.get(int(protocol))
-    if report_type is None:
-        raise ValueError(f"Unsupported protocol: {protocol}")
-    return tuple(field.name for field in report_type.DESCRIPTOR.fields)
-
-
-def calculate_reward_from_report_row(
-    protocol: int,
-    row: Mapping[str, object],
-    row_number: int,
-    prefix: str = "reward_",
-) -> float:
-    """Calculate a reward from all report fields stored in a CSV row."""
-    report_type = _REPORT_TYPES.get(int(protocol))
-    calculator = _REPORT_REWARD_CALCULATORS.get(int(protocol))
-    if report_type is None or calculator is None:
-        raise ValueError(f"Unsupported protocol: {protocol}")
-
-    values = {}
-    for field in report_type.DESCRIPTOR.fields:
-        column = f"{prefix}{field.name}"
-        raw_value = row.get(column)
-        if raw_value is None or str(raw_value).strip() == "":
-            raise ValueError(
-                f"Missing reward report value '{column}' at CSV line {row_number}."
-            )
-        try:
-            numeric_value = float(raw_value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Invalid reward report value for '{column}' at CSV line "
-                f"{row_number}: {raw_value!r}"
-            ) from exc
-        if not math.isfinite(numeric_value):
-            raise ValueError(
-                f"Non-finite reward report value for '{column}' at CSV line "
-                f"{row_number}: {raw_value!r}"
-            )
-        if field.type in (
-            field.TYPE_INT32,
-            field.TYPE_INT64,
-            field.TYPE_UINT32,
-            field.TYPE_UINT64,
-            field.TYPE_SINT32,
-            field.TYPE_SINT64,
-            field.TYPE_FIXED32,
-            field.TYPE_FIXED64,
-            field.TYPE_SFIXED32,
-            field.TYPE_SFIXED64,
-        ):
-            values[field.name] = int(numeric_value)
-        else:
-            values[field.name] = numeric_value
-
-    # Tendermint's applied timeouts are not report fields, so they are not
-    # covered by the loop above; reward_mixed needs them and reward_tps does
-    # not, hence the tolerant lookup.
-    if int(protocol) == agent_pb2.PROTOCOL_TENDERMINT:
-        for name in ("propose", "prevote", "precommit"):
-            raw_value = row.get(f"{name}_timeout_milliseconds_used")
-            if raw_value is None or str(raw_value).strip() == "":
-                continue
-            try:
-                values[f"{name}_timeout_ms"] = int(float(raw_value))
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"Invalid '{name}_timeout_milliseconds_used' at CSV line "
-                    f"{row_number}: {raw_value!r}"
-                ) from exc
-
-    return float(calculator(**values))

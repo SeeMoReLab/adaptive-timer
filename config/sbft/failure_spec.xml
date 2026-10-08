@@ -8,7 +8,6 @@
          phases are not yet calibrated: their expected pairs follow from the floors (election ties above them; with
          no straggler the fast path always completes, so W ties). -->
     <schemaVersion>4</schemaVersion>
-    <replicaIdType>global</replicaIdType>
     <warmUpTime>10</warmUpTime>
     <globalNetworkDelay>
         <delayMs>5</delayMs>
@@ -20,7 +19,6 @@
             <atTime>0</atTime>
             <network>
                 <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
                 <global>
                     <delayMs>0</delayMs>
                     <burstDurationMs>0</burstDurationMs>
@@ -38,7 +36,6 @@
             <atTime>300</atTime>
             <network>
                 <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
                 <global>
                     <delayMs>0</delayMs>
                     <burstDurationMs>0</burstDurationMs>
@@ -70,7 +67,6 @@
             <atTime>600</atTime>
             <network>
                 <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
                 <global>
                     <delayMs>50</delayMs>
                     <burstDurationMs>10000</burstDurationMs>
@@ -88,7 +84,6 @@
             <atTime>900</atTime>
             <network>
                 <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
                 <global>
                     <delayMs>50</delayMs>
                     <burstDurationMs>10000</burstDurationMs>
@@ -120,7 +115,6 @@
             <atTime>1200</atTime>
             <network>
                 <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
                 <global>
                     <delayMs>50</delayMs>
                     <burstDurationMs>10000</burstDurationMs>
@@ -152,7 +146,6 @@
             <atTime>1500</atTime>
             <network>
                 <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
                 <global>
                     <delayMs>150</delayMs>
                     <burstDurationMs>10000</burstDurationMs>
@@ -178,7 +171,6 @@
             <atTime>1800</atTime>
             <network>
                 <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
                 <global>
                     <delayMs>150</delayMs>
                     <burstDurationMs>10000</burstDurationMs>
@@ -204,7 +196,6 @@
             <atTime>2100</atTime>
             <network>
                 <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
                 <global>
                     <delayMs>0</delayMs>
                     <burstDurationMs>0</burstDurationMs>

@@ -2,7 +2,6 @@ from collections import deque
 from dataclasses import dataclass
 import math
 import os
-import time
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -279,10 +278,6 @@ class DerivedWaitActionCodec(ActionCodec[agent_pb2.Timeout]):
         self._wait_bounds_ms = action_codec.bounds_ms[1]
 
     @property
-    def inner(self) -> ContinuousTimeoutActionCodec:
-        return self._inner
-
-    @property
     def divisor(self) -> float:
         return self._divisor
 
@@ -368,10 +363,6 @@ class NormalizedLatencyFloor:
         self._latency_floor = (
             LatencyFloor() if latency_floor is None else latency_floor
         )
-
-    @property
-    def latency_floor(self) -> LatencyFloor:
-        return self._latency_floor
 
     @property
     def floor_ms(self) -> float:
@@ -488,11 +479,6 @@ class ContinuousHeuristicTimeoutModel(TensorModel):
         self._initial_timeout_ms = initial_timeout_ms
 
         self.reset_model()
-
-    @property
-    def timeout_ms(self) -> int:
-        """Milliseconds behind the most recent decision."""
-        return self._held_timeout_ms
 
     def _timeout_for(self, features: np.ndarray) -> int:
         self._estimate.observe_features(features)
@@ -928,7 +914,6 @@ class SimPriorGPModel(TensorModel):
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be > 0, got {value}")
 
-        self._codec = action_codec
         self._action_dim = action_dim
         # The optional constraint every model takes: grid points whose
         # election timeout is under it are not scored (see _feasible_mask).
@@ -1206,11 +1191,6 @@ class SimReturnGPModel(SimPriorGPModel):
             raise ValueError(f"Prior {prior_path} has hold_episodes {self._hold}")
         # Decisions whose h-episode return is not complete yet, (inputs, raw reward),
         # are kept in self._pending (reset_model).
-
-    @property
-    def reward_floor(self) -> float:
-        """Online rewards below this are taken as this, as in the prior's fit."""
-        return self._floor
 
     def reset_model(self) -> None:
         super().reset_model()
@@ -1549,22 +1529,8 @@ class ContinuousLinUCB(TensorModel):
         self.reset_model()
 
     @property
-    def timeout_ms(self) -> int:
-        """Milliseconds behind the most recent decision."""
-        return self._held_timeout_ms
-
-    @property
     def floor_ms(self) -> float:
         return 0.0 if self._latency_floor is None else self._latency_floor.floor_ms
-
-    @property
-    def observation_count(self) -> int:
-        return int(self._observation_count)
-
-    @property
-    def baseline_reward(self) -> float:
-        """The reward level an untried timeout is credited with."""
-        return self._baseline()
 
     def fit_prior_theta(
         self, features: np.ndarray, actions: np.ndarray, rewards: np.ndarray
@@ -1840,7 +1806,6 @@ class ContinuousLinUCB(TensorModel):
             self._covariance += np.outer(inputs, inputs)
             self._reward_vector += (centered / self._reward_scale) * inputs
             self._observe_reward(float(reward))
-            self._observation_count += 1
 
         return 0.0
 
@@ -1852,7 +1817,6 @@ class ContinuousLinUCB(TensorModel):
         self._precision = self._ridge * identity
         self._covariance = self._precision.copy()
         self._reward_vector = self._ridge * self._prior_theta
-        self._observation_count = 0
         self._design_index = 0
         self._baseline_total = 0.0
         self._baseline_weight = 0.0
@@ -1950,11 +1914,6 @@ class ContinuousPPO(PPOBase):
         return self._initial_concentration_bias
 
     # -- diagnostics --------------------------------------------------------
-
-    @property
-    def timeout_ms(self) -> int:
-        """Milliseconds behind the most recent decision."""
-        return self._held_timeout_ms
 
     @property
     def floor_ms(self) -> float:

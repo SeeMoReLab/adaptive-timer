@@ -9,10 +9,9 @@ generates the keys so the key format always matches the binary; for bedrock
 the keys are RSA PEM files produced by openssl. Can also be run locally.
 
 Replica i gets address ips[i] with ports (front, mempool, consensus) =
-(front_port, mempool_port, consensus_port) + i * port_stride. On CloudLab
-every replica has its own overlay IP, so the stride is 0; local testing on
-one IP uses a stride. CppBedrock uses a single port per replica
-(--front-port + i * port_stride) for peers and clients alike.
+(front_port, mempool_port, consensus_port). On CloudLab every replica has its
+own overlay IP, so the IPs must be distinct. CppBedrock uses a single port per
+replica (--front-port) for peers and clients alike.
 """
 
 import argparse
@@ -31,22 +30,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--front-port", type=int, default=9000, help="Client transactions port (default 9000)")
     parser.add_argument("--mempool-port", type=int, default=9100, help="Mempool-to-mempool port (default 9100)")
     parser.add_argument("--consensus-port", type=int, default=9200, help="Consensus port (default 9200)")
-    parser.add_argument("--port-stride", type=int, default=0, help="Per-replica port offset (default 0; use >=1 when IPs collide)")
     parser.add_argument("--parameters-template", default=None, help="Checked-in parameters.json template (config/<protocol>/parameters.json); the source of truth for all knobs not explicitly overridden below (Rust workspaces only)")
     # Every knob below defaults to None = "take the template's value"; a
     # given flag overrides the template field(s) it maps to.
     parser.add_argument("--timeout-delay-ms", type=int, default=None, help="Consensus timeout_delay in ms (the adaptive knob's initial value)")
-    parser.add_argument("--sync-retry-delay-ms", type=int, default=None)
     parser.add_argument("--max-payload-size", type=int, default=None, help="Mempool payload seal size in bytes (baselines) or worker batch size (autobahn)")
     parser.add_argument("--min-block-delay-ms", type=int, default=None)
-    parser.add_argument("--max-queued-transactions", type=int, default=None, help="Bound on transactions in sealed-but-uncommitted payloads (own intake shed beyond it)")
-    parser.add_argument("--max-queue-delay-ms", type=int, default=None, help="Bound on the age of the pending backlog in ms (own intake shed while exceeded)")
-    # Autobahn-specific knobs (ignored for baselines).
-    parser.add_argument("--header-size", type=int, default=None)
-    parser.add_argument("--max-header-delay-ms", type=int, default=None)
-    parser.add_argument("--max-batch-delay-ms", type=int, default=None)
-    parser.add_argument("--k", type=int, default=None)
-    parser.add_argument("--fast-path-timeout-ms", type=int, default=None)
     return parser.parse_args()
 
 
@@ -76,7 +65,7 @@ def generate_bedrock(args: argparse.Namespace, ips: list, out_dir: Path) -> int:
     )
 
     replicas = [
-        {"id": i, "host": ip, "port": args.front_port + i * args.port_stride}
+        {"id": i, "host": ip, "port": args.front_port}
         for i, ip in enumerate(ips)
     ]
     with (out_dir / "committee.json").open("w") as f:
@@ -106,12 +95,8 @@ def build_parameters(args: argparse.Namespace) -> dict:
         consensus = parameters["consensus"]
         mempool = parameters["mempool"]
         override(consensus, "timeout_delay", args.timeout_delay_ms)
-        override(consensus, "sync_retry_delay", args.sync_retry_delay_ms)
         override(consensus, "max_payload_size", args.max_payload_size)
         override(consensus, "min_block_delay", args.min_block_delay_ms)
-        override(mempool, "max_queued_transactions", args.max_queued_transactions)
-        override(mempool, "max_queue_delay", args.max_queue_delay_ms)
-        override(mempool, "sync_retry_delay", args.sync_retry_delay_ms)
         override(mempool, "max_payload_size", args.max_payload_size)
         override(mempool, "min_block_delay", args.min_block_delay_ms)
     else:
@@ -121,13 +106,7 @@ def build_parameters(args: argparse.Namespace) -> dict:
                 "(expected a flat parameter object with 'timeout_delay')"
             )
         override(parameters, "timeout_delay", args.timeout_delay_ms)
-        override(parameters, "sync_retry_delay", args.sync_retry_delay_ms)
         override(parameters, "batch_size", args.max_payload_size)
-        override(parameters, "header_size", args.header_size)
-        override(parameters, "max_header_delay", args.max_header_delay_ms)
-        override(parameters, "max_batch_delay", args.max_batch_delay_ms)
-        override(parameters, "k", args.k)
-        override(parameters, "fast_path_timeout", args.fast_path_timeout_ms)
     return parameters
 
 
@@ -147,8 +126,8 @@ def main() -> int:
     if not ips:
         print("no replica IPs given", file=sys.stderr)
         return 2
-    if len(set(ips)) != len(ips) and args.port_stride == 0:
-        print("duplicate replica IPs require --port-stride >= 1", file=sys.stderr)
+    if len(set(ips)) != len(ips):
+        print("duplicate replica IPs", file=sys.stderr)
         return 2
 
     out_dir = Path(args.out_dir)
@@ -182,17 +161,16 @@ def main() -> int:
     if args.workspace == "baselines":
         consensus_authorities = {}
         mempool_authorities = {}
-        for i, (name, ip) in enumerate(zip(names, ips)):
-            offset = i * args.port_stride
+        for name, ip in zip(names, ips):
             consensus_authorities[name] = {
                 "name": name,
                 "stake": 1,
-                "address": f"{ip}:{args.consensus_port + offset}",
+                "address": f"{ip}:{args.consensus_port}",
             }
             mempool_authorities[name] = {
                 "name": name,
-                "front_address": f"{ip}:{args.front_port + offset}",
-                "mempool_address": f"{ip}:{args.mempool_port + offset}",
+                "front_address": f"{ip}:{args.front_port}",
+                "mempool_address": f"{ip}:{args.mempool_port}",
             }
 
         committee = {
@@ -201,22 +179,21 @@ def main() -> int:
         }
     else:
         authorities = {}
-        for i, (name, ip) in enumerate(zip(names, ips)):
-            offset = i * args.port_stride
+        for name, ip in zip(names, ips):
             authorities[name] = {
                 "stake": 1,
                 "consensus": {
-                    "consensus_to_consensus": f"{ip}:{args.consensus_port + AUTOBAHN_PORT_CONSENSUS + offset}",
+                    "consensus_to_consensus": f"{ip}:{args.consensus_port + AUTOBAHN_PORT_CONSENSUS}",
                 },
                 "primary": {
-                    "primary_to_primary": f"{ip}:{args.consensus_port + AUTOBAHN_PORT_PRIMARY_TO_PRIMARY + offset}",
-                    "worker_to_primary": f"{ip}:{args.consensus_port + AUTOBAHN_PORT_WORKER_TO_PRIMARY + offset}",
+                    "primary_to_primary": f"{ip}:{args.consensus_port + AUTOBAHN_PORT_PRIMARY_TO_PRIMARY}",
+                    "worker_to_primary": f"{ip}:{args.consensus_port + AUTOBAHN_PORT_WORKER_TO_PRIMARY}",
                 },
                 "workers": {
                     "0": {
-                        "transactions": f"{ip}:{args.front_port + offset}",
-                        "worker_to_worker": f"{ip}:{args.consensus_port + AUTOBAHN_PORT_WORKER_TO_WORKER + offset}",
-                        "primary_to_worker": f"{ip}:{args.consensus_port + AUTOBAHN_PORT_PRIMARY_TO_WORKER + offset}",
+                        "transactions": f"{ip}:{args.front_port}",
+                        "worker_to_worker": f"{ip}:{args.consensus_port + AUTOBAHN_PORT_WORKER_TO_WORKER}",
+                        "primary_to_worker": f"{ip}:{args.consensus_port + AUTOBAHN_PORT_PRIMARY_TO_WORKER}",
                     }
                 },
             }
@@ -231,8 +208,8 @@ def main() -> int:
 
     # Client targets: one front endpoint per replica, replica order.
     with (out_dir / "client_targets.txt").open("w") as f:
-        for i, ip in enumerate(ips):
-            f.write(f"{ip}:{args.front_port + i * args.port_stride}\n")
+        for ip in ips:
+            f.write(f"{ip}:{args.front_port}\n")
 
     # Public key -> global replica id, for failure-spec targeting and
     # learning reports.

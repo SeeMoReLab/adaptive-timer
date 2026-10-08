@@ -17,7 +17,7 @@ LOG_ENABLED=0
 DATASET_ENABLED=0
 AGENT_MODEL_TYPE="discrete_random"
 AGENT_MODEL_SET=0
-REWARD_DESIGN="reward_tps"
+REWARD_DESIGN="reward_tps_latency"
 # Domain constraint on the action space: never apply a timeout below k times
 # the consensus latency the replicas are already achieving. 0 disables it.
 LATENCY_FLOOR_MULTIPLIER=0
@@ -92,7 +92,7 @@ Flags:
   --output-dir <path>
                     Store artifacts here instead of creating a timestamped run directory.
   --model           Learning-agent model for learning/sharing modes: discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo (default: discrete_random).
-  --reward-design   Reward the agent learns from: reward_tps|reward_mixed|reward_tps_latency (default: reward_tps).
+  --reward-design   Reward the agent learns from: reward_tps|reward_mixed|reward_tps_latency (default: reward_tps_latency).
                     reward_tps is throughput alone, concave past a 1000 tps knee. reward_mixed
                     also discounts it by the share of the window one fault would cost.
   --latency-floor-multiplier <float>
@@ -325,10 +325,6 @@ while [[ $# -gt 0 ]]; do
       LATENCY_FLOOR_MULTIPLIER="${2}"
       shift 2
       ;;
-    --latency-floor-k)
-      echo "--latency-floor-k was renamed to --latency-floor-multiplier." >&2
-      exit 2
-      ;;
     --prior-path)
       if [[ $# -lt 2 || -z "${2}" ]]; then
         echo "Missing value for --prior-path." >&2
@@ -400,6 +396,10 @@ case "${REWARD_DESIGN}" in
 esac
 if ! [[ "${LATENCY_FLOOR_MULTIPLIER}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   echo "Invalid --latency-floor-multiplier: ${LATENCY_FLOOR_MULTIPLIER}. Expected a non-negative number (0 disables the constraint)." >&2
+  exit 2
+fi
+if [[ "${MODE}" == "scheduled" && "${LATENCY_FLOOR_MULTIPLIER}" =~ [1-9] ]]; then
+  echo "--latency-floor-multiplier is only supported with learning or sharing mode; scheduled mode applies the schedule as written." >&2
   exit 2
 fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
@@ -935,6 +935,12 @@ setup_network_namespaces() {
   teardown_network_namespaces
 
   local bridge_ip="${overlay_a}.${overlay_b}.$((machine_idx + 1)).1"
+  # Another protocol's harness, interrupted before its teardown, can leave its
+  # bridge holding this same overlay address; its route then shadows ours.
+  local foreign_if
+  for foreign_if in $(ip -o -4 addr show | awk -v ip="${bridge_ip}/" -v own="${overlay_bridge_name}" 'index($4, ip) == 1 && $2 != own {print $2}' | sort -u); do
+    sudo -n ip link del "${foreign_if}" >/dev/null 2>&1 || true
+  done
   sudo -n ip link add name "${overlay_bridge_name}" type bridge
   sudo -n ip addr replace "${bridge_ip}/${overlay_mask}" dev "${overlay_bridge_name}"
   sudo -n ip link set "${overlay_bridge_name}" up
@@ -1236,8 +1242,8 @@ phase_start() {
       agent_mode_args="${agent_mode_args} --reward-design ${reward_design}"
     fi
     # The floor is a constraint on the action space, so it only means anything
-    # where the agent is choosing the timeout at all.
-    if [[ "${agent_mode_args}" != "" && "${latency_floor_multiplier}" != "0" ]]; then
+    # where the agent is choosing the timeout at all (learning or sharing).
+    if [[ "${mode}" == "learning" || "${mode}" == "sharing" ]] && [[ "${latency_floor_multiplier}" != "0" ]]; then
       agent_mode_args="${agent_mode_args} --latency-floor-multiplier ${latency_floor_multiplier}"
     fi
     # The prior file the model loads, relative to run_root; "" leaves it

@@ -28,7 +28,6 @@
     -->
 
     <schemaVersion>4</schemaVersion>
-    <replicaIdType>global</replicaIdType>
     <!-- Warm-up period in seconds: no failure behavior is active during this time. -->
     <warmUpTime>10</warmUpTime>
 
@@ -45,7 +44,6 @@
 
             <network>
                 <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
 
                 <!-- Extra burst delay applied to all directed edges unless overridden -->
                 <global>
@@ -133,7 +131,6 @@
             <atTime>300</atTime>
             <network>
                 <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
 
                 <global>
                     <delayMs>0</delayMs>
@@ -159,7 +156,6 @@
             <atTime>600</atTime>
             <network>
                 <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
 
                 <global>
                     <delayMs>0</delayMs>
@@ -186,7 +182,6 @@
             <atTime>900</atTime>
             <network>
                 <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
 
                 <global>
                     <delayMs>50</delayMs>
@@ -200,7 +195,6 @@
             <atTime>1200</atTime>
             <network>
                 <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
 
                 <global>
                     <delayMs>50</delayMs>
@@ -227,7 +221,6 @@
             <atTime>1500</atTime>
             <network>
                 <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
 
                 <global>
                     <delayMs>150</delayMs>
@@ -241,7 +234,6 @@
             <atTime>1800</atTime>
             <network>
                 <directedEdges>true</directedEdges>
-                <precedence>global,source,edge</precedence>
 
                 <global>
                     <delayMs>0</delayMs>

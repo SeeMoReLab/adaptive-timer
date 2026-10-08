@@ -77,7 +77,6 @@ import numpy as np
 import agent_pb2
 from continuous_bandit import CONTEXT_SPECS
 
-N_NODES = 4
 PROPOSAL_INTERVAL_MS = 100.0
 MAX_INFLIGHT_BATCHES = 16
 MAX_PENDING_REQUESTS = 32768

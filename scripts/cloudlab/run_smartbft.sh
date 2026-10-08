@@ -26,12 +26,11 @@ TARGETS_FILE="${TARGETS_FILE_DEFAULT}"
 EXPERIMENT_TIME_S=300
 CLIENT_START_DELAY_S=10
 START_OFFSET_AFTER_CLIENT_LAUNCH_S=10
-DATASET_ENABLED=0
 LOG_ENABLED=0
 VERBOSE_ENABLED=0
 AGENT_MODEL_TYPE="discrete_random"
 AGENT_MODEL_SET=0
-REWARD_DESIGN="reward_tps"
+REWARD_DESIGN="reward_tps_latency"
 # Domain constraint on the action space: never apply a timeout below k times
 # the consensus latency the replicas are already achieving. 0 disables it.
 LATENCY_FLOOR_MULTIPLIER=0
@@ -107,7 +106,7 @@ trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--log] [--output-dir <path>] [--model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -115,14 +114,13 @@ Arguments:
   targets_file      Optional path to cloudlab SSH targets file.
 
 Flags:
-  --dataset                         Compatibility flag; agent modes collect the agent CSV automatically.
   --log                             Download client, server, applier, and agent logs.
   --output-dir <path>               Store artifacts here instead of creating a timestamped run directory.
   --verbose                         Enable SmartBFT debug logs on server replicas.
   --model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo>
                                      Learning-agent model for learning mode (default: discrete_random).
   --reward-design <reward_tps|reward_mixed|reward_tps_latency>
-                                     Reward the agent learns from (default: reward_tps).
+                                     Reward the agent learns from (default: reward_tps_latency).
                                      reward_tps is throughput alone, concave past a 1000 tps knee.
                                      reward_mixed also discounts it by the share of the window one
                                      fault would cost (applied timeout + one consensus latency),
@@ -270,12 +268,11 @@ queue_artifact_download() {
   local node="$1"
   local host="$2"
   local user="$3"
-  local remote_check_path="$4"
-  local remote_copy_path="$5"
-  local local_path="$6"
-  local artifact_label="$7"
-  local artifact_kind="$8"
-  local missing_ok="${9:-0}"
+  local remote_copy_path="$4"
+  local local_path="$5"
+  local artifact_label="$6"
+  local artifact_kind="$7"
+  local missing_ok="${8:-0}"
 
   rm -f "${local_path}"
   while true; do
@@ -383,10 +380,6 @@ while [[ $# -gt 0 ]]; do
       EXPERIMENT_TIME_S="${2:-}"
       shift 2
       ;;
-    --dataset)
-      DATASET_ENABLED=1
-      shift
-      ;;
     --log)
       LOG_ENABLED=1
       shift
@@ -424,10 +417,6 @@ while [[ $# -gt 0 ]]; do
     --latency-floor-multiplier)
       LATENCY_FLOOR_MULTIPLIER="${2:-}"
       shift 2
-      ;;
-    --latency-floor-k)
-      echo "--latency-floor-k was renamed to --latency-floor-multiplier." >&2
-      exit 2
       ;;
     --schedule-file)
       SCHEDULE_FILE="${2:-}"
@@ -565,6 +554,10 @@ if ! [[ "${LATENCY_FLOOR_MULTIPLIER}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   echo "Invalid --latency-floor-multiplier: ${LATENCY_FLOOR_MULTIPLIER}. Expected a non-negative number (0 disables the constraint)." >&2
   exit 2
 fi
+if [[ "${MODE}" == "scheduled" && "${LATENCY_FLOOR_MULTIPLIER}" =~ [1-9] ]]; then
+  echo "--latency-floor-multiplier is only supported with learning or sharing mode; scheduled mode applies the schedule as written." >&2
+  exit 2
+fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
   echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo." >&2
   exit 2
@@ -590,13 +583,6 @@ if ! mode_enables_learning_agent "${MODE}"; then
   LEARNING_AGENT_ENABLED=0
 else
   LEARNING_AGENT_ENABLED=1
-fi
-if (( DATASET_ENABLED == 1 )) && (( LEARNING_AGENT_ENABLED == 0 )); then
-  echo "--dataset requires learning|sharing|scheduled mode." >&2
-  exit 2
-fi
-if (( LEARNING_AGENT_ENABLED == 1 )); then
-  DATASET_ENABLED=1
 fi
 SHARING_ENABLED=0
 if [[ "${MODE}" == "sharing" ]]; then
@@ -704,7 +690,6 @@ fi
   printf 'prior_path=%q\n' "${PRIOR_PATH:-}"
   printf 'schedule_file=%q\n' "${SCHEDULE_FILE}"
   printf 'learning_window_mode=wall-clock\n'
-  printf 'dataset_enabled=%q\n' "${DATASET_ENABLED}"
   printf 'log_enabled=%q\n' "${LOG_ENABLED}"
   printf 'failure_spec_enabled=%q\n' "${FAILURE_SPEC_ENABLED}"
   printf 'targets_file=%q\n' "${TARGETS_FILE}"
@@ -845,7 +830,7 @@ echo "Selected mode: ${MODE}"
 echo "SmartBFT nodes: ${NODES} (f=${F}, replicas_per_server_machine=${replicas_per_server_machine})"
 echo "Batch size: ${BATCH_SIZE}; batch timeout: ${BATCH_TIMEOUT}; request timeout: ${REQUEST_TIMEOUT}"
 echo "SmartBFT verbose server logs: ${VERBOSE_ENABLED}"
-echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (dataset=${DATASET_ENABLED}, log=${LOG_ENABLED})"
+echo "Learning-agent orchestration: ${LEARNING_AGENT_ENABLED} (log=${LOG_ENABLED})"
 if [[ "${MODE}" == "learning" ]]; then
   echo "Learning-agent model: ${AGENT_MODEL_TYPE}"
 fi
@@ -1022,7 +1007,7 @@ if [[ -n "${existing_ns}" ]]; then
     sudo -n ip netns del "${ns_name}" >/dev/null 2>&1 || true
   done
 fi
-stale_veths="$(ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*//' | awk '/^sbh[0-9]+$/')"
+stale_veths="$(ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*//' | awk '/^smh[0-9]+$/')"
 if [[ -n "${stale_veths}" ]]; then
   printf '%s\n' "${stale_veths}" | while read -r if_name; do
     [[ -z "${if_name}" ]] && continue
@@ -1032,6 +1017,11 @@ fi
 
 sudo -n ip link set "${bridge_name}" down >/dev/null 2>&1 || true
 sudo -n ip link del "${bridge_name}" type bridge >/dev/null 2>&1 || true
+# Another protocol's harness, interrupted before its teardown, can leave its
+# bridge holding this same overlay address; its route then shadows ours.
+for foreign_if in $(ip -o -4 addr show | awk -v ip="${bridge_ip}/" -v own="${bridge_name}" 'index($4, ip) == 1 && $2 != own {print $2}' | sort -u); do
+  sudo -n ip link del "${foreign_if}" >/dev/null 2>&1 || true
+done
 sudo -n ip link add name "${bridge_name}" type bridge
 sudo -n ip addr replace "${bridge_ip}/${overlay_mask}" dev "${bridge_name}"
 sudo -n ip link set "${bridge_name}" up
@@ -1040,8 +1030,8 @@ sudo -n sysctl -w net.ipv4.ip_forward=1 >/dev/null
 for ((n = 0; n < replicas_per_machine; n++)); do
   replica_id=$((machine_idx * replicas_per_machine + n))
   ns_name="smartbft-r${replica_id}"
-  host_if="sbh${replica_id}"
-  ns_if="sbn${replica_id}"
+  host_if="smh${replica_id}"
+  ns_if="smn${replica_id}"
   ns_ip="${overlay_a}.${overlay_b}.$((machine_idx + 1)).$((host_offset + n))"
 
   sudo -n ip netns del "${ns_name}" >/dev/null 2>&1 || true
@@ -1176,7 +1166,7 @@ run_root="$HOME/smartbft_cloudlab"
 for ((n = 0; n < replicas_per_machine; n++)); do
   replica_id=$((machine_idx * replicas_per_machine + n))
   ns_name="smartbft-r${replica_id}"
-  interface_name="sbn${replica_id}"
+  interface_name="smn${replica_id}"
   session_name="smartbft_applier_${replica_id}"
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   tmux new-session -d -s "${session_name}" \
@@ -1214,7 +1204,6 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
         "${machine_idx}" \
         "${START_UNIX_MS}" \
         "${MODE}" \
-        "${DATASET_ENABLED}" \
         "${AGENT_MODEL_TYPE}" \
         "${AGENT_PORT}" \
         "${SHARING_ENABLED}" \
@@ -1229,15 +1218,14 @@ replicas_per_machine="$1"
 machine_idx="$2"
 start_unix_ms="$3"
 mode="$4"
-dataset_enabled="$5"
-model_type="$6"
-agent_port="$7"
-sharing_enabled="$8"
-sharing_collect_wait_ms="$9"
-latency_floor_multiplier="${10}"
-reward_design="${11}"
-schedule_file="${12}"
-prior_path="${13:-}"
+model_type="$5"
+agent_port="$6"
+sharing_enabled="$7"
+sharing_collect_wait_ms="$8"
+latency_floor_multiplier="$9"
+reward_design="${10}"
+schedule_file="${11}"
+prior_path="${12:-}"
 run_root="$HOME/smartbft_cloudlab"
 learning_agent_python="${HOME}/.venvs/adaptive-timer-learning-agent/bin/python"
 
@@ -1254,8 +1242,8 @@ elif [[ "${mode}" == "scheduled" ]]; then
   agent_model_args="--model-type scheduled --schedule-file \"${schedule_file}\""
 fi
 # The floor is a constraint on the action space, so it only means anything
-# where the agent is choosing the timeout at all.
-if [[ "${agent_model_args}" != "" && "${latency_floor_multiplier}" != "0" ]]; then
+# where the agent is choosing the timeout at all (learning or sharing).
+if [[ "${mode}" == "learning" || "${mode}" == "sharing" ]] && [[ "${latency_floor_multiplier}" != "0" ]]; then
   agent_model_args="${agent_model_args} --latency-floor-multiplier ${latency_floor_multiplier}"
 fi
 # The reward shaping applies to every agent mode that trains, including the
@@ -1274,11 +1262,8 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   ns_name="smartbft-r${replica_id}"
   session_name="smartbft_agent_${replica_id}"
   agent_log="${run_root}/logs/agent_${replica_id}.log"
-  dataset_args=""
-  if [[ "${dataset_enabled}" == "1" ]]; then
-    rm -f "${run_root}/agent${replica_id}.csv"
-    dataset_args="--dataset-csv ${run_root}/agent${replica_id}.csv"
-  fi
+  rm -f "${run_root}/agent${replica_id}.csv"
+  dataset_args="--dataset-csv ${run_root}/agent${replica_id}.csv"
   bind_args="--host 127.0.0.1 --port ${agent_port}"
   if [[ "${sharing_enabled}" == "1" ]]; then
     # Sharing agents talk to each other, so they bind every interface in the
@@ -1617,7 +1602,6 @@ dataset_fetch_failed=0
 CLIENT_LOG_LOCAL="${ARTIFACT_DIR}/client.log"
 echo "Fetching SmartBFT client log..."
 queue_artifact_download "node0" "${node0_host}" "${node0_user}" \
-  "\$HOME/smartbft_cloudlab/logs/client.log" \
   "smartbft_cloudlab/logs/client.log" \
   "${CLIENT_LOG_LOCAL}" \
   "smartbft client.log" \
@@ -1636,14 +1620,12 @@ if (( LOG_ENABLED == 1 )); then
       replica_id=$((machine_idx * replicas_per_server_machine + n))
       node_id=$((replica_id + 1))
       queue_artifact_download "${node}" "${host}" "${user}" \
-        "\$HOME/smartbft_cloudlab/logs/server_${node_id}.log" \
         "smartbft_cloudlab/logs/server_${node_id}.log" \
         "${LOGS_LOCAL_DIR}/servers/server_${node_id}.log" \
         "server_${node_id}.log" \
         "log"
       if (( FAILURE_SPEC_ENABLED == 1 )); then
         queue_artifact_download "${node}" "${host}" "${user}" \
-          "\$HOME/smartbft_cloudlab/logs/applier_${replica_id}.log" \
           "smartbft_cloudlab/logs/applier_${replica_id}.log" \
           "${LOGS_LOCAL_DIR}/appliers/applier_${replica_id}.log" \
           "applier_${replica_id}.log" \
@@ -1652,7 +1634,6 @@ if (( LOG_ENABLED == 1 )); then
       fi
       if (( LEARNING_AGENT_ENABLED == 1 )); then
         queue_artifact_download "${node}" "${host}" "${user}" \
-          "\$HOME/smartbft_cloudlab/logs/agent_${replica_id}.log" \
           "smartbft_cloudlab/logs/agent_${replica_id}.log" \
           "${LOGS_LOCAL_DIR}/agents/agent_${replica_id}.log" \
           "agent_${replica_id}.log" \
@@ -1661,7 +1642,6 @@ if (( LOG_ENABLED == 1 )); then
       fi
       if (( SHARING_ENABLED == 1 )); then
         queue_artifact_download "${node}" "${host}" "${user}" \
-          "\$HOME/smartbft_cloudlab/logs/sharing_${replica_id}.log" \
           "smartbft_cloudlab/logs/sharing_${replica_id}.log" \
           "${LOGS_LOCAL_DIR}/sharing/sharing_${replica_id}.log" \
           "sharing_${replica_id}.log" \
@@ -1672,7 +1652,7 @@ if (( LOG_ENABLED == 1 )); then
   done
 fi
 
-if (( LEARNING_AGENT_ENABLED == 1 )) && (( DATASET_ENABLED == 1 )); then
+if (( LEARNING_AGENT_ENABLED == 1 )); then
   for i in "${!server_nodes[@]}"; do
     node="${server_nodes[$i]}"
     host="${server_hosts[$i]}"
@@ -1681,7 +1661,6 @@ if (( LEARNING_AGENT_ENABLED == 1 )) && (( DATASET_ENABLED == 1 )); then
     for ((n = 0; n < replicas_per_server_machine; n++)); do
       replica_id=$((machine_idx * replicas_per_server_machine + n))
       queue_artifact_download "${node}" "${host}" "${user}" \
-        "\$HOME/smartbft_cloudlab/agent${replica_id}.csv" \
         "smartbft_cloudlab/agent${replica_id}.csv" \
         "${ARTIFACT_DIR}/agent${replica_id}.csv" \
         "agent${replica_id}.csv" \
@@ -1713,7 +1692,7 @@ fi
 if (( dataset_fetch_failed != 0 )); then
   echo "Some SmartBFT dataset files could not be fetched." >&2
 fi
-if (( LEARNING_AGENT_ENABLED == 1 )) && (( DATASET_ENABLED == 1 )); then
+if (( LEARNING_AGENT_ENABLED == 1 )); then
   saved_agent_datasets=()
   for ((replica_id = 0; replica_id < NODES; replica_id++)); do
     agent_dataset_local="${ARTIFACT_DIR}/agent${replica_id}.csv"

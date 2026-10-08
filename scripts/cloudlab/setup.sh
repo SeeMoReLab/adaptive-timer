@@ -4,7 +4,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 DEFAULT_TARGETS_FILE="${SCRIPT_DIR}/tmp/cloudlab_ssh_targets.txt"
-IP_OUTPUT_FILE="${SCRIPT_DIR}/tmp/cloudlab_ip.txt"
 LEARNING_AGENT_REQUIREMENTS="${REPO_ROOT}/learning_agent/requirements.txt"
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new)
 
@@ -18,7 +17,6 @@ Options:
 
 Environment:
   LOCAL_SSH_KEY_PATH  Alternative to the positional private_key_path.
-  IP_OUTPUT_FILE      Output file for node IPs from first hostname -I entry (default: scripts/cloudlab/tmp/cloudlab_ip.txt).
 EOF
 }
 
@@ -56,14 +54,11 @@ if [[ ! -f "${LOCAL_SSH_KEY_PATH}" ]]; then
 fi
 SSH_OPTS+=(-i "${LOCAL_SSH_KEY_PATH}" -o IdentitiesOnly=yes)
 
-tmp_peers="$(mktemp)"
 tmp_all_nodes="$(mktemp)"
-tmp_ips="$(mktemp)"
-trap 'rm -f "${tmp_peers}" "${tmp_all_nodes}" "${tmp_ips}"' EXIT
+trap 'rm -f "${tmp_all_nodes}"' EXIT
 
 node0_host=""
 node0_user=""
-has_peers=0
 
 while read -r node host user _; do
   [[ -z "${node:-}" ]] && continue
@@ -77,8 +72,6 @@ while read -r node host user _; do
   if [[ "${node}" == "node0" ]]; then
     node0_host="${host}"
     node0_user="${user}"
-  else
-    printf '%s %s %s\n' "${node}" "${host}" "${user}" >> "${tmp_peers}"
   fi
 
   printf '%s %s %s\n' "${node}" "${host}" "${user}" >> "${tmp_all_nodes}"
@@ -93,16 +86,6 @@ if [[ ! -f "${LEARNING_AGENT_REQUIREMENTS}" ]]; then
   exit 1
 fi
 
-if [[ -s "${tmp_peers}" ]]; then
-  has_peers=1
-else
-  echo "Single-node CloudLab targets detected (node0 only); skipping node0->peer SSH setup."
-fi
-
-if (( has_peers == 1 )); then
-  echo "Multi-node targets detected; skipping node0->peer SSH bootstrap."
-fi
-
 echo "Installing SmartBFT, Tendermint, Rust, and CppBedrock dependencies on all nodes in parallel..."
 pids=()
 nodes=()
@@ -114,7 +97,6 @@ set -euo pipefail
 if command -v apt-get >/dev/null 2>&1; then
   sudo DEBIAN_FRONTEND=noninteractive apt-get update
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    openjdk-17-jre-headless \
     python3-pip \
     python3-venv \
     tmux \
@@ -230,7 +212,6 @@ ensure_rust_toolchain
 #   "go: updates to go.mod needed; to update it: go mod tidy"
 go env -w GOFLAGS=-mod=mod
 
-java -version >/dev/null 2>&1
 python3 -m pip --version >/dev/null 2>&1
 tmux -V >/dev/null 2>&1
 go version
@@ -291,7 +272,7 @@ if [[ ! -x "${venv_dir}/bin/python" ]]; then
   python3 -m venv "${venv_dir}"
 fi
 PIP_DISABLE_PIP_VERSION_CHECK=1 "${venv_dir}/bin/python" -m pip install -r "${requirements_path}"
-"${venv_dir}/bin/python" -c "import cryptography, grpc, matplotlib, numpy, pandas, scipy, sklearn, tqdm, xgboost"
+"${venv_dir}/bin/python" -c "import cryptography, grpc, matplotlib, numpy, scipy, sklearn, threadpoolctl"
 rm -f "${requirements_path}"
 REMOTE
   ) &
@@ -313,29 +294,5 @@ if [[ "${pip_failed}" -ne 0 ]]; then
   echo "Python requirements installation failed on one or more nodes." >&2
   exit 1
 fi
-
-if (( has_peers == 0 )); then
-  echo "Single-node mode: writing node0 IP as 127.0.0.1."
-  printf 'node0 127.0.0.1\n' > "${tmp_ips}"
-else
-  echo "Collecting node IPs directly from each node (first entry from hostname -I)..."
-  while read -r node host user; do
-    node_ip="$(
-      ssh "${SSH_OPTS[@]}" "${user}@${host}" \
-        "hostname -I | awk '{print \$1}'"
-    )"
-
-    if [[ -z "${node_ip}" ]]; then
-      echo "Could not determine IP for ${node}" >&2
-      exit 1
-    fi
-
-    printf '%s %s\n' "${node}" "${node_ip}" >> "${tmp_ips}"
-  done < "${tmp_all_nodes}"
-fi
-
-mkdir -p "$(dirname "${IP_OUTPUT_FILE}")"
-mv "${tmp_ips}" "${IP_OUTPUT_FILE}"
-echo "Wrote node IPs to ${IP_OUTPUT_FILE}"
 
 echo "Done."

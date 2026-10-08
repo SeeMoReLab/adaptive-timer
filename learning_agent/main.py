@@ -2050,16 +2050,6 @@ def serve(
     server.wait_for_termination()
 
 
-def _retired_flag(replacement: str):
-    """argparse ``type`` for a retired flag: any value is an error naming the
-    flag that replaced it."""
-
-    def reject(_value: str) -> None:
-        raise argparse.ArgumentTypeError(f"this flag was renamed to {replacement}")
-
-    return reject
-
-
 def main():
     _install_timestamped_print()
 
@@ -2264,11 +2254,6 @@ def main():
             "throughput. 0 disables the constraint (default: 0; try "
             f"{DEFAULT_LATENCY_FLOOR_MULTIPLIER})."
         ),
-    )
-    parser.add_argument(
-        "--latency-floor-k",
-        type=_retired_flag("--latency-floor-multiplier"),
-        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--latency-floor-window",

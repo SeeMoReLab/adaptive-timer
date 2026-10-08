@@ -12,7 +12,6 @@ from collections import deque
 import numpy as np
 
 import agent_pb2
-from reward_utils import reward_tps
 
 
 # Model-type names retired on 2026-10-07, mapped to their replacements. The
@@ -69,18 +68,6 @@ PBFT_TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(
 PBFT_TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
     value_ms: idx for idx, value_ms in enumerate(PBFT_TIMEOUT_VALUES_MS)
 }
-PBFT_TIMEOUT_INDEX_TO_MS: Dict[int, int] = {
-    idx: value_ms for idx, value_ms in enumerate(PBFT_TIMEOUT_VALUES_MS)
-}
-PBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE = {
-    0: frozenset(PBFT_TIMEOUT_VALUES_MS),
-    1: frozenset({250}),
-    2: frozenset({250, 550}),
-    3: frozenset({550, 1200}),
-    4: frozenset({550}),
-    5: frozenset({1200}),
-    6: frozenset(PBFT_TIMEOUT_VALUES_MS),
-}
 
 
 class SmartbftTimeoutOption(IntEnum):
@@ -101,15 +88,6 @@ SMARTBFT_TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(
 )
 SMARTBFT_TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
     value_ms: idx for idx, value_ms in enumerate(SMARTBFT_TIMEOUT_VALUES_MS)
-}
-SMARTBFT_ACCEPTABLE_TIMEOUTS_MS_BY_PHASE = {
-    0: frozenset(SMARTBFT_TIMEOUT_VALUES_MS),
-    1: frozenset({300}),
-    2: frozenset({300, 800}),
-    3: frozenset({800, 1800}),
-    4: frozenset({800}),
-    5: frozenset({1800}),
-    6: frozenset(SMARTBFT_TIMEOUT_VALUES_MS),
 }
 
 
@@ -151,9 +129,6 @@ SBFT_SLOW_PATH_MS_TO_INDEX: Dict[int, int] = {
 
 TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
     value_ms: idx for idx, value_ms in enumerate(TIMEOUT_VALUES_MS)
-}
-TIMEOUT_INDEX_TO_MS: Dict[int, int] = {
-    idx : value_ms for idx, value_ms in enumerate(TIMEOUT_VALUES_MS)
 }
 
 
@@ -205,9 +180,6 @@ HOTSTUFF_TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(
 HOTSTUFF_TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
     value_ms: idx for idx, value_ms in enumerate(HOTSTUFF_TIMEOUT_VALUES_MS)
 }
-HOTSTUFF_TIMEOUT_INDEX_TO_MS: Dict[int, int] = {
-    idx: value_ms for idx, value_ms in enumerate(HOTSTUFF_TIMEOUT_VALUES_MS)
-}
 
 
 class AutobahnTimeoutDelayOption(IntEnum):
@@ -236,29 +208,6 @@ AUTOBAHN_TIMEOUT_DELAY_MS_TO_INDEX: Dict[int, int] = {
     value_ms: idx for idx, value_ms in enumerate(AUTOBAHN_TIMEOUT_DELAY_VALUES_MS)
 }
 
-
-class PhaseMapping(IntEnum):
-    PHASE_0 = PbftTimeoutOption.TIMEOUT_250_MS
-    PHASE_1 = PbftTimeoutOption.TIMEOUT_250_MS
-    PHASE_2 = PbftTimeoutOption.TIMEOUT_250_MS
-    PHASE_3 = PbftTimeoutOption.TIMEOUT_550_MS
-    PHASE_4 = PbftTimeoutOption.TIMEOUT_550_MS
-    PHASE_5 = PbftTimeoutOption.TIMEOUT_1200_MS
-
-PHASE_OPTIONS: Tuple[PhaseMapping, ...] = (
-    PhaseMapping.PHASE_0,
-    PhaseMapping.PHASE_1,
-    PhaseMapping.PHASE_2,
-    PhaseMapping.PHASE_3,
-    PhaseMapping.PHASE_4,
-    PhaseMapping.PHASE_5,
-)
-
-PHASE_VALUES_MS: Tuple[int, ...] = tuple(int(option) for option in PHASE_OPTIONS)
-PHASE_INDEX_TO_TIMEOUT_INDEX: Dict[int, int] = {
-    idx: PBFT_TIMEOUT_MS_TO_INDEX[value_ms]
-    for idx, value_ms in enumerate(PHASE_VALUES_MS)
-}
 
 PBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "total_transactions",
@@ -714,31 +663,6 @@ def action_index_to_timeout(protocol: int, index: int) -> agent_pb2.Timeout:
     raise ValueError(f"Unsupported protocol: {_protocol_name(protocol)}")
 
 
-def describe_action(protocol: int, index: int) -> str:
-    protocol = _validate_protocol(protocol)
-    if protocol == agent_pb2.PROTOCOL_PBFT:
-        return f"election_timeout_ms={pbft_timeout_index_to_ms(index)}"
-    if protocol == agent_pb2.PROTOCOL_SMARTBFT:
-        return f"election_timeout_ms={smartbft_timeout_index_to_ms(index)}"
-    if protocol == agent_pb2.PROTOCOL_SBFT:
-        election_timeout_ms, slow_path_timeout_ms = _sbft_index_to_pair(index)
-        return (
-            f"election_timeout_ms={election_timeout_ms}, "
-            f"slow_path_timeout_ms={slow_path_timeout_ms}"
-        )
-    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
-        return f"timeout_delay_ms={hotstuff_timeout_index_to_ms(index)}"
-    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
-        return f"timeout_delay_ms={autobahn_timeout_delay_index_to_ms(index)}"
-    propose_timeout_ms, prevote_timeout_ms, precommit_timeout_ms = _tendermint_index_to_triple(
-        index
-    )
-    return (
-        f"propose_timeout_ms={propose_timeout_ms}, "
-        f"prevote_timeout_ms={prevote_timeout_ms}, "
-        f"precommit_timeout_ms={precommit_timeout_ms}"
-    )
-
 class FeatureExtractor(Generic[S], ABC):
     """Converts an input state into a tensor for model consumption."""
 
@@ -776,13 +700,6 @@ class TensorModel(ABC):
     def reset_model(self) -> None:
         pass
 
-
-class RewardTransformer(ABC):
-    """Converts throughput result into float reward."""
-
-    @abstractmethod
-    def transform(self, throughput: float) -> float:
-        pass
 
 class ProtocolReportFeatureExtractor(FeatureExtractor[object]):
     def __init__(self, protocol: int):
@@ -1001,13 +918,6 @@ class ScheduledTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
         return np.asarray(timeout_values, dtype=float)
 
 
-class QuadraticRewardScaler(RewardTransformer):
-    """Quadratic shaping below 1000, linear above. Prior work"""
-
-    @staticmethod
-    def transform(throughput: float) -> float:
-        return reward_tps(throughput)
-
 class LinearModel(TensorModel):
     """Linear policy over protocol-specific discrete timeout options.
 
@@ -1148,17 +1058,6 @@ class LinearModel(TensorModel):
         self._moment1 = np.zeros_like(self.weights)
         self._moment2 = np.zeros_like(self.weights)
         self._step = 0
-
-    def save(self) -> np.ndarray:
-        return self.weights.copy()
-
-    def load(self, weights: np.ndarray) -> None:
-        incoming = np.asarray(weights, dtype=np.float64)
-        if incoming.shape != self.weights.shape:
-            raise ValueError(
-                f"Expected weights of shape {self.weights.shape}, got {incoming.shape}"
-            )
-        self.weights = incoming.copy()
 
 
 class DiscountedLinUCB(TensorModel):
@@ -1453,12 +1352,6 @@ class RandomTimeoutModel(TensorModel):
     def reset_model(self) -> None:
         self._rng = np.random.default_rng(self._initial_seed)
 
-    def save(self) -> Dict[str, Any]:
-        pass
-
-    def load(self, checkpoint: Dict[str, Any]) -> None:
-        pass
-
 class ScheduledTimeoutModel(TensorModel):
     """Returns raw protocol timeout values from a time-based schedule."""
 
@@ -1601,10 +1494,6 @@ class ScheduledTimeoutModel(TensorModel):
             for switch_time_s, raw_action in self._schedule
         ]
 
-    def set_start_monotonic(self, start_monotonic: float) -> None:
-        self._start_time = float(start_monotonic)
-        self._active_row = -1
-
     def _current_action(self) -> np.ndarray:
         elapsed_s = time.monotonic() - self._start_time
         active_row = 0
@@ -1683,12 +1572,6 @@ class ScheduledTimeoutModel(TensorModel):
     def reset_model(self) -> None:
         self._start_time = time.monotonic()
         self._active_row = -1
-
-    def save(self) -> Dict[str, Any]:
-        pass
-
-    def load(self, checkpoint: Dict[str, Any]) -> None:
-        pass
 
 class ThompsonSamplingModel(TensorModel):
     """Per-arm bootstrapped-tree CMAB (contextual GIRO structure).
@@ -1940,18 +1823,6 @@ class PavlovTimeoutModel(TensorModel):
     def reset_model(self) -> None:
         self._tracked = 0.0
         self._index = self._start_index
-
-    @property
-    def tracked_reward(self) -> float:
-        return self._tracked
-
-    def save(self) -> Dict[str, Any]:
-        return {"tracked": self._tracked, "index": self._index}
-
-    def load(self, checkpoint: Dict[str, Any]) -> None:
-        self._tracked = float(checkpoint.get("tracked", 0.0))
-        index = int(checkpoint.get("index", self._start_index))
-        self._index = index if index in self._position else self._start_index
 
 
 @dataclass
@@ -2689,10 +2560,6 @@ class PPOBase(TensorModel):
 
     # -- head interface -----------------------------------------------------
 
-    def _sample_head(self, head: np.ndarray) -> float:
-        """Draw one action from one row of actor output. Returns the stored form."""
-        raise NotImplementedError
-
     def _head_terms(
         self, head: np.ndarray, actions: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -2702,22 +2569,6 @@ class PPOBase(TensorModel):
     @property
     def _output_bias(self) -> float:
         return 0.0
-
-    # -- diagnostics --------------------------------------------------------
-
-    @property
-    def observation_count(self) -> int:
-        return int(self._observation_count)
-
-    @property
-    def update_count(self) -> int:
-        """How many PPO updates have run. Zero means still at initialization."""
-        return int(self._update_count)
-
-    @property
-    def last_entropy(self) -> float:
-        """Policy entropy at the most recent update; the collapse warning."""
-        return float(self._last_entropy)
 
     # -- plumbing -----------------------------------------------------------
 
@@ -2814,14 +2665,11 @@ class PPOBase(TensorModel):
                 _clip_global_norm(critic_grads, self._max_grad_norm),
             )
 
-            self._last_entropy = float(entropy.mean())
             # Sample KL(old || new). Positive and roughly the reverse of the
             # usual estimator, but it is the one that is cheap here.
             approx_kl = float(np.mean(old_log_probs - log_probs))
             if self._target_kl > 0.0 and approx_kl > self._target_kl:
                 break
-
-        self._update_count += 1
 
     # -- TensorModel --------------------------------------------------------
 
@@ -2862,7 +2710,6 @@ class PPOBase(TensorModel):
             self._buffer_contexts.append(context.reshape(1, -1))
             self._buffer_actions.append(self._store_action(float(action)))
             self._buffer_rewards.append(float(reward))
-            self._observation_count += 1
             if len(self._buffer_rewards) >= self._update_every:
                 self._flush()
         return 0.0
@@ -2932,9 +2779,6 @@ class PPOBase(TensorModel):
         self._buffer_contexts: List[np.ndarray] = []
         self._buffer_actions: List[float] = []
         self._buffer_rewards: List[float] = []
-        self._observation_count = 0
-        self._update_count = 0
-        self._last_entropy = float("nan")
 
 
 class DiscretePPO(PPOBase):
@@ -3045,8 +2889,3 @@ class DiscretePPO(PPOBase):
                 f"actions must be between 0 and {self._action_dim - 1}, got {action}"
             )
         return float(index)
-
-    def action_probabilities(self, features: np.ndarray) -> np.ndarray:
-        """The behaviour distribution, for logging what the policy believes."""
-        _, mixed = self._probabilities(self._actor_head(self._contexts(features)))
-        return mixed

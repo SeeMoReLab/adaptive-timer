@@ -111,12 +111,15 @@ class _Window:
             return float(np.percentile(v, q, method="nearest")) if v else 0.0
 
         elapsed = self.end_s - self.start_s
+        # main._fill_empty_window_latency: the agent gives a window in which
+        # nothing committed its own length as its latency (the report gives 0).
+        empty_ms = elapsed * 1000.0
         return {
             "total_transactions": float(self.txs),
             "total_consensus_instances": float(self.heights),
-            "avg_consensus_latency_ms": avg(self.lat),
-            "p50_consensus_latency_ms": pct(self.lat, 50),
-            "p90_consensus_latency_ms": pct(self.lat, 90),
+            "avg_consensus_latency_ms": avg(self.lat) if self.lat else empty_ms,
+            "p50_consensus_latency_ms": pct(self.lat, 50) if self.lat else empty_ms,
+            "p90_consensus_latency_ms": pct(self.lat, 90) if self.lat else empty_ms,
             "throughput_tps": self.txs / elapsed if elapsed > 0 else 0.0,
             "timeout_violation_rate": (
                 self.rounds_gt0 / self.heights if self.heights else 0.0

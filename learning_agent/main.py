@@ -345,34 +345,41 @@ def _copy_state(state: object) -> object:
     return cloned
 
 
-# Protocols whose agents give an empty report window its own length as latency.
-EMPTY_WINDOW_PROTOCOLS = (
-    agent_pb2.PROTOCOL_SBFT,
-    agent_pb2.PROTOCOL_HOTSTUFF,
-    agent_pb2.PROTOCOL_AUTOBAHN,
-)
+def _fill_empty_window_latency(
+    protocol: int, state: object, window_ms: int, reward_window: bool
+) -> bool:
+    """Give a window in which nothing committed its own length as its latency.
 
-
-def _fill_empty_window_latency(state: object, window_ms: int) -> bool:
-    """Give a window in which no batch executed its own length as its latency.
-
-    CppBedrock reports 0 for a window without a latency sample (AgentClient.h),
-    so reward_tps_latency scored a full stall at 0, above every storm. The
-    oldest request still pending has waited at least the window whenever one
-    was pending at its start. SBFT (Kevin, 2026-10-01), HotStuff, whose
-    report also gives 0 for an empty window (Kevin, 2026-10-02), and Autobahn
-    (Kevin, 2026-10-07: its tps term is ~0.004, so a stall scored 0 against
-    about -0.6 at 5+50 and a simulator-pretrained prior learned to stall). Applied to the
-    report the model reads - the 2f+1 median in sharing mode - so it marks a
-    stall of the cluster; a lone replica that executed nothing while the
-    others served keeps its 0 in the median. Returns whether the window was
-    empty.
+    Every protocol's report gives 0 latency for a window without a latency
+    sample (CppBedrock AgentClient.h, SmartBFT learning_metrics.go, cometbft
+    windowPercentile, autobahn report.rs), so reward_tps_latency scored a full
+    stall at 0, above every slow window. The oldest request still pending has
+    waited at least the window whenever one was pending at its start. Kevin
+    ruled it for SBFT (2026-10-01), HotStuff (2026-10-02), and Autobahn,
+    PBFT, SmartBFT and Tendermint (2026-10-07, after a SmartBFT prior learned
+    to stall at 5+150). In a SmartBFT reward window, one that decided
+    something but has no latency sample counts as empty too: a decision
+    reached through sync carries no submit mark on the replica, and those
+    windows are stalls (one batch in 5 s). Only the reward window: a feature
+    report with commits is read as a measurement by the latency floor and
+    continuous_heuristic, which drop only windows without commits, so there
+    it keeps its 0. Applied to the report the model reads - the 2f+1 median in
+    sharing mode - so it marks a stall of the cluster; a lone replica that
+    executed nothing while the others served keeps its 0 in the median.
+    Returns whether the window was empty.
     """
-    if int(state.total_consensus_instances) != 0:
+    empty = int(state.total_consensus_instances) == 0
+    if reward_window and protocol == agent_pb2.PROTOCOL_SMARTBFT:
+        empty = empty or float(state.p50_consensus_latency_ms) <= 0.0
+    if not empty:
         return False
     state.avg_consensus_latency_ms = float(window_ms)
     state.p50_consensus_latency_ms = float(window_ms)
-    state.p95_consensus_latency_ms = float(window_ms)
+    # Tendermint reports a p90 where the others report a p95.
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        state.p90_consensus_latency_ms = float(window_ms)
+    else:
+        state.p95_consensus_latency_ms = float(window_ms)
     return True
 
 
@@ -699,16 +706,14 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         agent_injection_schedule: Optional[List[AgentInjectionPhase]],
         injection_start_mono: float,
         injection_warmup_s: float,
-        empty_window_latency_ms: Optional[Tuple[int, int]],
+        empty_window_latency_ms: Tuple[int, int],
     ):
         self._protocol = int(protocol)
         self.node_id = node_id
         # (feature window, reward window) lengths: an empty window's latency.
-        if (self._protocol in EMPTY_WINDOW_PROTOCOLS) != (
-            empty_window_latency_ms is not None
-        ):
+        if len(empty_window_latency_ms) != 2 or min(empty_window_latency_ms) <= 0:
             raise ValueError(
-                "empty_window_latency_ms is required for SBFT, HotStuff and Autobahn and only for them"
+                f"empty_window_latency_ms must be two positive lengths, got {empty_window_latency_ms}"
             )
         self._empty_window_latency_ms = empty_window_latency_ms
         self._collect_wait_s = collect_wait_s
@@ -1775,16 +1780,15 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._pending_rewards_by_episode.pop(reward_episode, None)
             return
 
-        if self._empty_window_latency_ms is not None:
-            reward_report = _copy_state(reward_report)
-            if _fill_empty_window_latency(
-                reward_report, self._empty_window_latency_ms[1]
-            ):
-                print(
-                    f"[report] reward episode {reward_episode}: no batch executed "
-                    f"in the reward window; latency set to "
-                    f"{self._empty_window_latency_ms[1]} ms"
-                )
+        reward_report = _copy_state(reward_report)
+        if _fill_empty_window_latency(
+            self._protocol, reward_report, self._empty_window_latency_ms[1], reward_window=True
+        ):
+            print(
+                f"[report] reward episode {reward_episode}: nothing committed "
+                f"in the reward window; latency set to "
+                f"{self._empty_window_latency_ms[1]} ms"
+            )
         total_transactions = _report_total_transactions(reward_report)
         throughput_tps = _report_throughput_tps(reward_report)
         engineered_reward = reward_engineering(
@@ -1862,11 +1866,11 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 f"Invalid report window for timeout prediction: start={start_tick}, seq={report_seq}"
             )
         cached_report = _copy_state(report)
-        if self._empty_window_latency_ms is not None and _fill_empty_window_latency(
-            cached_report, self._empty_window_latency_ms[0]
+        if _fill_empty_window_latency(
+            self._protocol, cached_report, self._empty_window_latency_ms[0], reward_window=False
         ):
             print(
-                f"[report] episode {episode}: no batch executed in the feature "
+                f"[report] episode {episode}: nothing committed in the feature "
                 f"window; latency set to {self._empty_window_latency_ms[0]} ms"
             )
         self._state_by_episode[episode] = cached_report
@@ -1916,7 +1920,7 @@ def serve(
     dataset_csv: Optional[Path],
     failure_spec: Optional[Path],
     injection_start_unix_ms: Optional[int],
-    empty_window_latency_ms: Optional[Tuple[int, int]],
+    empty_window_latency_ms: Tuple[int, int],
 ):
     use_explicit_bind = host is not None and port is not None
     if use_explicit_bind:
@@ -2319,10 +2323,8 @@ def main():
         type=int,
         default=None,
         help=(
-            "Length of the replicas' feature window in ms (CppBedrock "
-            "--learning-feature-duration). Required for --protocol sbft, "
-            "hotstuff and autobahn, where a window in which nothing committed "
-            "takes its length as its consensus latency; refused for other protocols."
+            "Length of the replicas' feature window in ms (required): a window "
+            "in which nothing committed takes its length as its consensus latency."
         ),
     )
     parser.add_argument(
@@ -2330,8 +2332,8 @@ def main():
         type=int,
         default=None,
         help=(
-            "Length of the replicas' reward window in ms (CppBedrock "
-            "--learning-reward-duration); see --feature-window-ms."
+            "Length of the replicas' reward window in ms (required); see "
+            "--feature-window-ms."
         ),
     )
 
@@ -2383,21 +2385,9 @@ def main():
         ),
     )
     args = parser.parse_args()
-    windows = (args.feature_window_ms, args.reward_window_ms)
-    if args.protocol in EMPTY_WINDOW_PROTOCOLS:
-        if None in windows or min(windows) <= 0:
-            parser.error(
-                "--protocol sbft, hotstuff and autobahn require positive --feature-window-ms "
-                "and --reward-window-ms"
-            )
-        empty_window_latency_ms = windows
-    else:
-        if windows != (None, None):
-            parser.error(
-                "--feature-window-ms/--reward-window-ms apply to --protocol "
-                "sbft, hotstuff and autobahn only"
-            )
-        empty_window_latency_ms = None
+    empty_window_latency_ms = (args.feature_window_ms, args.reward_window_ms)
+    if None in empty_window_latency_ms or min(empty_window_latency_ms) <= 0:
+        parser.error("positive --feature-window-ms and --reward-window-ms are required")
 
     prior_path = args.prior_path or None
     if prior_path is not None:

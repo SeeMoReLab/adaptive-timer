@@ -546,6 +546,21 @@ if [[ -n "${CREATE_WORKERS}" ]] && (! [[ "${CREATE_WORKERS}" =~ ^[0-9]+$ ]] || (
   echo "Invalid --create-workers value: ${CREATE_WORKERS}." >&2
   exit 2
 fi
+# The agent gives a window in which nothing committed its own length as its
+# latency, so it needs the feature and reward windows in ms (Go durations here).
+go_duration_ms() {
+  local d="$1"
+  if [[ "${d}" =~ ^([0-9]+)ms$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  elif [[ "${d}" =~ ^([0-9]+)s$ ]]; then
+    echo $(( BASH_REMATCH[1] * 1000 ))
+  else
+    echo "Unsupported learning duration '${d}': expected <n>s or <n>ms." >&2
+    return 1
+  fi
+}
+FEATURE_WINDOW_MS="$(go_duration_ms "${LEARNING_FEATURE_DURATION}")" || exit 2
+REWARD_WINDOW_MS="$(go_duration_ms "${LEARNING_REWARD_DURATION}")" || exit 2
 case "${REWARD_DESIGN}" in
   reward_tps|reward_mixed|reward_tps_latency) ;;
   *) echo "Invalid --reward-design: ${REWARD_DESIGN}. Expected reward_tps|reward_mixed|reward_tps_latency." >&2; exit 2 ;;
@@ -1211,6 +1226,8 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
         "${LATENCY_FLOOR_MULTIPLIER}" \
         "${REWARD_DESIGN}" \
         "${SCHEDULE_FILE}" \
+        "${FEATURE_WINDOW_MS}" \
+        "${REWARD_WINDOW_MS}" \
         "${PRIOR_PATH}" <<'REMOTE'
 set -euo pipefail
 
@@ -1225,7 +1242,10 @@ sharing_collect_wait_ms="$8"
 latency_floor_multiplier="$9"
 reward_design="${10}"
 schedule_file="${11}"
-prior_path="${12:-}"
+feature_window_ms="${12}"
+reward_window_ms="${13}"
+# ssh drops an empty last argument, so an omitted prior arrives unset.
+prior_path="${14:-}"
 run_root="$HOME/smartbft_cloudlab"
 learning_agent_python="${HOME}/.venvs/adaptive-timer-learning-agent/bin/python"
 
@@ -1256,6 +1276,8 @@ fi
 if [[ -n "${prior_path}" ]]; then
   agent_model_args="${agent_model_args} --prior-path ${prior_path}"
 fi
+# A window in which nothing committed takes its own length as its latency.
+agent_model_args="${agent_model_args} --feature-window-ms ${feature_window_ms} --reward-window-ms ${reward_window_ms}"
 
 for ((n = 0; n < replicas_per_machine; n++)); do
   replica_id=$((machine_idx * replicas_per_machine + n))

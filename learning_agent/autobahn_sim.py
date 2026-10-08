@@ -234,7 +234,7 @@ class _Window:
             gap_avg, gap_p50, gap_p95 = float(gaps.mean()), rank(gaps, 0.5), rank(gaps, 0.95)
             tx, batch_avg, batch_p95 = float(dig.sum()), float(dig.mean()), rank(dig, 0.95)
         else:
-            # main.EMPTY_WINDOW_PROTOCOLS: the agent gives a window in which
+            # main._fill_empty_window_latency: the agent gives a window in which
             # nothing committed its own length as its latency (the Rust side
             # reports 0).
             avg = p50 = p95 = self.end_ms - self.start_ms

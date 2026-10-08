@@ -184,12 +184,15 @@ class _Window:
         elapsed = self.end_s - self.start_s
         total_lat = sum(v * w for v, w in self.lat)
         n_lat = sum(w for _, w in self.lat)
+        # main._fill_empty_window_latency: the agent gives a window in which
+        # nothing committed its own length as its latency (the report gives 0).
+        empty_ms = elapsed * 1000.0
         return {
             "total_transactions": float(self.txs),
             "total_consensus_instances": float(self.decisions),
-            "avg_consensus_latency_ms": total_lat / n_lat if n_lat else 0.0,
-            "p50_consensus_latency_ms": _wpct(self.lat, 0.50),
-            "p95_consensus_latency_ms": _wpct(self.lat, 0.95),
+            "avg_consensus_latency_ms": total_lat / n_lat if n_lat else empty_ms,
+            "p50_consensus_latency_ms": _wpct(self.lat, 0.50) if n_lat else empty_ms,
+            "p95_consensus_latency_ms": _wpct(self.lat, 0.95) if n_lat else empty_ms,
             "throughput_tps": self.txs / elapsed if elapsed > 0 else 0.0,
             "avg_batch_size": self.txs / self.decisions if self.decisions else 0.0,
             "p95_batch_size": _pct(self.batch, 0.95),
@@ -630,17 +633,8 @@ def train_prior(
         n_iter_no_change=10,
         random_state=seed,
     )
-    # reward_mixed scales with reward_tps, and SmartBFT's closed loop delivers about
-    # 500 tps under +150 ms links against 11,000 at base, so the storm cliff there is
-    # 0.1-0.3 in reward, below a plain MSE fit's error, and a prior fit on the reward
-    # smoothed it away (its first version picked 691 ms where the storm-free tail is
-    # about 1,000). The fit is on log(reward), where that cliff is a 0.9 gap; NumpyMLP
-    # exponentiates when the file carries target_log, so the model still works in
-    # reward units. Rewards are >= 0 (reward_tps is); the floor keeps the log finite.
-    y_fit = np.log(np.maximum(y, 1e-3))
-    y_mean, y_std = float(y_fit.mean()), float(y_fit.std() + 1e-9)
-    mlp.fit((x[tr] - x_mean) / x_std, (y_fit[tr] - y_mean) / y_std)
-    pred = np.exp(mlp.predict((x[va] - x_mean) / x_std) * y_std + y_mean)
+    mlp.fit((x[tr] - x_mean) / x_std, (y[tr] - y_mean) / y_std)
+    pred = mlp.predict((x[va] - x_mean) / x_std) * y_std + y_mean
     rmse = float(np.sqrt(np.mean((pred - y[va]) ** 2)))
     arrays = {"n_layers": np.asarray(len(mlp.coefs_))}
     for i, (w, b) in enumerate(zip(mlp.coefs_, mlp.intercepts_)):
@@ -653,7 +647,6 @@ def train_prior(
         y_std=np.asarray(y_std),
         reward_design=np.asarray(design),
         target_floor=np.asarray(float(target_floor)),
-        target_log=np.asarray(1),
     )
     np.savez(out_path, **arrays)
     return rmse

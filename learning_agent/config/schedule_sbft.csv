@@ -1,6 +1,9 @@
 # time_s,election_timeout_ms,slow_path_timeout_ms
+# Rows sit on the phase boundaries (atTime; with the leading -10 row a switch
+# written at T fires at warmUpTime + T): Kevin's rule, the oracle switches at
+# onset, never before (2026-10-07; it switched 10 s early before).
 # CppBedrock SBFT oracle for config/sbft/failure_spec.xml: the best pair per phase,
-# switched 10 s before each boundary. Calibrated in runs/2026-09-27-sbft-pairs at
+# switched on each boundary. Calibrated in runs/2026-09-27-sbft-pairs at
 # 15,000 req/s, 3 draws per pair per phase; throughput ties everywhere, so pairs are
 # ranked on p50 consensus latency with a 50 ms threshold.
 #
@@ -27,10 +30,10 @@
 #
 -10,250,50
 0,250,50
-290,250,50
-590,525,50
-890,525,150
-1190,525,50
-1490,1100,150
-1790,1100,50
-2090,250,50
+300,250,50
+600,525,50
+900,525,150
+1200,525,50
+1500,1100,150
+1800,1100,50
+2100,250,50

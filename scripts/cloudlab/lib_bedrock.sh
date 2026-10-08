@@ -1342,18 +1342,15 @@ if [[ "${mode}" == "learning" || "${mode}" == "sharing" ]] && [[ "${latency_floo
   agent_model_args="${agent_model_args} --latency-floor-multiplier ${latency_floor_multiplier}"
 fi
 
-# SBFT agents give a window in which no batch executed its own length as its
-# latency, so they need the windows the replicas measure (main.py refuses
-# these flags for other protocols).
 # The prior file the model loads, relative to run_root; "" leaves it untrained.
 # The model and mode were checked locally.
 if [[ -n "${prior_path}" ]]; then
   agent_model_args="${agent_model_args} --prior-path ${prior_path}"
 fi
 
-if [[ "${agent_protocol}" == "sbft" ]]; then
-  agent_model_args="${agent_model_args} --feature-window-ms ${feature_window_ms} --reward-window-ms ${reward_window_ms}"
-fi
+# The agent gives a window in which nothing committed its own length as its
+# latency, so it needs the windows the replicas measure.
+agent_model_args="${agent_model_args} --feature-window-ms ${feature_window_ms} --reward-window-ms ${reward_window_ms}"
 
 failure_args=""
 if [[ "${failure_spec_enabled}" == "1" ]]; then

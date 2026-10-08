@@ -1206,6 +1206,20 @@ phase_install_testnet() {
   rm -f "${testnet_tar}"
 }
 
+# A "<n>s" or "<n>ms" duration key of the master config, in ms; fails otherwise.
+toml_duration_ms() {
+  local key="$1" value
+  value="$(sed -n "s/^${key} = \"\(.*\)\"\$/\1/p" "${master_config}")"
+  if [[ "${value}" =~ ^([0-9]+)ms$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  elif [[ "${value}" =~ ^([0-9]+)s$ ]]; then
+    echo $(( BASH_REMATCH[1] * 1000 ))
+  else
+    echo "Unsupported ${key} '${value}' in ${master_config}: expected <n>s or <n>ms." >&2
+    exit 1
+  fi
+}
+
 phase_start() {
   echo "Setting up namespaces for replicas ${first_local_replica}-${last_local_replica} on $(hostname)..."
   setup_network_namespaces
@@ -1251,6 +1265,12 @@ phase_start() {
     if [[ -n "${prior_path}" ]]; then
       agent_mode_args="${agent_mode_args} --prior-path ${prior_path}"
     fi
+    # The agent gives a window in which nothing committed its own length as its
+    # latency, so it needs the windows the replicas measure (master config).
+    local feature_window_ms reward_window_ms
+    feature_window_ms="$(toml_duration_ms adaptive_timer_feature_duration)" || exit 1
+    reward_window_ms="$(toml_duration_ms adaptive_timer_reward_duration)" || exit 1
+    agent_mode_args="${agent_mode_args} --feature-window-ms ${feature_window_ms} --reward-window-ms ${reward_window_ms}"
     local agent_session ns agent_log dataset_args
     for ((i = first_local_replica; i <= last_local_replica; i++)); do
       agent_session="tm_tendermint_agent_${i}"

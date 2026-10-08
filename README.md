@@ -15,7 +15,10 @@ If `--key-dir` is omitted, the agent uses the built-in default key pair. Signing
 
 ### Run Agents
 
-Start one agent per node id listed in `config/hosts.config`:
+Start one agent per node id listed in `config/hosts.config`. Every command also
+needs the replicas' feature and reward window lengths, `--feature-window-ms` and
+`--reward-window-ms` (CppBedrock defaults 10000 and 5000): a window in which
+nothing committed takes its length as its latency. They are omitted below.
 
 ```bash
 python learning_agent/main.py --node-id 0

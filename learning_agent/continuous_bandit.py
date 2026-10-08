@@ -778,9 +778,8 @@ class NumpyMLP:
         self._y_mean = float(data["y_mean"])
         self._y_std = float(data["y_std"])
         self.reward_design = str(data["reward_design"])
-        # A prior fit on log(reward) (smartbft_sim.train_prior) says so; its outputs are
-        # exponentiated back to reward units so the GP residual stays in those units.
-        self.target_log = bool(int(data["target_log"])) if "target_log" in data else False
+        if "target_log" in data:
+            raise ValueError(f"{path}: fit on log(reward), which cannot represent a negative reward; retrain it")
         # Episodes the action was held for in training (tendermint_sim train
         # --hold-episodes); the target was the mean reward over the hold. 1 = one
         # episode's reward, the SimPriorGPModel prior.
@@ -805,7 +804,7 @@ class NumpyMLP:
             if i < len(self._weights) - 1:
                 h = np.maximum(h, 0.0)
         out = h.reshape(-1) * self._y_std + self._y_mean
-        return np.exp(out) if self.target_log else out
+        return out
 
 
 # Default floor for an untrained prior. SimReturnGPModel needs a finite one -
@@ -831,7 +830,6 @@ class ZeroPrior:
     ):
         self._input_dim = int(input_dim)
         self.reward_design = str(reward_design)
-        self.target_log = False
         self.hold_episodes = 1
         self.target_floor = float(target_floor)
 

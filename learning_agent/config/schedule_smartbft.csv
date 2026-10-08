@@ -1,6 +1,9 @@
 # time_s,timeout_ms
 # may be any integer from 1 through 4294967295
+# Rows sit on the phase boundaries (atTime; with the leading -10 row a switch
+# written at T fires at warmUpTime + T): Kevin's rule, the oracle switches at
+# onset, never before (2026-10-07; it switched 10 s early before).
 -10,300
 0,300
-890,800
-1490,1800
+900,800
+1500,1800

@@ -1338,12 +1338,9 @@ if [[ -n "${prior_path}" ]]; then
   agent_model_args="${agent_model_args} --prior-path ${prior_path}"
 fi
 
-# HotStuff and Autobahn agents give a window in which nothing committed its own
-# length as its latency, so they need the windows the replicas measure (main.py
-# refuses these flags for protocols that do not).
-if [[ "${agent_protocol}" == "hotstuff" || "${agent_protocol}" == "autobahn" ]]; then
-  agent_model_args="${agent_model_args} --feature-window-ms ${feature_window_ms} --reward-window-ms ${reward_window_ms}"
-fi
+# The agent gives a window in which nothing committed its own length as its
+# latency, so it needs the windows the replicas measure.
+agent_model_args="${agent_model_args} --feature-window-ms ${feature_window_ms} --reward-window-ms ${reward_window_ms}"
 
 failure_args=""
 if [[ "${failure_spec_enabled}" == "1" ]]; then

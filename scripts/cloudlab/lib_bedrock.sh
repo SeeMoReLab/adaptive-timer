@@ -70,19 +70,23 @@ PRIOR_PATH=""
 
 TX_RATE="${TX_RATE:-40000}"
 REQUEST_TIMEOUT_MS=10000
+# Serialized bytes of every client request (0: the client's unpadded transfer request).
+REQUEST_SIZE=512
 # Parallel client streams (independent sender lanes) per replica.
 CLIENT_CONNECTIONS_PER_TARGET=4
 CLIENT_SIGN="false"
 PROPOSAL_INTERVAL_MS=100
 BATCH_MAX_REQUESTS=8192
-BATCH_MAX_BYTES=524288
+# 4.5 MiB: with 512 B requests the 8192-request cap binds first (up to ~575 B per request).
+BATCH_MAX_BYTES=4718592
 # Batches the leader may keep unexecuted, and so the depth of the pipeline.
 # A protocol's failure spec and oracle schedule are calibrated at one depth -
 # 16 stalls execution for seconds at a time at 150 ms one way, which moves the
 # usable timeout ladder - so each runner pins the depth its calibration assumes.
 MAX_INFLIGHT_BATCHES="${MAX_INFLIGHT_BATCHES:-16}"
 MAX_PENDING_REQUESTS=32768
-MAX_PENDING_BYTES=16777216
+# 32 MiB: with 512 B requests the 32,768-request cap binds first (up to 1 KiB per request).
+MAX_PENDING_BYTES=33554432
 MONITOR_INTERVAL_MS=1000
 REPLICA_PORT=15000
 AGENT_PORT=15501
@@ -94,10 +98,10 @@ SHARING_CONSENSUS_PORT=15701
 SHARING_COLLECT_WAIT_MS=100
 INITIAL_TIMEOUT_MS=""
 INITIAL_SLOW_PATH_TIMEOUT_MS=""
-LEARNING_FEATURE_DURATION_MS=10000
+LEARNING_FEATURE_DURATION_MS=7000
 LEARNING_REPLY_WAIT_MS=2000
-LEARNING_WARMUP_DURATION_MS=3000
-LEARNING_REWARD_DURATION_MS=5000
+LEARNING_WARMUP_DURATION_MS=4000
+LEARNING_REWARD_DURATION_MS=7000
 FAILURE_SPEC_PATH="${FAILURE_SPEC_DEFAULT}"
 FAILURE_SPEC_ENABLED=1
 
@@ -178,12 +182,12 @@ Flags:
   --verbose                         Enable per-message debug logs on server replicas.
   --reward-design <reward_tps|reward_mixed|reward_tps_latency>
                                     Reward the agent learns from (default: reward_tps_latency).
-  --model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo>
+  --model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|discrete_gp|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo>
                                      Learning-agent model for learning mode (default: discrete_random).
   --latency-floor-multiplier <float> Never apply a timeout below this multiplier x the recent
                                      consensus latency; any model except scheduled (0 disables it;
                                      default: 0).
-  --prior-path <path>                Prior file the model loads, for continuous_gp, discrete_linucb,
+  --prior-path <path>                Prior file the model loads, for continuous_gp, discrete_gp, discrete_linucb,
                                      continuous_linucb, discrete_ppo or continuous_ppo in learning or
                                      sharing mode. It must be under learning_agent/, the only tree
                                      shipped to the nodes. Omitted (default): the model starts untrained.
@@ -199,11 +203,13 @@ ${PROTOCOL_NAME} options:
   --rate <int>                      Total client requests/s across all lanes (default: 1000).
   --proposal-interval <ms>          Fixed proposal cadence (default: 100).
   --batch-max-requests <int>        Requests per batch (default/max: 8192).
-  --batch-max-bytes <int>           Bytes per batch (default/max: 524288).
+  --batch-max-bytes <int>           Bytes per batch (default: 4718592).
   --max-inflight-batches <int>      Unexecuted proposals (default and max: 16, the consensus window).
   --max-pending-requests <int>      Bound each ingress/pending queue (default: 32768). Raising it
                                      trades rejection for queueing delay; measured worse at 40k.
-  --max-pending-bytes <int>         Bound each ingress/pending queue (default: 16777216).
+  --max-pending-bytes <int>         Bound each ingress/pending queue (default: 33554432).
+  --request-size <bytes>            Serialized size of every client request, padded with a blank
+                                     transaction; 0 sends unpadded transfer requests (default: 512).
   --request-timeout <ms>            Client per-request timeout in ms (default: 10000).
   --client-connections <int>        Client streams (independent sender lanes) per replica (default: 4).
   --client-sign <true|false>        RSA-sign every client request (default: false).
@@ -215,10 +221,10 @@ Learning-agent options:
   --agent-port <port>               Learning-agent port inside each replica namespace (default: 15501).
   --initial-timeout <ms>            Initial election (view-change) timeout (default: from ${BEDROCK_PROTOCOL_CONFIG_REL}).
   --initial-slow-path-timeout <ms>  Initial SBFT slow-path timeout (default: from the protocol config).
-  --learning-feature-duration <ms>  Feature window (default: 10000).
+  --learning-feature-duration <ms>  Feature window (default: 7000).
   --learning-reply-wait <ms>        Recommendation wait (default: 2000).
-  --learning-warmup-duration <ms>   Post-apply warm-up (default: 3000).
-  --learning-reward-duration <ms>   Reward window (default: 5000).
+  --learning-warmup-duration <ms>   Post-apply warm-up (default: 4000).
+  --learning-reward-duration <ms>   Reward window (default: 7000).
 EOF
 }
 
@@ -257,7 +263,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo) printf '%s\n' "${model_lower}" ;;
+    discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|discrete_gp|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo) printf '%s\n' "${model_lower}" ;;
     *)
       local renamed
       if renamed="$(renamed_model_type "${model_lower}")"; then
@@ -313,6 +319,28 @@ absolute_path() {
 is_ipv4_literal() {
   local value="$1"
   [[ "${value}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+# Prints a failure spec's start-up warm-up in ms, read as the replicas and the
+# network applier read it: <warmUpTimeMs>, else <warmUpTime> in seconds. Fails
+# when the spec has neither.
+failure_spec_warmup_ms() {
+  python3 - "$1" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+path = sys.argv[1]
+root = ET.parse(path).getroot()
+ms = root.find("warmUpTimeMs")
+secs = root.find("warmUpTime")
+if ms is not None and ms.text and ms.text.strip():
+    value = int(ms.text.strip())
+elif secs is not None and secs.text and secs.text.strip():
+    value = int(float(secs.text.strip()) * 1000.0 + 0.5)
+else:
+    sys.exit(f"{path}: no <warmUpTimeMs> or <warmUpTime>")
+print(max(0, value))
+PY
 }
 
 write_filtered_output() {
@@ -466,6 +494,7 @@ bedrock_main() {
       --max-inflight-batches) MAX_INFLIGHT_BATCHES="${2:-}"; shift 2 ;;
       --max-pending-requests) MAX_PENDING_REQUESTS="${2:-}"; shift 2 ;;
       --max-pending-bytes) MAX_PENDING_BYTES="${2:-}"; shift 2 ;;
+      --request-size) REQUEST_SIZE="${2:-}"; shift 2 ;;
       --request-timeout) REQUEST_TIMEOUT_MS="${2:-}"; shift 2 ;;
       --client-connections) CLIENT_CONNECTIONS_PER_TARGET="${2:-}"; shift 2 ;;
       --client-sign) CLIENT_SIGN="${2:-}"; shift 2 ;;
@@ -526,6 +555,10 @@ bedrock_main() {
       exit 2
     fi
   done
+  if ! [[ "${REQUEST_SIZE}" =~ ^[0-9]+$ ]]; then
+    echo "Invalid --request-size value: ${REQUEST_SIZE}. Use an integer >= 0." >&2
+    exit 2
+  fi
   for value_name in CLIENT_START_DELAY_S START_OFFSET_AFTER_CLIENT_LAUNCH_S; do
     value="${!value_name}"
     if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
@@ -550,7 +583,7 @@ bedrock_main() {
     exit 2
   fi
   if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-    echo "Invalid --model value. Use one of discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo." >&2
+    echo "Invalid --model value. Use one of discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|discrete_gp|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo." >&2
     exit 2
   fi
   if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -563,8 +596,8 @@ bedrock_main() {
       exit 2
     fi
     case "${AGENT_MODEL_TYPE}" in
-      continuous_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo) ;;
-      *) echo "--prior-path is not supported with --model ${AGENT_MODEL_TYPE}. Use one of continuous_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo." >&2; exit 2 ;;
+      continuous_gp|discrete_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo) ;;
+      *) echo "--prior-path is not supported with --model ${AGENT_MODEL_TYPE}. Use one of continuous_gp|discrete_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo." >&2; exit 2 ;;
     esac
     if ! PRIOR_PATH="$(repo_relative_prior_path "${PRIOR_PATH}")"; then
       exit 2
@@ -615,6 +648,31 @@ bedrock_main() {
   if (( FAILURE_SPEC_ENABLED == 1 )) && [[ ! -f "${FAILURE_SPEC_PATH}" ]]; then
     echo "Failure spec not found: ${FAILURE_SPEC_PATH}" >&2
     exit 1
+  fi
+  # Every replica anchors its episode grid on start + the spec's warm-up (also
+  # with --no-failure-spec), and the agent maps episodes to schedule rows by the
+  # episode period.
+  if (( LEARNING_AGENT_ENABLED == 1 )); then
+    for value_name in LEARNING_FEATURE_DURATION_MS LEARNING_REPLY_WAIT_MS LEARNING_WARMUP_DURATION_MS LEARNING_REWARD_DURATION_MS; do
+      value="${!value_name}"
+      if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
+        echo "Invalid ${value_name}: ${value}" >&2
+        exit 2
+      fi
+    done
+    LEARNING_EPISODE_MS="$((LEARNING_FEATURE_DURATION_MS + LEARNING_REPLY_WAIT_MS + LEARNING_WARMUP_DURATION_MS + LEARNING_REWARD_DURATION_MS))"
+    if (( LEARNING_EPISODE_MS <= 0 )); then
+      echo "Invalid learning episode period: ${LEARNING_EPISODE_MS} ms" >&2
+      exit 2
+    fi
+    if [[ ! -f "${FAILURE_SPEC_PATH}" ]]; then
+      echo "Failure spec not found (the learning episode grid needs its warm-up): ${FAILURE_SPEC_PATH}" >&2
+      exit 1
+    fi
+    if ! LEARNING_ANCHOR_WARMUP_MS="$(failure_spec_warmup_ms "${FAILURE_SPEC_PATH}")"; then
+      echo "Cannot read the warm-up from failure spec ${FAILURE_SPEC_PATH}" >&2
+      exit 1
+    fi
   fi
   if [[ "${MODE}" == "scheduled" && ! -f "${REPO_ROOT}/${SCHEDULE_FILE_REL}" ]]; then
     echo "Schedule file not found: ${REPO_ROOT}/${SCHEDULE_FILE_REL}" >&2
@@ -682,6 +740,7 @@ bedrock_main() {
     printf 'nodes=%q\n' "${NODES}"
     printf 'experiment_time_s=%q\n' "${EXPERIMENT_TIME_S}"
     printf 'tx_rate=%q\n' "${TX_RATE}"
+    printf 'request_size=%q\n' "${REQUEST_SIZE}"
     printf 'proposal_interval_ms=%q\n' "${PROPOSAL_INTERVAL_MS}"
     printf 'batch_max_requests=%q\n' "${BATCH_MAX_REQUESTS}"
     printf 'batch_max_bytes=%q\n' "${BATCH_MAX_BYTES}"
@@ -1217,6 +1276,11 @@ REMOTE
 
   START_UNIX_MS="$(( ($(date +%s) + CLIENT_START_DELAY_S + START_OFFSET_AFTER_CLIENT_LAUNCH_S) * 1000 ))"
   echo "Using shared start_unix_ms=${START_UNIX_MS}"
+  LEARNING_ANCHOR_UNIX_MS=0
+  if (( LEARNING_AGENT_ENABLED == 1 )); then
+    LEARNING_ANCHOR_UNIX_MS="$((START_UNIX_MS + LEARNING_ANCHOR_WARMUP_MS))"
+    echo "Learning episode grid: anchor_unix_ms=${LEARNING_ANCHOR_UNIX_MS} (start + warm-up ${LEARNING_ANCHOR_WARMUP_MS} ms) period_ms=${LEARNING_EPISODE_MS}"
+  fi
 
   if (( FAILURE_SPEC_ENABLED == 1 )); then
     echo "Starting ${PROTOCOL_NAME} network failure appliers..."
@@ -1246,7 +1310,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   session_name="${protocol}_applier_${replica_id}"
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   tmux new-session -d -s "${session_name}" \
-    "cd \"${run_root}\" && python3 \"${run_root}/scripts/apply_network_failures.py\" --failure-spec \"${run_root}/failure_spec.xml\" --hosts-config \"${run_root}/hosts.failure.config\" --replica-id ${replica_id} --netns ${ns_name} --interface ${interface_name} --start-unix-ms ${start_unix_ms} > \"${run_root}/logs/applier_${replica_id}.log\" 2>&1"
+    "cd \"${run_root}\" && python3 \"${run_root}/scripts/apply_network_failures.py\" --failure-spec \"${run_root}/failure_spec.xml\" --hosts-config \"${run_root}/hosts.failure.config\" --replica-id ${replica_id} --netns ${ns_name} --interface ${interface_name} --start-unix-ms ${start_unix_ms} --pre-apply-base > \"${run_root}/logs/applier_${replica_id}.log\" 2>&1"
 done
 REMOTE
       then
@@ -1260,6 +1324,41 @@ REMOTE
       echo "Applier start failed on one or more nodes." >&2
       exit 1
     fi
+    # The replicas must connect over the base delay (see --pre-apply-base), so wait for
+    # every applier to have installed it before any replica starts.
+    for i in "${!server_nodes[@]}"; do
+      if ! remote_bash "${server_users[$i]}" "${server_hosts[$i]}" \
+      "${replicas_per_server_machine}" "${i}" "${RUN_ROOT_REMOTE_NAME}" <<'REMOTE'
+set -euo pipefail
+
+replicas_per_machine="$1"
+machine_idx="$2"
+run_root="$HOME/$3"
+
+for ((n = 0; n < replicas_per_machine; n++)); do
+  replica_id=$((machine_idx * replicas_per_machine + n))
+  applier_log="${run_root}/logs/applier_${replica_id}.log"
+  ready=0
+  for attempt in $(seq 1 60); do
+    if grep -q "Pre-applied base delay" "${applier_log}" 2>/dev/null; then
+      ready=1
+      break
+    fi
+    sleep 0.5
+  done
+  if (( ready == 0 )); then
+    echo "Network applier ${replica_id} did not install the base delay within 30 s; see ${applier_log}:" >&2
+    tail -n 5 "${applier_log}" >&2 || true
+    exit 1
+  fi
+done
+REMOTE
+      then
+        echo "  - ${server_nodes[$i]}: base delay not installed" >&2
+        exit 1
+      fi
+    done
+    echo "Base delay pre-applied on every replica."
   else
     echo "Failure spec disabled; not starting network appliers."
   fi
@@ -1293,6 +1392,7 @@ REMOTE
           "${LATENCY_FLOOR_MULTIPLIER}" \
           "${LEARNING_FEATURE_DURATION_MS}" \
           "${LEARNING_REWARD_DURATION_MS}" \
+          "${LEARNING_EPISODE_MS}" \
           "${PRIOR_PATH}" <<'REMOTE'
 set -euo pipefail
 
@@ -1313,7 +1413,8 @@ reward_design="${14}"
 latency_floor_multiplier="${15}"
 feature_window_ms="${16}"
 reward_window_ms="${17}"
-prior_path="${18:-}"
+episode_ms="${18}"
+prior_path="${19:-}"
 learning_agent_python="${HOME}/.venvs/adaptive-timer-learning-agent/bin/python"
 
 if [[ ! -x "${learning_agent_python}" ]]; then
@@ -1351,6 +1452,8 @@ fi
 # The agent gives a window in which nothing committed its own length as its
 # latency, so it needs the windows the replicas measure.
 agent_model_args="${agent_model_args} --feature-window-ms ${feature_window_ms} --reward-window-ms ${reward_window_ms}"
+# Episode e's schedule row and phase label are taken at its grid apply instant.
+agent_model_args="${agent_model_args} --episode-ms ${episode_ms}"
 
 failure_args=""
 if [[ "${failure_spec_enabled}" == "1" ]]; then
@@ -1441,7 +1544,8 @@ REMOTE
         "${START_UNIX_MS}" \
         "${FAILURE_SPEC_ENABLED}" \
         "${PROPOSAL_INTERVAL_MS}" "${BATCH_MAX_REQUESTS}" "${BATCH_MAX_BYTES}" \
-        "${MAX_INFLIGHT_BATCHES}" "${MAX_PENDING_REQUESTS}" "${MAX_PENDING_BYTES}" <<'REMOTE'
+        "${MAX_INFLIGHT_BATCHES}" "${MAX_PENDING_REQUESTS}" "${MAX_PENDING_BYTES}" \
+        "${LEARNING_ANCHOR_UNIX_MS}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
@@ -1467,6 +1571,7 @@ batch_max_bytes="${20}"
 max_inflight_batches="${21}"
 max_pending_requests="${22}"
 max_pending_bytes="${23}"
+learning_anchor_unix_ms="${24}"
 
 for ((n = 0; n < replicas_per_machine; n++)); do
   replica_id=$((machine_idx * replicas_per_machine + n))
@@ -1502,6 +1607,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   if [[ "${learning_enabled}" == "1" ]]; then
     args+=(
       "--agent-port" "${agent_port}"
+      "--learning-anchor-unix-ms" "${learning_anchor_unix_ms}"
       "--learning-feature-duration" "${learning_feature_ms}"
       "--learning-reply-wait" "${learning_reply_wait_ms}"
       "--learning-warmup-duration" "${learning_warmup_ms}"
@@ -1561,7 +1667,8 @@ REMOTE
     "${RUN_ROOT_REMOTE_NAME}" \
     "${PROTOCOL_NAME}" \
     "${CLIENT_CONNECTIONS_PER_TARGET}" \
-    "${CLIENT_SIGN}" <<'REMOTE'
+    "${CLIENT_SIGN}" \
+    "${REQUEST_SIZE}" <<'REMOTE'
 set -euo pipefail
 
 start_unix_ms="$1"
@@ -1572,6 +1679,7 @@ run_root="$HOME/$5"
 protocol="$6"
 client_connections_per_target="$7"
 client_sign="$8"
+request_size="$9"
 
 args=(
   "${run_root}/bin/bedrock_client"
@@ -1584,6 +1692,7 @@ args=(
   "--connections" "${client_connections_per_target}"
   "--sign" "${client_sign}"
   "--client-key" "${run_root}/netcfg/keys/client_private.pem"
+  "--request-size" "${request_size}"
 )
 printf -v client_cmd '%q ' "${args[@]}"
 tmux kill-session -t "${protocol}_client" >/dev/null 2>&1 || true
@@ -1739,6 +1848,22 @@ REMOTE
     rm -rf "${LOGS_LOCAL_DIR}"
     mkdir -p "${LOGS_LOCAL_DIR}/servers" "${LOGS_LOCAL_DIR}/appliers" "${LOGS_LOCAL_DIR}/agents"
     [[ "${MODE}" == "sharing" ]] && mkdir -p "${LOGS_LOCAL_DIR}/sharing"
+    # Replica logs are compressed on their host (the replicas are stopped by
+    # now) and pulled as server_<id>.log.gz; a missing log is left to the
+    # download below to report, as before.
+    for i in "${!server_nodes[@]}"; do
+      if ! remote_bash "${server_users[$i]}" "${server_hosts[$i]}" "${RUN_ROOT_REMOTE_NAME}" <<'REMOTE'
+set -euo pipefail
+cd "$HOME/$1/logs"
+for f in server_*.log; do
+  [[ -f "${f}" ]] || continue
+  gzip -f "${f}"
+done
+REMOTE
+      then
+        echo "  - ${server_nodes[$i]}: failed to compress server logs" >&2
+      fi
+    done
     for i in "${!server_nodes[@]}"; do
       node="${server_nodes[$i]}"
       host="${server_hosts[$i]}"
@@ -1747,9 +1872,9 @@ REMOTE
       for ((n = 0; n < replicas_per_server_machine; n++)); do
         replica_id=$((machine_idx * replicas_per_server_machine + n))
         queue_artifact_download "${node}" "${host}" "${user}" \
-          "${RUN_ROOT_REMOTE_NAME}/logs/server_${replica_id}.log" \
-          "${LOGS_LOCAL_DIR}/servers/server_${replica_id}.log" \
-          "server_${replica_id}.log" \
+          "${RUN_ROOT_REMOTE_NAME}/logs/server_${replica_id}.log.gz" \
+          "${LOGS_LOCAL_DIR}/servers/server_${replica_id}.log.gz" \
+          "server_${replica_id}.log.gz" \
           "log"
         if (( FAILURE_SPEC_ENABLED == 1 )); then
           queue_artifact_download "${node}" "${host}" "${user}" \

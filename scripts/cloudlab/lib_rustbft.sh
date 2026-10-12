@@ -72,6 +72,8 @@ AGENT_MODEL_TYPE="discrete_random"
 AGENT_MODEL_SET=0
 # Prior file the model loads, repo-relative after validation; "" (omitted) is untrained.
 PRIOR_PATH=""
+# Latency floor on the action space (main.py --latency-floor-multiplier); 0 disables it.
+LATENCY_FLOOR_MULTIPLIER="0"
 
 TX_RATE=60000
 TX_SIZE=512
@@ -98,10 +100,15 @@ SHARING_CONSENSUS_PORT=15701
 SHARING_COLLECT_WAIT_MS=100
 INITIAL_TIMEOUT_MS=""
 SCHEDULE_FILE_ARG=""
-LEARNING_FEATURE_DURATION_MS=10000
+LEARNING_FEATURE_DURATION_MS=7000
 LEARNING_REPLY_WAIT_MS=2000
-LEARNING_WARMUP_DURATION_MS=3000
-LEARNING_REWARD_DURATION_MS=5000
+LEARNING_WARMUP_DURATION_MS=4000
+LEARNING_REWARD_DURATION_MS=7000
+# Set when the learning agent runs: the spec's warm-up, the episode period
+# (the sum of the four durations above) and the shared grid anchor.
+LEARNING_SPEC_WARMUP_MS=""
+LEARNING_EPISODE_MS=""
+LEARNING_ANCHOR_UNIX_MS=""
 FAILURE_SPEC_PATH="${FAILURE_SPEC_DEFAULT}"
 FAILURE_SPEC_ENABLED=1
 
@@ -165,12 +172,15 @@ Flags:
   --log                             Download client, server, applier, and agent logs.
   --output-dir <path>               Store artifacts here instead of a timestamped run directory.
   --verbose                         Enable debug logs on server replicas.
-  --model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo>
+  --model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|discrete_gp|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo>
                                      Learning-agent model for learning mode (default: discrete_random).
-  --prior-path <path>                Prior file the model loads, for continuous_gp, discrete_linucb,
+  --prior-path <path>                Prior file the model loads, for continuous_gp, discrete_gp, discrete_linucb,
                                      continuous_linucb, discrete_ppo or continuous_ppo in learning or
                                      sharing mode. It must be under learning_agent/, the only tree
                                      shipped to the nodes. Omitted (default): the model starts untrained.
+  --latency-floor-multiplier <float> Never apply a timeout below this multiplier x the recent
+                                     consensus latency (main.py's latency floor), learning or
+                                     sharing mode only; 0 disables it (default: 0).
   -f <int>                          Fault tolerance f; nodes defaults to 3f+1 (default: 1).
   -t <int>                          Seconds to run after benchmark start (default: 300).
 
@@ -194,10 +204,10 @@ Learning-agent options:
   --agent-port <port>               Learning-agent port inside each replica namespace (default: 15501).
   --initial-timeout <ms>            Override the initial consensus timeout_delay (default: from config/${PROTOCOL_NAME}/parameters.json).
   --schedule <path>                 Schedule CSV for scheduled mode, inside the repo (default: ${SCHEDULE_FILE_REL}).
-  --learning-feature-duration <ms>  Feature window (default: 10000).
+  --learning-feature-duration <ms>  Feature window (default: 7000).
   --learning-reply-wait <ms>        Recommendation wait (default: 2000).
-  --learning-warmup-duration <ms>   Post-apply warm-up (default: 3000).
-  --learning-reward-duration <ms>   Reward window (default: 5000).
+  --learning-warmup-duration <ms>   Post-apply warm-up (default: 4000).
+  --learning-reward-duration <ms>   Reward window (default: 7000).
 EOF
 }
 
@@ -236,7 +246,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo) printf '%s\n' "${model_lower}" ;;
+    discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|discrete_gp|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo) printf '%s\n' "${model_lower}" ;;
     *)
       local renamed
       if renamed="$(renamed_model_type "${model_lower}")"; then
@@ -292,6 +302,28 @@ absolute_path() {
 is_ipv4_literal() {
   local value="$1"
   [[ "${value}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+# Prints the failure spec's warm-up in ms (<warmUpTimeMs>, else <warmUpTime> in
+# seconds, as the engines and the applier read it); fails if neither parses.
+spec_warmup_ms() {
+  python3 - "$1" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+root = ET.parse(sys.argv[1]).getroot()
+ms = root.findtext("warmUpTimeMs")
+if ms is not None:
+    value = int(ms.strip())
+else:
+    seconds = root.findtext("warmUpTime")
+    if seconds is None:
+        sys.exit(f"{sys.argv[1]}: no <warmUpTimeMs> or <warmUpTime>")
+    value = round(float(seconds.strip()) * 1000)
+if value < 0:
+    sys.exit(f"{sys.argv[1]}: negative warm-up {value} ms")
+print(value)
+PY
 }
 
 write_filtered_output() {
@@ -433,6 +465,7 @@ rustbft_main() {
         PRIOR_PATH="${2}"
         shift 2
         ;;
+      --latency-floor-multiplier) LATENCY_FLOOR_MULTIPLIER="${2:-}"; shift 2 ;;
       --nodes) NODES="${2:-}"; NODES_SET=1; shift 2 ;;
       --failure-spec) FAILURE_SPEC_PATH="${2:-}"; FAILURE_SPEC_ENABLED=1; shift 2 ;;
       --no-failure-spec) FAILURE_SPEC_ENABLED=0; shift ;;
@@ -543,7 +576,7 @@ rustbft_main() {
     exit 2
   fi
   if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-    echo "Invalid --model value. Use one of discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo." >&2
+    echo "Invalid --model value. Use one of discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|discrete_gp|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo." >&2
     exit 2
   fi
   if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -556,12 +589,20 @@ rustbft_main() {
       exit 2
     fi
     case "${AGENT_MODEL_TYPE}" in
-      continuous_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo) ;;
-      *) echo "--prior-path is not supported with --model ${AGENT_MODEL_TYPE}. Use one of continuous_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo." >&2; exit 2 ;;
+      continuous_gp|discrete_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo) ;;
+      *) echo "--prior-path is not supported with --model ${AGENT_MODEL_TYPE}. Use one of continuous_gp|discrete_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo." >&2; exit 2 ;;
     esac
     if ! PRIOR_PATH="$(repo_relative_prior_path "${PRIOR_PATH}")"; then
       exit 2
     fi
+  fi
+  if ! [[ "${LATENCY_FLOOR_MULTIPLIER}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "Invalid --latency-floor-multiplier: ${LATENCY_FLOOR_MULTIPLIER}. Expected a non-negative number (0 disables the constraint)." >&2
+    exit 2
+  fi
+  if [[ "${MODE}" != "learning" && "${MODE}" != "sharing" && "${LATENCY_FLOOR_MULTIPLIER}" =~ [1-9] ]]; then
+    echo "--latency-floor-multiplier is only supported with learning or sharing mode; scheduled mode applies the schedule as written." >&2
+    exit 2
   fi
   if ! mode_enables_learning_agent "${MODE}"; then
     LEARNING_AGENT_ENABLED=0
@@ -592,6 +633,26 @@ rustbft_main() {
   if (( FAILURE_SPEC_ENABLED == 1 )) && [[ ! -f "${FAILURE_SPEC_PATH}" ]]; then
     echo "Failure spec not found: ${FAILURE_SPEC_PATH}" >&2
     exit 1
+  fi
+  # Every replica anchors its episode grid on start + the spec's warm-up, so the
+  # warm-up is read even when fault injection is off.
+  if (( LEARNING_AGENT_ENABLED == 1 )); then
+    for value_name in LEARNING_FEATURE_DURATION_MS LEARNING_REPLY_WAIT_MS LEARNING_WARMUP_DURATION_MS LEARNING_REWARD_DURATION_MS; do
+      value="${!value_name}"
+      if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
+        echo "Invalid ${value_name}: ${value}" >&2
+        exit 2
+      fi
+    done
+    if ! LEARNING_SPEC_WARMUP_MS="$(spec_warmup_ms "${FAILURE_SPEC_PATH}")"; then
+      echo "Cannot read the warm-up from failure spec ${FAILURE_SPEC_PATH}; the learning episode grid needs it." >&2
+      exit 1
+    fi
+    LEARNING_EPISODE_MS="$((LEARNING_FEATURE_DURATION_MS + LEARNING_REPLY_WAIT_MS + LEARNING_WARMUP_DURATION_MS + LEARNING_REWARD_DURATION_MS))"
+    if (( LEARNING_EPISODE_MS < 1 )); then
+      echo "The learning episode period (the sum of the four learning durations) must be positive." >&2
+      exit 2
+    fi
   fi
   if [[ ! -f "${TARGETS_FILE}" ]]; then
     echo "Targets file not found: ${TARGETS_FILE}" >&2
@@ -668,7 +729,12 @@ rustbft_main() {
     printf 'initial_timeout_ms=%q\n' "${INITIAL_TIMEOUT_MS:-from-template}"
     printf 'agent_model=%q\n' "${AGENT_MODEL_TYPE}"
     printf 'prior_path=%q\n' "${PRIOR_PATH:-}"
+    printf 'latency_floor_multiplier=%q\n' "${LATENCY_FLOOR_MULTIPLIER}"
     printf 'learning_window_mode=wall-clock\n'
+    printf 'learning_feature_duration_ms=%q\n' "${LEARNING_FEATURE_DURATION_MS}"
+    printf 'learning_reply_wait_ms=%q\n' "${LEARNING_REPLY_WAIT_MS}"
+    printf 'learning_warmup_duration_ms=%q\n' "${LEARNING_WARMUP_DURATION_MS}"
+    printf 'learning_reward_duration_ms=%q\n' "${LEARNING_REWARD_DURATION_MS}"
     printf 'log_enabled=%q\n' "${LOG_ENABLED}"
     printf 'failure_spec_enabled=%q\n' "${FAILURE_SPEC_ENABLED}"
     printf 'targets_file=%q\n' "${TARGETS_FILE}"
@@ -1217,6 +1283,10 @@ REMOTE
 
   START_UNIX_MS="$(( ($(date +%s) + CLIENT_START_DELAY_S + START_OFFSET_AFTER_CLIENT_LAUNCH_S) * 1000 ))"
   echo "Using shared start_unix_ms=${START_UNIX_MS}"
+  if (( LEARNING_AGENT_ENABLED == 1 )); then
+    LEARNING_ANCHOR_UNIX_MS="$((START_UNIX_MS + LEARNING_SPEC_WARMUP_MS))"
+    echo "Using learning anchor_unix_ms=${LEARNING_ANCHOR_UNIX_MS} (start + warm-up ${LEARNING_SPEC_WARMUP_MS} ms), episode_ms=${LEARNING_EPISODE_MS}"
+  fi
 
   if (( FAILURE_SPEC_ENABLED == 1 )); then
     echo "Starting ${PROTOCOL_NAME} network failure appliers..."
@@ -1246,7 +1316,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   session_name="${protocol}_applier_${replica_id}"
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   tmux new-session -d -s "${session_name}" \
-    "cd \"${run_root}\" && python3 \"${run_root}/scripts/apply_network_failures.py\" --failure-spec \"${run_root}/failure_spec.xml\" --hosts-config \"${run_root}/hosts.failure.config\" --replica-id ${replica_id} --netns ${ns_name} --interface ${interface_name} --start-unix-ms ${start_unix_ms} > \"${run_root}/logs/applier_${replica_id}.log\" 2>&1"
+    "cd \"${run_root}\" && python3 \"${run_root}/scripts/apply_network_failures.py\" --failure-spec \"${run_root}/failure_spec.xml\" --hosts-config \"${run_root}/hosts.failure.config\" --replica-id ${replica_id} --netns ${ns_name} --interface ${interface_name} --start-unix-ms ${start_unix_ms} --pre-apply-base > \"${run_root}/logs/applier_${replica_id}.log\" 2>&1"
 done
 REMOTE
       then
@@ -1260,6 +1330,41 @@ REMOTE
       echo "Applier start failed on one or more nodes." >&2
       exit 1
     fi
+    # The replicas must connect over the base delay (see --pre-apply-base), so wait for
+    # every applier to have installed it before any replica starts.
+    for i in "${!server_nodes[@]}"; do
+      if ! ssh "${SSH_OPTS[@]}" "${server_users[$i]}@${server_hosts[$i]}" "bash -s" -- \
+      "${replicas_per_server_machine}" "${i}" "${RUN_ROOT_REMOTE_NAME}" <<'REMOTE'
+set -euo pipefail
+
+replicas_per_machine="$1"
+machine_idx="$2"
+run_root="$HOME/$3"
+
+for ((n = 0; n < replicas_per_machine; n++)); do
+  replica_id=$((machine_idx * replicas_per_machine + n))
+  applier_log="${run_root}/logs/applier_${replica_id}.log"
+  ready=0
+  for attempt in $(seq 1 60); do
+    if grep -q "Pre-applied base delay" "${applier_log}" 2>/dev/null; then
+      ready=1
+      break
+    fi
+    sleep 0.5
+  done
+  if (( ready == 0 )); then
+    echo "Network applier ${replica_id} did not install the base delay within 30 s; see ${applier_log}:" >&2
+    tail -n 5 "${applier_log}" >&2 || true
+    exit 1
+  fi
+done
+REMOTE
+      then
+        echo "  - ${server_nodes[$i]}: base delay not installed" >&2
+        exit 1
+      fi
+    done
+    echo "Base delay pre-applied on every replica."
   else
     echo "Failure spec disabled; not starting network appliers."
   fi
@@ -1291,6 +1396,8 @@ REMOTE
           "${LEARNING_FEATURE_DURATION_MS}" \
           "${LEARNING_REWARD_DURATION_MS}" \
           "${SHARING_COLLECT_WAIT_MS}" \
+          "${LATENCY_FLOOR_MULTIPLIER}" \
+          "${LEARNING_EPISODE_MS}" \
           "${PRIOR_PATH}" <<'REMOTE'
 set -euo pipefail
 
@@ -1309,8 +1416,10 @@ failure_spec_enabled="${12}"
 feature_window_ms="${13}"
 reward_window_ms="${14}"
 sharing_collect_wait_ms="${15}"
+latency_floor_multiplier="${16}"
+episode_ms="${17}"
 # ssh drops an empty last argument, so an omitted prior arrives unset.
-prior_path="${16:-}"
+prior_path="${18:-}"
 learning_agent_python="${HOME}/.venvs/adaptive-timer-learning-agent/bin/python"
 
 if [[ ! -x "${learning_agent_python}" ]]; then
@@ -1337,10 +1446,17 @@ fi
 if [[ -n "${prior_path}" ]]; then
   agent_model_args="${agent_model_args} --prior-path ${prior_path}"
 fi
+# The floor is a constraint on the action space, so it only means anything where the
+# agent is choosing the timeout at all (learning or sharing), as in lib_bedrock.sh.
+if [[ "${mode}" == "learning" || "${mode}" == "sharing" ]] && [[ "${latency_floor_multiplier}" != "0" ]]; then
+  agent_model_args="${agent_model_args} --latency-floor-multiplier ${latency_floor_multiplier}"
+fi
 
 # The agent gives a window in which nothing committed its own length as its
 # latency, so it needs the windows the replicas measure.
 agent_model_args="${agent_model_args} --feature-window-ms ${feature_window_ms} --reward-window-ms ${reward_window_ms}"
+# The replicas' episode period; the agent maps an episode number to its schedule row with it.
+agent_model_args="${agent_model_args} --episode-ms ${episode_ms}"
 
 failure_args=""
 if [[ "${failure_spec_enabled}" == "1" ]]; then
@@ -1427,7 +1543,8 @@ REMOTE
         "${LEARNING_REPLY_WAIT_MS}" \
         "${LEARNING_WARMUP_DURATION_MS}" \
         "${LEARNING_REWARD_DURATION_MS}" \
-        "${LAUNCH_KIND}" <<'REMOTE'
+        "${LAUNCH_KIND}" \
+        "${LEARNING_ANCHOR_UNIX_MS}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
@@ -1445,6 +1562,8 @@ learning_reply_wait_ms="${12}"
 learning_warmup_ms="${13}"
 learning_reward_ms="${14}"
 launch_kind="${15}"
+# ssh drops an empty last argument, so without learning the anchor arrives unset.
+learning_anchor_unix_ms="${16:-}"
 
 verbosity="-vv"
 if [[ "${verbose_enabled}" == "1" ]]; then
@@ -1477,6 +1596,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
     adaptive_args+=(
       "--learning"
       "--agent-target" "127.0.0.1:${agent_port}"
+      "--learning-anchor-unix-ms" "${learning_anchor_unix_ms}"
       "--learning-feature-duration" "${learning_feature_ms}"
       "--learning-reply-wait" "${learning_reply_wait_ms}"
       "--learning-warmup-duration" "${learning_warmup_ms}"
@@ -1729,6 +1849,23 @@ REMOTE
     rm -rf "${LOGS_LOCAL_DIR}"
     mkdir -p "${LOGS_LOCAL_DIR}/servers" "${LOGS_LOCAL_DIR}/appliers" "${LOGS_LOCAL_DIR}/agents"
     [[ "${MODE}" == "sharing" ]] && mkdir -p "${LOGS_LOCAL_DIR}/sharing"
+    # Replica logs (and Autobahn worker logs) are compressed on their host
+    # (the replicas are stopped by now) and pulled as <name>.log.gz; a missing
+    # log is left to the download below to report, as before.
+    for i in "${!server_nodes[@]}"; do
+      if ! ssh "${SSH_OPTS[@]}" "${server_users[$i]}@${server_hosts[$i]}" "bash -s" -- \
+      "${RUN_ROOT_REMOTE_NAME}" <<'REMOTE'
+set -euo pipefail
+cd "$HOME/$1/logs"
+for f in server_*.log worker_*.log; do
+  [[ -f "${f}" ]] || continue
+  gzip -f "${f}"
+done
+REMOTE
+      then
+        echo "  - ${server_nodes[$i]}: failed to compress server logs" >&2
+      fi
+    done
     for i in "${!server_nodes[@]}"; do
       node="${server_nodes[$i]}"
       host="${server_hosts[$i]}"
@@ -1737,15 +1874,15 @@ REMOTE
       for ((n = 0; n < replicas_per_server_machine; n++)); do
         replica_id=$((machine_idx * replicas_per_server_machine + n))
         queue_artifact_download "${node}" "${host}" "${user}" \
-          "${RUN_ROOT_REMOTE_NAME}/logs/server_${replica_id}.log" \
-          "${LOGS_LOCAL_DIR}/servers/server_${replica_id}.log" \
-          "server_${replica_id}.log" \
+          "${RUN_ROOT_REMOTE_NAME}/logs/server_${replica_id}.log.gz" \
+          "${LOGS_LOCAL_DIR}/servers/server_${replica_id}.log.gz" \
+          "server_${replica_id}.log.gz" \
           "log"
         if [[ "${LAUNCH_KIND}" == "autobahn" ]]; then
           queue_artifact_download "${node}" "${host}" "${user}" \
-            "${RUN_ROOT_REMOTE_NAME}/logs/worker_${replica_id}.log" \
-            "${LOGS_LOCAL_DIR}/servers/worker_${replica_id}.log" \
-            "worker_${replica_id}.log" \
+            "${RUN_ROOT_REMOTE_NAME}/logs/worker_${replica_id}.log.gz" \
+            "${LOGS_LOCAL_DIR}/servers/worker_${replica_id}.log.gz" \
+            "worker_${replica_id}.log.gz" \
             "log" \
             1
         fi

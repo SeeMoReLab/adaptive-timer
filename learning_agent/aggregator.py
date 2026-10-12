@@ -5,7 +5,7 @@ import numpy as np
 from google.protobuf.descriptor import FieldDescriptor
 
 import agent_pb2
-from models import get_report_feature_field_names
+from models import get_report_field_names, report_message_class
 
 
 def _extract_state(report_local: agent_pb2.ReportLocal, protocol: int) -> object:
@@ -56,7 +56,9 @@ SBFT_LEADER_MEASURED_FIELDS = (
 
 
 def _report_to_array(protocol: int, report: object) -> np.ndarray:
-    fields = get_report_feature_field_names(protocol)
+    # Every report field, not only the model's inputs, so the aggregated report
+    # carries all of them into the dataset (a field left out would read 0).
+    fields = get_report_field_names(protocol)
     return np.array([float(getattr(report, field_name)) for field_name in fields], dtype=float)
 
 
@@ -84,25 +86,9 @@ def _integer_field_names(message_cls: type) -> frozenset:
     )
 
 
-def _report_message_class(protocol: int) -> type:
-    if protocol == agent_pb2.PROTOCOL_PBFT:
-        return agent_pb2.PbftReport
-    if protocol == agent_pb2.PROTOCOL_SBFT:
-        return agent_pb2.SbftReport
-    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
-        return agent_pb2.TendermintReport
-    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
-        return agent_pb2.HotstuffReport
-    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
-        return agent_pb2.AutobahnReport
-    if protocol == agent_pb2.PROTOCOL_SMARTBFT:
-        return agent_pb2.SmartbftReport
-    raise ValueError(f"Unsupported protocol: {protocol}")
-
-
 def _array_to_report(protocol: int, values: np.ndarray) -> object:
-    fields = get_report_feature_field_names(protocol)
-    message_cls = _report_message_class(protocol)
+    fields = get_report_field_names(protocol)
+    message_cls = report_message_class(protocol)
     integer_fields = _integer_field_names(message_cls)
 
     kwargs = {}
@@ -167,7 +153,7 @@ class BaseAggregator(ABC):
                     node,
                 ),
             )
-            fields = get_report_feature_field_names(self.protocol)
+            fields = get_report_field_names(self.protocol)
             for name in SBFT_LEADER_MEASURED_FIELDS:
                 aggregated_values[fields.index(name)] = float(
                     getattr(reports_by_node[leader], name)

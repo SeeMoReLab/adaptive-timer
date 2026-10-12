@@ -2,7 +2,7 @@ from collections import deque
 from dataclasses import dataclass
 import math
 import os
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.linalg import solve_triangular
@@ -392,109 +392,308 @@ class NormalizedLatencyFloor:
         self._latency_floor.reset()
 
 
-DEFAULT_PROPORTIONAL_K = 1.0
-# Reports the heuristic's latency estimate is taken over, and the quantile of
-# them. One report is the latest committing window's latency, as before.
-DEFAULT_HEURISTIC_WINDOW = 1
-DEFAULT_HEURISTIC_QUANTILE = 0.5
+@dataclass(frozen=True)
+class HeuristicSpec:
+    """continuous_heuristic's constants on one protocol.
+
+    Kevin (2026-10-08): one rule, with per-protocol constants taken from the
+    fixed-timeout calibration cells and the mechanics, never from oracle or
+    evaluation runs. Cells: scripts/cloudlab/tmp/cal/pt/cells and sbcal (one spec
+    phase per run at a constant timeout), judged by cal/pt/cell_judge.py.
+
+    A window that committed sets T = ``multiplier`` x the ``quantile`` of
+    ``signal`` over the last ``window`` committing windows, clamped to
+    ``bounds_ms``. A window with at least ``storm_view_changes`` view changes is
+    a storm: T doubles, and the T that stormed is not played again until the
+    estimate falls by a third (a faster link). Any other window holds T. With
+    ``storm_view_changes`` None the rule has no storm branch: on that protocol
+    the signal itself rises steeply under a too-low T, and the view-change count
+    is not a storm signal (Autobahn and HotStuff time out every few slots even
+    at their best T).
+
+    Shared choices (2026-10-08, documented after the review; values unchanged):
+    ``bounds_ms`` are each protocol's ContextSpec action range, the range the
+    GP and the other continuous models search, so every model plays the same
+    space. ``window`` 1 follows a link change within one window; the replays of
+    the cells (cal/pt/heur_replay.py) converge to the clean region from both
+    sides at window 1 on SmartBFT, HotStuff and Autobahn. ``quantile`` has no
+    effect at window 1. ``storm_view_changes`` 3 is a design choice, not a
+    value the cells separate per window. It is read per 7 s feature window
+    (2026-10-09; kept at 3: a storm's count per 7 s window is about 0.7 times
+    its 10 s count, so 3 is a slightly stricter test). The cells
+    were measured per 10 s feature window: the SBFT storm cells run 2-16 view
+    changes (c1 W500 dips to 2) and an escaping cell reaches 4 (c1 W150);
+    SmartBFT storm cells run 0-20 per window and clean or best cells reach 5-7
+    (cal_L4_T800, cal_L4_T1200). Per cell the counts do separate (PBFT,
+    CppBedrock/adaptive_timers.MD 2026-09 Utah: storms 40-140 per phase, escapes
+    1-6 per 120 s phase), so a storm is a sustained high count, and a single
+    window at 3 can misfire either way (goal review, 2026-10-08).
+    """
+
+    signal: str
+    multiplier: float
+    window: int
+    quantile: float
+    bounds_ms: Tuple[int, int]
+    storm_view_changes: Optional[int]
+
+
+# k, all six alike (2026-10-10): fitted blind by scripts/cloudlab/tmp/cal/blindall/<protocol>/fit/
+# heur_fit_sig.py on constant-T runs of blind.xml (stratified draws, none of the evaluation spec's
+# values): per blind phase the rule's fixed point T = k x estimate(T), scored by the client judge's R;
+# per k the median over the blind phases; k is the low edge of the plateau around the best (within
+# 0.01), rounded up to 2 decimals. The link phases bound k from below and are well sampled; the attack
+# phases that bound it from above are one or two draws. The real spec was a check only.
+HEURISTIC_SPECS: Dict[int, HeuristicSpec] = {
+    # A request's age at execution (acceptance to execution, so a little under the
+    # reported latency): clean at T = 0.85 x p95 at 5+75 (300 vs 354) and 0.93 x
+    # at 5+175 (600 vs 648), every T from 100 clean at base. The slow leader
+    # inflates the latency only while T
+    # keeps it (base + D120: T 150 escapes, 250 keeps it at p95 244; + D400:
+    # T <= 400 escapes, 600 keeps it at 569), so the estimate is the minimum
+    # over 4 windows, which an escape window resets to the healthy latency.
+    agent_pb2.PROTOCOL_PBFT: HeuristicSpec(
+        "p95_consensus_latency_ms", 1.26, 4, 0.0, (100, 3000), 3),
+    # T as PBFT but from the fast path: clean at 150 (p95 97) at base, 350 (p95
+    # 227) at 5+50 and 750 (p95 685) at 5+150. The slow-path bound and the wait W are
+    # in ContinuousHeuristicTimeoutModel (SBFT_* below).
+    agent_pb2.PROTOCOL_SBFT: HeuristicSpec(
+        "p95_consensus_latency_ms", 1.76, 4, 0.0, (100, 3000), 3),
+    # A request's timer from arrival (forward T/2, then complain T/2), closed-loop
+    # client. Cells with a 50 s base lead-in: at 5+50 T <= 600 storms and 800 is
+    # clean (p95 351); at 5+150 1000 storms, 1200-1800 stall for 3-15 s and 2400
+    # is clean (p95 967); the lowest clean ratios there are 2.28 and 2.48.
+    # At base every T from 100 is clean (p95 41); under the 300 ms proposal delay
+    # 300 is best and 800 keeps the slow leader. Storms run 3-18 view changes a
+    # window, depositions 0-2.
+    agent_pb2.PROTOCOL_SMARTBFT: HeuristicSpec(
+        "p95_consensus_latency_ms", 1.39, 1, 0.5, (100, 4000), 3),
+    # The propose timeout of each round (prevote and precommit at T/3). p50, not
+    # the mean: under the proposer hold only the attacked heights are slow, and
+    # p50 stays flat in T while the mean follows it.
+    agent_pb2.PROTOCOL_TENDERMINT: HeuristicSpec(
+        "p50_consensus_latency_ms", 0.53, 1, 0.5, (100, 3000), None),
+    # One round is 2h (3h when a Nagle-delayed vote follows a timeout) and the
+    # reported latency is three rounds. Floors: 160 storms and 200 is clean at
+    # 5+50 (avg 333), 460 storms and 530 is clean at 5+150 (avg 934), so the
+    # floor sits at 0.5-0.6 x the latency; under the slow-leader hold (relative
+    # to the live timeout) 200 still loses at 5+50 + X400 and 300 is best, and
+    # at base the lowest T wins.
+    agent_pb2.PROTOCOL_HOTSTUFF: HeuristicSpec(
+        "avg_consensus_latency_ms", 0.96, 1, 0.5, (100, 2000), None),
+    # Header first seen to commit, about one slot: the best measured T is 0.75 x
+    # it at 5+50 (400 at 533) and 0.76 x at 5+150 (1000 at 1308); below the soft
+    # floor the latency climbs steeply (250 at 5+50: 989). Base is flat in T (100-750).
+    agent_pb2.PROTOCOL_AUTOBAHN: HeuristicSpec(
+        "avg_consensus_latency_ms", 0.94, 1, 0.5, (100, 3000), None),
+}
+
+# SBFT's slow path takes about 125 + 5h + W (CLAUDE.md hop model); a T under it
+# elects on every slow-path commit (cells: 5+50 at T 525 storms with W 300 and
+# 500, 5+150 at T 1100 with W 300). T stays above it by this margin once the slow
+# path is in use (at least SBFT_SLOW_SHARE of the recent commits).
+# Design margin over the hop-model bound: CLAUDE.md puts the floor at about 1.1 x the
+# bound; 1.15 adds a little more. Not fitted to a cell.
+SBFT_SLOW_PATH_MARGIN = 1.15
+# Any slow-path commits in the recent windows: the cells are 0% slow when the wait
+# catches or no straggler exists (c0, c2, c5 at W >= 150, three of four c3 W150 draws)
+# and slow when it does not (c1, c4 W50: 100%); a storming wait mixes the paths (c4
+# W300: 5-20% a window), so 0.05 is a design threshold at the low edge of that mix.
+SBFT_SLOW_SHARE = 0.05
+# The wait: catch the straggler's prepare only when its lag g is shorter than the
+# extra slow-path round R = 2h + 25 (cells: g ~80 at 5+50 caught at W >= 150,
+# better than the slow path; g ~300 at 5+50 lost to W <= 50; g ~100 at 5+150
+# caught). W = g + SBFT_WAIT_SLACK_MS, else SBFT_WAIT_MIN_MS. g is the largest
+# seen n-th prepare gap over the last SBFT_GAP_WINDOWS windows; the gap is
+# observable up to the leader's execution, about W + 2h after the quorum, so a
+# catchable gap is seen even at the minimum wait.
+# The slack: with jitterRatio 0 and W = 50 the seen gap is constant to the millisecond
+# in the cells (c3 84, c5 100, c6 300); at other W it varies (c3 79-84, c5 96-100, and
+# storming cells 72-520), so 20 ms is a design margin over the non-storming spread.
+# The windows: the gap is seen only while a leader that receives the straggler's
+# prepare leads (c3 at W 50: seen in 2 of 6 windows, the others unseen), so the
+# catch is held across leader changes for 3 windows (one leader re-pin tick is 60 s).
+# The low rung of the SBFT ladder (SBFT_SLOW_PATH_VALUES_MS 50/150); the cells tie W 10
+# and W 50 (c1 1.30 vs 1.32, c4 1.12 vs 1.11), so this is a choice between equals.
+SBFT_WAIT_MIN_MS = 50
+SBFT_WAIT_SLACK_MS = 20
+SBFT_GAP_WINDOWS = 3
+
+
+def heuristic_spec(protocol: int) -> HeuristicSpec:
+    if protocol not in HEURISTIC_SPECS:
+        raise ValueError(f"continuous_heuristic has no constants for protocol {protocol}")
+    return HEURISTIC_SPECS[protocol]
 
 
 class ContinuousHeuristicTimeoutModel(TensorModel):
-    """Proportional rule over recent consensus latency.
+    """The per-protocol rule of :class:`HeuristicSpec`; on SBFT also the wait W.
 
-        timeout_ms = clamp(k * estimate_ms, lower_ms, upper_ms)
+    SBFT: W is the straggler catch above; T is the larger of multiplier x the
+    p95 estimate and, once the slow path is in use or the rule waits beyond the
+    minimum, SBFT_SLOW_PATH_MARGIN x (125 + 5h + W). h is the one-way delay, from
+    the minimum p50 of the recent committing windows: (p50 - 100 - caught gap) / 3
+    on the fast path, (p50 - 125 - W) / 5 on the slow one.
 
-    ``estimate_ms`` is the ``quantile`` of avg_consensus_latency_ms over the
-    last ``window`` windows that committed something. With ``window = 1`` that
-    is the latest committing window, so a single degraded window moves the
-    timeout; a longer window with a low quantile is slower to follow a regime
-    change and much harder for one bad window to carry.
-
-    The mean latency rather than the p95: the p95 of a window is dominated by
-    the rounds the current timer already mishandled, so it reports the arm's
-    own thrashing back to the rule that chose it.
-
-    ``latency_floor`` is the optional constraint every model takes
-    (--latency-floor-multiplier): the timeout played is never below it. It is a
-    separate estimate with its own window and quantile, so a smoothed rule can
-    sit on a fast floor.
+    ``multiplier``, ``window`` and ``quantile`` override the protocol's constants
+    (None keeps them). ``latency_floor`` is the optional constraint every model
+    takes (--latency-floor-multiplier): T is never below it.
 
     Not a bandit: nothing is explored or learned. Until a window commits, and
-    while none does, the last timeout is held.
+    while none does, T is held.
     """
 
     def __init__(
         self,
+        protocol: int,
         action_codec: ContinuousTimeoutActionCodec,
-        n_features: int,
-        latency_index: int,
-        instances_index: Optional[int],
-        multiplier: float = DEFAULT_PROPORTIONAL_K,
-        window: int = DEFAULT_HEURISTIC_WINDOW,
-        quantile: float = DEFAULT_HEURISTIC_QUANTILE,
-        clamp_ms: Optional[Tuple[int, int]] = None,
-        initial_timeout_ms: Optional[int] = None,
+        feature_names: Sequence[str],
+        initial_timeout_ms: Tuple[int, ...],
+        multiplier: Optional[float] = None,
+        window: Optional[int] = None,
+        quantile: Optional[float] = None,
         latency_floor: Optional[NormalizedLatencyFloor] = None,
     ):
-        if n_features <= 0:
-            raise ValueError(f"n_features must be > 0, got {n_features}")
-        if action_codec.action_dim != 1:
-            raise ValueError(
-                "ContinuousHeuristicTimeoutModel scales a single timeout, so it "
-                f"needs a 1-dimensional codec, got {action_codec.action_dim}"
-            )
-        if not math.isfinite(multiplier) or multiplier <= 0.0:
-            raise ValueError(f"multiplier must be > 0, got {multiplier}")
-
-        codec_lower_ms, codec_upper_ms = action_codec.bounds_ms[0]
-        if clamp_ms is None:
-            clamp_ms = (codec_lower_ms, codec_upper_ms)
-        lower_ms, upper_ms = (int(clamp_ms[0]), int(clamp_ms[1]))
-        if upper_ms <= lower_ms:
-            raise ValueError(f"Invalid clamp bounds: {lower_ms}..{upper_ms}ms")
-        if lower_ms < codec_lower_ms or upper_ms > codec_upper_ms:
-            raise ValueError(
-                f"Clamp bounds {lower_ms}..{upper_ms}ms fall outside the codec "
-                f"bounds {codec_lower_ms}..{codec_upper_ms}ms"
-            )
-        if initial_timeout_ms is None:
-            initial_timeout_ms = int(round(math.sqrt(lower_ms * upper_ms)))
-        initial_timeout_ms = min(upper_ms, max(lower_ms, int(initial_timeout_ms)))
-
-        self._action_codec = action_codec
-        self._obs_dim = int(n_features)
-        self._multiplier = float(multiplier)
-        # The estimator is a LatencyFloor at multiplier 1: the same "quantile
-        # over recent committing windows", read here as the rule's input.
-        self._estimate = NormalizedLatencyFloor(
-            action_codec=action_codec,
-            latency_index=latency_index,
-            n_features=n_features,
-            instances_index=instances_index,
-            latency_floor=LatencyFloor(multiplier=1.0, window=window, quantile=quantile),
+        spec = heuristic_spec(protocol)
+        spec = HeuristicSpec(
+            spec.signal,
+            spec.multiplier if multiplier is None else float(multiplier),
+            spec.window if window is None else int(window),
+            spec.quantile if quantile is None else float(quantile),
+            spec.bounds_ms,
+            spec.storm_view_changes,
         )
+        if not math.isfinite(spec.multiplier) or spec.multiplier <= 0.0:
+            raise ValueError(f"multiplier must be > 0, got {spec.multiplier}")
+        if spec.window <= 0:
+            raise ValueError(f"window must be > 0, got {spec.window}")
+        if not 0.0 <= spec.quantile <= 1.0:
+            raise ValueError(f"quantile must be in [0, 1], got {spec.quantile}")
+        self._sbft = protocol == agent_pb2.PROTOCOL_SBFT
+        want_dim = 2 if self._sbft else 1
+        if action_codec.action_dim != want_dim:
+            raise ValueError(
+                f"continuous_heuristic needs a {want_dim}-dimensional codec on this "
+                f"protocol, got {action_codec.action_dim}"
+            )
+        names = list(feature_names)
+        required = [spec.signal, "total_consensus_instances"]
+        if spec.storm_view_changes is not None:
+            required.append("view_change_count")
+        if self._sbft:
+            required += ["p50_consensus_latency_ms", "fast_path_count", "slow_path_count",
+                         "slow_path_timeout_ms", "nth_prepare_gap_ms", "nth_prepare_seen_count"]
+        missing = [f for f in required if f not in names]
+        if missing:
+            raise ValueError(f"continuous_heuristic needs report fields {missing}")
+        self._idx = {name: i for i, name in enumerate(names)}
+        self._obs_dim = len(names)
+        self._spec = spec
+        self._action_codec = action_codec
         self._latency_floor = latency_floor
-        self._lower_ms = lower_ms
-        self._upper_ms = upper_ms
-        self._initial_timeout_ms = initial_timeout_ms
-
+        if len(initial_timeout_ms) != want_dim:
+            raise ValueError(f"initial_timeout_ms needs {want_dim} values, got {initial_timeout_ms}")
+        self._initial = tuple(int(v) for v in initial_timeout_ms)
         self.reset_model()
 
-    def _timeout_for(self, features: np.ndarray) -> int:
-        self._estimate.observe_features(features)
-        estimate_ms = float(self._estimate.floor_ms)
-        if estimate_ms > 0.0:
-            timeout_ms = int(round(self._multiplier * estimate_ms))
-            timeout_ms = min(self._upper_ms, max(self._lower_ms, timeout_ms))
+    def _field(self, row: np.ndarray, name: str) -> float:
+        return float(row[self._idx[name]])
+
+    def _clamp_t(self, timeout_ms: float) -> int:
+        lower_ms, upper_ms = self._spec.bounds_ms
+        return int(min(upper_ms, max(lower_ms, round(timeout_ms))))
+
+    def _estimate(self, values: Deque[float]) -> Optional[float]:
+        if not values:
+            return None
+        return float(np.quantile(np.asarray(values, dtype=float), self._spec.quantile))
+
+    def _sbft_wait_and_bound(
+        self, row: np.ndarray, committed: bool
+    ) -> Tuple[float, Optional[float], Optional[float]]:
+        """(W, slow-path lower bound on T or None, h or None) from this window and
+        the recent ones."""
+        seen = self._field(row, "nth_prepare_seen_count") > 0.0
+        self._gaps.append(self._field(row, "nth_prepare_gap_ms") if seen else None)
+        if committed:
+            fast = self._field(row, "fast_path_count")
+            slow = self._field(row, "slow_path_count")
+            if fast + slow > 0.0:
+                self._slow_shares.append(slow / (fast + slow))
+        p50_min = min(self._p50s) if self._p50s else None
+        if p50_min is None:
+            return float(self._held[1]), None, None
+        slow_in_use = bool(self._slow_shares) and max(self._slow_shares) >= SBFT_SLOW_SHARE
+        wait_now = self._field(row, "slow_path_timeout_ms") or float(self._held[1])
+        gaps = [g for g in self._gaps if g is not None]
+        gap = max(gaps) if gaps else None
+        # Design choice: the latest window's majority path picks the hop formula.
+        if slow_in_use and self._slow_shares[-1] >= 0.5:
+            h = (p50_min - 125.0 - wait_now) / 5.0
         else:
-            # No committing window yet (cold start or a stall): hold.
-            timeout_ms = self._held_timeout_ms
+            # A fast-path commit waited for the straggler's prepare when it caught it.
+            h = (p50_min - 100.0 - min(gap or 0.0, wait_now)) / 3.0
+        h = max(1.0, h)
+        extra_round_ms = 2.0 * h + 25.0
+        if gap is not None and gap + SBFT_WAIT_SLACK_MS < extra_round_ms:
+            wait_ms = gap + SBFT_WAIT_SLACK_MS
+        else:
+            wait_ms = float(SBFT_WAIT_MIN_MS)
+        # A wait longer than the minimum can miss and take the slow path too, so T
+        # covers the slow path whenever the rule waits, not only once it is in use.
+        waiting = wait_ms > SBFT_WAIT_MIN_MS
+        bound = SBFT_SLOW_PATH_MARGIN * (125.0 + 5.0 * h + wait_ms) if (slow_in_use or waiting) else None
+        return wait_ms, bound, h
+
+    def _step(self, row: np.ndarray) -> Tuple[int, ...]:
+        spec = self._spec
+        committed = self._field(row, "total_consensus_instances") > 0.0
+        signal = self._field(row, spec.signal)
+        if committed and signal > 0.0:
+            self._signals.append(signal)
+        if self._sbft and committed:
+            p50 = self._field(row, "p50_consensus_latency_ms")
+            if p50 > 0.0:
+                self._p50s.append(p50)
+        estimate = self._estimate(self._signals)
+        held_t = self._held[0]
+        storm = (
+            spec.storm_view_changes is not None
+            and self._field(row, "view_change_count") >= spec.storm_view_changes
+        )
+        wait_ms, bound, h = (
+            self._sbft_wait_and_bound(row, committed) if self._sbft else (None, None, None)
+        )
+        if storm:
+            self._storm_ms = max(self._storm_ms or 0, held_t)
+            self._storm_estimate = estimate
+            timeout_ms = self._clamp_t(2 * held_t)
+            if self._sbft:
+                wait_ms = SBFT_WAIT_MIN_MS
+        elif committed and estimate is not None:
+            # Design choice: a fall of a third in the estimate counts as a faster
+            # link (the spec's link steps change the latency by 2x or more).
+            if (self._storm_ms is not None and self._storm_estimate is not None
+                    and estimate < self._storm_estimate * 2.0 / 3.0):
+                self._storm_ms = self._storm_estimate = None
+            target = spec.multiplier * estimate
+            if bound is not None:
+                target = max(target, bound)
+            if self._storm_ms is not None:
+                target = max(target, 2 * self._storm_ms)
+            timeout_ms = self._clamp_t(target)
+        else:
+            timeout_ms = held_t
+            wait_ms = self._held[1] if self._sbft else None
         if self._latency_floor is not None:
-            self._latency_floor.observe_features(features)
+            self._latency_floor.observe_features(row)
             floor_ms = float(self._latency_floor.floor_ms)
             if floor_ms > timeout_ms:
-                timeout_ms = min(self._upper_ms, int(math.ceil(floor_ms)))
-        return timeout_ms
+                timeout_ms = self._clamp_t(math.ceil(floor_ms))
+        if self._sbft:
+            lower_w, upper_w = self._action_codec.bounds_ms[1]
+            return (timeout_ms, int(min(upper_w, max(lower_w, round(wait_ms)))))
+        return (timeout_ms,)
 
     def predict_action(self, features: np.ndarray) -> np.ndarray:
         features_np = np.asarray(features, dtype=float)
@@ -502,15 +701,11 @@ class ContinuousHeuristicTimeoutModel(TensorModel):
         if single:
             features_np = features_np.reshape(1, -1)
         if features_np.shape[1] != self._obs_dim:
-            raise ValueError(
-                f"Expected {self._obs_dim} features, got {features_np.shape[1]}"
-            )
-
+            raise ValueError(f"Expected {self._obs_dim} features, got {features_np.shape[1]}")
         actions = []
         for row in features_np:
-            self._held_timeout_ms = self._timeout_for(row)
-            actions.append([self._action_codec.normalize_ms(self._held_timeout_ms)])
-
+            self._held = self._step(row)
+            actions.append([self._action_codec.normalize_ms(v, d) for d, v in enumerate(self._held)])
         result = np.asarray(actions, dtype=float)
         return result[0] if single else result
 
@@ -526,10 +721,15 @@ class ContinuousHeuristicTimeoutModel(TensorModel):
         return 0.0
 
     def reset_model(self) -> None:
-        self._estimate.reset()
+        self._signals: Deque[float] = deque(maxlen=self._spec.window)
+        self._p50s: Deque[float] = deque(maxlen=self._spec.window)
+        self._gaps: Deque[Optional[float]] = deque(maxlen=SBFT_GAP_WINDOWS)
+        self._slow_shares: Deque[float] = deque(maxlen=SBFT_GAP_WINDOWS)
+        self._storm_ms: Optional[int] = None
+        self._storm_estimate: Optional[float] = None
         if self._latency_floor is not None:
             self._latency_floor.reset()
-        self._held_timeout_ms = self._initial_timeout_ms
+        self._held: Tuple[int, ...] = self._initial
 
 
 # --- Simulator-pretrained Gaussian-process bandit -----------------------------
@@ -543,7 +743,7 @@ DEFAULT_TENDERMINT_PRIOR_PATH = os.path.join(_PRIOR_DIR, "continuous_tendermint_
 
 @dataclass(frozen=True)
 class ContextSpec:
-    """What --model-type=continuous_gp reads and plays on one protocol.
+    """What --model-type=continuous_gp and discrete_gp read and play on one protocol.
 
     The context vector is log1p of ``log_fields`` followed by ``raw_fields``
     verbatim, in that order; ``length_scales`` has one GP length scale per
@@ -590,8 +790,9 @@ _TENDERMINT_CONTEXT_LOG_FIELDS: Tuple[str, ...] = (
 )
 # GP length scales per context dimension: 0.3 in log units is a factor of 1.35.
 # The GP tells contexts apart only by p50 latency, throughput and violation
-# rate. The other fields swing from one 8 s window to the next within a phase
-# (p3 prevote latency 77-143 ms), which made every window a new context and
+# rate. The other fields swing from one feature window to the next within a
+# phase (p3 prevote latency 77-143 ms in 8 s windows; the feature window is 7 s
+# since 2026-10-09), which made every window a new context and
 # kept the GP from pooling a phase's evidence. inf drops a field from the
 # kernel; the prior still reads every field.
 _TENDERMINT_CONTEXT_LENGTH_SCALES: Tuple[float, ...] = (
@@ -617,8 +818,9 @@ _PBFT_CONTEXT_LOG_FIELDS: Tuple[str, ...] = (
     "view_change_count",
 )
 # Same reading as the Tendermint scales; 0.7 on the log1p count is a factor
-# of 2 in view changes (quiet windows report 0, a PBFT storm 3-5 per 10 s
-# window, a SmartBFT storm about 18).
+# of 2 in view changes (quiet windows report 0; measured per 10 s window, a
+# PBFT storm 3-5 and a SmartBFT storm about 18, about 0.7 times that in the 7 s
+# feature window).
 _PBFT_CONTEXT_LENGTH_SCALES: Tuple[float, ...] = (
     math.inf,  # avg_consensus_latency_ms
     0.3,  # p50_consensus_latency_ms
@@ -736,7 +938,7 @@ def context_spec(protocol: int) -> ContextSpec:
     spec = CONTEXT_SPECS.get(int(protocol))
     if spec is None:
         raise ValueError(
-            "--model-type=continuous_gp has no context spec for "
+            "--model-type=continuous_gp/discrete_gp has no context spec for "
             f"{agent_pb2.Protocol.Name(int(protocol))}; it runs on PBFT, SmartBFT, "
             "SBFT, Tendermint, HotStuff and Autobahn"
         )
@@ -872,6 +1074,11 @@ class SimPriorGPModel(TensorModel):
     two. The context, scales, and prior come from
     ``CONTEXT_SPECS[action_codec.protocol]``.
     There is no floor, clamp, or rule other than the codec's range.
+
+    ``axes_ms`` (discrete_gp) replaces the log-spaced grid with given timeouts
+    in ms, one tuple per action dimension, normalized by the codec; on SBFT
+    the grid is their T-major product, so on the ladder rungs grid row i is
+    discrete arm i. ``grid_size`` and ``wait_grid_size`` are then unused.
     """
 
     def __init__(
@@ -889,17 +1096,23 @@ class SimPriorGPModel(TensorModel):
         level_std: float = 0.2,
         wait_grid_size: int = 16,
         latency_floor: Optional[NormalizedLatencyFloor] = None,
+        axes_ms: Optional[Tuple[Sequence[int], ...]] = None,
     ):
         action_dim = int(action_codec.action_dim)
         if action_dim not in (1, 2):
             raise ValueError(
                 f"SimPriorGPModel supports one or two timeout dimensions, got {action_dim}"
             )
-        for name, value in (
-            ("grid_size", grid_size),
-            ("wait_grid_size", wait_grid_size),
-            ("memory_size", memory_size),
-        ):
+        sizes = (("memory_size", memory_size),)
+        if axes_ms is None:
+            sizes = (("grid_size", grid_size), ("wait_grid_size", wait_grid_size)) + sizes
+        elif len(axes_ms) != action_dim:
+            raise ValueError(
+                f"axes_ms has {len(axes_ms)} axes, the codec {action_dim} dimensions"
+            )
+        elif any(len(axis) == 0 for axis in axes_ms):
+            raise ValueError(f"axes_ms has an empty axis: {axes_ms}")
+        for name, value in sizes:
             if int(value) <= 1:
                 raise ValueError(f"{name} must be > 1, got {value}")
         for name, value in (
@@ -950,20 +1163,27 @@ class SimPriorGPModel(TensorModel):
                 f"Prior {prior_path} takes {self._prior.input_dim} inputs, "
                 f"expected {context_dim + action_dim} (context + action)"
             )
+        if axes_ms is None:
+            axes = tuple(
+                np.linspace(0.0, 1.0, int(size))
+                for size in (grid_size, wait_grid_size)[:action_dim]
+            )
+        else:
+            axes = tuple(
+                np.array([action_codec.normalize_ms(ms, dim) for ms in axis], dtype=float)
+                for dim, axis in enumerate(axes_ms)
+            )
         if action_dim == 1:
-            self._grid = np.linspace(0.0, 1.0, int(grid_size))
-            self._mid_index = int(grid_size) // 2
+            self._grid = axes[0]
+            self._mid_index = axes[0].size // 2
         else:
             # One (T, W) row per pair, T major.
-            timeouts = np.linspace(0.0, 1.0, int(grid_size))
-            waits = np.linspace(0.0, 1.0, int(wait_grid_size))
+            timeouts, waits = axes
             self._grid = np.column_stack(
                 (np.repeat(timeouts, waits.size), np.tile(waits, timeouts.size))
             )
             # T major, W minor: the middle of both axes, not of the flat index.
-            self._mid_index = (int(grid_size) // 2) * int(wait_grid_size) + int(
-                wait_grid_size
-            ) // 2
+            self._mid_index = (timeouts.size // 2) * waits.size + waits.size // 2
             self._grid_axes = (timeouts, waits)
         self._signal_var = float(signal_std) ** 2
         self._noise_var = float(noise_std) ** 2
@@ -1158,6 +1378,7 @@ class SimReturnGPModel(SimPriorGPModel):
         level_std: float = 0.5,
         wait_grid_size: int = 16,
         latency_floor: Optional[NormalizedLatencyFloor] = None,
+        axes_ms: Optional[Tuple[Sequence[int], ...]] = None,
     ):
         super().__init__(
             action_codec,
@@ -1173,6 +1394,7 @@ class SimReturnGPModel(SimPriorGPModel):
             level_std=level_std,
             wait_grid_size=wait_grid_size,
             latency_floor=latency_floor,
+            axes_ms=axes_ms,
         )
         if not math.isfinite(self._prior.target_floor):
             raise ValueError(

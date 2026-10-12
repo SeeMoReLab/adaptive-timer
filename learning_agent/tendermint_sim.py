@@ -19,16 +19,19 @@ fit to run data. One height is simulated round by round, all four nodes in step:
   (config.toml ``size``); arrivals to a full mempool are lost. A block takes
   everything pending.
 
-Episodes follow the wall-clock learning windows in config.toml: 8 s features,
-2 s reply wait, 2 s warm-up, 8 s reward. Reports carry the same fields, with
+Episodes follow the wall-clock learning windows in config.toml: 7 s features,
+2 s reply wait, 4 s warm-up, 7 s reward. Reports carry the same fields, with
 the same round-0 definitions, as ``consensus/adaptive_timer.go``, seen from
 node 0 (replica 0's agent reads its own node's report): in the heights node 0
 proposes, its propose step ends when it sends its own proposal, and its
 prevote step runs from then until the others' prevotes reach it.
 
-Constants the mechanics do not fix (processing costs, the peer-state hop
-count, the load) are drawn per simulated run from ranges wider than the real
-setup, so the prior learned from it has to hold across them.
+Constants the mechanics do not fix are drawn per simulated run, so the prior
+learned from it has to hold across them: the ones the blind fit sets
+(FREE in scripts/cloudlab/tmp/cal/blindall/tendermint/fit/sim_fit.py) 0.5-2x
+around their SimConstants defaults, the rest (link, jitter, fixed processing
+costs, the peer-state hop count, the load) from ranges wider than the real
+setup.
 """
 
 from __future__ import annotations
@@ -41,45 +44,50 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from prior_windows import PriorWindows, check_prior_windows
+
 N_NODES = 4
 QUORUM = 3  # 2f+1 of 4: accepting nodes for a block, nil prevotes to end a round
 MEMPOOL_CAP = 5000
 PROPOSE_DELTA_MS = 150.0
 VOTE_DELTA_MS = 50.0
-FEATURE_S = 8.0
+FEATURE_S = 7.0
 REPLY_S = 2.0
-WARMUP_S = 2.0
-REWARD_S = 8.0
+WARMUP_S = 4.0
+REWARD_S = 7.0
 EPISODE_S = FEATURE_S + REPLY_S + WARMUP_S + REWARD_S
+SIM_WINDOWS = PriorWindows.from_seconds(FEATURE_S, REPLY_S, WARMUP_S, REWARD_S)
 
 
 @dataclass
+# Fitted defaults: blind best-by-loss candidate i=108 (loss 0.152) of fit7_tendermint_blind.jsonl, 7/2/4/7 calibration (blindall, 2026-10-09).
 class SimConstants:
-    """Defaults are an evaluation point eyeballed from b1_codex, used only to
-    pre-screen policies; training draws every field from sample_constants."""
+    """Defaults are an evaluation point eyeballed from b1_codex, used to
+    pre-screen policies; training draws every field from sample_constants,
+    the fitted ones around these defaults."""
 
     base_delay_ms: float = 5.0
-    vote_proc_ms: float = 5.0
+    vote_proc_ms: float = 4.883969
     create_ms: float = 5.0
-    create_per_tx_ms: float = 0.025
+    create_per_tx_ms: float = 0.017403
     exec_ms: float = 5.0
-    exec_per_tx_ms: float = 0.035
+    exec_per_tx_ms: float = 0.036707
     peer_hops: int = 1
     # netem jitter as a fraction of each hop's delay (apply_network_failures
     # DEFAULT_NETWORK_DELAY_JITTER_RATIO, 0.2 when the spec sets none), plus
     # the reactor's gossip sleep and flush before a proposal goes out.
     jitter_ratio: float = 0.2
-    gossip_proc_ms: float = 10.0
+    gossip_proc_ms: float = 6.588905
     # Block parts take longer to arrive the bigger the block, and more so on a
     # slow link (the transfer is window-limited, so it scales with the RTT).
-    propagate_per_tx_ms: float = 0.008
-    propagate_per_tx_per_delay_ms: float = 0.0002
+    propagate_per_tx_ms: float = 0.014701
+    propagate_per_tx_per_delay_ms: float = 4.8e-05
     # Per-proposal lognormal spread of the transfer time: a timeout just above
     # the mean arrival still misses the slow tail.
-    propagate_sigma: float = 0.35
+    propagate_sigma: float = 0.262992
     load_tps: float = 4000.0
     # Offered load falls when the client's own links slow down.
-    load_delay_sensitivity: float = 0.0036
+    load_delay_sensitivity: float = 0.000284
 
 
 @dataclass
@@ -108,7 +116,9 @@ class _Window:
             return float(np.mean(v)) if v else 0.0
 
         def pct(v, q):
-            return float(np.percentile(v, q, method="nearest")) if v else 0.0
+            # Nearest rank, sorted[ceil(q/100 n) - 1], as the engine's windowPercentile
+            # (cometbft consensus/adaptive_timer.go).
+            return float(np.percentile(v, q, method="inverted_cdf")) if v else 0.0
 
         elapsed = self.end_s - self.start_s
         # main._fill_empty_window_latency: the agent gives a window in which
@@ -293,12 +303,14 @@ class TendermintSim:
     ) -> Tuple[Dict[str, float], float, Dict[str, float], int]:
         """Run one episode; ``choose(features) -> timeout_ms`` is called at the
         feature deadline. Returns (features, timeout, reward report, phase index
-        at decision time)."""
+        when the timeout applies)."""
         s = self.episode_start_s
         wa = _Window(s, s + FEATURE_S)
         self._advance_to((s + FEATURE_S) * 1000.0, [wa])
         features = wa.report()
-        phase_idx, _ = self.phase_at(s + FEATURE_S)
+        # The phase in force when the timeout applies, as main.py's dataset
+        # phase: the onset episode carries the phase its reward window measures.
+        phase_idx, _ = self.phase_at(s + FEATURE_S + REPLY_S)
         new_timeout = float(choose(features))
         # Applied at the end of the reply wait; heights already running keep
         # the old value, as ApplyPendingTimeout does.
@@ -313,22 +325,32 @@ class TendermintSim:
 # --- Randomized environments -------------------------------------------------
 
 
+def _around(rng: np.random.Generator, host: float, lo: float = 0.5, hi: float = 2.0) -> float:
+    """A host constant scaled by a log-uniform factor in [lo, hi]."""
+    if host <= 0:
+        raise ValueError(f"cannot draw around a non-positive default {host}")
+    return float(host * math.exp(rng.uniform(math.log(lo), math.log(hi))))
+
+
 def sample_constants(rng: np.random.Generator) -> SimConstants:
+    # The blind fit's FREE fields (blindall/tendermint/fit/sim_fit.py) are drawn
+    # around the SimConstants defaults; the others keep their wide ranges.
+    h = SimConstants()
     return SimConstants(
         base_delay_ms=float(rng.uniform(1.0, 12.0)),
-        vote_proc_ms=float(rng.uniform(2.0, 25.0)),
+        vote_proc_ms=_around(rng, h.vote_proc_ms),
         create_ms=float(rng.uniform(2.0, 40.0)),
-        create_per_tx_ms=float(rng.uniform(0.0, 0.08)),
+        create_per_tx_ms=_around(rng, h.create_per_tx_ms),
         exec_ms=float(rng.uniform(2.0, 40.0)),
-        exec_per_tx_ms=float(rng.uniform(0.0, 0.15)),
+        exec_per_tx_ms=_around(rng, h.exec_per_tx_ms),
         peer_hops=int(rng.integers(0, 3)),
         jitter_ratio=float(rng.uniform(0.0, 0.3)),
-        gossip_proc_ms=float(rng.uniform(0.0, 20.0)),
-        propagate_per_tx_ms=float(rng.uniform(0.0, 0.04)),
-        propagate_per_tx_per_delay_ms=float(rng.uniform(0.0, 0.003)),
-        propagate_sigma=float(rng.uniform(0.0, 0.6)),
+        gossip_proc_ms=_around(rng, h.gossip_proc_ms),
+        propagate_per_tx_ms=_around(rng, h.propagate_per_tx_ms),
+        propagate_per_tx_per_delay_ms=_around(rng, h.propagate_per_tx_per_delay_ms),
+        propagate_sigma=_around(rng, h.propagate_sigma),
         load_tps=float(rng.uniform(1000.0, 8000.0)),
-        load_delay_sensitivity=float(rng.uniform(0.0, 0.006)),
+        load_delay_sensitivity=_around(rng, h.load_delay_sensitivity),
     )
 
 
@@ -365,7 +387,7 @@ def spec_schedule() -> List[Phase]:
     """config/tendermint/failure_spec.xml (six phases, p2/p3 +50 ms continuous):
     warm-up 10 s, phases at warm-up + atTime. Used only to evaluate policies in
     simulation, never to train."""
-    w = 10.0
+    w = WARMUP_PHASE_S
     return [
         Phase(0.0),
         Phase(w + 300.0, proposal_delay_ms=10000.0),
@@ -413,6 +435,8 @@ def episode_reward(report: Dict[str, float], timeout_ms: float) -> float:
 
 
 WARMUP_PHASE_S = 10.0  # failure_spec warmUpTime: decisions before it are phase -1
+# Spec runs start so that episode e applies at warm-up + 20 (e - 1), on the phase onsets, as on every engine.
+SPEC_START_OFFSET_S = WARMUP_PHASE_S - FEATURE_S - REPLY_S
 
 
 def run_agent(
@@ -582,6 +606,7 @@ def train_prior(
         target_floor=np.asarray(float(target_floor)),
         peer_spread=np.asarray(float(peer_spread)),
     )
+    arrays.update(SIM_WINDOWS.arrays())
     np.savez(out_path, **arrays)
     return rmse
 
@@ -594,7 +619,6 @@ def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
     import agent_pb2
     from continuous_bandit import (
         CONTINUOUS_TENDERMINT_BOUNDS_MS,
-        ContinuousHeuristicTimeoutModel,
         ContinuousTimeoutActionCodec,
         SimPriorGPModel,
     )
@@ -608,17 +632,10 @@ def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
 
     protocol = agent_pb2.PROTOCOL_TENDERMINT
     if kind == "heuristic":
-        codec = ContinuousTimeoutActionCodec(protocol)
-        arms = get_timeout_values_ms(protocol)
-        model = ContinuousHeuristicTimeoutModel(
-            action_codec=codec,
-            n_features=len(names),
-            latency_index=names.index("avg_consensus_latency_ms"),
-            instances_index=names.index("total_consensus_instances"),
-            multiplier=1.0,
-            clamp_ms=(min(arms), max(arms)),
-            initial_timeout_ms=sorted(arms)[len(arms) // 2],
-        )
+        from model_builder import build_model
+
+        built = build_model(protocol, "continuous_heuristic")
+        model, codec = built.model, built.action_codec
     elif kind == "discrete_linucb":
         codec = ProtocolTimeoutActionCodec(protocol)
         latency_index, instances_index = latency_feature_indices(names)
@@ -635,6 +652,7 @@ def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
         from continuous_bandit import NumpyMLP, SimReturnGPModel
         from reward_utils import get_reward_design
 
+        check_prior_windows(prior_path, SIM_WINDOWS)
         # A held-action return prior (train --hold-episodes > 1) belongs to
         # SimReturnGPModel; a one-episode prior to SimPriorGPModel (H18).
         cls = SimReturnGPModel if NumpyMLP(prior_path).hold_episodes > 1 else SimPriorGPModel
@@ -671,10 +689,7 @@ def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
 def evaluate_spec(kind: str, constants: SimConstants, seed: int, **kwargs) -> np.ndarray:
     """Per-phase (tps, mean latency, median timeout) of one policy on the spec."""
     predict, update = make_policy(kind, **kwargs)
-    # Real runs on a warm build make their first decision ~22.5 s after start
-    # (b2/c1/c2 agent logs), so every phase switch lands ~12.5 s before a
-    # decision: in the reward window of the old phase's last episode.
-    sim = TendermintSim(constants, spec_schedule(), seed=seed, start_offset_s=14.5)
+    sim = TendermintSim(constants, spec_schedule(), seed=seed, start_offset_s=SPEC_START_OFFSET_S)
     rows = run_agent(sim, 90, predict, update)
     out = np.zeros((6, 3))
     for ph in range(6):
@@ -715,7 +730,7 @@ def pretrain_adapter(peer_spread: float = 0.0):
         simulator="tendermint_sim",
         training_run=lambda seed: training_sim(np.random.default_rng(seed), seed, peer_spread),
         spec_run=lambda seed: (
-            TendermintSim(SimConstants(), spec_schedule(), seed=seed, start_offset_s=14.5), 90),
+            TendermintSim(SimConstants(), spec_schedule(), seed=seed, start_offset_s=SPEC_START_OFFSET_S), 90),
         run_agent=run_agent,
         # A training schedule's phase 0 is a real phase, so run_agent already
         # updates every decision from 10 s.

@@ -16,8 +16,11 @@ policy over the model's own action space and saves the ridge fit as the
 LinUCB prior mean. ppo runs one PPO model on-policy through randomized
 training runs and saves its weights. eval runs a model online on the spec,
 beside the oracle (where the simulator has one), the fixed rungs and, with
---compare-untrained, the same model without its prior. The GP prior is
-trained by each simulator's own train command, not here.
+--compare-untrained, the same model without its prior. The GP prior (one
+file for continuous_gp and discrete_gp) is trained by each simulator's own
+train command, not here. Every prior records the simulator's windows
+(SimAdapter.windows, prior_windows), and eval refuses a prior trained under
+other windows.
 
 Training runs are the randomized runs each simulator's GP generator draws;
 an episode is updated on when its decision is at or after the simulator's
@@ -47,10 +50,8 @@ from latency_floor import (
     LatencyFloorPolicy,
 )
 from model_builder import BuiltModel, build_model, save_model_prior
+from prior_windows import PriorWindows
 from continuous_bandit import (
-    DEFAULT_HEURISTIC_QUANTILE,
-    DEFAULT_HEURISTIC_WINDOW,
-    DEFAULT_PROPORTIONAL_K,
     DEFAULT_WAIT_DIVISOR,
 )
 from models import TensorModel, action_index_to_timeout, get_action_space_size
@@ -75,6 +76,7 @@ EVAL_MODEL_TYPES = (
     "discrete_tree_blocks",
     "discrete_linucb",
     "discrete_ppo",
+    "discrete_gp",
     "continuous_gp",
     "continuous_linucb",
     "continuous_heuristic",
@@ -122,6 +124,14 @@ class SimAdapter:
     spec_phase_count: int
     # sim -> predict callable playing the spec's oracle schedule, or None.
     oracle: Optional[Callable[[Any], Predict]]
+
+    @property
+    def windows(self) -> PriorWindows:
+        """The simulator's windows, which its priors record and are checked against."""
+        module = importlib.import_module(self.simulator)
+        return PriorWindows.from_seconds(
+            module.FEATURE_S, module.REPLY_S, module.WARMUP_S, module.REWARD_S
+        )
 
 
 def timeout_message(timeout: agent_pb2.Timeout, field: str) -> Any:
@@ -187,15 +197,16 @@ class ModelSettings:
     """build_model's settings beside the protocol and model type."""
 
     wait_divisor: float = DEFAULT_WAIT_DIVISOR
-    heuristic_multiplier: float = DEFAULT_PROPORTIONAL_K
-    heuristic_window: int = DEFAULT_HEURISTIC_WINDOW
-    heuristic_quantile: float = DEFAULT_HEURISTIC_QUANTILE
+    heuristic_multiplier: Optional[float] = None
+    heuristic_window: Optional[int] = None
+    heuristic_quantile: Optional[float] = None
     # 0 disables the floor, as main's --latency-floor-multiplier does.
     floor_multiplier: float = 0.0
     floor_window: int = DEFAULT_LATENCY_FLOOR_WINDOW
     floor_quantile: float = DEFAULT_LATENCY_FLOOR_QUANTILE
 
-    def build(self, protocol: int, model_type: str, prior_path: Optional[str]) -> BuiltModel:
+    def build(self, protocol: int, model_type: str, prior_path: Optional[str],
+              windows: PriorWindows) -> BuiltModel:
         # A LatencyFloor keeps its own history, so each model gets a new one.
         floor = (
             None
@@ -210,6 +221,7 @@ class ModelSettings:
             protocol,
             model_type,
             prior_path=prior_path,
+            prior_windows=windows,
             latency_floor=floor,
             heuristic_multiplier=self.heuristic_multiplier,
             heuristic_window=self.heuristic_window,
@@ -279,7 +291,7 @@ def _fit_job(args: tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, floa
     set_reward_design(design)
     started = time.perf_counter()
     adapter = load_adapter(protocol_name, peer_spread)
-    built = settings.build(adapter.protocol, model_type, None)
+    built = settings.build(adapter.protocol, model_type, None, adapter.windows)
     behaviour = _Behaviour(built, adapter, model_type,
                            np.random.default_rng([seed, BEHAVIOUR_STREAM]))
     xs: List[np.ndarray] = []
@@ -329,16 +341,17 @@ def cmd_fit(args: argparse.Namespace, settings: ModelSettings) -> None:
     skipped = sum(p[3] for p in parts)
     run_s = [p[4] for p in parts]
 
-    built = settings.build(adapter.protocol, args.model_type, None)
+    built = settings.build(adapter.protocol, args.model_type, None, adapter.windows)
     model = _unwrap(built.model)
     theta = model.fit_prior_theta(x, a, r)
     save_model_prior(
         args.out, args.model_type, adapter.protocol, model, {"theta": theta},
-        simulator=adapter.simulator, runs=args.runs, seed=args.seed, samples=len(r),
-        skipped=skipped, peer_spread=args.peer_spread, wait_divisor=settings.wait_divisor,
+        windows=adapter.windows, simulator=adapter.simulator, runs=args.runs, seed=args.seed,
+        samples=len(r), skipped=skipped, peer_spread=args.peer_spread,
+        wait_divisor=settings.wait_divisor,
     )
     # The checkpoint must load into the model main builds for it.
-    settings.build(adapter.protocol, args.model_type, args.out)
+    settings.build(adapter.protocol, args.model_type, args.out, adapter.windows)
     print(
         f"{adapter.simulator} fit {args.model_type}: runs={args.runs} samples={len(r)} "
         f"skipped={skipped} reward mean={r.mean():+.4f} std={r.std():.4f} "
@@ -371,7 +384,7 @@ def _spec_rows(adapter: SimAdapter, seed: int, policy: str, settings: ModelSetti
     if policy != "model":
         raise ValueError(f"unknown policy {policy!r}")
     if built is None:
-        built = settings.build(adapter.protocol, model_type, prior_path)
+        built = settings.build(adapter.protocol, model_type, prior_path, adapter.windows)
     driver = ModelDriver(built, adapter)
     rows = adapter.run_agent(sim, episodes, driver.predict, driver.update)
     return rows, driver.skipped
@@ -440,7 +453,8 @@ def cmd_eval(args: argparse.Namespace, settings: ModelSettings) -> None:
         raise ValueError("--compare-untrained needs --prior-path; without one the model "
                          "is untrained")
     # Built once here so a bad prior or setting fails before any simulation.
-    for line in settings.build(adapter.protocol, args.model_type, args.prior_path).description:
+    for line in settings.build(adapter.protocol, args.model_type, args.prior_path,
+                               adapter.windows).description:
         print(line)
 
     policies: List[Tuple[str, str, Optional[str]]] = []
@@ -516,7 +530,7 @@ def cmd_ppo(args: argparse.Namespace, settings: ModelSettings) -> None:
     if (args.eval_every > 0) != (args.eval_seeds > 0):
         raise ValueError("--eval-every and --eval-seeds go together")
     _worker_init()
-    built = settings.build(adapter.protocol, args.model_type, None)
+    built = settings.build(adapter.protocol, args.model_type, None, adapter.windows)
     for line in built.description:
         print(line)
     driver = ModelDriver(built, adapter)
@@ -547,11 +561,11 @@ def cmd_ppo(args: argparse.Namespace, settings: ModelSettings) -> None:
     model = _unwrap(built.model)
     save_model_prior(
         args.out, args.model_type, adapter.protocol, model, model.state_arrays(),
-        simulator=adapter.simulator, runs=args.runs, seed=args.seed, updates=driver.updates,
-        skipped=driver.skipped, peer_spread=args.peer_spread, wait_divisor=settings.wait_divisor,
-        latency_floor_multiplier=settings.floor_multiplier,
+        windows=adapter.windows, simulator=adapter.simulator, runs=args.runs, seed=args.seed,
+        updates=driver.updates, skipped=driver.skipped, peer_spread=args.peer_spread,
+        wait_divisor=settings.wait_divisor, latency_floor_multiplier=settings.floor_multiplier,
     )
-    settings.build(adapter.protocol, args.model_type, args.out)
+    settings.build(adapter.protocol, args.model_type, args.out, adapter.windows)
     print(
         f"{adapter.simulator} ppo {args.model_type}: runs={args.runs} episodes={episodes_total} "
         f"updates={driver.updates} skipped={driver.skipped} "
@@ -618,9 +632,9 @@ def main() -> None:
     e.add_argument("--compare-untrained", action="store_true",
                    help="also run the model type without its prior on the same seeds")
     e.add_argument("--per-seed", action="store_true", help="print every seed, not only means")
-    e.add_argument("--heuristic-multiplier", type=float, default=DEFAULT_PROPORTIONAL_K)
-    e.add_argument("--heuristic-window", type=int, default=DEFAULT_HEURISTIC_WINDOW)
-    e.add_argument("--heuristic-quantile", type=float, default=DEFAULT_HEURISTIC_QUANTILE)
+    e.add_argument("--heuristic-multiplier", type=float, default=None)
+    e.add_argument("--heuristic-window", type=int, default=None)
+    e.add_argument("--heuristic-quantile", type=float, default=None)
 
     args = parser.parse_args()
     for name in ("runs", "seeds"):
@@ -629,9 +643,9 @@ def main() -> None:
     set_reward_design(args.reward_design)
     settings = ModelSettings(
         wait_divisor=args.wait_divisor,
-        heuristic_multiplier=getattr(args, "heuristic_multiplier", DEFAULT_PROPORTIONAL_K),
-        heuristic_window=getattr(args, "heuristic_window", DEFAULT_HEURISTIC_WINDOW),
-        heuristic_quantile=getattr(args, "heuristic_quantile", DEFAULT_HEURISTIC_QUANTILE),
+        heuristic_multiplier=getattr(args, "heuristic_multiplier", None),
+        heuristic_window=getattr(args, "heuristic_window", None),
+        heuristic_quantile=getattr(args, "heuristic_quantile", None),
         floor_multiplier=getattr(args, "latency_floor_multiplier", 0.0),
         floor_window=getattr(args, "latency_floor_window", DEFAULT_LATENCY_FLOOR_WINDOW),
         floor_quantile=getattr(args, "latency_floor_quantile", DEFAULT_LATENCY_FLOOR_QUANTILE),

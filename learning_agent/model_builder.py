@@ -4,13 +4,15 @@ main.serve and the simulators both call :func:`build_model`, so a simulator
 trains and evaluates exactly the model the agent runs: same hyperparameters,
 same seed, same codec, same latency-floor wiring.
 
-Priors. ``continuous_gp`` loads a simulator-trained GP prior (NumpyMLP .npz,
-validated by SimPriorGPModel). The LinUCB and PPO models load a checkpoint
+Priors. ``continuous_gp`` and ``discrete_gp`` load a simulator-trained GP
+prior (NumpyMLP .npz, validated by SimPriorGPModel); the two share one .npz. The LinUCB and PPO models load a checkpoint
 written by :func:`save_model_prior`: the LinUCB models a prior mean theta0
 (``prior_theta``), the PPO models their actor and critic weights. A
 checkpoint carries the setup it was trained under, and loading refuses one
 whose model type, protocol, reward design, features, action space or
-hyperparameters differ from the current ones.
+hyperparameters differ from the current ones. Every prior also records the
+windows it was trained under, and build_model refuses one whose windows differ
+from the run's or that records none (prior_windows.check_prior_windows).
 """
 
 from dataclasses import dataclass
@@ -22,10 +24,8 @@ import numpy as np
 
 import agent_pb2
 from continuous_bandit import (
-    DEFAULT_HEURISTIC_QUANTILE,
-    DEFAULT_HEURISTIC_WINDOW,
-    DEFAULT_PROPORTIONAL_K,
     DEFAULT_WAIT_DIVISOR,
+    SBFT_WAIT_MIN_MS,
     ContinuousHeuristicTimeoutModel,
     ContinuousLinUCB,
     ContinuousPPO,
@@ -34,9 +34,12 @@ from continuous_bandit import (
     NormalizedLatencyFloor,
     SimReturnGPModel,
     context_spec,
+    heuristic_spec,
 )
 from latency_floor import LatencyFloor, LatencyFloorPolicy, latency_feature_indices
+from prior_windows import PriorWindows, check_prior_windows
 from models import (
+    SBFT_SLOW_PATH_VALUES_MS,
     ActionCodec,
     BlockedTreeBandit,
     DiscountedLinUCB,
@@ -49,6 +52,7 @@ from models import (
     ScheduledTimeoutModel,
     TensorModel,
     ThompsonSamplingModel,
+    action_index_to_timeout,
     get_action_space_size,
     get_arm_timeout_values_ms,
     get_report_feature_dim,
@@ -62,6 +66,7 @@ from reward_utils import get_reward_design
 # an error rather than a prior silently ignored.
 PRETRAINABLE_MODEL_TYPES = (
     "continuous_gp",
+    "discrete_gp",
     "discrete_linucb",
     "continuous_linucb",
     "discrete_ppo",
@@ -70,8 +75,10 @@ PRETRAINABLE_MODEL_TYPES = (
 
 # Model types whose codec is built with the model; every other one but
 # scheduled uses ProtocolTimeoutActionCodec over the discrete arms.
+# discrete_gp plays only the arms but emits them through the continuous codec.
 _CONTINUOUS_CODEC_MODEL_TYPES = (
     "continuous_gp",
+    "discrete_gp",
     "continuous_linucb",
     "continuous_heuristic",
     "continuous_ppo",
@@ -155,6 +162,8 @@ def save_model_prior(
     protocol: int,
     model: TensorModel,
     arrays: Dict[str, np.ndarray],
+    *,
+    windows: PriorWindows,
     **provenance: object,
 ) -> None:
     """Write a LinUCB or PPO prior for :func:`build_model` to load.
@@ -162,8 +171,9 @@ def save_model_prior(
     ``model`` is a model built for the setup the prior is for (its metadata is
     taken from it, see :func:`prior_metadata`). ``arrays`` is ``{"theta":
     model.fit_prior_theta(...)}`` for the LinUCB models and
-    ``model.state_arrays()`` for the PPO models. ``provenance`` (runs, seed,
-    simulator, ...) is stored and never validated.
+    ``model.state_arrays()`` for the PPO models. ``windows`` are the
+    simulator's windows the prior was trained under. ``provenance`` (runs,
+    seed, simulator, ...) is stored and never validated.
     """
     if not str(path).endswith(".npz"):
         raise ValueError(f"Prior path {path} must end in .npz")
@@ -182,6 +192,7 @@ def save_model_prior(
                 f"got {type(value).__name__}"
             )
         payload[_PROVENANCE_PREFIX + key] = stored
+    payload.update(windows.arrays())
     np.savez(path, **payload)
 
 
@@ -244,18 +255,21 @@ def build_model(
     model_type: str,
     *,
     prior_path: Optional[str] = None,
+    prior_windows: Optional[PriorWindows] = None,
     latency_floor: Optional[LatencyFloor] = None,
     schedule_file: Optional[Path] = None,
     start_monotonic: Optional[float] = None,
-    heuristic_multiplier: float = DEFAULT_PROPORTIONAL_K,
-    heuristic_window: int = DEFAULT_HEURISTIC_WINDOW,
-    heuristic_quantile: float = DEFAULT_HEURISTIC_QUANTILE,
+    heuristic_multiplier: Optional[float] = None,
+    heuristic_window: Optional[int] = None,
+    heuristic_quantile: Optional[float] = None,
     wait_divisor: float = DEFAULT_WAIT_DIVISOR,
 ) -> BuiltModel:
     """The model main.serve runs for ``model_type`` on ``protocol``.
 
     ``prior_path`` None is an untrained model; a path is loaded, and only by
-    PRETRAINABLE_MODEL_TYPES. ``latency_floor`` None disables the floor. The
+    PRETRAINABLE_MODEL_TYPES, after checking that it was trained under
+    ``prior_windows``, the run's windows (required with a prior).
+    ``latency_floor`` None disables the floor. The
     GP's BLAS thread limit is process-global and left to the caller.
     """
     if prior_path is not None:
@@ -266,16 +280,19 @@ def build_model(
                 f"--prior-path is not supported with --model-type={model_type}; "
                 f"it applies to {', '.join(PRETRAINABLE_MODEL_TYPES)}"
             )
+        if prior_windows is None:
+            raise ValueError("a prior needs prior_windows, the windows of the run it is loaded into")
+        check_prior_windows(prior_path, prior_windows)
 
     # Domain constraint on the action space, taken by every model except the
-    # scheduled oracle: a timeout under the consensus latency the replicas are
-    # already achieving cannot be met, so it is not worth a decision. The
-    # field is the window mean, avg_consensus_latency_ms, the same one
-    # continuous_heuristic reads, so the rule and the constraint are on one
-    # measurement. Discrete models get it as a wrapper that hides the arms
-    # under it; continuous models are handed it and search above it.
+    # scheduled oracle: a timeout under the part of the consensus latency it
+    # must cover cannot be met, so it is not worth a decision. The floor reads
+    # its own field (LatencyFloor.field; main.py gives it continuous_heuristic's
+    # signal). Discrete models get it as a wrapper that hides the arms under it;
+    # continuous models are handed it and search above it.
     latency_index, instances_index = latency_feature_indices(
-        get_report_feature_field_names(protocol)
+        get_report_feature_field_names(protocol),
+        latency_floor.field if latency_floor is not None else "avg_consensus_latency_ms",
     )
     if latency_floor is not None and model_type == "scheduled":
         raise ValueError(
@@ -318,44 +335,80 @@ def build_model(
     description: List[str] = []
     action_codec: Optional[ActionCodec] = None
     if model_type == "continuous_heuristic":
-        action_codec = one_dimensional_codec()
-        arms_ms = get_timeout_values_ms(protocol)
+        # Per-protocol rule (HEURISTIC_SPECS); on SBFT it also sets the wait W.
+        hspec = heuristic_spec(protocol)
+        if protocol == agent_pb2.PROTOCOL_SBFT:
+            action_codec = ContinuousTimeoutActionCodec(
+                protocol, bounds_ms=hspec.bounds_ms,
+                wait_bounds_ms=context_spec(protocol).wait_bounds_ms,
+            )
+        else:
+            action_codec = ContinuousTimeoutActionCodec(protocol, bounds_ms=hspec.bounds_ms)
+        arms_ms = sorted(get_timeout_values_ms(protocol))
+        initial = (arms_ms[len(arms_ms) // 2],)
+        if protocol == agent_pb2.PROTOCOL_SBFT:
+            initial = initial + (SBFT_WAIT_MIN_MS,)
         model = ContinuousHeuristicTimeoutModel(
+            protocol=protocol,
             action_codec=action_codec,
-            n_features=get_report_feature_dim(protocol),
-            latency_index=latency_index,
-            instances_index=instances_index,
+            feature_names=get_report_feature_field_names(protocol),
+            initial_timeout_ms=initial,
             multiplier=heuristic_multiplier,
             window=heuristic_window,
             quantile=heuristic_quantile,
-            clamp_ms=(min(arms_ms), max(arms_ms)),
-            initial_timeout_ms=sorted(arms_ms)[len(arms_ms) // 2],
             latency_floor=normalized_floor(action_codec),
         )
+        k = hspec.multiplier if heuristic_multiplier is None else heuristic_multiplier
         description.append(
-            f"[continuous_heuristic] {heuristic_multiplier:g} x the "
-            f"{heuristic_quantile:g} quantile of the last {heuristic_window} "
-            f"committing windows' latency, clamped to {min(arms_ms)}..{max(arms_ms)}ms"
+            f"[continuous_heuristic] {k:g} x {hspec.signal} over recent committing "
+            f"windows, clamped to {hspec.bounds_ms[0]}..{hspec.bounds_ms[1]}ms"
+            + (", storm doubling" if hspec.storm_view_changes is not None else "")
+            + (", SBFT wait from the n-th prepare gap" if protocol == agent_pb2.PROTOCOL_SBFT else "")
         )
-    elif model_type == "continuous_gp":
+    elif model_type in ("continuous_gp", "discrete_gp"):
         # Refuses a protocol without a context spec; wait_bounds_ms is SBFT's
         # fast-path wait (None elsewhere). No prior path is a zero prior.
         # SimPriorGPModel (H18) stays in the code, unwired.
+        # discrete_gp is the same model scoring only the ladder rungs (on SBFT
+        # the T-major product with the waits, the arm order), with the same prior.
         spec = context_spec(protocol)
         action_codec = ContinuousTimeoutActionCodec(
             protocol, bounds_ms=spec.bounds_ms, wait_bounds_ms=spec.wait_bounds_ms
         )
+        axes_ms = None
+        if model_type == "discrete_gp":
+            axes_ms = (tuple(get_timeout_values_ms(protocol)),)
+            if protocol == agent_pb2.PROTOCOL_SBFT:
+                axes_ms = axes_ms + (tuple(SBFT_SLOW_PATH_VALUES_MS),)
         model = SimReturnGPModel(
             action_codec=action_codec,
             field_names=get_report_feature_field_names(protocol),
             prior_path=prior_path,
             reward_design=get_reward_design(),
             latency_floor=normalized_floor(action_codec),
+            axes_ms=axes_ms,
         )
-        description.append(
-            "[continuous_gp] prior: "
-            + ("untrained (zero prior)" if prior_path is None else prior_path)
-        )
+        prior_text = "untrained (zero prior)" if prior_path is None else prior_path
+        if model_type == "continuous_gp":
+            description.append(f"[continuous_gp] prior: {prior_text}")
+        else:
+            # Grid row i must emit exactly discrete arm i, or the model is not
+            # playing the ladder the other discrete models play.
+            n_arms = get_action_space_size(protocol)
+            if len(model._grid) != n_arms:
+                raise RuntimeError(
+                    f"discrete_gp grid has {len(model._grid)} rows, expected {n_arms} arms"
+                )
+            for index in range(n_arms):
+                emitted = action_codec.decode(model._grid[index])
+                expected = action_index_to_timeout(protocol, index)
+                if emitted != expected:
+                    raise RuntimeError(
+                        f"discrete_gp grid row {index} decodes to {emitted}, "
+                        f"arm {index} is {expected}"
+                    )
+            rungs_text = " x ".join(str(axis) for axis in axes_ms)
+            description.append(f"[discrete_gp] rungs {rungs_text}ms, prior: {prior_text}")
     elif model_type == "discrete_random":
         # Seeded like the other models so that, in sharing mode, every node
         # draws the same action from the same agreed features. Reward
@@ -469,14 +522,19 @@ def build_model(
         raise ValueError(f"Unsupported model type: {model_type}")
 
     # Discrete models get the floor as a wrapper that hides the arms under it;
-    # the continuous models were handed it above, and scheduled refused it.
+    # the continuous models and discrete_gp were handed it above, and
+    # scheduled refused it.
     # A prior was loaded into the inner model above, before this wrap.
     #
     # In sharing mode the floor stays identical on every replica for free: it
     # is estimated from the consensus-agreed feature vector, which is the same
     # on all of them, so constraining the action space does not break the
     # lockstep the aggregated reward depends on.
-    if latency_floor is not None and model_type.startswith("discrete_"):
+    if (
+        latency_floor is not None
+        and model_type.startswith("discrete_")
+        and model_type not in _CONTINUOUS_CODEC_MODEL_TYPES
+    ):
         model = LatencyFloorPolicy(
             model=model,
             # Per arm, not the distinct ladder: SBFT has 6 arms over a 3-rung

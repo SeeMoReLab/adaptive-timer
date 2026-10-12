@@ -21,17 +21,22 @@ def reward_tps(throughput_tps: float) -> float:
     excess = (value - REWARD_THROUGHPUT_KNEE_TPS) / REWARD_THROUGHPUT_KNEE_TPS
     return 1.0 + REWARD_THROUGHPUT_ABOVE_KNEE_WEIGHT * excess
 
-def reward_tps_latency(throughput_tps: float, p50_consensus_latency_ms: float) -> float:
-    """Throughput and median consensus latency at a fixed exchange rate.
+def reward_tps_latency(throughput_tps: float, latency_ms: float) -> float:
+    """Throughput and consensus latency at a fixed exchange rate.
 
-    10,000 tps is worth one unit and so is one second of p50 latency, so 100 ms
-    trades for 1,000 tps. Within a fault phase this ranks the calibrated best
-    SBFT pair first in all ten phase x rate cells of
-    runs/2026-09-28-sbft-revalidation. Across phases the level moves with the
-    network delay (about -0.8 from base to 5+150), which the contextual models
+    10,000 tps is worth one unit and so is one second of latency, so 100 ms
+    trades for 1,000 tps. The agent scores a reward window with its MEAN
+    consensus latency (_apply_reward_design; Kevin, 2026-10-09): on Tendermint
+    the delayed proposer slows only every fourth height, so the window p50 stays
+    at ~70 ms at every timeout while the mean rises 111 -> 510 ms and clients
+    wait (scripts/cloudlab/tmp/cal/phaseD/notes.md), and on the other five
+    protocols the mean ranks the calibration cells as p50 did
+    (scripts/cloudlab/tmp/cal/rewardstat). The client-side judges (results/plot.py,
+    results/table.py, cal/pt/judge.py) keep the client's per-second p50. Across
+    phases the level moves with the network delay, which the contextual models
     must absorb through their features.
     """
-    return float(throughput_tps) / 10000.0 - float(p50_consensus_latency_ms) / 1000.0
+    return float(throughput_tps) / 10000.0 - float(latency_ms) / 1000.0
 
 
 def reward_mixed(
@@ -95,13 +100,12 @@ def _apply_reward_design(
     timeout_ms: Optional[int],
     avg_consensus_latency_ms: float,
     total_transactions: int,
-    p50_consensus_latency_ms: float,
     protocol_name: str = "",
 ) -> float:
     if _active_reward_design == "reward_tps":
         return reward_tps(throughput_tps)
     if _active_reward_design == "reward_tps_latency":
-        return reward_tps_latency(throughput_tps, p50_consensus_latency_ms)
+        return reward_tps_latency(throughput_tps, avg_consensus_latency_ms)
     if timeout_ms is None:
         target = f" for {protocol_name}" if protocol_name else ""
         raise ValueError(
@@ -138,7 +142,6 @@ def calculate_pbft_reward(
         timeout_ms=timeout_ms,
         avg_consensus_latency_ms=avg_consensus_latency_ms,
         total_transactions=total_transactions,
-        p50_consensus_latency_ms=p50_consensus_latency_ms,
     )
 
 
@@ -172,7 +175,6 @@ def calculate_smartbft_reward(
         timeout_ms=timeout_ms,
         avg_consensus_latency_ms=avg_consensus_latency_ms,
         total_transactions=total_transactions,
-        p50_consensus_latency_ms=p50_consensus_latency_ms,
     )
 
 
@@ -216,7 +218,6 @@ def calculate_sbft_reward(
         timeout_ms=timeout_ms,
         avg_consensus_latency_ms=avg_consensus_latency_ms,
         total_transactions=total_transactions,
-        p50_consensus_latency_ms=p50_consensus_latency_ms,
         protocol_name="sbft",
     )
 
@@ -270,7 +271,6 @@ def calculate_tendermint_reward(
         timeout_ms=timeout_ms,
         avg_consensus_latency_ms=avg_consensus_latency_ms,
         total_transactions=total_transactions,
-        p50_consensus_latency_ms=p50_consensus_latency_ms,
         protocol_name="tendermint",
     )
 
@@ -300,7 +300,6 @@ def calculate_hotstuff_reward(
         timeout_ms=timeout_ms,
         avg_consensus_latency_ms=avg_consensus_latency_ms,
         total_transactions=total_transactions,
-        p50_consensus_latency_ms=p50_consensus_latency_ms,
     )
 
 
@@ -328,5 +327,4 @@ def calculate_autobahn_reward(
         timeout_ms=timeout_ms,
         avg_consensus_latency_ms=avg_consensus_latency_ms,
         total_transactions=total_transactions,
-        p50_consensus_latency_ms=p50_consensus_latency_ms,
     )

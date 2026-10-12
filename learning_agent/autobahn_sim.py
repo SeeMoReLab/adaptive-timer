@@ -75,15 +75,15 @@ latency (header latency plus the batch and car waits, the quantity the
 calibration cells were judged on) is kept beside it for ``check`` and
 ``eval``.
 
-Episodes follow the wall-clock learning windows in lib_rustbft.sh: 10 s
-features, 2 s reply wait (applied at the deadline), 3 s warm-up, 5 s reward.
+Episodes follow the wall-clock learning windows in lib_rustbft.sh: 7 s
+features, 2 s reply wait (applied at the deadline), 4 s warm-up, 7 s reward.
 
 Constants the mechanics do not fix (car and slot processing, the TCP extra
 per hop and what timeout traffic removes of it, the view-change delay, noise)
 were fit to the measured cells and the 2026-10-07 single-host 5+150
 points (``check``: the client R ranking within 11 of the 12 (link, fault)
 groups, mean absolute R error 0.10) and are drawn per simulated training run
-from ranges around those values. The simulator knows
+0.5-2x around those values (sample_constants). The simulator knows
 the fault mechanisms, not the spec's values.
 """
 
@@ -101,6 +101,7 @@ import numpy as np
 
 import agent_pb2
 from continuous_bandit import CONTEXT_SPECS
+from prior_windows import PriorWindows, check_prior_windows
 
 N_NODES = 4
 # config/autobahn/parameters.json: k, fast_path_timeout, max_header_delay,
@@ -118,16 +119,18 @@ CLIENT_STALL_P50_MS = 10000.0
 # config/autobahn/parameters.json timeout_delay: in effect until the first
 # decision.
 DEFAULT_TIMEOUT_MS = 5000.0
-FEATURE_S = 10.0
+FEATURE_S = 7.0
 REPLY_S = 2.0
-WARMUP_S = 3.0
-REWARD_S = 5.0
+WARMUP_S = 4.0
+REWARD_S = 7.0
 EPISODE_S = FEATURE_S + REPLY_S + WARMUP_S + REWARD_S
+SIM_WINDOWS = PriorWindows.from_seconds(FEATURE_S, REPLY_S, WARMUP_S, REWARD_S)
 
 DEFAULT_PRIOR_PATH = CONTEXT_SPECS[agent_pb2.PROTOCOL_AUTOBAHN].prior_path
 
 
 @dataclass
+# Fitted defaults: blind best-by-loss candidate i=1480 (loss 0.039) of fit7_autobahn_blind.jsonl, 7/2/4/7 calibration (blindall, 2026-10-09).
 class SimConstants:
     """Defaults are the calibration host (cloudlab_1, 10,000 tx/s): the car
     period from the measured header rates, the rest a search over the
@@ -139,14 +142,14 @@ class SimConstants:
 
     # Car period max(100, car_hops * h + car_proc_ms); lanes jitter by
     # lane_sigma * C around the common tick, the tick by car_sigma.
-    car_hops: float = 2.65
-    car_proc_ms: float = 50.0
+    car_hops: float = 2.005932
+    car_proc_ms: float = 32.983897
     car_sigma: float = 0.05
     lane_sigma: float = 0.15
     # A car is certified cert_hops * h plus one hop's TCP extra after it is made.
-    cert_hops: float = 1.739
+    cert_hops: float = 2.169036
     # From the third lane's newly certified car to the Prepare.
-    slot_proc_ms: float = 5.0
+    slot_proc_ms: float = 5.805047
     # TCP extra per hop: uniform on [0, 2 nagle_frac min(h, nagle_cap_ms)],
     # nagle_common of it shared by all voters of a round. It grows with h
     # through 5+150: replica 3's Prepare-to-Confirm vote gap is 2h + F plus
@@ -154,20 +157,20 @@ class SimConstants:
     # 5-host 70 / 271 / 594), and a view lasts T + 80 at 5+50 and T + 230 at
     # 5+150 (T + h plus half the extra), so the cap sits above the links
     # calibrated on.
-    nagle_frac: float = 0.422
-    nagle_cap_ms: float = 216.7
-    nagle_common: float = 0.641
+    nagle_frac: float = 0.456534
+    nagle_cap_ms: float = 184.021179
+    nagle_common: float = 0.637984
     # Timeout traffic gives the receivers data to piggyback their ACKs on, so
     # the delayed-ACK part of the extra goes: each hop's extra shrinks by
     # flush_ms times the recent timeouts per slot (at most one).
-    flush_ms: float = 15.21
+    flush_ms: float = 6.662239
     # A new view's Prepare goes out view_change_hops * min(h, nagle_cap_ms)
     # after the replicas start its timer.
-    view_change_hops: float = 0.627
+    view_change_hops: float = 0.5175
     # Lognormal spread of one view's round trips, common to its messages.
-    view_sigma: float = 0.294
+    view_sigma: float = 0.225971
     # Per message processing.
-    proc_ms: float = 0.8
+    proc_ms: float = 1.952149
     # A vote is late with this probability, by an exponential of mean
     # tail_hops * h + tail_ms (a minor term: 0 or 0.03 move check little).
     vote_tail_prob: float = 0.01
@@ -566,7 +569,8 @@ class AutobahnSim:
         self.timeout_ms = new_timeout
         self._advance(t0 + EPISODE_S * 1000.0)
         reward = self._window(t0 + (FEATURE_S + REPLY_S + WARMUP_S) * 1000.0, t0 + EPISODE_S * 1000.0)
-        phase_idx, _ = self.phase_at(self.episode_start_s + FEATURE_S)
+        # The phase in force at the apply instant, as main.py labels an episode.
+        phase_idx, _ = self.phase_at(self.episode_start_s + FEATURE_S + REPLY_S)
         self.episode_start_s += EPISODE_S
         self._prune(t0 + EPISODE_S * 1000.0)
         return (report, new_timeout,
@@ -604,21 +608,34 @@ class AutobahnSim:
         return (float(np.mean(rewards)) if rewards else float("nan")), p50
 
 
+def _around(rng: np.random.Generator, host: float, lo: float = 0.5, hi: float = 2.0) -> float:
+    """A host constant scaled by a log-uniform factor in [lo, hi]."""
+    if host <= 0:
+        raise ValueError(f"cannot draw around a non-positive default {host}")
+    return float(host * math.exp(rng.uniform(math.log(lo), math.log(hi))))
+
+
 def sample_constants(rng: np.random.Generator) -> SimConstants:
+    # The fitted constants (blindall/autobahn/fit/sim_fit.py FREE) 0.5-2x around
+    # the installed defaults; the rest keep their own ranges.
+    h = SimConstants()
+    if not 0.0 < h.nagle_common <= 1.0:
+        raise ValueError(f"SimConstants.nagle_common {h.nagle_common} is a share, outside (0, 1]")
     return SimConstants(
-        car_hops=float(rng.uniform(2.0, 3.3)),
-        car_proc_ms=float(rng.uniform(30.0, 70.0)),
+        car_hops=_around(rng, h.car_hops),
+        car_proc_ms=_around(rng, h.car_proc_ms),
         car_sigma=float(rng.uniform(0.02, 0.1)),
         lane_sigma=float(rng.uniform(0.05, 0.3)),
-        cert_hops=float(rng.uniform(1.2, 2.2)),
-        slot_proc_ms=float(rng.uniform(2.0, 15.0)),
-        nagle_frac=float(rng.uniform(0.3, 0.65)),
-        nagle_cap_ms=float(rng.uniform(150.0, 300.0)),
-        nagle_common=float(rng.uniform(0.45, 0.85)),
-        flush_ms=float(rng.uniform(5.0, 30.0)),
-        view_change_hops=float(rng.uniform(0.3, 0.9)),
-        view_sigma=float(rng.uniform(0.15, 0.4)),
-        proc_ms=float(rng.uniform(0.4, 2.0)),
+        cert_hops=_around(rng, h.cert_hops),
+        slot_proc_ms=_around(rng, h.slot_proc_ms),
+        nagle_frac=_around(rng, h.nagle_frac),
+        nagle_cap_ms=_around(rng, h.nagle_cap_ms),
+        # A share of the extra: the factor stops where it reaches 1.
+        nagle_common=_around(rng, h.nagle_common, hi=min(2.0, 1.0 / h.nagle_common)),
+        flush_ms=_around(rng, h.flush_ms),
+        view_change_hops=_around(rng, h.view_change_hops),
+        view_sigma=_around(rng, h.view_sigma),
+        proc_ms=_around(rng, h.proc_ms),
         vote_tail_prob=float(rng.uniform(0.0, 0.03)),
         tail_hops=float(rng.uniform(2.0, 6.0)),
         tail_ms=float(rng.uniform(0.0, 50.0)),
@@ -673,7 +690,10 @@ SPEC_PHASES: Tuple[Tuple[float, float, Optional[float]], ...] = (
     (1200.0, 155.0, None),
     (1500.0, 5.0, None),
 )
-SPEC_ORACLE_MS: Tuple[float, ...] = (250.0, 250.0, 750.0, 750.0, 1250.0, 250.0)
+SPEC_ORACLE_MS: Tuple[float, ...] = (250.0, 250.0, 500.0, 500.0, 1250.0, 250.0)
+# What the measured oracle runs below played (the 2026-10-05 schedule, 750 at 5+50
+# before 2026-10-08); `check` replays these to compare against their reports.
+MEASURED_ORACLE_MS: Tuple[float, ...] = (250.0, 250.0, 750.0, 750.0, 1250.0, 250.0)
 SPEC_RATE_TPS = 10000.0
 SPEC_WARMUP_S = 10.0
 SPEC_EPISODES = int((SPEC_WARMUP_S + SPEC_PHASES[-1][0] + 300.0 + 10.0) // EPISODE_S)
@@ -777,7 +797,9 @@ def spec_sim(seed: int, constants: Optional[SimConstants] = None,
              track_client: bool = False) -> Tuple[AutobahnSim, int]:
     """The spec schedule at SPEC_RATE_TPS: (simulator, episodes)."""
     c = replace(constants if constants is not None else SimConstants(), load_tps=SPEC_RATE_TPS)
-    sim = AutobahnSim(c, spec_schedule(), seed=seed, start_offset_s=0.2, track_client=track_client)
+    # Episode e applies at warm-up + 20(e-1), on the phase onsets, as the engine does.
+    sim = AutobahnSim(c, spec_schedule(), seed=seed, start_offset_s=SPEC_WARMUP_S - FEATURE_S - REPLY_S,
+                      track_client=track_client)
     return sim, SPEC_EPISODES
 
 
@@ -887,6 +909,7 @@ def train_prior(
         hold_episodes=np.asarray(int(hold)),
         target_floor=np.asarray(float(target_floor)),
     )
+    arrays.update(SIM_WINDOWS.arrays())
     np.savez(out_path, **arrays)
     return rmse
 
@@ -903,6 +926,7 @@ def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH):
         value = float(kind.split(":", 1)[1])
         return (lambda x: value), None
     if kind == "candidate":
+        check_prior_windows(prior_path, SIM_WINDOWS)
         spec = CONTEXT_SPECS[protocol]
         codec = ContinuousTimeoutActionCodec(protocol, bounds_ms=spec.bounds_ms)
         model = SimReturnGPModel(
@@ -1045,9 +1069,12 @@ def _check_job(args) -> Tuple[Tuple, float, int, Dict[str, float], float]:
     h, withhold, offset = key
     # As the cells ran: 10 s healthy warm-up at base, then the fault; the
     # cell's timeout from the start.
-    phases = [Phase(0.0), Phase(10.0, one_way_ms=h, vote_withhold=withhold, hold_offset_ms=offset)]
+    warm_s = 10.0
+    phases = [Phase(0.0), Phase(warm_s, one_way_ms=h, vote_withhold=withhold, hold_offset_ms=offset)]
+    # Episode e applies at warm-up + 20(e-1), on the fault onset, as the engine does.
     sim = AutobahnSim(replace(SimConstants(), load_tps=SPEC_RATE_TPS), phases, seed=seed,
-                      start_offset_s=0.0, initial_timeout_ms=float(timeout_ms), track_client=True)
+                      start_offset_s=warm_s - FEATURE_S - REPLY_S, initial_timeout_ms=float(timeout_ms),
+                      track_client=True)
     reps = []
     for _ in range(int(CHECK_RUN_S // EPISODE_S)):
         s0 = sim.episode_start_s
@@ -1055,12 +1082,13 @@ def _check_job(args) -> Tuple[Tuple, float, int, Dict[str, float], float]:
         if s0 >= CHECK_STEADY_S:
             reps.append(feature)
     r, p50 = sim.client_score(CHECK_STEADY_S, CHECK_RUN_S)
+    per_10s = 10.0 / FEATURE_S  # counts per 10 s, the window the cells were measured in
     res = {
         "R": r,
         "clat": p50,
         "p50": float(np.mean([x["p50_consensus_latency_ms"] for x in reps])),
-        "inst": float(np.mean([x["total_consensus_instances"] for x in reps])),
-        "vc": float(np.mean([x["view_change_count"] for x in reps])),
+        "inst": float(np.mean([x["total_consensus_instances"] for x in reps])) * per_10s,
+        "vc": float(np.mean([x["view_change_count"] for x in reps])) * per_10s,
         "agent": float(np.mean([episode_reward(x) for x in reps])),
     }
     return key, timeout_ms, seed, res, time.time() - t0
@@ -1075,7 +1103,7 @@ def _oracle_job(seed: int):
     for _ in range(episodes):
         s0 = sim.episode_start_s
         feature, _, _, _ = sim.run_episode(
-            lambda r: SPEC_ORACLE_MS[max(0, sim.phase_at(sim.episode_start_s + FEATURE_S + REPLY_S)[0] - 1)])
+            lambda r: MEASURED_ORACLE_MS[max(0, sim.phase_at(sim.episode_start_s + FEATURE_S + REPLY_S)[0] - 1)])
         rows.append((sim.phase_at(s0)[0] - 1, feature))
     out = []
     for ph in range(len(SPEC_PHASES)):
@@ -1137,12 +1165,14 @@ def run_check(seeds: int, workers: int) -> str:
     lines.append(f"rankings reproduced in {matched}/{len(MEASURED_CELLS)} groups, "
                  f"{pairs_ok}/{pairs_all} separated pairs; level error mean {np.mean(level):+.3f} "
                  f"mean abs {np.mean(np.abs(level)):.3f} max abs {np.max(np.abs(level)):.3f}")
-    lines.append("oracle on the spec, per 10 s feature window (sim mean of seeds, skipping two "
-                 "episodes per phase | measured): inst p50 p95 vc | np batch lc p95gap")
+    lines.append("oracle on the spec, counts per 10 s (sim mean of seeds over its feature windows, "
+                 "skipping two episodes per phase | measured per 10 s feature window): "
+                 "inst p50 p95 vc | np batch lc p95gap")
     o = np.mean(np.asarray(oracle), axis=0)
+    o[:, [0, 3, 4, 6]] *= 10.0 / FEATURE_S  # instances, view changes, no-progress, leader changes
     for ph in range(len(SPEC_PHASES)):
         mi, mp, mq, mv = MEASURED_ORACLE_REPORT[ph]
-        lines.append(f"  p{ph} T={SPEC_ORACLE_MS[ph]:4.0f}  {o[ph,0]:5.0f} {o[ph,1]:6.0f} {o[ph,2]:6.0f} "
+        lines.append(f"  p{ph} T={MEASURED_ORACLE_MS[ph]:4.0f}  {o[ph,0]:5.0f} {o[ph,1]:6.0f} {o[ph,2]:6.0f} "
                      f"{o[ph,3]:5.1f} | {mi:5.0f} {mp:6.0f} {mq:6.0f} {mv:5.1f} | {o[ph,4]:5.1f} "
                      f"{o[ph,5]:5.2f} {o[ph,6]:5.0f} {o[ph,7]:6.0f}")
     return "\n".join(lines)
@@ -1167,7 +1197,7 @@ def main() -> None:
     e.add_argument("--seeds", type=int, default=10)
     e.add_argument("--prior", default=None,
                    help="prior for the candidate; without one only the oracle and the rungs run")
-    e.add_argument("--rungs", default="250,750,1250", help="the fixed timeouts to compare")
+    e.add_argument("--rungs", default="250,500,1250", help="the fixed timeouts to compare")
     e.add_argument("--randomize", action="store_true", help="random constants per seed")
     e.add_argument("--reward-design", default="reward_tps_latency")
     c = sub.add_parser("check", help="the measured calibration cells at the host constants")
@@ -1195,7 +1225,8 @@ def main() -> None:
 
     rungs = [float(v) for v in args.rungs.split(",")]
     rng = np.random.default_rng(12345)
-    print("measured oracle client R " + " | ".join(
+    print(f"measured oracle client R (T {'/'.join(f'{t:.0f}' for t in MEASURED_ORACLE_MS)}, "
+          f"the sim oracle below plays {'/'.join(f'{t:.0f}' for t in SPEC_ORACLE_MS)}) " + " | ".join(
         " ".join(f"p{ph} {v:+.3f}" for ph, v in enumerate(run)) for run in SPEC_ORACLE_CLIENT_R))
     for s in range(args.seeds):
         constants = sample_constants(rng) if args.randomize else SimConstants()

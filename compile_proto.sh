@@ -5,8 +5,8 @@
 #     SmartBFT smallbank and sharing examples)
 #   - cometbft/proto/adaptive_timers/agent.proto and agent.pb.go (a copy of
 #     proto/agent.proto with cometbft's go_package, then gogo Go)
-# The Rust binding under autobahn/ is compiled from the proto at cargo build
-# time and needs no step here.
+#   - autobahn/proto/agent.proto (a byte-identical copy: the Rust crate's build.rs compiles it at
+#     cargo build time, and lib_rustbft.sh aborts a run when it drifts from proto/agent.proto)
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -72,6 +72,11 @@ generate_cometbft_go() {
       cometbft/proto/adaptive_timers/agent.proto
 }
 
+vendor_rust_proto() {
+  cp proto/agent.proto autobahn/proto/agent.proto
+}
+
 generate_python
 generate_smartbft_go
 generate_cometbft_go
+vendor_rust_proto

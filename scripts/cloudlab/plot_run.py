@@ -16,6 +16,7 @@ time, not a client reply as for the other protocols.
 """
 
 import argparse
+import gzip
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -29,7 +30,7 @@ START_RE = re.compile(r"Waiting until benchmark start unix ms (\d+)")
 MONITOR_RE = re.compile(rf"\[client ({ISO_TS})\] Monitor (duration=.*)")
 KV_RE = re.compile(r"([A-Za-z0-9_]+)=(\S+)")
 TIMEOUT_MARKER = "applied timeouts:"
-SERVER_FILE_RE = re.compile(r"server_(\d+)\.log$")
+SERVER_FILE_RE = re.compile(r"server_(\d+)\.log(?:\.gz)?$")  # the harnesses pull replica logs gzipped
 PHASE_COLORS = ("#dceaf7", "#fff0c2", "#e6d9f2", "#d8ead2", "#f4d1d1", "#d7e5e5")
 LINE_STYLES = ("-", "--", "-.", ":")
 
@@ -104,7 +105,8 @@ def parse_replica_log(path: Path, start: datetime) -> ReplicaLog:
         raise ValueError(f"Cannot determine the replica ID from {path.name}")
     timeouts: dict[str, list[tuple[float, float]]] = {}
     views = []
-    with path.open(encoding="utf-8", errors="replace") as handle:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
         for line_number, line in enumerate(handle, start=1):
             is_timeout = TIMEOUT_MARKER in line
             is_stats = " Stats " in line and " view=" in line
@@ -289,7 +291,7 @@ def main() -> int:
     try:
         start, samples = parse_client_output(input_path, args.skip_warmup_lines)
         phase_spans = load_phase_spans(failure_spec)
-        replica_paths = sorted(server_logs_dir.glob("server_*.log"),
+        replica_paths = sorted([p for p in server_logs_dir.glob("server_*.log*") if SERVER_FILE_RE.search(p.name)],
                                key=lambda path: int(SERVER_FILE_RE.search(path.name).group(1)))
         if not replica_paths:
             raise ValueError(f"No server_N.log files in {server_logs_dir}")

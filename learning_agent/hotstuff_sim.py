@@ -32,14 +32,15 @@ votes to the next leader, a pacemaker timer reset on every round advance, a
   that leader's timer (and the Nagle hop); one that outlasts the other
   replicas' wait ends the round in a timeout certificate instead, ``T + 2h``.
 
-Episodes follow the wall-clock learning windows in lib_rustbft.sh: 10 s
-features, 2 s reply wait (applied at the deadline), 3 s warm-up, 5 s reward.
+Episodes follow the wall-clock learning windows in lib_rustbft.sh: 7 s
+features, 2 s reply wait (applied at the deadline), 4 s warm-up, 7 s reward.
 A window in which nothing committed gets its own length as its latency, as
 the agent does for HotStuff (main.py, Kevin 2026-10-02).
 
-Constants the mechanics do not fix (processing, noise, the degraded regime's
-shape, the collapse threshold, how readily the bistable band tips, the load)
-are drawn per simulated run from ranges wider than the calibration host.
+Constants the mechanics do not fix are drawn per simulated run: the fitted
+ones (processing, the degraded regime's shape, the collapse threshold, how
+readily the bistable band tips) 0.5-2x around the SimConstants defaults, the
+noise and the load from ranges wider than the calibration host.
 """
 
 from __future__ import annotations
@@ -54,42 +55,45 @@ import numpy as np
 
 import agent_pb2
 from continuous_bandit import CONTEXT_SPECS
+from prior_windows import PriorWindows, check_prior_windows
 
 N_NODES = 4
 MIN_BLOCK_DELAY_MS = 100.0
 # config/hotstuff/parameters.json consensus.timeout_delay: in effect until the
 # first decision.
 DEFAULT_TIMEOUT_MS = 5000.0
-FEATURE_S = 10.0
+FEATURE_S = 7.0
 REPLY_S = 2.0
-WARMUP_S = 3.0
-REWARD_S = 5.0
+WARMUP_S = 4.0
+REWARD_S = 7.0
 EPISODE_S = FEATURE_S + REPLY_S + WARMUP_S + REWARD_S
+SIM_WINDOWS = PriorWindows.from_seconds(FEATURE_S, REPLY_S, WARMUP_S, REWARD_S)
 
 DEFAULT_PRIOR_PATH = CONTEXT_SPECS[agent_pb2.PROTOCOL_HOTSTUFF].prior_path
 
 
 @dataclass
+# Fitted defaults: blind best-by-loss candidate i=1013 (loss 1.610) of fit7_hotstuff_blind.jsonl, 7/2/4/7 calibration (blindall, 2026-10-09).
 class SimConstants:
     """Defaults are the calibration host (cloudlab_1, 10,000 tx/s); training
-    draws every field from sample_constants."""
+    draws every field from sample_constants, the fitted ones around these."""
 
     # Per-round processing when the network sets the pace (measured 2-4 ms)
     # and in the sleep-bound regime (42.6 ms at 5 ms one-way gives 23).
-    proc_net_ms: float = 3.0
-    proc_sleep_ms: float = 23.0
+    proc_net_ms: float = 2.84228
+    proc_sleep_ms: float = 28.040112
     # Lognormal spread of a round's duration.
     round_sigma: float = 0.03
     load_tps: float = 10000.0
     # Degraded regime (T under p3): rounds take p3 + degraded_hops * h and
     # this share of the load commits (measured 4.0-4.2 h and 0.79-0.91 at 5+50).
-    degraded_hops: float = 1.0
-    degraded_share: float = 0.85
+    degraded_hops: float = 1.240074
+    degraded_share: float = 0.60067
     # Nothing commits below collapse_hops * h (2 h degrades, 1.55 h collapses).
-    collapse_hops: float = 1.7
+    collapse_hops: float = 2.061011
     # Probability that a perturbation tips a run in the bistable band into the
     # 3-hop state (the 5+150 onset did at 3.3 h, the 5+50 one did not at 3.3 h).
-    tip_prob: float = 0.7
+    tip_prob: float = 0.931279
 
 
 @dataclass
@@ -100,6 +104,12 @@ class Phase:
     # fixed hold_ms; neither means no slow leader.
     hold_offset_ms: Optional[float] = None
     hold_ms: Optional[float] = None
+
+
+def _rank(values: np.ndarray, q: float) -> float:
+    """Nearest-rank percentile, sorted[ceil(q n) - 1], as metrics.rs."""
+    ordered = np.sort(values)
+    return float(ordered[max(0, math.ceil(q * len(ordered)) - 1)])
 
 
 @dataclass
@@ -115,10 +125,13 @@ class _Window:
     def report(self, timeout_ms: float, empty_latency_ms: float) -> Dict[str, float]:
         length_s = self.end_s - self.start_s
         committed = len(self.latencies)
-        rounds = np.asarray(self.rounds) if self.rounds else np.zeros(1)
+        # A round's duration is the gap to the previous commit; the window's
+        # first reaches back before it, and gaps reset per window (metrics.rs:
+        # n commits give n-1 gaps).
+        gaps = np.asarray(self.rounds[1:])
         if committed:
             lat = np.asarray(self.latencies)
-            avg, p50, p95 = float(lat.mean()), float(np.percentile(lat, 50)), float(np.percentile(lat, 95))
+            avg, p50, p95 = float(lat.mean()), _rank(lat, 0.50), _rank(lat, 0.95)
         else:
             # The agent's empty-window rule: the window's own length.
             avg = p50 = p95 = empty_latency_ms
@@ -136,9 +149,9 @@ class _Window:
             "leader_change_count": float(max(0, committed - 1)),
             "regency_change_count": 0.0,
             "timeout_ms": float(timeout_ms),
-            "avg_inter_commit_gap_ms": float(rounds.mean()) if committed else 0.0,
-            "p50_inter_commit_gap_ms": float(np.percentile(rounds, 50)) if committed else 0.0,
-            "p95_inter_commit_gap_ms": float(np.percentile(rounds, 95)) if committed else 0.0,
+            "avg_inter_commit_gap_ms": float(gaps.mean()) if len(gaps) else 0.0,
+            "p50_inter_commit_gap_ms": _rank(gaps, 0.50) if len(gaps) else 0.0,
+            "p95_inter_commit_gap_ms": _rank(gaps, 0.95) if len(gaps) else 0.0,
             "view_change_count": float(round(self.timeouts)),
             "no_progress_view_change_count": float(round(self.stalled_timeouts)),
         }
@@ -284,21 +297,32 @@ class HotstuffSim:
         reward = _Window(t0 + FEATURE_S + REPLY_S + WARMUP_S, t0 + EPISODE_S)
         for s in range(int(FEATURE_S + REPLY_S), int(EPISODE_S)):
             self._second(t0 + s, [reward])
-        phase_idx, _ = self.phase_at(t0 + FEATURE_S)
+        # The phase in force at the apply instant, as main.py labels an episode.
+        phase_idx, _ = self.phase_at(t0 + FEATURE_S + REPLY_S)
         self.episode_start_s = t0 + EPISODE_S
         return report, new_timeout, reward.report(new_timeout, REWARD_S * 1000.0), phase_idx
 
 
+def _around(rng: np.random.Generator, host: float, lo: float = 0.5, hi: float = 2.0) -> float:
+    """A host constant scaled by a log-uniform factor in [lo, hi]."""
+    if host <= 0:
+        raise ValueError(f"cannot draw around a non-positive default {host}")
+    return float(host * math.exp(rng.uniform(math.log(lo), math.log(hi))))
+
+
 def sample_constants(rng: np.random.Generator) -> SimConstants:
+    # The fitted constants (sim_fit.py FREE) 0.5-2x around the defaults; the
+    # share and the probability are capped at 1 by narrowing the factor.
+    h = SimConstants()
     return SimConstants(
-        proc_net_ms=float(rng.uniform(1.0, 8.0)),
-        proc_sleep_ms=float(rng.uniform(10.0, 40.0)),
+        proc_net_ms=_around(rng, h.proc_net_ms),
+        proc_sleep_ms=_around(rng, h.proc_sleep_ms),
         round_sigma=float(rng.uniform(0.01, 0.08)),
         load_tps=float(rng.uniform(4000.0, 16000.0)),
-        degraded_hops=float(rng.uniform(0.5, 1.5)),
-        degraded_share=float(rng.uniform(0.6, 0.95)),
-        collapse_hops=float(rng.uniform(1.3, 2.1)),
-        tip_prob=float(rng.uniform(0.2, 1.0)),
+        degraded_hops=_around(rng, h.degraded_hops),
+        degraded_share=_around(rng, h.degraded_share, hi=min(2.0, 1.0 / h.degraded_share)),
+        collapse_hops=_around(rng, h.collapse_hops),
+        tip_prob=_around(rng, h.tip_prob, hi=min(2.0, 1.0 / h.tip_prob)),
     )
 
 
@@ -344,8 +368,10 @@ SPEC_PHASES: Tuple[Tuple[float, float, Optional[float]], ...] = (
     (1200.0, 155.0, None),
     (1500.0, 5.0, None),
 )
-SPEC_ORACLE_MS: Tuple[float, ...] = (160.0, 160.0, 460.0, 460.0, 760.0, 160.0)
+SPEC_ORACLE_MS: Tuple[float, ...] = (100.0, 100.0, 300.0, 300.0, 700.0, 100.0)
 SPEC_WARMUP_S = 10.0
+# Episode e applies at warm-up + 20 (e - 1) s, on the phase onsets, as the engine does.
+SPEC_START_S = SPEC_WARMUP_S - FEATURE_S - REPLY_S
 SPEC_EPISODES = int((SPEC_WARMUP_S + SPEC_PHASES[-1][0] + 300.0 + 10.0) // EPISODE_S)
 
 
@@ -544,6 +570,7 @@ def train_prior(
         hold_episodes=np.asarray(int(hold)),
         target_floor=np.asarray(float(target_floor)),
     )
+    arrays.update(SIM_WINDOWS.arrays())
     np.savez(out_path, **arrays)
     return rmse
 
@@ -560,6 +587,7 @@ def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH):
         value = float(kind.split(":", 1)[1])
         return (lambda x: value), None
     if kind == "candidate":
+        check_prior_windows(prior_path, SIM_WINDOWS)
         spec = CONTEXT_SPECS[protocol]
         codec = ContinuousTimeoutActionCodec(protocol, bounds_ms=spec.bounds_ms)
         model = SimReturnGPModel(
@@ -587,7 +615,7 @@ def evaluate_spec(kind: str, constants: SimConstants, seed: int, **kwargs) -> np
     """Per-phase (mean reward after the switch episode, mean p50, median timeout,
     mean reward over the whole phase including its switch episode) of one policy
     on the spec."""
-    sim = HotstuffSim(constants, spec_schedule(), seed=seed, start_offset_s=0.2)
+    sim = HotstuffSim(constants, spec_schedule(), seed=seed, start_offset_s=SPEC_START_S)
     if kind == "oracle":
         def predict(x: np.ndarray) -> float:
             idx, _ = sim.phase_at(sim.episode_start_s + FEATURE_S + REPLY_S)
@@ -637,7 +665,7 @@ def pretrain_adapter():
         simulator="hotstuff_sim",
         training_run=lambda seed: training_sim(np.random.default_rng(seed), seed),
         spec_run=lambda seed: (
-            HotstuffSim(SimConstants(), spec_schedule(), seed=seed, start_offset_s=0.2),
+            HotstuffSim(SimConstants(), spec_schedule(), seed=seed, start_offset_s=SPEC_START_S),
             SPEC_EPISODES,
         ),
         run_agent=run_agent,
@@ -669,7 +697,7 @@ def main() -> None:
     e = sub.add_parser("eval", help="compare policies on the spec schedule in simulation")
     e.add_argument("--seeds", type=int, default=10)
     e.add_argument("--prior", default=DEFAULT_PRIOR_PATH)
-    e.add_argument("--rungs", default="160,460,760", help="the fixed timeouts to compare")
+    e.add_argument("--rungs", default="100,300,700", help="the fixed timeouts to compare")
     e.add_argument("--randomize", action="store_true", help="random constants per seed")
     e.add_argument("--reward-design", default="reward_tps_latency")
     args = parser.parse_args()

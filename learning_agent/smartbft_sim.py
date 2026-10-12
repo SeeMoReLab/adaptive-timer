@@ -40,8 +40,8 @@ nodes in step:
   deposed again after delivering what it got through. A view whose first
   decision misses ``T`` delivers nothing.
 
-Episodes follow the wall-clock learning windows of run_smartbft.sh: 10 s
-features, 2 s reply wait (apply at its end), 3 s warm-up, 5 s reward. Reports
+Episodes follow the wall-clock learning windows of run_smartbft.sh: 7 s
+features, 2 s reply wait (apply at its end), 4 s warm-up, 7 s reward. Reports
 carry the 16 SmartbftReport fields with ``learning_metrics.go``'s
 definitions: latency from the replica's own submit mark to the decision, over
 delivered requests; throughput over the window; regency and leader changes
@@ -51,15 +51,15 @@ between consecutive decisions in the window; ``view_change_count`` one per
 ``timeout_ms`` the applied T: the one in force when the window opened,
 updated by each decision.
 
-Constants the mechanics do not fix are drawn per simulated run from ranges
-wider than the real setup (sample_constants): base one-way delay 1-12 ms,
-jitter 0-30% of each hop, 256-1024 terminals, client turnaround 2-30 ms,
-per-decision processing 3-40 ms plus 0-0.1 ms per request, proposal transfer
-0-0.05 ms per request plus 0-0.002 ms per request per ms of link delay,
-lognormal spread 0-0.4, view-change processing 5-300 ms, new leader's first
-proposal 0-400 ms late. Phases (sample_phase): proposal delay log-uniform
-50 ms-2 s re-pinned every 30-120 s, extra link delay 10-300 ms, 40-400 s
-apart. The spec phases (300/600 ms, 50/150 ms) sit inside those ranges and
+Constants the mechanics do not fix are drawn per simulated run
+(sample_constants): base one-way delay 1-12 ms, jitter 0-30% of each hop and
+256-1024 terminals from ranges wider than the real setup; the fitted
+constants (client turnaround, per-decision processing and its per-request
+part, proposal transfer per request and per request per ms of link delay,
+lognormal spread, view-change processing, new leader's first proposal)
+log-uniformly 0.5-2x around the SimConstants defaults. Phases
+(sample_phase): proposal delay log-uniform 50 ms-2 s re-pinned every
+30-120 s, extra link delay 10-300 ms, 40-400 s apart. The spec phases (300/600 ms, 50/150 ms) sit inside those ranges and
 are used only to evaluate policies.
 """
 
@@ -74,21 +74,26 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from prior_windows import PriorWindows, check_prior_windows
+
 N_NODES = 4
 BATCH_MAX = 256  # RequestBatchMaxCount
 BATCH_INTERVAL_MS = 50.0  # RequestBatchMaxInterval
-FEATURE_S = 10.0
+FEATURE_S = 7.0
 REPLY_S = 2.0
-WARMUP_S = 3.0
-REWARD_S = 5.0
+WARMUP_S = 4.0
+REWARD_S = 7.0
 EPISODE_S = FEATURE_S + REPLY_S + WARMUP_S + REWARD_S
+SIM_WINDOWS = PriorWindows.from_seconds(FEATURE_S, REPLY_S, WARMUP_S, REWARD_S)
 
 
 @dataclass
+# Fitted defaults: blind best-by-loss candidate i=251 (loss 10.399) of fit7_smartbft_blind.jsonl, 7/2/4/7 calibration (blindall, 2026-10-09).
 class SimConstants:
     """Defaults are an evaluation point eyeballed from the base phase (about
-    11,000 tps at 35 ms), used only to pre-screen policies; training draws
-    every field from sample_constants."""
+    11,000 tps at 35 ms), used to pre-screen policies; training draws the
+    fitted fields 0.5-2x around them and the rest from wide ranges
+    (sample_constants)."""
 
     base_delay_ms: float = 5.0
     # netem jitter as a fraction of each hop's delay (apply_network_failures
@@ -97,20 +102,20 @@ class SimConstants:
     terminals: int = 512
     # Reply hop plus the client's own turnaround before the next request of a
     # terminal reaches the replicas.
-    client_turnaround_ms: float = 8.0
+    client_turnaround_ms: float = 9.956832
     # Leader batch assembly, verification and execution per decision.
-    proc_ms: float = 5.0
-    proc_per_tx_ms: float = 0.02
+    proc_ms: float = 3.362654
+    proc_per_tx_ms: float = 0.011038
     # The 44 KB proposal takes longer to arrive than a vote, and more so on a
     # slow link (window-limited, so it scales with the RTT).
-    transfer_per_tx_ms: float = 0.005
-    transfer_per_tx_per_delay_ms: float = 0.0002
+    transfer_per_tx_ms: float = 0.006563
+    transfer_per_tx_per_delay_ms: float = 0.000864
     # Per-decision lognormal spread of processing and transfer.
-    decision_sigma: float = 0.1
+    decision_sigma: float = 0.310334
     # ViewData collection, NewView, install; a sync when a node is behind.
-    vc_proc_ms: float = 20.0
+    vc_proc_ms: float = 124.293797
     # The new leader's first proposal after install.
-    new_view_first_ms: float = 20.0
+    new_view_first_ms: float = 58.417096
 
 
 @dataclass
@@ -395,7 +400,9 @@ class SmartbftSim:
         wa = _Window(s, s + FEATURE_S, timeout_ms=self.timeout_ms)
         self._advance_to((s + FEATURE_S) * 1000.0, [wa])
         features = wa.report()
-        phase_idx, _ = self.phase_at(s + FEATURE_S)
+        # The phase in force at the apply instant, as main.py labels an episode,
+        # so the onset episode carries the phase its reward window measures.
+        phase_idx, _ = self.phase_at(s + FEATURE_S + REPLY_S)
         new_timeout = float(choose(features))
         # Applied at the end of the reply wait, restarting every pending timer.
         self._pending_apply = ((s + FEATURE_S + REPLY_S) * 1000.0, new_timeout)
@@ -411,19 +418,29 @@ class SmartbftSim:
 # --- Randomized environments -------------------------------------------------
 
 
+def _around(rng: np.random.Generator, host: float, lo: float = 0.5, hi: float = 2.0) -> float:
+    """A host constant scaled by a log-uniform factor in [lo, hi]."""
+    if host <= 0:
+        raise ValueError(f"cannot draw around a non-positive default {host}")
+    return float(host * math.exp(rng.uniform(math.log(lo), math.log(hi))))
+
+
 def sample_constants(rng: np.random.Generator) -> SimConstants:
+    # The fitted constants (blindall/smartbft/fit/sim_fit.py FREE) 0.5-2x
+    # around the installed defaults; base delay, jitter and terminals stay wide.
+    h = SimConstants()
     return SimConstants(
         base_delay_ms=float(rng.uniform(1.0, 12.0)),
         jitter_ratio=float(rng.uniform(0.0, 0.3)),
         terminals=int(rng.integers(256, 1025)),
-        client_turnaround_ms=float(rng.uniform(2.0, 30.0)),
-        proc_ms=float(rng.uniform(3.0, 40.0)),
-        proc_per_tx_ms=float(rng.uniform(0.0, 0.1)),
-        transfer_per_tx_ms=float(rng.uniform(0.0, 0.05)),
-        transfer_per_tx_per_delay_ms=float(rng.uniform(0.0, 0.002)),
-        decision_sigma=float(rng.uniform(0.0, 0.4)),
-        vc_proc_ms=float(rng.uniform(5.0, 300.0)),
-        new_view_first_ms=float(rng.uniform(0.0, 400.0)),
+        client_turnaround_ms=_around(rng, h.client_turnaround_ms),
+        proc_ms=_around(rng, h.proc_ms),
+        proc_per_tx_ms=_around(rng, h.proc_per_tx_ms),
+        transfer_per_tx_ms=_around(rng, h.transfer_per_tx_ms),
+        transfer_per_tx_per_delay_ms=_around(rng, h.transfer_per_tx_per_delay_ms),
+        decision_sigma=_around(rng, h.decision_sigma),
+        vc_proc_ms=_around(rng, h.vc_proc_ms),
+        new_view_first_ms=_around(rng, h.new_view_first_ms),
     )
 
 
@@ -508,6 +525,8 @@ def episode_reward(report: Dict[str, float]) -> float:
 
 
 WARMUP_PHASE_S = 10.0  # failure_spec warmUpTime: decisions before it are phase -1
+# Episode e applies at warm-up + 20(e-1), on the phase onsets, as on the engine.
+SPEC_START_OFFSET_S = WARMUP_PHASE_S - FEATURE_S - REPLY_S
 
 
 def run_agent(
@@ -648,6 +667,7 @@ def train_prior(
         reward_design=np.asarray(design),
         target_floor=np.asarray(float(target_floor)),
     )
+    arrays.update(SIM_WINDOWS.arrays())
     np.savez(out_path, **arrays)
     return rmse
 
@@ -661,7 +681,6 @@ DEFAULT_PRIOR_PATH = context_spec(agent_pb2.PROTOCOL_SMARTBFT).prior_path
 def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
     """(predict, update) closures around the real model classes, built as main.serve does."""
     from continuous_bandit import (
-        ContinuousHeuristicTimeoutModel,
         ContinuousTimeoutActionCodec,
         SimPriorGPModel,
     )
@@ -675,17 +694,10 @@ def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
 
     protocol = agent_pb2.PROTOCOL_SMARTBFT
     if kind == "heuristic":
-        codec = ContinuousTimeoutActionCodec(protocol)
-        arms = get_timeout_values_ms(protocol)
-        model = ContinuousHeuristicTimeoutModel(
-            action_codec=codec,
-            n_features=len(names),
-            latency_index=names.index("avg_consensus_latency_ms"),
-            instances_index=names.index("total_consensus_instances"),
-            multiplier=1.0,
-            clamp_ms=(min(arms), max(arms)),
-            initial_timeout_ms=sorted(arms)[len(arms) // 2],
-        )
+        from model_builder import build_model
+
+        built = build_model(protocol, "continuous_heuristic")
+        model, codec = built.model, built.action_codec
     elif kind == "discrete_linucb":
         codec = ProtocolTimeoutActionCodec(protocol)
         latency_index, instances_index = latency_feature_indices(names)
@@ -701,6 +713,7 @@ def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
         codec = ContinuousTimeoutActionCodec(protocol, bounds_ms=context_spec(protocol).bounds_ms)
         from reward_utils import get_reward_design
 
+        check_prior_windows(prior_path, SIM_WINDOWS)
         model = SimPriorGPModel(
             action_codec=codec,
             field_names=names,
@@ -733,10 +746,7 @@ STRICT_LATENCY_PHASES = (1, 2, 4)  # runs/2026-09-29-continuous-port/spec.md, pr
 def evaluate_spec(kind: str, constants: SimConstants, seed: int, **kwargs) -> np.ndarray:
     """Per-phase (tps, mean latency, median timeout) of one policy on the spec."""
     predict, update = make_policy(kind, **kwargs)
-    # Where the first decision falls relative to the injection clock is not
-    # measured for SmartBFT; 5 s puts every phase switch inside a feature
-    # window. The judge drops each phase's first and last episode anyway.
-    sim = SmartbftSim(constants, spec_schedule(), seed=seed, start_offset_s=5.0)
+    sim = SmartbftSim(constants, spec_schedule(), seed=seed, start_offset_s=SPEC_START_OFFSET_S)
     rows = run_agent(sim, 105, predict, update)
     out = np.zeros((N_SPEC_PHASES, 3))
     for ph in range(N_SPEC_PHASES):
@@ -767,7 +777,8 @@ def pretrain_adapter():
         simulator="smartbft_sim",
         training_run=lambda seed: training_sim(np.random.default_rng(seed), seed),
         spec_run=lambda seed: (
-            SmartbftSim(SimConstants(), spec_schedule(), seed=seed, start_offset_s=5.0), 105),
+            SmartbftSim(SimConstants(), spec_schedule(), seed=seed,
+                        start_offset_s=SPEC_START_OFFSET_S), 105),
         run_agent=run_agent,
         # A training schedule's phase 0 is a real phase, so run_agent already
         # updates every decision from 10 s.

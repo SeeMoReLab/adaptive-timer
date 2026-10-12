@@ -49,18 +49,20 @@ proposing on a fixed cadence; one batch is one consensus instance:
   it carry an extra ``spike_ms``, which is what lets a rung just above the
   delayed latency escape once per tick.
 
-Episodes follow the wall-clock learning windows in lib_bedrock.sh: 10 s
-features, 2 s reply wait (applied at the deadline), 3 s warm-up, 5 s reward.
-Reports carry the 16 PbftReport fields as ``AgentClient::MetricsWindow``
-fills them on replica 0: one latency and batch-size sample per executed
-batch, inter-commit gaps between consecutive executions, view changes as
+Episodes follow the wall-clock learning windows in lib_bedrock.sh: 7 s
+features, 2 s reply wait (applied at the deadline), 4 s warm-up, 7 s reward.
+Reports carry the 16 PbftReport fields the models read, as
+``AgentClient::MetricsWindow`` fills them on replica 0: one latency and
+batch-size sample per executed batch, nearest-rank percentiles, inter-commit
+gaps between consecutive executions in the window, view changes as
 started (no-progress when nothing committed since the last), leader and
 regency changes as views installed, and the election timeout in effect.
 
-Constants the mechanics do not fix (link delay, processing costs, the byte
-cap, the view-change overhead, the knee, the load, a start-up backlog) are
-drawn per simulated run from ranges wider than the calibration host, so the
-prior learned from it has to hold across them.
+Constants the mechanics do not fix are drawn per simulated run: the fitted
+ones (processing, the byte cap, the delayed-leader shape) within 0.5-2 x
+their SimConstants defaults, the rest (link delay, the view-change overhead,
+the load, a start-up backlog) from ranges wider than the calibration host,
+so the prior learned from it has to hold across them.
 """
 
 from __future__ import annotations
@@ -76,6 +78,7 @@ import numpy as np
 
 import agent_pb2
 from continuous_bandit import CONTEXT_SPECS
+from prior_windows import PriorWindows, check_prior_windows
 
 PROPOSAL_INTERVAL_MS = 100.0
 MAX_INFLIGHT_BATCHES = 16
@@ -85,16 +88,18 @@ MAX_ELECTION_BACKOFF_MS = 30000.0
 # config.pbft.yaml timers.view_change_ms: the election timeout before the
 # first decision.
 DEFAULT_ELECTION_TIMEOUT_MS = 8000.0
-FEATURE_S = 10.0
+FEATURE_S = 7.0
 REPLY_S = 2.0
-WARMUP_S = 3.0
-REWARD_S = 5.0
+WARMUP_S = 4.0
+REWARD_S = 7.0
 EPISODE_S = FEATURE_S + REPLY_S + WARMUP_S + REWARD_S
+SIM_WINDOWS = PriorWindows.from_seconds(FEATURE_S, REPLY_S, WARMUP_S, REWARD_S)
 
 DEFAULT_PRIOR_PATH = CONTEXT_SPECS[agent_pb2.PROTOCOL_PBFT].prior_path
 
 
 @dataclass
+# Fitted defaults: blind best-by-loss candidate i=763 (loss 1.573) of fit7m_pbft_blind.jsonl, 7/2/4/7 calibration, replica-median targets (blindall, 2026-10-10).
 class SimConstants:
     """Defaults are the calibration setup of adaptive_timers.MD (5 ms base,
     20,000 req/s), used only to pre-screen policies; with them the healthy p50
@@ -106,13 +111,13 @@ class SimConstants:
     jitter_ratio: float = 0.0
     # Engine time per batch across the three hops (admission, digest,
     # signatures, execution) and its lognormal spread; p95 sits ~20 ms over p50.
-    proc_ms: float = 45.0
-    proc_sigma: float = 0.2
-    proc_per_tx_us: float = 4.0
+    proc_ms: float = 2.156797
+    proc_sigma: float = 0.057178
+    proc_per_tx_us: float = 1.268588
     load_tps: float = 20000.0
     # Requests per batch where the 512 KiB budget binds (5,500 at 40k in
     # adaptive_timers.MD); the count limit is 8192.
-    batch_cap: int = 5500
+    batch_cap: int = 7524
     # Age of a batch's oldest request at the tick, in proposal intervals: 1
     # when the client's lanes spread arrivals over the interval.
     batching_wait: float = 1.0
@@ -120,11 +125,11 @@ class SimConstants:
     # verification, body fetches; one maintenance interval by default.
     vc_overhead_ms: float = 250.0
     vc_sigma: float = 0.2
-    knee_ms: float = 175.0
-    excess_factor: float = 1.2
-    excess_sigma: float = 0.35
-    spike_ms: float = 160.0
-    spike_batches: int = 2
+    knee_ms: float = 209.78361
+    excess_factor: float = 1.060142
+    excess_sigma: float = 0.410971
+    spike_ms: float = 272.09495
+    spike_batches: int = 4
     # Requests already queued when the run starts: the ramp into an empty
     # pipeline overshoots pending, and any timeout elects while it drains.
     initial_backlog: int = 0
@@ -156,6 +161,8 @@ class _Window:
     lat: List[float] = field(default_factory=list)
     batch: List[float] = field(default_factory=list)
     gap: List[float] = field(default_factory=list)
+    # Gaps reset at every window (AgentClient.cpp): n commits give n-1 gaps.
+    last_exec_ms: Optional[float] = None
     view_changes: int = 0
     no_progress: int = 0
     new_views: int = 0
@@ -168,8 +175,11 @@ class _Window:
             return float(np.mean(v)) if v else 0.0
 
         def pct(v, q):
-            # Linear interpolation between ranks, as AgentClient.cpp percentile.
-            return float(np.percentile(v, q)) if v else 0.0
+            # Nearest rank, sorted[ceil(p n) - 1], as AgentClient.cpp percentile.
+            if not v:
+                return 0.0
+            ordered = sorted(v)
+            return float(ordered[max(0, math.ceil(q / 100.0 * len(ordered)) - 1)])
 
         elapsed = self.end_s - self.start_s
         txs = float(round(self.txs))
@@ -387,8 +397,9 @@ class PbftSim:
                     w.instances += 1
                     w.lat.append(t - b.oldest_ms)
                     w.batch.append(b.size)
-                    if self.last_exec_ms is not None:
-                        w.gap.append(t - self.last_exec_ms)
+                    if w.last_exec_ms is not None:
+                        w.gap.append(t - w.last_exec_ms)
+                    w.last_exec_ms = t
         # The backoff restores only on evidence the timeout is adequate: the
         # watched entry (this batch carries the oldest) completed before a
         # deadline granted from arrival, not floored. Draining the queue
@@ -451,12 +462,14 @@ class PbftSim:
     ) -> Tuple[Dict[str, float], float, Dict[str, float], int]:
         """Run one episode; ``choose(features) -> timeout_ms`` is called at the
         feature deadline. Returns (features, timeout, reward report, phase index
-        at decision time)."""
+        at the apply instant)."""
         s = self.episode_start_s
         wa = _Window(s, s + FEATURE_S)
         self._advance_to((s + FEATURE_S) * 1000.0, [wa])
         features = wa.report(self.timeout_ms)
-        phase_idx, _ = self.phase_at(s + FEATURE_S)
+        # main.py labels an episode with the phase at its apply instant, so the
+        # onset episode carries the phase its reward window measures.
+        phase_idx, _ = self.phase_at(s + FEATURE_S + REPLY_S)
         new_timeout = float(choose(features))
         # Applied at the end of the reply wait (applyAgentTimeouts): instances
         # in flight keep going; a lower timeout floors the deadlines at the
@@ -474,23 +487,36 @@ class PbftSim:
 # --- Randomized environments -------------------------------------------------
 
 
+def _around(rng: np.random.Generator, host: float, lo: float = 0.5, hi: float = 2.0) -> float:
+    """A host constant scaled by a log-uniform factor in [lo, hi]."""
+    if host <= 0:
+        raise ValueError(f"cannot draw around a non-positive default {host}")
+    return float(host * math.exp(rng.uniform(math.log(lo), math.log(hi))))
+
+
 def sample_constants(rng: np.random.Generator) -> SimConstants:
+    """Per-run physics. The fitted constants (sim_fit.py FREE: processing, the
+    byte cap, the delayed-leader shape) are drawn within 0.5-2 x their
+    SimConstants defaults; the excess factor scales its excess over D, since
+    the hold never costs less than D, and the byte cap stays within the count
+    limit. Every other field keeps its wide draw."""
+    h = SimConstants()
     return SimConstants(
         base_delay_ms=float(rng.uniform(2.0, 10.0)),
         jitter_ratio=float(rng.uniform(0.0, 0.1)),
-        proc_ms=float(rng.uniform(0.0, 70.0)),
-        proc_sigma=float(rng.uniform(0.05, 0.3)),
-        proc_per_tx_us=float(rng.uniform(0.0, 10.0)),
+        proc_ms=_around(rng, h.proc_ms),
+        proc_sigma=_around(rng, h.proc_sigma),
+        proc_per_tx_us=_around(rng, h.proc_per_tx_us),
         load_tps=float(rng.uniform(8000.0, 26000.0)),
-        batch_cap=int(rng.integers(4000, BATCH_MAX_REQUESTS + 1)),
+        batch_cap=int(round(_around(rng, h.batch_cap, hi=min(2.0, BATCH_MAX_REQUESTS / h.batch_cap)))),
         batching_wait=float(rng.uniform(0.6, 1.0)),
         vc_overhead_ms=float(math.exp(rng.uniform(math.log(50.0), math.log(1500.0)))),
         vc_sigma=float(rng.uniform(0.0, 0.5)),
-        knee_ms=float(rng.uniform(120.0, 250.0)),
-        excess_factor=float(rng.uniform(1.0, 1.8)),
-        excess_sigma=float(rng.uniform(0.0, 0.8)),
-        spike_ms=float(rng.uniform(50.0, 450.0)),
-        spike_batches=int(rng.integers(1, 5)),
+        knee_ms=_around(rng, h.knee_ms),
+        excess_factor=1.0 + _around(rng, h.excess_factor - 1.0),
+        excess_sigma=_around(rng, h.excess_sigma),
+        spike_ms=_around(rng, h.spike_ms),
+        spike_batches=max(1, int(round(_around(rng, h.spike_batches)))),
         initial_backlog=int(rng.integers(0, MAX_PENDING_REQUESTS + 1)) if rng.random() < 0.5 else 0,
     )
 
@@ -581,6 +607,8 @@ def episode_reward(report: Dict[str, float]) -> float:
 
 
 WARMUP_PHASE_S = 10.0  # failure_spec warmUpTime: decisions before it are phase -1
+# Spec runs start the episode clock so that episode e applies at warm-up + 20(e-1), on the phase onsets.
+SPEC_START_OFFSET_S = WARMUP_PHASE_S - FEATURE_S - REPLY_S
 
 
 def run_agent(
@@ -722,6 +750,7 @@ def train_prior(
         reward_design=np.asarray(design),
         target_floor=np.asarray(float(target_floor)),
     )
+    arrays.update(SIM_WINDOWS.arrays())
     np.savez(out_path, **arrays)
     return rmse
 
@@ -729,7 +758,6 @@ def train_prior(
 def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
     """(predict, update) closures around the real model classes, built as main.serve does."""
     from continuous_bandit import (
-        ContinuousHeuristicTimeoutModel,
         ContinuousTimeoutActionCodec,
         SimPriorGPModel,
     )
@@ -744,16 +772,10 @@ def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
     protocol = agent_pb2.PROTOCOL_PBFT
     arms = get_timeout_values_ms(protocol)
     if kind == "heuristic":
-        codec = ContinuousTimeoutActionCodec(protocol)
-        model = ContinuousHeuristicTimeoutModel(
-            action_codec=codec,
-            n_features=len(names),
-            latency_index=names.index("avg_consensus_latency_ms"),
-            instances_index=names.index("total_consensus_instances"),
-            multiplier=1.0,
-            clamp_ms=(min(arms), max(arms)),
-            initial_timeout_ms=sorted(arms)[len(arms) // 2],
-        )
+        from model_builder import build_model
+
+        built = build_model(protocol, "continuous_heuristic")
+        model, codec = built.model, built.action_codec
     elif kind == "discrete_linucb":
         codec = ProtocolTimeoutActionCodec(protocol)
         latency_index, instances_index = latency_feature_indices(names)
@@ -769,6 +791,7 @@ def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
         codec = ContinuousTimeoutActionCodec(protocol, bounds_ms=CONTEXT_SPECS[protocol].bounds_ms)
         from reward_utils import get_reward_design
 
+        check_prior_windows(prior_path, SIM_WINDOWS)
         model = SimPriorGPModel(
             action_codec=codec,
             field_names=names,
@@ -796,10 +819,7 @@ STRICT_PHASES = (1, 2, 4)  # runs/2026-09-29-continuous-port/spec.md rule: escap
 def evaluate_spec(kind: str, constants: SimConstants, seed: int, **kwargs) -> np.ndarray:
     """Per-phase (tps, mean latency, median timeout) of one policy on the spec."""
     predict, update = make_policy(kind, **kwargs)
-    # The first batch executes about 0.2 s after the client starts, so the
-    # episode clock (AgentClient firstSampleTime_) leads the spec clock by
-    # that much and every phase switch lands just before a decision.
-    sim = PbftSim(constants, spec_schedule(), seed=seed, start_offset_s=0.2)
+    sim = PbftSim(constants, spec_schedule(), seed=seed, start_offset_s=SPEC_START_OFFSET_S)
     rows = run_agent(sim, 105, predict, update)
     out = np.zeros((7, 3))
     for ph in range(7):
@@ -830,7 +850,8 @@ def pretrain_adapter():
         simulator="pbft_sim",
         training_run=lambda seed: training_sim(np.random.default_rng(seed), seed),
         spec_run=lambda seed: (
-            PbftSim(SimConstants(), spec_schedule(), seed=seed, start_offset_s=0.2), 105),
+            PbftSim(SimConstants(), spec_schedule(), seed=seed,
+                    start_offset_s=SPEC_START_OFFSET_S), 105),
         run_agent=run_agent,
         # A training schedule's phase 0 is a real phase, so run_agent already
         # updates every decision from 10 s.

@@ -1373,6 +1373,18 @@ def main() -> int:
         help="Do not prefix tc commands with sudo when not root.",
     )
     parser.add_argument(
+        "--pre-apply-base",
+        action="store_true",
+        help=(
+            "Install the base delay (globalNetworkDelay, with its jitter) on every peer edge "
+            "at launch, before waiting for the first phase, and then update the rules in place. "
+            "Start the applier before the replicas so their TCP connections are set up at the "
+            "real base RTT: Linux keeps the minimum RTT seen for tcp_min_rtt_wlen (300 s), and "
+            "RACK's reordering window is a quarter of it, so a connection set up on the bare "
+            "veth (RTT ~0.006 ms) reads jittered long delays as loss for its first 300 s."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print tc commands without executing them.",
@@ -1399,6 +1411,28 @@ def main() -> int:
         use_sudo=use_sudo,
         netns=args.netns,
     )
+    tc_initialized = False
+    if args.pre_apply_base:
+        base_rules = [
+            IpRule(dst_ip=r.dst_ip, dst_replicas=r.dst_replicas,
+                   fault=BurstDelay(delay_ms=0.0, burst_duration_ms=0.0, burst_interval_ms=0.0),
+                   class_id=r.class_id)
+            for r in _build_ip_rules(phases[0], args.replica_id, hosts)
+        ]
+        tc_initialized = _configure_phase_tc(
+            rules=base_rules,
+            base_delay_ms=base_delay_ms,
+            initialized=False,
+            interface=interface,
+            tc_bin=args.tc_bin,
+            link_rate=args.link_rate,
+            netem_limit=args.netem_limit,
+            jitter_ratio=jitter_ratio,
+            use_sudo=use_sudo,
+            dry_run=args.dry_run,
+            netns=args.netns,
+        )
+        _log(f"Pre-applied base delay {base_delay_ms:g} ms on {interface} to {len(base_rules)} peer edge(s) before the first phase.")
     start_mono = _compute_start_mono(args.start_unix_ms)
 
     _log(
@@ -1408,7 +1442,6 @@ def main() -> int:
         f"base_delay_ms={base_delay_ms:g}, jitter_ratio={jitter_ratio:g}, phases={len(phases)})"
     )
 
-    tc_initialized = False
     for idx, phase in enumerate(phases):
         target_mono = start_mono + warmup_s + phase.at_time_s
         _sleep_until(target_mono)

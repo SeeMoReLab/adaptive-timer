@@ -23,27 +23,21 @@ import agent_pb2
 import agent_pb2_grpc
 from aggregator import BaseAggregator, MedianAggregator, WeightedMedianAggregator
 from continuous_bandit import (
-    DEFAULT_PROPORTIONAL_K,
-    DEFAULT_HEURISTIC_QUANTILE,
-    DEFAULT_HEURISTIC_WINDOW,
     DEFAULT_WAIT_DIVISOR,
+    heuristic_spec,
 )
-from latency_floor import (
-    DEFAULT_LATENCY_FLOOR_MULTIPLIER,
-    DEFAULT_LATENCY_FLOOR_QUANTILE,
-    DEFAULT_LATENCY_FLOOR_WINDOW,
-    LatencyFloor,
-)
+from latency_floor import LatencyFloor
 from model_builder import PRETRAINABLE_MODEL_TYPES, build_model
+from prior_windows import PriorWindows
 from models import (
     ActionCodec,
     FeatureExtractor,
     ProtocolReportFeatureExtractor,
     ScheduledTimeoutModel,
     TensorModel,
-    get_report_feature_field_names,
+    get_report_field_names,
     reject_renamed_model_type,
-    report_to_feature_values,
+    report_to_values,
 )
 from reward_utils import (
     DEFAULT_REWARD_DESIGN,
@@ -373,13 +367,11 @@ def _fill_empty_window_latency(
         empty = empty or float(state.p50_consensus_latency_ms) <= 0.0
     if not empty:
         return False
+    # Every report carries all four consensus-latency statistics.
     state.avg_consensus_latency_ms = float(window_ms)
     state.p50_consensus_latency_ms = float(window_ms)
-    # Tendermint reports a p90 where the others report a p95.
-    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
-        state.p90_consensus_latency_ms = float(window_ms)
-    else:
-        state.p95_consensus_latency_ms = float(window_ms)
+    state.p90_consensus_latency_ms = float(window_ms)
+    state.p95_consensus_latency_ms = float(window_ms)
     return True
 
 
@@ -707,6 +699,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         injection_start_mono: float,
         injection_warmup_s: float,
         empty_window_latency_ms: Tuple[int, int],
+        episode_ms: int,
     ):
         self._protocol = int(protocol)
         self.node_id = node_id
@@ -716,6 +709,10 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 f"empty_window_latency_ms must be two positive lengths, got {empty_window_latency_ms}"
             )
         self._empty_window_latency_ms = empty_window_latency_ms
+        if episode_ms <= 0:
+            raise ValueError(f"episode_ms must be > 0, got {episode_ms}")
+        # The replicas' episode period: episode e applies at warm-up + P*(e-1).
+        self._episode_ms = int(episode_ms)
         self._collect_wait_s = collect_wait_s
         self._sharing = sharing
         self._model = model
@@ -786,8 +783,10 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._timeouts_by_episode: Dict[int, TimeoutDecision] = {}
         self._state_by_episode: Dict[int, object] = {}
         self._phase_by_episode: Dict[int, int] = {}
+        self._warmup_by_episode: Dict[int, bool] = {}
         self._pending_rewards_by_episode: Dict[int, Tuple[int, object, object]] = {}
-        self._report_feature_field_names = get_report_feature_field_names(self._protocol)
+        # Every report field (the descriptor), not only the model's inputs.
+        self._report_field_names = get_report_field_names(self._protocol)
         self._dataset_timeout_field_names = _dataset_timeout_field_names(self._protocol)
         self._dataset_handle = None
         self._dataset_writer = None
@@ -804,11 +803,11 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             "report_node_id",
             *(
                 f"feature_{field_name}"
-                for field_name in self._report_feature_field_names
+                for field_name in self._report_field_names
             ),
             *(
                 f"reward_{field_name}"
-                for field_name in self._report_feature_field_names
+                for field_name in self._report_field_names
             ),
             *self._dataset_timeout_field_names,
         ]
@@ -897,10 +896,12 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         )
 
     def _current_injection_phase_index_locked(self) -> int:
+        elapsed_s = max(0.0, time.monotonic() - self._injection_start_mono)
+        return self._injection_phase_index_at(elapsed_s - self._injection_warmup_s)
+
+    def _injection_phase_index_at(self, elapsed_injection_s: float) -> int:
         if not self._agent_injection_schedule:
             return -1
-        elapsed_s = max(0.0, time.monotonic() - self._injection_start_mono)
-        elapsed_injection_s = elapsed_s - self._injection_warmup_s
         if elapsed_injection_s < 0.0:
             return -1
         active_index = -1
@@ -911,8 +912,27 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 break
         return active_index
 
+    def _dirty_phase_latencies(
+        self, dirty_report: object, state: object, phases: Tuple[str, ...]
+    ) -> None:
+        """Dirty each phase's avg and p50/p90/p95, keeping the percentiles ordered."""
+        for phase in phases:
+            avg_field = f"{phase}_latency_ms"
+            setattr(
+                dirty_report,
+                avg_field,
+                float(max(0.0, float(getattr(state, avg_field)) * self._rng.uniform(0.4, 2.0))),
+            )
+            previous = 0.0
+            for prefix, high in (("p50", 2.1), ("p90", 2.2), ("p95", 2.2)):
+                field = f"{prefix}_{phase}_latency_ms"
+                previous = float(
+                    max(previous, float(getattr(state, field)) * self._rng.uniform(0.4, high))
+                )
+                setattr(dirty_report, field, previous)
+
     def _dirty_pbft_state(self, state: object) -> object:
-        """Dirty a PbftReport or SmartbftReport; both share the same layout."""
+        """Dirty the layout PbftReport, SbftReport and SmartbftReport share (no phases)."""
         baseline_total_tx = max(int(state.total_transactions), 1)
         baseline_total_cons = max(int(state.total_consensus_instances), 1)
         dirty_report = state.__class__()
@@ -928,9 +948,15 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 float(state.p50_consensus_latency_ms) * self._rng.uniform(0.4, 2.1),
             )
         )
-        dirty_report.p95_consensus_latency_ms = float(
+        dirty_report.p90_consensus_latency_ms = float(
             max(
                 dirty_report.p50_consensus_latency_ms,
+                float(state.p90_consensus_latency_ms) * self._rng.uniform(0.4, 2.2),
+            )
+        )
+        dirty_report.p95_consensus_latency_ms = float(
+            max(
+                dirty_report.p90_consensus_latency_ms,
                 float(state.p95_consensus_latency_ms) * self._rng.uniform(0.4, 2.2),
             )
         )
@@ -940,10 +966,22 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         dirty_report.avg_batch_size = float(
             max(0.0, float(state.avg_batch_size) * self._rng.uniform(0.4, 1.6))
         )
-        dirty_report.p95_batch_size = float(
+        dirty_report.p50_batch_size = float(
             max(
                 float(dirty_report.avg_batch_size),
-                float(state.p95_batch_size) * self._rng.uniform(0.4, 1.8),
+                float(state.p50_batch_size) * self._rng.uniform(0.4, 1.8),
+            )
+        )
+        dirty_report.p90_batch_size = float(
+            max(
+                float(dirty_report.p50_batch_size),
+                float(state.p90_batch_size) * self._rng.uniform(0.4, 2.0),
+            )
+        )
+        dirty_report.p95_batch_size = float(
+            max(
+                float(dirty_report.p90_batch_size),
+                float(state.p95_batch_size) * self._rng.uniform(0.4, 2.2),
             )
         )
         dirty_report.leader_change_count = self._rng.randint(
@@ -962,9 +1000,15 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 float(state.p50_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.1),
             )
         )
-        dirty_report.p95_inter_commit_gap_ms = float(
+        dirty_report.p90_inter_commit_gap_ms = float(
             max(
                 dirty_report.p50_inter_commit_gap_ms,
+                float(state.p90_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.2),
+            )
+        )
+        dirty_report.p95_inter_commit_gap_ms = float(
+            max(
+                dirty_report.p90_inter_commit_gap_ms,
                 float(state.p95_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.2),
             )
         )
@@ -979,15 +1023,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
     def _dirty_sbft_state(self, state: agent_pb2.SbftReport) -> agent_pb2.SbftReport:
         """Dirty an SbftReport: the shared PBFT layout plus the SBFT extras."""
         dirty_report = self._dirty_pbft_state(state)
-        dirty_report.pre_prepare_latency_ms = float(
-            max(0.0, float(state.pre_prepare_latency_ms) * self._rng.uniform(0.4, 2.0))
-        )
-        dirty_report.prepare_latency_ms = float(
-            max(0.0, float(state.prepare_latency_ms) * self._rng.uniform(0.4, 2.0))
-        )
-        dirty_report.commit_latency_ms = float(
-            max(0.0, float(state.commit_latency_ms) * self._rng.uniform(0.4, 2.0))
-        )
+        self._dirty_phase_latencies(dirty_report, state, ("pre_prepare", "prepare", "commit"))
         dirty_report.slow_path_timeout_ms = max(
             0, int(round(float(state.slow_path_timeout_ms) * self._rng.uniform(0.8, 1.2)))
         )
@@ -1023,6 +1059,12 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 float(state.p90_consensus_latency_ms) * self._rng.uniform(0.4, 2.4),
             )
         )
+        dirty_report.p95_consensus_latency_ms = float(
+            max(
+                dirty_report.p90_consensus_latency_ms,
+                float(state.p95_consensus_latency_ms) * self._rng.uniform(0.4, 2.6),
+            )
+        )
         dirty_report.throughput_tps = float(
             max(0.0, float(state.throughput_tps) * self._rng.uniform(0.4, 1.8))
         )
@@ -1044,21 +1086,40 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 float(state.p90_batch_size) * self._rng.uniform(0.4, 2.0),
             )
         )
+        dirty_report.p95_batch_size = float(
+            max(
+                float(dirty_report.p90_batch_size),
+                float(state.p95_batch_size) * self._rng.uniform(0.4, 2.2),
+            )
+        )
         dirty_report.leader_change_count = self._rng.randint(
             0, max(int(state.leader_change_count), 1) * 3
         )
         dirty_report.regency_change_count = self._rng.randint(
             0, max(int(state.regency_change_count), 1) * 3
         )
-        dirty_report.propose_latency_ms = float(
-            max(0.0, float(state.propose_latency_ms) * self._rng.uniform(0.4, 2.0))
+        dirty_report.avg_inter_commit_gap_ms = float(
+            max(0.0, float(state.avg_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.0))
         )
-        dirty_report.prevote_latency_ms = float(
-            max(0.0, float(state.prevote_latency_ms) * self._rng.uniform(0.4, 2.0))
+        dirty_report.p50_inter_commit_gap_ms = float(
+            max(
+                0.0,
+                float(state.p50_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.1),
+            )
         )
-        dirty_report.precommit_latency_ms = float(
-            max(0.0, float(state.precommit_latency_ms) * self._rng.uniform(0.4, 2.0))
+        dirty_report.p90_inter_commit_gap_ms = float(
+            max(
+                dirty_report.p50_inter_commit_gap_ms,
+                float(state.p90_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.2),
+            )
         )
+        dirty_report.p95_inter_commit_gap_ms = float(
+            max(
+                dirty_report.p90_inter_commit_gap_ms,
+                float(state.p95_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.2),
+            )
+        )
+        self._dirty_phase_latencies(dirty_report, state, ("propose", "prevote", "precommit"))
         return dirty_report
 
     def _dirty_hotstuff_state(
@@ -1079,9 +1140,15 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 float(state.p50_consensus_latency_ms) * self._rng.uniform(0.4, 2.1),
             )
         )
-        dirty_report.p95_consensus_latency_ms = float(
+        dirty_report.p90_consensus_latency_ms = float(
             max(
                 dirty_report.p50_consensus_latency_ms,
+                float(state.p90_consensus_latency_ms) * self._rng.uniform(0.4, 2.2),
+            )
+        )
+        dirty_report.p95_consensus_latency_ms = float(
+            max(
+                dirty_report.p90_consensus_latency_ms,
                 float(state.p95_consensus_latency_ms) * self._rng.uniform(0.4, 2.2),
             )
         )
@@ -1091,10 +1158,22 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         dirty_report.avg_batch_size = float(
             max(0.0, float(state.avg_batch_size) * self._rng.uniform(0.4, 1.6))
         )
-        dirty_report.p95_batch_size = float(
+        dirty_report.p50_batch_size = float(
             max(
                 float(dirty_report.avg_batch_size),
-                float(state.p95_batch_size) * self._rng.uniform(0.4, 1.8),
+                float(state.p50_batch_size) * self._rng.uniform(0.4, 1.8),
+            )
+        )
+        dirty_report.p90_batch_size = float(
+            max(
+                float(dirty_report.p50_batch_size),
+                float(state.p90_batch_size) * self._rng.uniform(0.4, 2.0),
+            )
+        )
+        dirty_report.p95_batch_size = float(
+            max(
+                float(dirty_report.p90_batch_size),
+                float(state.p95_batch_size) * self._rng.uniform(0.4, 2.2),
             )
         )
         dirty_report.leader_change_count = self._rng.randint(
@@ -1113,9 +1192,15 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 float(state.p50_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.1),
             )
         )
-        dirty_report.p95_inter_commit_gap_ms = float(
+        dirty_report.p90_inter_commit_gap_ms = float(
             max(
                 dirty_report.p50_inter_commit_gap_ms,
+                float(state.p90_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.2),
+            )
+        )
+        dirty_report.p95_inter_commit_gap_ms = float(
+            max(
+                dirty_report.p90_inter_commit_gap_ms,
                 float(state.p95_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.2),
             )
         )
@@ -1145,9 +1230,15 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 float(state.p50_consensus_latency_ms) * self._rng.uniform(0.4, 2.1),
             )
         )
-        dirty_report.p95_consensus_latency_ms = float(
+        dirty_report.p90_consensus_latency_ms = float(
             max(
                 dirty_report.p50_consensus_latency_ms,
+                float(state.p90_consensus_latency_ms) * self._rng.uniform(0.4, 2.2),
+            )
+        )
+        dirty_report.p95_consensus_latency_ms = float(
+            max(
+                dirty_report.p90_consensus_latency_ms,
                 float(state.p95_consensus_latency_ms) * self._rng.uniform(0.4, 2.2),
             )
         )
@@ -1157,10 +1248,22 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         dirty_report.avg_batch_size = float(
             max(0.0, float(state.avg_batch_size) * self._rng.uniform(0.4, 1.6))
         )
-        dirty_report.p95_batch_size = float(
+        dirty_report.p50_batch_size = float(
             max(
                 float(dirty_report.avg_batch_size),
-                float(state.p95_batch_size) * self._rng.uniform(0.4, 1.8),
+                float(state.p50_batch_size) * self._rng.uniform(0.4, 1.8),
+            )
+        )
+        dirty_report.p90_batch_size = float(
+            max(
+                float(dirty_report.p50_batch_size),
+                float(state.p90_batch_size) * self._rng.uniform(0.4, 2.0),
+            )
+        )
+        dirty_report.p95_batch_size = float(
+            max(
+                float(dirty_report.p90_batch_size),
+                float(state.p95_batch_size) * self._rng.uniform(0.4, 2.2),
             )
         )
         dirty_report.leader_change_count = self._rng.randint(
@@ -1176,9 +1279,15 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 float(state.p50_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.1),
             )
         )
-        dirty_report.p95_inter_commit_gap_ms = float(
+        dirty_report.p90_inter_commit_gap_ms = float(
             max(
                 dirty_report.p50_inter_commit_gap_ms,
+                float(state.p90_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.2),
+            )
+        )
+        dirty_report.p95_inter_commit_gap_ms = float(
+            max(
+                dirty_report.p90_inter_commit_gap_ms,
                 float(state.p95_inter_commit_gap_ms) * self._rng.uniform(0.4, 2.2),
             )
         )
@@ -1191,7 +1300,11 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         return dirty_report
 
     def _dirty_state(self, state: object) -> object:
-        if self._protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
+        if self._protocol == agent_pb2.PROTOCOL_PBFT:
+            dirty_report = self._dirty_pbft_state(state)
+            self._dirty_phase_latencies(dirty_report, state, ("pre_prepare", "prepare", "commit"))
+            return dirty_report
+        if self._protocol == agent_pb2.PROTOCOL_SMARTBFT:
             return self._dirty_pbft_state(state)
         if self._protocol == agent_pb2.PROTOCOL_SBFT:
             return self._dirty_sbft_state(state)
@@ -1215,8 +1328,8 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         if self._dataset_writer is None or self._dataset_handle is None:
             return
 
-        feature_values = report_to_feature_values(self._protocol, feature_report)
-        reward_values = report_to_feature_values(self._protocol, reward_report)
+        feature_values = report_to_values(self._protocol, feature_report)
+        reward_values = report_to_values(self._protocol, reward_report)
         timeout_values = _dataset_timeout_values(self._protocol, timeout_used)
         self._dataset_writer.writerow(
             [
@@ -1513,6 +1626,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._timeouts_by_episode.clear()
             self._state_by_episode.clear()
             self._phase_by_episode.clear()
+            self._warmup_by_episode.clear()
             self._pending_rewards_by_episode.clear()
             self._current_episode = 0
             self._sealed_through_episode = 0
@@ -1795,6 +1909,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._protocol, reward_report, timeout_used
         )
         phase = self._phase_by_episode.get(reward_episode, -1)
+        in_warmup = self._warmup_by_episode.get(reward_episode, True)
         self._log_completed_episode_row_locked(
             phase=phase,
             report_node_id=report_node_id,
@@ -1822,7 +1937,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 f"{timeout_used.precommit_timeout_milliseconds}"
             )
 
-        if phase == -1:
+        if in_warmup:
             print(
                 "[learning] skipped model update during warmup "
                 f"(episode={reward_episode}, timeout={reward_timeout}, "
@@ -1844,15 +1959,24 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         # Reward for this episode has been consumed.
         self._state_by_episode.pop(reward_episode, None)
         self._phase_by_episode.pop(reward_episode, None)
+        self._warmup_by_episode.pop(reward_episode, None)
         self._pending_rewards_by_episode.pop(reward_episode, None)
 
-    def _dataset_phase_for_episode_locked(self) -> int:
+    def _report_in_warmup_locked(self) -> bool:
+        # Judged when the report arrives: a report inside the warm-up (episode 1,
+        # when the replica joined its slot) is skipped. A replica that joins at
+        # e = 2 reports after the warm-up, so that reward is used.
         elapsed_s = max(0.0, time.monotonic() - self._injection_start_mono)
         if elapsed_s < self._injection_warmup_s:
-            return -1
+            return True
         if isinstance(self._model, ScheduledTimeoutModel) and self._model.is_warmup_active():
-            return -1
-        return self._current_injection_phase_index_locked()
+            return True
+        return self._current_injection_phase_index_locked() == -1
+
+    def _dataset_phase_for_episode_locked(self, episode: int) -> int:
+        # The phase in force at the episode's apply instant, warm-up + P*(e-1),
+        # so the onset episode carries the phase its reward window measures.
+        return self._injection_phase_index_at(self._episode_ms * (episode - 1) / 1000.0)
 
     def _predict_timeout_locked(
         self,
@@ -1874,10 +1998,14 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 f"window; latency set to {self._empty_window_latency_ms[0]} ms"
             )
         self._state_by_episode[episode] = cached_report
-        self._phase_by_episode[episode] = self._dataset_phase_for_episode_locked()
+        self._warmup_by_episode[episode] = self._report_in_warmup_locked()
+        self._phase_by_episode[episode] = self._dataset_phase_for_episode_locked(episode)
 
         features = self._feature_extractor.featurize(cached_report)
-        action = self._model.predict_action(features)
+        if isinstance(self._model, ScheduledTimeoutModel):
+            action = self._model.action_for_episode(episode)
+        else:
+            action = self._model.predict_action(features)
         timeout = self._action_codec.decode(action)
 
         pending_reward = self._pending_rewards_by_episode.get(episode)
@@ -1913,14 +2041,13 @@ def serve(
     heuristic_window: int,
     heuristic_quantile: float,
     latency_floor_multiplier: float,
-    latency_floor_window: int,
-    latency_floor_quantile: float,
     prior_path: Optional[str],
     wait_divisor: float,
     dataset_csv: Optional[Path],
     failure_spec: Optional[Path],
     injection_start_unix_ms: Optional[int],
     empty_window_latency_ms: Tuple[int, int],
+    episode_ms: int,
 ):
     use_explicit_bind = host is not None and port is not None
     if use_explicit_bind:
@@ -1960,19 +2087,33 @@ def serve(
         )
         consensus_stub = agent_pb2_grpc.ConsensusStub(consensus_channel)
 
+    # The floor reads continuous_heuristic's latency estimate (its signal, window
+    # and quantile, HEURISTIC_SPECS): those were chosen to resist the latency a
+    # badly chosen timeout causes (Tendermint's p50 stays flat under the delayed
+    # proposer while the mean follows T; PBFT's 4-window minimum resets on an
+    # escape). Kevin 2026-10-10; the window mean it read before locked the floor
+    # high under the proposer attack (E1/E1v2, Tendermint p3).
+    hspec = heuristic_spec(protocol) if latency_floor_multiplier > 0.0 else None
     latency_floor = (
         None
-        if latency_floor_multiplier <= 0.0
+        if hspec is None
         else LatencyFloor(
             multiplier=latency_floor_multiplier,
-            window=latency_floor_window,
-            quantile=latency_floor_quantile,
+            window=hspec.window if heuristic_window is None else heuristic_window,
+            quantile=hspec.quantile if heuristic_quantile is None else heuristic_quantile,
+            field=hspec.signal,
         )
     )
     built = build_model(
         protocol,
         model_type,
         prior_path=prior_path,
+        # A prior trained under other windows is refused (prior_windows).
+        prior_windows=PriorWindows(
+            feature_ms=empty_window_latency_ms[0],
+            reward_ms=empty_window_latency_ms[1],
+            episode_ms=episode_ms,
+        ),
         latency_floor=latency_floor,
         schedule_file=schedule_file,
         start_monotonic=start_mono,
@@ -1983,9 +2124,11 @@ def serve(
     )
     model = built.model
     action_codec = built.action_codec
+    if isinstance(model, ScheduledTimeoutModel):
+        model.set_episode_ms(episode_ms)
     for line in built.description:
         print(line)
-    if model_type == "continuous_gp":
+    if model_type in ("continuous_gp", "discrete_gp"):
         # A decision is small dense linear algebra (on SBFT the GP over 1,024 grid
         # points). OpenBLAS starts one thread per core; on the 64-core CloudLab host,
         # with four agents beside the replicas, those threads oversubscribe: an SBFT
@@ -1995,7 +2138,7 @@ def serve(
     if latency_floor is not None:
         print(
             f"[latency_floor] multiplier={latency_floor_multiplier:g} "
-            f"window={latency_floor_window} quantile={latency_floor_quantile:g} "
+            f"signal={latency_floor.field} window={latency_floor._window} quantile={latency_floor._quantile:g} "
             f"applied to {model_type}"
         )
 
@@ -2040,6 +2183,7 @@ def serve(
         injection_start_mono=start_mono,
         injection_warmup_s=injection_warmup_s,
         empty_window_latency_ms=empty_window_latency_ms,
+        episode_ms=episode_ms,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -2142,6 +2286,7 @@ def main():
             "discrete_tree_ts",
             "discrete_tree_blocks",
             "discrete_linucb",
+            "discrete_gp",
             "continuous_gp",
             "continuous_linucb",
             "continuous_heuristic",
@@ -2169,16 +2314,20 @@ def main():
             "residual, lower-confidence-bound choice; the prior is zero unless "
             "--prior-path names one trained by that protocol's *_sim.py on the "
             "agent's --reward-design; "
+            "discrete_gp: continuous_gp scoring only the discrete arms (on SBFT "
+            "the election-timeout rungs times the fast-path waits), with the "
+            "same prior file; "
             "continuous_linucb: discrete_linucb over a continuous timeout - the "
             "same discounted LinUCB scored on a 65-point grid across the arm "
             "range rather than on the arms alone; "
-            "continuous_heuristic: --heuristic-multiplier times a quantile of "
-            "recent committing windows' avg_consensus_latency_ms "
-            "(--heuristic-window, --heuristic-quantile), clamped to the arm "
-            "range; no learning; "
+            "continuous_heuristic: a per-protocol rule, k times a latency "
+            "signal over recent committing windows, doubling on a storm, and "
+            "on SBFT a fast-path wait from the n-th prepare gap "
+            "(continuous_bandit.HEURISTIC_SPECS); no learning; "
             "continuous_ppo: discrete_ppo with a Beta policy over the "
             "continuous timeout range instead of the arm set; "
-            "scheduled: timeout from a time-based schedule CSV."
+            "scheduled: timeout from a schedule CSV looked up by episode number "
+            "(--episode-ms)."
         ),
     )
 
@@ -2200,32 +2349,29 @@ def main():
     parser.add_argument(
         "--heuristic-multiplier",
         type=float,
-        default=DEFAULT_PROPORTIONAL_K,
+        default=None,
         help=(
-            "Multiplier k for --model-type=continuous_heuristic: "
-            "timeout_ms = clamp(k * latency estimate, arm range) "
-            f"(default: {DEFAULT_PROPORTIONAL_K})."
+            "Override of continuous_heuristic's per-protocol multiplier k "
+            "(continuous_bandit.HEURISTIC_SPECS, fitted on the blind calibration runs); "
+            "omitted: the protocol's own."
         ),
     )
     parser.add_argument(
         "--heuristic-window",
         type=int,
-        default=DEFAULT_HEURISTIC_WINDOW,
+        default=None,
         help=(
-            "Committing windows continuous_heuristic's latency estimate is "
-            "taken over. 1 is the latest window; more smooths over single bad "
-            "windows and follows a real change more slowly "
-            f"(default: {DEFAULT_HEURISTIC_WINDOW})."
+            "Override of the committing windows continuous_heuristic's estimate "
+            "is taken over; omitted: the protocol's own."
         ),
     )
     parser.add_argument(
         "--heuristic-quantile",
         type=float,
-        default=DEFAULT_HEURISTIC_QUANTILE,
+        default=None,
         help=(
-            "Quantile of those windows' latencies continuous_heuristic uses; "
-            "no effect at --heuristic-window 1 "
-            f"(default: {DEFAULT_HEURISTIC_QUANTILE})."
+            "Override of the quantile of those windows continuous_heuristic "
+            "uses; omitted: the protocol's own."
         ),
     )
 
@@ -2252,21 +2398,14 @@ def main():
         help=(
             "Domain constraint for every model except scheduled: never apply a "
             "timeout below this multiplier times the consensus latency the "
-            "replicas are already achieving (a quantile over the last "
-            "--latency-floor-window committing windows). A timeout under that "
-            "latency cannot be met, so it buys view changes and stalls "
-            "throughput. 0 disables the constraint (default: 0; try "
-            f"{DEFAULT_LATENCY_FLOOR_MULTIPLIER})."
-        ),
-    )
-    parser.add_argument(
-        "--latency-floor-window",
-        type=int,
-        default=DEFAULT_LATENCY_FLOOR_WINDOW,
-        help=(
-            "Committing windows the latency floor is estimated over; 1 is the "
-            "latest window, where --latency-floor-quantile has no effect "
-            f"(default: {DEFAULT_LATENCY_FLOOR_WINDOW})."
+            "replicas are already achieving, estimated as continuous_heuristic "
+            "estimates it (the protocol's HEURISTIC_SPECS signal, window and "
+            "quantile). The multiplier is the share of that latency the "
+            "protocol's timer must cover: about 1/3 on Tendermint (the propose "
+            "timeout covers only the propose step), 1 for a request timer that "
+            "covers the whole commit. A timeout under it cannot be met, so it "
+            "buys view changes and stalls throughput. 0 disables the "
+            "constraint (default: 0)."
         ),
     )
     parser.add_argument(
@@ -2280,8 +2419,8 @@ def main():
             "carry the same one-way-delay term, so a T that has tracked the "
             "delay drags W with it. Measured on sbft_sim: holding the phase's "
             "best T, 8 costs a mean 0.038 reward against the best W at that T "
-            "(12 costs 0.084, 5 costs 0.289). --model-type=continuous_gp searches "
-            f"both dimensions and ignores this (default: {DEFAULT_WAIT_DIVISOR:g})."
+            "(12 costs 0.084, 5 costs 0.289). --model-type=continuous_gp and "
+            f"discrete_gp search both dimensions and ignore this (default: {DEFAULT_WAIT_DIVISOR:g})."
         ),
     )
     parser.add_argument(
@@ -2292,29 +2431,14 @@ def main():
             "Prior the model starts from; omitted (the default) or empty, the "
             "model starts untrained. Accepted only with --model-type "
             + ", ".join(PRETRAINABLE_MODEL_TYPES)
-            + ". For continuous_gp it is a reward prior written by "
-            "<protocol>_sim.py train (without one the GP fits the reward "
+            + ". For continuous_gp and discrete_gp it is a reward prior "
+            "(the same file for both) written by <protocol>_sim.py train (without one the GP fits the reward "
             "itself from a zero prior); for discrete_linucb and "
             "continuous_linucb a checkpoint of the prior mean of the "
             "coefficients, for discrete_ppo and continuous_ppo one of the actor "
             "and critic weights. A checkpoint is refused unless its protocol, "
             "reward design, features, action space and hyperparameters match "
             "this agent's. The value is recorded in run.env."
-        ),
-    )
-    parser.add_argument(
-        "--latency-floor-quantile",
-        type=float,
-        default=DEFAULT_LATENCY_FLOOR_QUANTILE,
-        help=(
-            "Quantile of the recent-latency window taken as the round time to "
-            "bound against. Lower resists contamination - latency measured "
-            "under a badly chosen timeout is inflated by that choice - while "
-            "higher is needed when faults are intermittent, because a low "
-            "quantile then selects the windows that saw no fault and the floor "
-            "stops binding at all. See DEFAULT_LATENCY_FLOOR_QUANTILE in "
-            f"latency_floor.py for the measurements (default: "
-            f"{DEFAULT_LATENCY_FLOOR_QUANTILE})."
         ),
     )
 
@@ -2336,6 +2460,17 @@ def main():
             "--feature-window-ms."
         ),
     )
+    parser.add_argument(
+        "--episode-ms",
+        type=int,
+        default=None,
+        help=(
+            "The replicas' episode period P in ms (required), the sum of their "
+            "stage durations: episode e applies its timeouts at warm-up + P*(e-1) "
+            "after the start. The scheduled model picks its row by episode "
+            "number on this grid, and the dataset phase is the one in force there."
+        ),
+    )
 
     parser.add_argument(
         "--schedule-file",
@@ -2348,8 +2483,10 @@ def main():
             "precommit are derived as one-third of propose. "
             "HotStuff format: time_s,timeout_ms. "
             "Autobahn format: time_s,timeout_delay_ms. "
-            "Negative time_s values are allowed for pre-start offsets; schedule "
-            "activations are shifted so the earliest entry begins at time 0. "
+            "Episode e takes the last row with time_s <= P*(e-1)/1000 "
+            "(P = --episode-ms), so a row written at T applies at warm-up + T; "
+            "a leading negative row (the warm-up row, e.g. -10) counts for every "
+            "episode, and a non-negative time_s off the P grid is refused. "
             "Required when --model-type=scheduled."
         ),
     )
@@ -2379,15 +2516,18 @@ def main():
         type=int,
         default=None,
         help=(
-            "Optional epoch start time in milliseconds for injection schedule "
-            "and scheduled timeout model timeline. If omitted, both start when "
-            "the server starts."
+            "Optional epoch start time in milliseconds for the injection "
+            "schedule and the warm-up check on reports. If omitted, both start "
+            "when the server starts. The scheduled model does not use it: it "
+            "looks rows up by episode number (--episode-ms)."
         ),
     )
     args = parser.parse_args()
     empty_window_latency_ms = (args.feature_window_ms, args.reward_window_ms)
     if None in empty_window_latency_ms or min(empty_window_latency_ms) <= 0:
         parser.error("positive --feature-window-ms and --reward-window-ms are required")
+    if args.episode_ms is None or args.episode_ms <= 0:
+        parser.error("a positive --episode-ms is required")
 
     prior_path = args.prior_path or None
     if prior_path is not None:
@@ -2423,14 +2563,13 @@ def main():
         heuristic_window=args.heuristic_window,
         heuristic_quantile=args.heuristic_quantile,
         latency_floor_multiplier=args.latency_floor_multiplier,
-        latency_floor_window=args.latency_floor_window,
-        latency_floor_quantile=args.latency_floor_quantile,
         prior_path=prior_path,
         wait_divisor=args.wait_divisor,
         dataset_csv=args.dataset_csv,
         failure_spec=args.failure_spec,
         injection_start_unix_ms=args.injection_start_unix_ms,
         empty_window_latency_ms=empty_window_latency_ms,
+        episode_ms=args.episode_ms,
     )
 
 

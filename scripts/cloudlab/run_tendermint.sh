@@ -24,6 +24,13 @@ LATENCY_FLOOR_MULTIPLIER=0
 # Prior file the model loads, repo-relative after validation; "" (omitted) is untrained.
 PRIOR_PATH=""
 SCHEDULE_FILE="learning_agent/config/schedule_tendermint.csv"
+FAILURE_SPEC_DEFAULT="config/tendermint/failure_spec.xml"
+FAILURE_SPEC="${FAILURE_SPEC_DEFAULT}"
+TM_CONFIG_DEFAULT="config/tendermint/config.toml"
+TM_CONFIG="${TM_CONFIG_DEFAULT}"
+BLOCK_MAX_BYTES=""
+# Blocks each kvstore retains after commit (ResponseCommit.RetainHeight); 0 keeps all.
+RETAIN_BLOCKS=0
 LOAD_CONNECTIONS=5
 LOAD_RATE=20
 LOAD_SEND_PERIOD_MS=100
@@ -77,7 +84,7 @@ trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--dataset] [--log] [--output-dir <path>] [--model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|discrete_gp|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -89,9 +96,11 @@ Arguments:
 Flags:
   --dataset         Collect per-replica learning-agent dataset CSVs as agentN.csv.
   --log             Fetch remote Tendermint, ABCI, and client logs into the run artifact directory.
+                    Replica Tendermint and ABCI logs are gzipped on their host first and
+                    land as logs/servers/*.log.gz.
   --output-dir <path>
                     Store artifacts here instead of creating a timestamped run directory.
-  --model           Learning-agent model for learning/sharing modes: discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo (default: discrete_random).
+  --model           Learning-agent model for learning/sharing modes: discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|discrete_gp|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo (default: discrete_random).
   --reward-design   Reward the agent learns from: reward_tps|reward_mixed|reward_tps_latency (default: reward_tps_latency).
                     reward_tps is throughput alone, concave past a 1000 tps knee. reward_mixed
                     also discounts it by the share of the window one fault would cost.
@@ -100,7 +109,7 @@ Flags:
                     already achieving (by default, the latest committing window's). Any model
                     except scheduled; 0 disables it (default: 0).
   --prior-path <path>
-                    Prior file the model loads, for continuous_gp, discrete_linucb, continuous_linucb,
+                    Prior file the model loads, for continuous_gp, discrete_gp, discrete_linucb, continuous_linucb,
                     discrete_ppo or continuous_ppo in learning or sharing mode. It must be under
                     learning_agent/, the only tree shipped to the nodes. Omitted (default): the
                     model starts untrained.
@@ -108,8 +117,27 @@ Flags:
                     scheduled-mode oracle CSV, relative to the repo root
                     (default: learning_agent/config/schedule_tendermint.csv). It must be inside
                     the deployed payload to exist on the remote.
+  --failure-spec <repo-rel-path>
+                    Failure spec, relative to the repo root (default:
+                    config/tendermint/failure_spec.xml). The payload carries it as
+                    config/tendermint/failure_spec.xml, so every replica reads it there.
   -f <int>          Fault tolerance f. Number of nodes is derived as 3f+1 (default: 1).
   -t <int>          Load-generation duration in seconds (default: 60).
+  --tendermint-config <repo-rel-path>
+                    Master Tendermint config, relative to the repo root (default:
+                    config/tendermint/config.toml). The payload carries it as
+                    config/tendermint/config.toml, so every node is configured from it.
+  --block-max-bytes <int>
+                    Genesis consensus_params.block.max_bytes (default: CometBFT's own,
+                    about 53 MiB, which never binds before the mempool cap).
+  --retain-blocks <int>
+                    Blocks each kvstore app retains after commit; the node prunes its block
+                    store below that height. 0 keeps all (default: 0; pruning frees no disk within a run, see runs/2026-10-11-req512-capacity).
+  --load-connections <int>
+                    Load connections per endpoint (default: 5).
+  --load-rate <int> Transactions per send period (100 ms) per connection (default: 20).
+                    The offered rate is connections x rate x 10 per endpoint, so the
+                    defaults offer 1,000 tx/s to each of the four endpoints.
 EOF
 }
 
@@ -143,7 +171,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo)
+    discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|discrete_gp|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo)
       printf '%s\n' "${model_lower}"
       ;;
     *)
@@ -188,12 +216,15 @@ repo_relative_prior_path() {
 # Fetch the run's logs into the layout the other protocols' harnesses use:
 # client.log in the run directory, replica processes under servers/, then
 # appliers/, agents/ and sharing/. Each replica's logs come from the machine
-# hosting it, client.log from the client machine.
+# hosting it, client.log from the client machine. The replica Tendermint and
+# ABCI logs are gzipped on their host first (gzip_first names the log to
+# compress, "" for none) and land under servers/ as .log.gz.
 fetch_tendermint_logs_parallel() {
   local local_logs_dir="$1"
   local i idx machine src failed=0
   local sources=("${client_user}@${client_host}")
   local remote_files=("client.log")
+  local gzip_first=("")
   local local_paths=("$(dirname "${local_logs_dir}")/client.log")
   local pids=()
 
@@ -205,20 +236,23 @@ fetch_tendermint_logs_parallel() {
     machine=$((i / replicas_per_machine))
     src="${server_users[$machine]}@${server_hosts[$machine]}"
     sources+=("${src}" "${src}" "${src}")
-    remote_files+=("node_${i}.log" "abci_${i}.log" "applier_${i}.log")
+    remote_files+=("node_${i}.log.gz" "abci_${i}.log.gz" "applier_${i}.log")
+    gzip_first+=("node_${i}.log" "abci_${i}.log" "")
     local_paths+=(
-      "${local_logs_dir}/servers/server_${i}.log"
-      "${local_logs_dir}/servers/abci_${i}.log"
+      "${local_logs_dir}/servers/server_${i}.log.gz"
+      "${local_logs_dir}/servers/abci_${i}.log.gz"
       "${local_logs_dir}/appliers/applier_${i}.log"
     )
     if (( LEARNING_AGENT_ENABLED == 1 )); then
       sources+=("${src}")
       remote_files+=("agent_${i}.log")
+      gzip_first+=("")
       local_paths+=("${local_logs_dir}/agents/agent_${i}.log")
     fi
     if [[ "${MODE}" == "sharing" ]]; then
       sources+=("${src}")
       remote_files+=("sharing_${i}.log")
+      gzip_first+=("")
       local_paths+=("${local_logs_dir}/sharing/sharing_${i}.log")
     fi
   done
@@ -232,7 +266,11 @@ fetch_tendermint_logs_parallel() {
       local attempt
       for ((attempt = 1; attempt <= LOG_FETCH_MAX_ATTEMPTS; attempt++)); do
         rm -f "${local_paths[$idx]}"
-        if scp -q "${SSH_OPTS[@]}" \
+        # A retry finds the log already compressed; a missing log fails the scp below.
+        if { [[ -z "${gzip_first[$idx]}" ]] ||
+          ssh "${SSH_OPTS[@]}" "${sources[$idx]}" \
+            "cd tendermint_cloudlab/logs && { [ ! -f ${gzip_first[$idx]} ] || gzip -f ${gzip_first[$idx]}; }"; } &&
+          scp -q "${SSH_OPTS[@]}" \
           "${sources[$idx]}:tendermint_cloudlab/logs/${remote_files[$idx]}" \
           "${local_paths[$idx]}"; then
           exit 0
@@ -279,6 +317,42 @@ while [[ $# -gt 0 ]]; do
         exit 2
       fi
       F="${2}"
+      shift 2
+      ;;
+    --tendermint-config)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --tendermint-config." >&2
+        usage >&2
+        exit 2
+      fi
+      TM_CONFIG="${2}"
+      shift 2
+      ;;
+    --block-max-bytes)
+      if [[ $# -lt 2 || ! "${2}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "--block-max-bytes needs a positive integer." >&2
+        usage >&2
+        exit 2
+      fi
+      BLOCK_MAX_BYTES="${2}"
+      shift 2
+      ;;
+    --retain-blocks)
+      if [[ $# -lt 2 || ! "${2}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+        echo "--retain-blocks needs an integer >= 0." >&2
+        usage >&2
+        exit 2
+      fi
+      RETAIN_BLOCKS="${2}"
+      shift 2
+      ;;
+    --load-connections|--load-rate)
+      if [[ $# -lt 2 || ! "${2}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "${1} needs a positive integer." >&2
+        usage >&2
+        exit 2
+      fi
+      if [[ "${1}" == "--load-connections" ]]; then LOAD_CONNECTIONS="${2}"; else LOAD_RATE="${2}"; fi
       shift 2
       ;;
     -t)
@@ -331,6 +405,15 @@ while [[ $# -gt 0 ]]; do
         exit 2
       fi
       PRIOR_PATH="${2}"
+      shift 2
+      ;;
+    --failure-spec)
+      if [[ $# -lt 2 || -z "${2}" ]]; then
+        echo "Missing value for --failure-spec." >&2
+        usage >&2
+        exit 2
+      fi
+      FAILURE_SPEC="${2}"
       shift 2
       ;;
     --schedule-file)
@@ -403,7 +486,7 @@ if [[ "${MODE}" == "scheduled" && "${LATENCY_FLOOR_MULTIPLIER}" =~ [1-9] ]]; the
   exit 2
 fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|discrete_gp|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -416,8 +499,8 @@ if [[ -n "${PRIOR_PATH}" ]]; then
     exit 2
   fi
   case "${AGENT_MODEL_TYPE}" in
-    continuous_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo) ;;
-    *) echo "--prior-path is not supported with --model ${AGENT_MODEL_TYPE}. Use one of continuous_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo." >&2; exit 2 ;;
+    continuous_gp|discrete_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo) ;;
+    *) echo "--prior-path is not supported with --model ${AGENT_MODEL_TYPE}. Use one of continuous_gp|discrete_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo." >&2; exit 2 ;;
   esac
   if ! PRIOR_PATH="$(repo_relative_prior_path "${PRIOR_PATH}")"; then
     exit 2
@@ -443,13 +526,26 @@ if [[ ! -d "${REPO_ROOT}/cometbft" ]]; then
   echo "Local cometbft directory not found: ${REPO_ROOT}/cometbft" >&2
   exit 1
 fi
-if [[ ! -f "${REPO_ROOT}/config/tendermint/config.toml" ]]; then
-  echo "Master Tendermint config not found: ${REPO_ROOT}/config/tendermint/config.toml" >&2
+if [[ ! -f "${REPO_ROOT}/${TM_CONFIG}" ]]; then
+  echo "Master Tendermint config not found: ${REPO_ROOT}/${TM_CONFIG}" >&2
   exit 1
 fi
-if [[ ! -f "${REPO_ROOT}/config/tendermint/failure_spec.xml" ]]; then
-  echo "Tendermint failure spec not found: ${REPO_ROOT}/config/tendermint/failure_spec.xml" >&2
+if [[ ! -f "${REPO_ROOT}/${FAILURE_SPEC}" ]]; then
+  echo "Tendermint failure spec not found: ${REPO_ROOT}/${FAILURE_SPEC}" >&2
   exit 1
+fi
+# A spec other than the default replaces config/tendermint/failure_spec.xml in the
+# payload (bsdtar -s), so the remote side reads it at the usual path.
+spec_tar_args=()
+spec_tar_paths=()
+if [[ "${FAILURE_SPEC}" != "${FAILURE_SPEC_DEFAULT}" ]]; then
+  spec_tar_args=(--exclude="${FAILURE_SPEC_DEFAULT}" -s ",^${FAILURE_SPEC}\$,${FAILURE_SPEC_DEFAULT},")
+  spec_tar_paths=("${FAILURE_SPEC}")
+fi
+# The same for a master config other than the default.
+if [[ "${TM_CONFIG}" != "${TM_CONFIG_DEFAULT}" ]]; then
+  spec_tar_args+=(--exclude="${TM_CONFIG_DEFAULT}" -s ",^${TM_CONFIG}\$,${TM_CONFIG_DEFAULT},")
+  spec_tar_paths+=("${TM_CONFIG}")
 fi
 if [[ ! -f "${APPLIER_LOCAL_PATH}" ]]; then
   echo "Network applier script not found: ${APPLIER_LOCAL_PATH}" >&2
@@ -559,8 +655,8 @@ if (( LOG_ENABLED == 1 )); then
   mkdir -p "${LOGS_LOCAL_DIR}"
 fi
 
-cp "${REPO_ROOT}/config/tendermint/config.toml" "${ARTIFACT_DIR}/config.toml"
-cp "${REPO_ROOT}/config/tendermint/failure_spec.xml" "${ARTIFACT_DIR}/failure_spec.xml"
+cp "${REPO_ROOT}/${TM_CONFIG}" "${ARTIFACT_DIR}/config.toml"
+cp "${REPO_ROOT}/${FAILURE_SPEC}" "${ARTIFACT_DIR}/failure_spec.xml"
 cp "${TARGETS_FILE}" "${ARTIFACT_DIR}/cloudlab_ssh_targets.txt"
 if [[ "${MODE}" == "scheduled" ]]; then
   cp "${REPO_ROOT}/${SCHEDULE_FILE}" "${ARTIFACT_DIR}/schedule_tendermint.csv"
@@ -580,6 +676,12 @@ fi
   printf 'dataset_enabled=%q\n' "${DATASET_ENABLED}"
   printf 'log_enabled=%q\n' "${LOG_ENABLED}"
   printf 'targets_file=%q\n' "${TARGETS_FILE}"
+  printf 'tendermint_config=%q\n' "${TM_CONFIG}"
+  printf 'block_max_bytes=%q\n' "${BLOCK_MAX_BYTES:-default}"
+  printf 'retain_blocks=%q\n' "${RETAIN_BLOCKS}"
+  printf 'load_connections=%q\n' "${LOAD_CONNECTIONS}"
+  printf 'load_rate=%q\n' "${LOAD_RATE}"
+  printf 'load_send_period_ms=%q\n' "${LOAD_SEND_PERIOD_MS}"
   printf 'server_machines=%q\n' "${server_names[*]}"
   printf 'replicas_per_machine=%q\n' "${replicas_per_machine}"
   printf 'command='
@@ -601,11 +703,13 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
     --exclude='cometbft/mytestnet' \
     --exclude='cometbft/logs' \
     --exclude='cometbft/build' \
+    ${spec_tar_args[@]+"${spec_tar_args[@]}"} \
     --exclude='learning_agent/__pycache__' \
     --exclude='SmartBFT/.git' \
     --exclude='SmartBFT/build' \
     cometbft \
     config/tendermint \
+    ${spec_tar_paths[@]+"${spec_tar_paths[@]}"} \
     learning_agent \
     ${SHARING_PAYLOAD_PATHS} \
     scripts/tendermint_phase_report.py
@@ -614,8 +718,10 @@ else
     --exclude='cometbft/mytestnet' \
     --exclude='cometbft/logs' \
     --exclude='cometbft/build' \
+    ${spec_tar_args[@]+"${spec_tar_args[@]}"} \
     cometbft \
     config/tendermint \
+    ${spec_tar_paths[@]+"${spec_tar_paths[@]}"} \
     scripts/tendermint_phase_report.py
 fi
 
@@ -695,6 +801,8 @@ server_route_names_csv="${22}"
 server_route_hosts_csv="${23}"
 testnet_tar="$HOME/${24}"
 prior_path="${25:-}"
+block_max_bytes="${26:-}"
+retain_blocks="${27}"
 
 num_nodes=$((fault_tolerance * 3 + 1))
 learning_agent_enabled=0
@@ -723,7 +831,7 @@ applier_hosts_config="${run_root}/applier_hosts.config"
 applier_script="${run_root}/apply_network_failures.py"
 cometbft_bin="${src_dir}/build/cometbft"
 
-load_size=500
+load_size=512
 post_peer_connect_delay=5
 buildvcs_flag="-buildvcs=false"
 failure_spec="${run_root}/config/tendermint/failure_spec.xml"
@@ -962,6 +1070,15 @@ setup_network_namespaces() {
     sudo -n ip netns exec "${ns}" ip addr replace "${ip}/${overlay_mask}" dev "${inner_if}"
     sudo -n ip netns exec "${ns}" ip link set "${inner_if}" up
     sudo -n ip netns exec "${ns}" ip route replace default via "${bridge_ip}"
+    # TCP tuning inside the replica namespace (namespace-scoped, host untouched), as
+    # lib_bedrock.sh, lib_rustbft.sh and run_smartbft.sh do. Under 110-310 ms round
+    # trips the default 4 MB buffers cap one stream far below what a multi-MB block
+    # needs, slow start after idle re-throttles every burst of block parts, and a
+    # cached low estimate from an earlier delay phase would seed new connections.
+    sudo -n ip netns exec "${ns}" sysctl -q -w \
+      net.ipv4.tcp_rmem="4096 131072 67108864" \
+      net.ipv4.tcp_wmem="4096 16384 67108864" \
+      net.ipv4.tcp_slow_start_after_idle=0
   done
 
   local peer
@@ -1018,7 +1135,25 @@ start_network_appliers() {
     applier_log="${logs_dir}/applier_${i}.log"
     tmux kill-session -t "${session}" >/dev/null 2>&1 || true
     tmux new-session -d -s "${session}" \
-      "cd \"${run_root}\" && python3 \"${applier_script}\" --failure-spec \"${failure_spec}\" --hosts-config \"${applier_hosts_config}\" --replica-id ${i} --netns ${ns} --interface ${iface} --start-unix-ms ${start_unix_ms} > \"${applier_log}\" 2>&1"
+      "cd \"${run_root}\" && python3 \"${applier_script}\" --failure-spec \"${failure_spec}\" --hosts-config \"${applier_hosts_config}\" --replica-id ${i} --netns ${ns} --interface ${iface} --start-unix-ms ${start_unix_ms} --pre-apply-base > \"${applier_log}\" 2>&1"
+  done
+  # The replicas must connect over the base delay (see --pre-apply-base), so wait for
+  # every applier to have installed it before any replica starts.
+  local attempt ready
+  for ((i = first_local_replica; i <= last_local_replica; i++)); do
+    applier_log="${logs_dir}/applier_${i}.log"
+    ready=0
+    for attempt in $(seq 1 60); do
+      if grep -q "Pre-applied base delay" "${applier_log}" 2>/dev/null; then
+        ready=1
+        break
+      fi
+      sleep 0.5
+    done
+    if (( ready == 0 )); then
+      echo "Network applier ${i} did not install the base delay within 30 s; see ${applier_log}." >&2
+      return 1
+    fi
   done
 }
 
@@ -1175,6 +1310,30 @@ phase_testnet() {
     --populate-persistent-peers \
     --starting-ip-address "$(testnet_ip 0)"
 
+  if [[ -n "${block_max_bytes}" ]]; then
+    echo "Setting genesis consensus_params.block.max_bytes=${block_max_bytes}"
+    local g
+    for g in "${testnet_dir}"/node*/config/genesis.json; do
+      python3 - "${g}" "${block_max_bytes}" <<'PY'
+import json, sys
+path, value = sys.argv[1], sys.argv[2]
+with open(path) as fh:
+    genesis = json.load(fh)
+params = genesis["consensus_params"]
+block = params["block"]
+# CometBFT writes int64 fields as JSON strings; keep the type it used.
+block["max_bytes"] = value if isinstance(block["max_bytes"], str) else int(value)
+# Genesis validation requires evidence.max_bytes <= block.max_bytes (default 1 MiB).
+evidence = params["evidence"]
+if int(evidence["max_bytes"]) > int(value):
+    print(f"Lowering genesis evidence.max_bytes {evidence['max_bytes']} -> {value} to fit the block")
+    evidence["max_bytes"] = value if isinstance(evidence["max_bytes"], str) else int(value)
+with open(path, "w") as fh:
+    json.dump(genesis, fh, indent=2)
+PY
+    done
+  fi
+
   echo "Applying master Tendermint config: ${master_config}"
   local i j config_file
   for ((i = 0; i < num_nodes; i++)); do
@@ -1220,11 +1379,46 @@ toml_duration_ms() {
   fi
 }
 
+# The failure spec's warm-up in ms: <warmUpTimeMs>, else <warmUpTime> in seconds,
+# as the engine, the applier and the agent read it; fails if neither parses.
+failure_spec_warmup_ms() {
+  python3 - "${failure_spec}" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+path = sys.argv[1]
+root = ET.parse(path).getroot()
+ms_text = (root.findtext("warmUpTimeMs") or "").strip()
+s_text = (root.findtext("warmUpTime") or "").strip()
+try:
+    if ms_text:
+        value = int(ms_text)
+    elif s_text:
+        value = round(float(s_text) * 1000)
+    else:
+        sys.exit(f"{path}: no <warmUpTimeMs> or <warmUpTime>")
+except ValueError as exc:
+    sys.exit(f"{path}: invalid warm-up: {exc}")
+if value < 0:
+    sys.exit(f"{path}: negative warm-up {value} ms")
+print(value)
+PY
+}
+
 phase_start() {
   echo "Setting up namespaces for replicas ${first_local_replica}-${last_local_replica} on $(hostname)..."
   setup_network_namespaces
 
   local i
+  # Every replica's episode grid is anchored on the shared start: episode 1
+  # applies at start + warm-up, the onset of the spec's atTime 0.
+  local learning_anchor_env=""
+  if (( learning_agent_enabled == 1 )); then
+    local warmup_ms
+    warmup_ms="$(failure_spec_warmup_ms)" || exit 1
+    learning_anchor_env="COMETBFT_LEARNING_ANCHOR_UNIX_MS=$((start_unix_ms + warmup_ms))"
+    echo "Learning anchor unix_ms=$((start_unix_ms + warmup_ms)) (start_unix_ms + ${warmup_ms} ms warm-up)"
+  fi
   if (( learning_agent_enabled == 1 )); then
     if [[ "${mode}" == "sharing" ]]; then
       : > "${sharing_hosts_config}"
@@ -1239,8 +1433,11 @@ phase_start() {
       echo "${i} $(node_ip "${i}") 0 0 $(agent_port "${i}") $(sharing_consensus_port "${i}")" >> "${agent_hosts_config}"
     done
   fi
-  echo "Starting replicas ${first_local_replica}-${last_local_replica} (kvstore and CometBFT) in tmux..."
   kill_run_sessions
+  write_applier_hosts_config
+  echo "Starting per-replica network failure appliers in tmux (base delay before the replicas connect)..."
+  start_network_appliers || exit 1
+  echo "Starting replicas ${first_local_replica}-${last_local_replica} (kvstore and CometBFT) in tmux..."
   if (( learning_agent_enabled == 1 )); then
     local agent_mode_args=""
     if [[ "${mode}" == "sharing" ]]; then
@@ -1267,10 +1464,14 @@ phase_start() {
     fi
     # The agent gives a window in which nothing committed its own length as its
     # latency, so it needs the windows the replicas measure (master config).
-    local feature_window_ms reward_window_ms
+    # The episode period is the sum of the stage lengths the replicas run.
+    local feature_window_ms reward_window_ms reply_wait_ms warmup_window_ms
     feature_window_ms="$(toml_duration_ms adaptive_timer_feature_duration)" || exit 1
     reward_window_ms="$(toml_duration_ms adaptive_timer_reward_duration)" || exit 1
+    reply_wait_ms="$(toml_duration_ms adaptive_timer_reply_wait)" || exit 1
+    warmup_window_ms="$(toml_duration_ms adaptive_timer_warmup_duration)" || exit 1
     agent_mode_args="${agent_mode_args} --feature-window-ms ${feature_window_ms} --reward-window-ms ${reward_window_ms}"
+    agent_mode_args="${agent_mode_args} --episode-ms $((feature_window_ms + reply_wait_ms + warmup_window_ms + reward_window_ms))"
     local agent_session ns agent_log dataset_args
     for ((i = first_local_replica; i <= last_local_replica; i++)); do
       agent_session="tm_tendermint_agent_${i}"
@@ -1330,14 +1531,10 @@ phase_start() {
     node_home="${testnet_dir}/node${i}"
 
     tmux new-session -d -s "${abci_session}" \
-      "sudo -n ip netns exec ${ns} sudo -n -u ${run_as_user} env HOME=${run_as_home} PATH=${run_as_home}/go/bin:${PATH} bash -lc 'cd \"${src_dir}\" && exec abci-cli kvstore --address tcp://127.0.0.1:${abci_p}' > \"${abci_log}\" 2>&1"
+      "sudo -n ip netns exec ${ns} sudo -n -u ${run_as_user} env HOME=${run_as_home} PATH=${run_as_home}/go/bin:${PATH} bash -lc 'cd \"${src_dir}\" && exec abci-cli kvstore --address tcp://127.0.0.1:${abci_p} --retain-blocks ${retain_blocks}' > \"${abci_log}\" 2>&1"
     tmux new-session -d -s "${node_session}" \
-      "sudo -n ip netns exec ${ns} sudo -n -u ${run_as_user} env HOME=${run_as_home} PATH=${run_as_home}/go/bin:${PATH} COMETBFT_NODE_INDEX=${i} COMETBFT_PROPOSE_DELAY_FAILURE_SPEC=\"${failure_spec}\" COMETBFT_PROPOSE_DELAY_FAULTY_NODES=${fault_tolerance} COMETBFT_PROPOSE_DELAY_START_UNIX_MS=${start_unix_ms} bash -lc 'cd \"${src_dir}\" && exec \"${cometbft_bin}\" node --home \"${node_home}\" --proxy_app tcp://127.0.0.1:${abci_p} --p2p.laddr tcp://0.0.0.0:${p2p_p} --rpc.laddr tcp://0.0.0.0:${rpc_p}' > \"${node_log}\" 2>&1"
+      "sudo -n ip netns exec ${ns} sudo -n -u ${run_as_user} env HOME=${run_as_home} PATH=${run_as_home}/go/bin:${PATH} COMETBFT_NODE_INDEX=${i} COMETBFT_PROPOSE_DELAY_FAILURE_SPEC=\"${failure_spec}\" COMETBFT_PROPOSE_DELAY_FAULTY_NODES=${fault_tolerance} COMETBFT_PROPOSE_DELAY_START_UNIX_MS=${start_unix_ms} ${learning_anchor_env} bash -lc 'cd \"${src_dir}\" && exec \"${cometbft_bin}\" node --home \"${node_home}\" --proxy_app tcp://127.0.0.1:${abci_p} --p2p.laddr tcp://0.0.0.0:${p2p_p} --rpc.laddr tcp://0.0.0.0:${rpc_p}' > \"${node_log}\" 2>&1"
   done
-
-  write_applier_hosts_config
-  echo "Starting per-replica network failure appliers in tmux..."
-  start_network_appliers
 
   local ready attempt
   for ((i = first_local_replica; i <= last_local_replica; i++)); do
@@ -1419,6 +1616,10 @@ phase_stop() {
 phase_report() {
   echo ""
   echo "==> Latency report:"
+  # The report reads node0's block store from Base(), which pruning moves forward.
+  if (( retain_blocks > 0 )); then
+    echo "NOTE: block store pruned (--retain-blocks ${retain_blocks}); the latency, throughput and results.csv below cover only the last ${retain_blocks} heights, not the whole run. Use client.log for whole-run tps and latency."
+  fi
   if [[ -f "${report_state_log}" ]]; then
     echo "Using state log for wall-clock latency: ${report_state_log}"
     run_report_with_retry --data-dir "${testnet_dir}/node0/data" --database-type goleveldb --state-log "${report_state_log}" --csv "${results_csv}"
@@ -1481,13 +1682,17 @@ REMOTE
 # Run one remote phase: remote_phase <user> <host> <phase> <server machine index or -1> <is client>
 remote_phase() {
   local user="$1" host="$2" phase="$3" machine_idx="$4" is_client="$5"
-  ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s" -- \
+  # ssh joins its arguments into one command line, so an empty argument would vanish
+  # and shift every later position: quote each one.
+  local args
+  args="$(printf '%q ' \
     "${phase}" "${REMOTE_PAYLOAD}" "${REMOTE_APPLIER}" "${F}" "${EXPERIMENT_TIME_S}" "${MODE}" \
     "${LOG_ENABLED}" "${DATASET_ENABLED}" "${LOAD_CONNECTIONS}" "${LOAD_RATE}" "${LOAD_SEND_PERIOD_MS}" \
     "${AGENT_MODEL_TYPE}" "${REWARD_DESIGN}" "${LATENCY_FLOOR_MULTIPLIER}" "${SCHEDULE_FILE}" \
     "${machine_idx}" "${is_client}" "${server_machine_count}" "${replicas_per_machine}" \
     "${START_UNIX_MS}" "${GATEWAY_IPS_CSV}" "${SERVER_ROUTE_NAMES_CSV}" "${SERVER_ROUTE_HOSTS_CSV}" \
-    "${REMOTE_TESTNET}" "${PRIOR_PATH}" <<< "${REMOTE_SCRIPT}"
+    "${REMOTE_TESTNET}" "${PRIOR_PATH}" "${BLOCK_MAX_BYTES}" "${RETAIN_BLOCKS}")"
+  ssh "${SSH_OPTS[@]}" "${user}@${host}" "bash -s -- ${args}" <<< "${REMOTE_SCRIPT}"
 }
 
 # A machine's role arguments: its server machine index (or -1) and whether it runs the client.

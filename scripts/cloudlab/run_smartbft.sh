@@ -41,17 +41,16 @@ SCHEDULE_FILE="learning_agent/config/schedule_smartbft.csv"
 BATCH_SIZE=256
 BATCH_TIMEOUT="50ms"
 REQUEST_TIMEOUT="30s"
-CREATE_WORKERS=""
 SERVER_PORT_BASE=19100
 AGENT_PORT=15501
 SHARING_REPORT_PORT=15601
 SHARING_CONSENSUS_PORT=15701
 SHARING_COLLECT_WAIT_MS=100
 INITIAL_TIMEOUT="5s"
-LEARNING_FEATURE_DURATION="10s"
+LEARNING_FEATURE_DURATION="7s"
 LEARNING_REPLY_WAIT="2s"
-LEARNING_WARMUP_DURATION="3s"
-LEARNING_REWARD_DURATION="5s"
+LEARNING_WARMUP_DURATION="4s"
+LEARNING_REWARD_DURATION="7s"
 CONFIG_PATH="${CONFIG_DEFAULT}"
 FAILURE_SPEC_PATH="${FAILURE_SPEC_DEFAULT}"
 FAILURE_SPEC_ENABLED=1
@@ -106,7 +105,7 @@ trap cleanup_local_run_locks EXIT
 
 usage() {
   cat <<EOF
-Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--log] [--output-dir <path>] [--model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
+Usage: $0 <private_key_path> [normal|learning|sharing|scheduled] [--log] [--output-dir <path>] [--model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|discrete_gp|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo>] [-f <fault_tolerance>] [-t <experiment_seconds>] [targets_file]
 
 Arguments:
   private_key_path  Local SSH private key for CloudLab nodes.
@@ -117,7 +116,7 @@ Flags:
   --log                             Download client, server, applier, and agent logs.
   --output-dir <path>               Store artifacts here instead of creating a timestamped run directory.
   --verbose                         Enable SmartBFT debug logs on server replicas.
-  --model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo>
+  --model <discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|discrete_gp|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo>
                                      Learning-agent model for learning mode (default: discrete_random).
   --reward-design <reward_tps|reward_mixed|reward_tps_latency>
                                      Reward the agent learns from (default: reward_tps_latency).
@@ -129,7 +128,7 @@ Flags:
                                      replicas are already achieving (by default, the latest committing
                                      window's). Such a timeout cannot be met, so it only buys view
                                      changes. Any model except scheduled; 0 disables it (default: 0).
-  --prior-path <path>                Prior file the model loads, for continuous_gp, discrete_linucb,
+  --prior-path <path>                Prior file the model loads, for continuous_gp, discrete_gp, discrete_linucb,
                                      continuous_linucb, discrete_ppo or continuous_ppo in learning or
                                      sharing mode. It must be under learning_agent/, the only tree
                                      shipped to the nodes. Omitted (default): the model starts untrained.
@@ -147,7 +146,6 @@ SmartBFT options:
   --batch-size <int>                SmartBFT batch size (default: 200).
   --batch-timeout <duration>        SmartBFT batch timeout (default: 50ms).
   --request-timeout <duration>      Client request timeout (default: 30s).
-  --create-workers <int>            Account creation workers (default: first workload phase terminals).
   --client-start-delay <seconds>    Wait after servers are ready before launching client (default: 10).
   --start-offset <seconds>          Delay from client launch to benchmark/failure start (default: 20).
   --port-base <int>                 Base server port; node i listens on base+i (default: 19100).
@@ -156,12 +154,12 @@ Learning-agent options:
   --agent-port <port>               Learning-agent port inside each replica namespace (default: 15501).
   --initial-timeout <duration>      Initial PBFT timeout value reported by SmartBFT (default: 5s).
   --learning-feature-duration <duration>
-                                     Feature window in wall-clock mode (default: 10s).
+                                     Feature window in wall-clock mode (default: 7s).
   --learning-reply-wait <duration>  Recommendation wait in wall-clock mode (default: 2s).
   --learning-warmup-duration <duration>
-                                     Post-apply warm-up in wall-clock mode (default: 3s).
+                                     Post-apply warm-up in wall-clock mode (default: 4s).
   --learning-reward-duration <duration>
-                                     Reward window in wall-clock mode (default: 5s).
+                                     Reward window in wall-clock mode (default: 7s).
 EOF
 }
 
@@ -191,7 +189,7 @@ normalize_agent_model_type() {
   local model_lower
   model_lower="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
   case "${model_lower}" in
-    discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo) printf '%s\n' "${model_lower}" ;;
+    discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|discrete_gp|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo) printf '%s\n' "${model_lower}" ;;
     *)
       local renamed
       if renamed="$(renamed_model_type "${model_lower}")"; then
@@ -452,10 +450,6 @@ while [[ $# -gt 0 ]]; do
       REQUEST_TIMEOUT="${2:-}"
       shift 2
       ;;
-    --create-workers)
-      CREATE_WORKERS="${2:-}"
-      shift 2
-      ;;
     --client-start-delay)
       CLIENT_START_DELAY_S="${2:-}"
       shift 2
@@ -542,10 +536,6 @@ if (( SERVER_PORT_BASE + NODES > 65535 )); then
   echo "Invalid --port-base ${SERVER_PORT_BASE} for ${NODES} nodes." >&2
   exit 2
 fi
-if [[ -n "${CREATE_WORKERS}" ]] && (! [[ "${CREATE_WORKERS}" =~ ^[0-9]+$ ]] || (( CREATE_WORKERS < 1 ))); then
-  echo "Invalid --create-workers value: ${CREATE_WORKERS}." >&2
-  exit 2
-fi
 # The agent gives a window in which nothing committed its own length as its
 # latency, so it needs the feature and reward windows in ms (Go durations here).
 go_duration_ms() {
@@ -561,6 +551,11 @@ go_duration_ms() {
 }
 FEATURE_WINDOW_MS="$(go_duration_ms "${LEARNING_FEATURE_DURATION}")" || exit 2
 REWARD_WINDOW_MS="$(go_duration_ms "${LEARNING_REWARD_DURATION}")" || exit 2
+# The episode period the replicas run (feature, reply wait, warm-up, reward);
+# the agent picks the schedule row by episode number with it.
+REPLY_WAIT_MS="$(go_duration_ms "${LEARNING_REPLY_WAIT}")" || exit 2
+EPISODE_WARMUP_MS="$(go_duration_ms "${LEARNING_WARMUP_DURATION}")" || exit 2
+EPISODE_MS=$(( FEATURE_WINDOW_MS + REPLY_WAIT_MS + EPISODE_WARMUP_MS + REWARD_WINDOW_MS ))
 case "${REWARD_DESIGN}" in
   reward_tps|reward_mixed|reward_tps_latency) ;;
   *) echo "Invalid --reward-design: ${REWARD_DESIGN}. Expected reward_tps|reward_mixed|reward_tps_latency." >&2; exit 2 ;;
@@ -574,7 +569,7 @@ if [[ "${MODE}" == "scheduled" && "${LATENCY_FLOOR_MULTIPLIER}" =~ [1-9] ]]; the
   exit 2
 fi
 if ! AGENT_MODEL_TYPE="$(normalize_agent_model_type "${AGENT_MODEL_TYPE}")"; then
-  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo." >&2
+  echo "Invalid --model value: ${AGENT_MODEL_TYPE}. Use one of discrete_random|discrete_pavlov|discrete_linear|discrete_tree_ts|discrete_tree_blocks|discrete_linucb|discrete_ppo|discrete_gp|continuous_gp|continuous_linucb|continuous_heuristic|continuous_ppo." >&2
   exit 2
 fi
 if (( AGENT_MODEL_SET == 1 )) && [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]]; then
@@ -587,8 +582,8 @@ if [[ -n "${PRIOR_PATH}" ]]; then
     exit 2
   fi
   case "${AGENT_MODEL_TYPE}" in
-    continuous_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo) ;;
-    *) echo "--prior-path is not supported with --model ${AGENT_MODEL_TYPE}. Use one of continuous_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo." >&2; exit 2 ;;
+    continuous_gp|discrete_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo) ;;
+    *) echo "--prior-path is not supported with --model ${AGENT_MODEL_TYPE}. Use one of continuous_gp|discrete_gp|discrete_linucb|continuous_linucb|discrete_ppo|continuous_ppo." >&2; exit 2 ;;
   esac
   if ! PRIOR_PATH="$(repo_relative_prior_path "${PRIOR_PATH}")"; then
     exit 2
@@ -633,6 +628,37 @@ fi
 if (( FAILURE_SPEC_ENABLED == 1 )) && [[ ! -f "${FAILURE_SPEC_PATH}" ]]; then
   echo "Failure spec not found: ${FAILURE_SPEC_PATH}" >&2
   exit 1
+fi
+# Every replica applies episode 1 at start + the spec warm-up. The spec is the
+# one the agent reads remotely: the shipped one, or the payload's default copy
+# under --no-failure-spec.
+SPEC_WARM_UP_MS=""
+if (( LEARNING_AGENT_ENABLED == 1 )); then
+  anchor_spec_path="${FAILURE_SPEC_DEFAULT}"
+  if (( FAILURE_SPEC_ENABLED == 1 )); then
+    anchor_spec_path="${FAILURE_SPEC_PATH}"
+  fi
+  if ! SPEC_WARM_UP_MS="$(python3 - "${anchor_spec_path}" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+root = ET.parse(sys.argv[1]).getroot()
+ms_text = root.findtext("warmUpTimeMs")
+s_text = root.findtext("warmUpTime")
+if ms_text is not None:
+    warm_up_ms = int(ms_text.strip())
+elif s_text is not None:
+    warm_up_ms = round(float(s_text.strip()) * 1000)
+else:
+    sys.exit(f"{sys.argv[1]}: no <warmUpTimeMs> or <warmUpTime>")
+if warm_up_ms < 0:
+    sys.exit(f"{sys.argv[1]}: negative warm-up {warm_up_ms} ms")
+print(warm_up_ms)
+PY
+  )"; then
+    echo "Failed to parse the warm-up from ${anchor_spec_path}; the learning episode anchor needs it." >&2
+    exit 1
+  fi
 fi
 if [[ ! -f "${TARGETS_FILE}" ]]; then
   echo "Targets file not found: ${TARGETS_FILE}" >&2
@@ -705,6 +731,10 @@ fi
   printf 'prior_path=%q\n' "${PRIOR_PATH:-}"
   printf 'schedule_file=%q\n' "${SCHEDULE_FILE}"
   printf 'learning_window_mode=wall-clock\n'
+  printf 'learning_feature_duration_ms=%q\n' "${FEATURE_WINDOW_MS}"
+  printf 'learning_reply_wait_ms=%q\n' "${REPLY_WAIT_MS}"
+  printf 'learning_warmup_duration_ms=%q\n' "${EPISODE_WARMUP_MS}"
+  printf 'learning_reward_duration_ms=%q\n' "${REWARD_WINDOW_MS}"
   printf 'log_enabled=%q\n' "${LOG_ENABLED}"
   printf 'failure_spec_enabled=%q\n' "${FAILURE_SPEC_ENABLED}"
   printf 'targets_file=%q\n' "${TARGETS_FILE}"
@@ -1161,6 +1191,11 @@ fi
 
 START_UNIX_MS="$(( ($(date +%s) + CLIENT_START_DELAY_S + START_OFFSET_AFTER_CLIENT_LAUNCH_S) * 1000 ))"
 echo "Using shared start_unix_ms=${START_UNIX_MS}"
+LEARNING_ANCHOR_UNIX_MS=-1
+if (( LEARNING_AGENT_ENABLED == 1 )); then
+  LEARNING_ANCHOR_UNIX_MS=$(( START_UNIX_MS + SPEC_WARM_UP_MS ))
+  echo "Using learning anchor_unix_ms=${LEARNING_ANCHOR_UNIX_MS} (start_unix_ms + warm_up_ms=${SPEC_WARM_UP_MS}) episode_ms=${EPISODE_MS}"
+fi
 
 if (( FAILURE_SPEC_ENABLED == 1 )); then
   echo "Starting SmartBFT network failure appliers..."
@@ -1185,7 +1220,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
   session_name="smartbft_applier_${replica_id}"
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   tmux new-session -d -s "${session_name}" \
-    "cd \"${run_root}\" && python3 \"${run_root}/scripts/apply_network_failures.py\" --failure-spec \"${run_root}/config/smartbft/failure_spec.xml\" --hosts-config \"${run_root}/hosts.failure.config\" --replica-id ${replica_id} --netns ${ns_name} --interface ${interface_name} --start-unix-ms ${start_unix_ms} > \"${run_root}/logs/applier_${replica_id}.log\" 2>&1"
+    "cd \"${run_root}\" && python3 \"${run_root}/scripts/apply_network_failures.py\" --failure-spec \"${run_root}/config/smartbft/failure_spec.xml\" --hosts-config \"${run_root}/hosts.failure.config\" --replica-id ${replica_id} --netns ${ns_name} --interface ${interface_name} --start-unix-ms ${start_unix_ms} --pre-apply-base > \"${run_root}/logs/applier_${replica_id}.log\" 2>&1"
 done
 REMOTE
     then
@@ -1199,6 +1234,41 @@ REMOTE
     echo "Applier start failed on one or more nodes." >&2
     exit 1
   fi
+  # The replicas must connect over the base delay (see --pre-apply-base), so wait for
+  # every applier to have installed it before any replica starts.
+  for i in "${!server_nodes[@]}"; do
+    if ! ssh "${SSH_OPTS[@]}" "${server_users[$i]}@${server_hosts[$i]}" "bash -s" -- \
+    "${replicas_per_server_machine}" "${i}" <<'REMOTE'
+set -euo pipefail
+
+replicas_per_machine="$1"
+machine_idx="$2"
+run_root="$HOME/smartbft_cloudlab"
+
+for ((n = 0; n < replicas_per_machine; n++)); do
+  replica_id=$((machine_idx * replicas_per_machine + n))
+  applier_log="${run_root}/logs/applier_${replica_id}.log"
+  ready=0
+  for attempt in $(seq 1 60); do
+    if grep -q "Pre-applied base delay" "${applier_log}" 2>/dev/null; then
+      ready=1
+      break
+    fi
+    sleep 0.5
+  done
+  if (( ready == 0 )); then
+    echo "Network applier ${replica_id} did not install the base delay within 30 s; see ${applier_log}:" >&2
+    tail -n 5 "${applier_log}" >&2 || true
+    exit 1
+  fi
+done
+REMOTE
+    then
+      echo "  - ${server_nodes[$i]}: base delay not installed" >&2
+      exit 1
+    fi
+  done
+  echo "Base delay pre-applied on every replica."
 else
   echo "Failure spec disabled; not starting network appliers."
 fi
@@ -1228,6 +1298,7 @@ if (( LEARNING_AGENT_ENABLED == 1 )); then
         "${SCHEDULE_FILE}" \
         "${FEATURE_WINDOW_MS}" \
         "${REWARD_WINDOW_MS}" \
+        "${EPISODE_MS}" \
         "${PRIOR_PATH}" <<'REMOTE'
 set -euo pipefail
 
@@ -1244,8 +1315,9 @@ reward_design="${10}"
 schedule_file="${11}"
 feature_window_ms="${12}"
 reward_window_ms="${13}"
+episode_ms="${14}"
 # ssh drops an empty last argument, so an omitted prior arrives unset.
-prior_path="${14:-}"
+prior_path="${15:-}"
 run_root="$HOME/smartbft_cloudlab"
 learning_agent_python="${HOME}/.venvs/adaptive-timer-learning-agent/bin/python"
 
@@ -1278,6 +1350,8 @@ if [[ -n "${prior_path}" ]]; then
 fi
 # A window in which nothing committed takes its own length as its latency.
 agent_model_args="${agent_model_args} --feature-window-ms ${feature_window_ms} --reward-window-ms ${reward_window_ms}"
+# The replicas' episode period; the agent maps an episode number to its apply time.
+agent_model_args="${agent_model_args} --episode-ms ${episode_ms}"
 
 for ((n = 0; n < replicas_per_machine; n++)); do
   replica_id=$((machine_idx * replicas_per_machine + n))
@@ -1368,7 +1442,8 @@ for i in "${!server_nodes[@]}"; do
 	      "${LEARNING_REPLY_WAIT}" \
 	      "${LEARNING_WARMUP_DURATION}" \
 	      "${LEARNING_REWARD_DURATION}" \
-	      "${VERBOSE_ENABLED}" <<'REMOTE'
+	      "${VERBOSE_ENABLED}" \
+	      "${LEARNING_ANCHOR_UNIX_MS}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
@@ -1385,6 +1460,7 @@ learning_reply_wait="${11}"
 learning_warmup_duration="${12}"
 learning_reward_duration="${13}"
 verbose_enabled="${14}"
+learning_anchor_unix_ms="${15}"
 run_root="$HOME/smartbft_cloudlab"
 
 for ((n = 0; n < replicas_per_machine; n++)); do
@@ -1415,6 +1491,7 @@ for ((n = 0; n < replicas_per_machine; n++)); do
 	      "--learning-reply-wait" "${learning_reply_wait}"
 	      "--learning-warmup-duration" "${learning_warmup_duration}"
 	      "--learning-reward-duration" "${learning_reward_duration}"
+	      "--learning-anchor-unix-ms" "${learning_anchor_unix_ms}"
 	    )
 	  fi
 	  if [[ "${verbose_enabled}" == "1" ]]; then
@@ -1465,21 +1542,15 @@ if (( remaining_client_delay > 0 )); then
 fi
 
 echo "Starting SmartBFT client on node0..."
-remote_create_workers="${CREATE_WORKERS:-__default__}"
 ssh "${SSH_OPTS[@]}" "${node0_user}@${node0_host}" "bash -s" -- \
   "${START_UNIX_MS}" \
   "${REQUEST_TIMEOUT}" \
-  "${remote_create_workers}" \
   "${node0_advertise_ip}" <<'REMOTE'
 set -euo pipefail
 
 start_unix_ms="$1"
 request_timeout="$2"
-create_workers="$3"
-reply_advertise="$4"
-if [[ "${create_workers}" == "__default__" ]]; then
-  create_workers=""
-fi
+reply_advertise="$3"
 run_root="$HOME/smartbft_cloudlab"
 args=(
   "${run_root}/bin/smartbft-smallbank"
@@ -1489,13 +1560,9 @@ args=(
   "--request-timeout" "${request_timeout}"
   "--client-reply-listen" "0.0.0.0:0"
   "--client-reply-advertise-host" "${reply_advertise}"
-  "--create"
   "--execute"
   "--start-unix-ms" "${start_unix_ms}"
 )
-if [[ -n "${create_workers}" ]]; then
-  args+=("--create-workers" "${create_workers}")
-fi
 printf -v client_cmd '%q ' "${args[@]}"
 tmux kill-session -t smartbft_client >/dev/null 2>&1 || true
 : > "${run_root}/logs/client.log"
@@ -1633,6 +1700,22 @@ if (( LOG_ENABLED == 1 )); then
   LOGS_LOCAL_DIR="${ARTIFACT_DIR}/logs"
   rm -rf "${LOGS_LOCAL_DIR}"
   mkdir -p "${LOGS_LOCAL_DIR}/servers" "${LOGS_LOCAL_DIR}/appliers" "${LOGS_LOCAL_DIR}/agents" "${LOGS_LOCAL_DIR}/sharing"
+  # Replica logs are compressed on their host (the replicas are stopped by
+  # now) and pulled as server_<id>.log.gz; a missing log is left to the
+  # download below to report, as before.
+  for i in "${!server_nodes[@]}"; do
+    if ! ssh "${SSH_OPTS[@]}" "${server_users[$i]}@${server_hosts[$i]}" "bash -s" <<'REMOTE'
+set -euo pipefail
+cd "$HOME/smartbft_cloudlab/logs"
+for f in server_*.log; do
+  [[ -f "${f}" ]] || continue
+  gzip -f "${f}"
+done
+REMOTE
+    then
+      echo "  - ${server_nodes[$i]}: failed to compress server logs" >&2
+    fi
+  done
   for i in "${!server_nodes[@]}"; do
     node="${server_nodes[$i]}"
     host="${server_hosts[$i]}"
@@ -1642,9 +1725,9 @@ if (( LOG_ENABLED == 1 )); then
       replica_id=$((machine_idx * replicas_per_server_machine + n))
       node_id=$((replica_id + 1))
       queue_artifact_download "${node}" "${host}" "${user}" \
-        "smartbft_cloudlab/logs/server_${node_id}.log" \
-        "${LOGS_LOCAL_DIR}/servers/server_${node_id}.log" \
-        "server_${node_id}.log" \
+        "smartbft_cloudlab/logs/server_${node_id}.log.gz" \
+        "${LOGS_LOCAL_DIR}/servers/server_${node_id}.log.gz" \
+        "server_${node_id}.log.gz" \
         "log"
       if (( FAILURE_SPEC_ENABLED == 1 )); then
         queue_artifact_download "${node}" "${host}" "${user}" \

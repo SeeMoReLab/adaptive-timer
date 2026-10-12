@@ -133,20 +133,25 @@ TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
 
 
 class TendermintProposeTimeoutOption(IntEnum):
-    # Calibrated on the six-phase config/tendermint/failure_spec.xml
-    # (runs/2026-09-29-tendermint-arms/report.md), one arm per regime:
-    #   150 - proposal delay only: the cheapest escape from a withheld proposal.
-    #   450 - +50 ms links: the lowest value that clears the proposal arrival.
-    #   750 - +150 ms links: rides them without the collapse 450 falls into.
-    TIMEOUT_150_MS = 150
-    TIMEOUT_450_MS = 450
-    TIMEOUT_750_MS = 750
+    # One arm per regime of config/tendermint/failure_spec.xml (Kevin 2026-10-10;
+    # constant-T runs of the compressed spec, scripts/cloudlab/tmp/cal/blindall/
+    # tendermint/real_c120.xml, 2 draws, client judge). Only the propose timeout
+    # binds in a healthy round: prevote and precommit (T/3) start only on a split
+    # vote, and the propose step takes about two one-way trips (108 ms at +50,
+    # 280 ms at +150).
+    #   100 - proposal delay: the fastest escape from a withheld proposal.
+    #   200 - +50 ms links: no missed proposals (150 misses 1.6 a window).
+    #   400 - +150 ms links: 0.3 missed a window (300 misses 5, and collapses).
+    # Replaced 150 / 450 / 750 (2026-09-29).
+    TIMEOUT_100_MS = 100
+    TIMEOUT_200_MS = 200
+    TIMEOUT_400_MS = 400
 
 
 TENDERMINT_PROPOSE_TIMEOUT_OPTIONS: Tuple[TendermintProposeTimeoutOption, ...] = (
-    TendermintProposeTimeoutOption.TIMEOUT_150_MS,
-    TendermintProposeTimeoutOption.TIMEOUT_450_MS,
-    TendermintProposeTimeoutOption.TIMEOUT_750_MS,
+    TendermintProposeTimeoutOption.TIMEOUT_100_MS,
+    TendermintProposeTimeoutOption.TIMEOUT_200_MS,
+    TendermintProposeTimeoutOption.TIMEOUT_400_MS,
 )
 TENDERMINT_PROPOSE_TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(
     int(option) for option in TENDERMINT_PROPOSE_TIMEOUT_OPTIONS
@@ -158,21 +163,23 @@ TENDERMINT_PROPOSE_TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
 
 
 class HotstuffTimeoutOption(IntEnum):
-    # 160 and 460 sit just under what the next link level needs (one-way 5+50:
-    # 170 still locks into 3-hop rounds, 180 runs clean; 5+150: about 470), so
-    # each works at its own level and fails one level up; 760 keeps the 300 ms
-    # gap and clears the 4h band where 5+150 is bistable (no TCP_NODELAY, a
-    # vote after a Timeout waits an RTT). Calibrated 2026-10-02 against
-    # config/hotstuff/failure_spec.xml.
-    TIMEOUT_160_MS = 160
-    TIMEOUT_460_MS = 460
-    TIMEOUT_760_MS = 760
+    # One value per link level of config/hotstuff/failure_spec.xml, each the best
+    # (or tied best) there and failing one level up: 100 at base, 300 at one-way
+    # 5+50 (floor about 180: 170 still locks into 3-hop rounds), 700 at 5+150
+    # (floor between 460, which storms, and 530). Under the slow-leader attack a
+    # lower T replaces the leader sooner: constant-T cells (client R over t > 60
+    # s, 2026-10-08) base + slow leader T100 0.798 vs T160 0.761, 5+50 + slow
+    # leader T300 0.469 vs T460 0.398; the no-attack phases tie. Replaced
+    # 160 / 460 / 760 (2026-10-02) on 2026-10-08 (Kevin).
+    TIMEOUT_100_MS = 100
+    TIMEOUT_300_MS = 300
+    TIMEOUT_700_MS = 700
 
 
 HOTSTUFF_TIMEOUT_OPTIONS: Tuple[HotstuffTimeoutOption, ...] = (
-    HotstuffTimeoutOption.TIMEOUT_160_MS,
-    HotstuffTimeoutOption.TIMEOUT_460_MS,
-    HotstuffTimeoutOption.TIMEOUT_760_MS,
+    HotstuffTimeoutOption.TIMEOUT_100_MS,
+    HotstuffTimeoutOption.TIMEOUT_300_MS,
+    HotstuffTimeoutOption.TIMEOUT_700_MS,
 )
 HOTSTUFF_TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(
     int(option) for option in HOTSTUFF_TIMEOUT_OPTIONS
@@ -187,18 +194,20 @@ class AutobahnTimeoutDelayOption(IntEnum):
     # config/autobahn/parameters.json). Healthy Autobahn has no floor; the
     # floors come from replica 3 withholding its votes, so every quorum needs
     # all three honest replicas and a premature view change starves it. They
-    # are soft (about 400 at one-way 5+50, about 1000 at 5+150), so 250 and
-    # 750 sit as far under them as it takes to lose clearly one level up (300
-    # lost to 750 at 5+50 by only 0.03); 1250 keeps the 500 ms gap.
-    # Calibrated 2026-10-02 against config/autobahn/failure_spec.xml.
+    # are soft (about 400 at one-way 5+50, about 1000 at 5+150). One value per
+    # link level: 250 at base, 500 at 5+50, 1250 at 5+150. Constant-T cells
+    # (client R over t > 60 s, 2026-10-08): 5+50 T250 -0.164 (storms), T400
+    # 0.260, T500 0.247, T750 0.176; with the slow leader -0.146 / 0.259 / 0.249 /
+    # 0.169; 5+150 T750 storms, T1000 -0.835 (a 3 s stall), T1250 -0.873. 500
+    # replaced 750 on 2026-10-08 (Kevin), within noise of 400.
     TIMEOUT_250_MS = 250
-    TIMEOUT_750_MS = 750
+    TIMEOUT_500_MS = 500
     TIMEOUT_1250_MS = 1250
 
 
 AUTOBAHN_TIMEOUT_DELAY_OPTIONS: Tuple[AutobahnTimeoutDelayOption, ...] = (
     AutobahnTimeoutDelayOption.TIMEOUT_250_MS,
-    AutobahnTimeoutDelayOption.TIMEOUT_750_MS,
+    AutobahnTimeoutDelayOption.TIMEOUT_500_MS,
     AutobahnTimeoutDelayOption.TIMEOUT_1250_MS,
 )
 AUTOBAHN_TIMEOUT_DELAY_VALUES_MS: Tuple[int, ...] = tuple(
@@ -332,6 +341,34 @@ def get_report_feature_field_names(protocol: int) -> Tuple[str, ...]:
 
 def get_report_feature_dim(protocol: int) -> int:
     return len(get_report_feature_field_names(protocol))
+
+
+def report_message_class(protocol: int) -> type:
+    protocol = _validate_protocol(protocol)
+    if protocol == agent_pb2.PROTOCOL_PBFT:
+        return agent_pb2.PbftReport
+    if protocol == agent_pb2.PROTOCOL_SBFT:
+        return agent_pb2.SbftReport
+    if protocol == agent_pb2.PROTOCOL_TENDERMINT:
+        return agent_pb2.TendermintReport
+    if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
+        return agent_pb2.HotstuffReport
+    if protocol == agent_pb2.PROTOCOL_AUTOBAHN:
+        return agent_pb2.AutobahnReport
+    if protocol == agent_pb2.PROTOCOL_SMARTBFT:
+        return agent_pb2.SmartbftReport
+    raise ValueError(f"Unsupported protocol: {protocol}")
+
+
+def get_report_field_names(protocol: int) -> Tuple[str, ...]:
+    """Every field of the protocol's report message, in field-number order.
+
+    The dataset columns and the sharing-mode median use this, so a report field
+    added to proto/agent.proto reaches both with no hand list. The model inputs
+    are the *_REPORT_FEATURE_FIELD_NAMES tuples above, a subset of it.
+    """
+    fields = report_message_class(protocol).DESCRIPTOR.fields
+    return tuple(f.name for f in sorted(fields, key=lambda f: f.number))
 
 
 def get_timeout_values_ms(protocol: int) -> Tuple[int, ...]:
@@ -581,6 +618,11 @@ def report_to_feature_values(protocol: int, state: object) -> List[float]:
     protocol = _validate_protocol(protocol)
     fields = get_report_feature_field_names(protocol)
     return [float(getattr(state, field_name)) for field_name in fields]
+
+
+def report_to_values(protocol: int, state: object) -> List[float]:
+    """Every report field (get_report_field_names), for the dataset rows."""
+    return [float(getattr(state, field_name)) for field_name in get_report_field_names(protocol)]
 
 
 def timeout_to_action_index(protocol: int, timeout_used: object) -> int:
@@ -1353,7 +1395,7 @@ class RandomTimeoutModel(TensorModel):
         self._rng = np.random.default_rng(self._initial_seed)
 
 class ScheduledTimeoutModel(TensorModel):
-    """Returns raw protocol timeout values from a time-based schedule."""
+    """Returns raw protocol timeout values from a schedule looked up by episode number."""
 
     def __init__(
         self,
@@ -1373,12 +1415,13 @@ class ScheduledTimeoutModel(TensorModel):
             )
             normalized_schedule.append((float(time_s), normalized_action))
         self._schedule = sorted(normalized_schedule, key=lambda entry: entry[0])
-        self._effective_schedule: List[Tuple[float, Tuple[int, ...]]] = []
         self._schedule_time_shift_s = 0.0
         self._rebuild_effective_schedule()
         self._start_time = (
             time.monotonic() if start_monotonic is None else float(start_monotonic)
         )
+        # Set by set_episode_ms before the first lookup.
+        self._episode_ms: Optional[int] = None
         self._active_row = -1
 
     @classmethod
@@ -1489,26 +1532,52 @@ class ScheduledTimeoutModel(TensorModel):
             raise ValueError("Schedule must contain at least one entry.")
         first_switch_time_s = float(self._schedule[0][0])
         self._schedule_time_shift_s = -min(0.0, first_switch_time_s)
-        self._effective_schedule = [
-            (switch_time_s + self._schedule_time_shift_s, raw_action)
-            for switch_time_s, raw_action in self._schedule
-        ]
 
-    def _current_action(self) -> np.ndarray:
-        elapsed_s = time.monotonic() - self._start_time
+    def set_episode_ms(self, episode_ms: int) -> None:
+        """Bind the replicas' episode period P and check every row is on its grid.
+
+        Episode e applies its timeouts at start + warmUp + P*(e-1), so a row
+        written at time_s takes effect from the episode whose apply instant is
+        time_s after the warm-up. A non-negative row off that grid would apply
+        at the next multiple without saying so, and is refused.
+        """
+        episode_ms = int(episode_ms)
+        if episode_ms <= 0:
+            raise ValueError(f"episode_ms must be > 0, got {episode_ms}")
+        if self._schedule[0][0] > 0.0:
+            raise ValueError(
+                "Schedule has no row for episode 1: its first row is at "
+                f"time_s={self._schedule[0][0]:g}, it must be at or below 0."
+            )
+        for time_s, _ in self._schedule:
+            if time_s < 0.0:
+                continue
+            time_ms = time_s * 1000.0
+            if abs(time_ms - round(time_ms)) > 1e-6 or round(time_ms) % episode_ms != 0:
+                raise ValueError(
+                    f"Schedule row time_s={time_s:g} is not a multiple of the "
+                    f"episode period {episode_ms / 1000.0:g} s."
+                )
+        self._episode_ms = episode_ms
+
+    def action_for_episode(self, episode: int) -> np.ndarray:
+        """The last row with time_s <= P*(episode-1); negative rows count for every episode."""
+        if self._episode_ms is None:
+            raise RuntimeError("set_episode_ms must be called before action_for_episode.")
+        episode = int(episode)
+        if episode < 1:
+            raise ValueError(f"Episode numbers start at 1, got {episode}")
+        episode_time_ms = self._episode_ms * (episode - 1)
         active_row = 0
-        raw_action = self._effective_schedule[0][1]
-        for row_idx, (switch_time_s, schedule_action) in enumerate(
-            self._effective_schedule
-        ):
-            if elapsed_s >= switch_time_s:
+        raw_action = self._schedule[0][1]
+        for row_idx, (switch_time_s, schedule_action) in enumerate(self._schedule):
+            if switch_time_s < 0.0 or round(switch_time_s * 1000.0) <= episode_time_ms:
                 active_row = row_idx
                 raw_action = schedule_action
             else:
                 break
         if active_row != self._active_row:
-            switch_time_s, active_action = self._effective_schedule[active_row]
-            source_switch_time_s, _ = self._schedule[active_row]
+            source_switch_time_s, active_action = self._schedule[active_row]
             timeout = self._action_codec.decode(active_action)
             if self._protocol == agent_pb2.PROTOCOL_PBFT:
                 description = (
@@ -1546,7 +1615,8 @@ class ScheduledTimeoutModel(TensorModel):
                 )
             print(
                 "[scheduled-model] active schedule: "
-                f"time_s>={switch_time_s:g}, "
+                f"episode={episode}, "
+                f"episode_time_s={episode_time_ms / 1000.0:g}, "
                 f"source_time_s={source_switch_time_s:g}, "
                 f"{description}"
             )
@@ -1561,7 +1631,9 @@ class ScheduledTimeoutModel(TensorModel):
 
     def predict_action(self, features: np.ndarray) -> np.ndarray:
         del features
-        return self._current_action()
+        raise RuntimeError(
+            "ScheduledTimeoutModel is looked up by episode number; call action_for_episode."
+        )
 
     def update_model(
         self, features: np.ndarray, action: np.ndarray, reward: float

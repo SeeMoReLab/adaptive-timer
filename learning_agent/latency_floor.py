@@ -13,7 +13,8 @@ from models import TensorModel
 # headroom for the jitter around that estimate.
 DEFAULT_LATENCY_FLOOR_MULTIPLIER = 1.0
 
-# Windows kept for the quantile (--latency-floor-window). At 1 the floor is the
+# Windows kept for the quantile (pretrain.py and the simulators; the live agent takes
+# continuous_heuristic's window, main.py). At 1 the floor is the
 # latest committing window's latency and the quantile has no effect. A longer
 # window (it was 16 until 2026-10-07) keeps a burst of degraded windows from
 # carrying the quantile on its own, at the cost of following a regime change
@@ -50,8 +51,9 @@ DEFAULT_LATENCY_FLOOR_WINDOW = 1
 # rather than assuming this transfers.
 #
 # Those measurements were taken with a 16-window floor. At the 1-window default
-# the quantile has no effect; it starts to matter with a longer
-# --latency-floor-window, where 0.50 is the value measured above.
+# the quantile has no effect; it starts to matter with a longer window
+# (pretrain.py --latency-floor-window), where 0.50 is the value measured above.
+# The live agent takes continuous_heuristic's window and quantile instead (main.py).
 DEFAULT_LATENCY_FLOOR_QUANTILE = 0.50
 
 
@@ -68,6 +70,7 @@ class LatencyFloor:
         window: int = DEFAULT_LATENCY_FLOOR_WINDOW,
         quantile: float = DEFAULT_LATENCY_FLOOR_QUANTILE,
         max_floor_ms: Optional[float] = None,
+        field: str = "avg_consensus_latency_ms",
     ) -> None:
         if not math.isfinite(multiplier) or multiplier <= 0.0:
             raise ValueError(f"multiplier must be > 0, got {multiplier}")
@@ -82,6 +85,7 @@ class LatencyFloor:
         self._window = int(window)
         self._quantile = float(quantile)
         self._max_floor_ms = None if max_floor_ms is None else float(max_floor_ms)
+        self.field = field  # the report field observe() is fed from (model_builder)
         self.reset()
 
     def observe(self, latency_ms: float, alive: bool = True) -> None:

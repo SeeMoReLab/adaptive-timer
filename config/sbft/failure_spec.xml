@@ -1,5 +1,8 @@
 <?xml version="1.0"?>
 <failureSpec>
+    <!-- 2026-10-19 (restart from scratch): the phase values are unchanged; the T ladder is 250 / 650 / 1600 x W 10 / 150 and there is no crash straggler (the September text below names 250 / 525 / 1100 x 50 / 150 and a 5000 ms straggler at t=300). The per-phase
+         "best" comments record the calibration of their time; the current oracle is
+         learning_agent/config/schedule_sbft.csv. -->
     <!-- Proposed by runs/2026-09-27-sbft-pairs (2026-09-28). One phase per SBFT timeout pair; each pair is best in its phase by
          steady throughput then p50 (>= 50 ms), 3 draws each, 15,000 req/s, on CppBedrock 3fb8d58. (250, 150) is unreachable:
          see the run log. Straggler 5000 ms (t=300) is a crash in effect (above the 5 s gRPC keepalive). jitterRatio 0.
@@ -31,7 +34,10 @@
                 </proposalDelay>
             </sbft>
         </phase>
-        <!-- t=300: best (250, 50). base + crash + D=150: 250 elects away from the delayed leader, both waits miss, W=50 cheapest -->
+        <!-- t=300: best (250, 50). base + D=300: 250 elects away from the delayed leader (100 + 300 + 15 > 250), 550 tolerates it (415 < 550) and pays the hold, both waits miss, W=50 cheapest.
+             2026-10-13 (Kevin, runs/2026-10-12-sbft-margins): the 5000 ms crash straggler removed; at 20,000 req/s it stalled the 550 rung on the view-change split (R 0.00 vs 0.90) and the phase no longer tested the timeout.
+             2026-10-14 (Kevin, runs/2026-10-13-recal-sbft-pbft): D 150 -> 200. On the five-machine deployment the arrivals spread over the 100 ms tick, so at D 150 a request's age stayed under 250 and the 250 rung tolerated the leader too (single-host cells deposed it).
+             2026-10-14 later (Kevin, runs/2026-10-14-five-machine-models): D 200 -> 300. At D 200 the 250 rung deposed the onset only; after the 60 s re-pin every backup expiry was re-armed by the overtaken rule (the backups' watched request runs about 90 ms younger than the batch's oldest). At D 300 it deposes at the onset and at every re-pin (two cells, p1 +0.91 / +0.92). -->
         <phase>
             <atTime>300</atTime>
             <network>
@@ -41,14 +47,6 @@
                     <burstDurationMs>0</burstDurationMs>
                     <burstIntervalMs>0</burstIntervalMs>
                 </global>
-                <sources>
-                    <source>
-                        <src>2</src>
-                        <delayMs>5000</delayMs>
-                        <burstDurationMs>10000</burstDurationMs>
-                        <burstIntervalMs>10000</burstIntervalMs>
-                    </source>
-                </sources>
             </network>
             <sbft>
                 <proposalDelay>
@@ -56,7 +54,7 @@
                     <replicas>
                         <replica>
                             <id>leader</id>
-                            <delayMs>150</delayMs>
+                            <delayMs>300</delayMs>
                         </replica>
                     </replicas>
                 </proposalDelay>
@@ -79,7 +77,8 @@
                 </proposalDelay>
             </sbft>
         </phase>
-        <!-- t=900: best (525, 150). 5+50 + S=80 + D=350: 250 storms (floor 275), 525 escapes D, W=150 catches the 80 ms lag -->
+        <!-- t=900: best (550, 150). 5+50 + S=60 + D=550: 250 storms (floor 275), 550 deposes the held leader (100 + 550 + 165 > 550) and 1200 tolerates it, W=150 catches the 60 ms lag.
+             2026-10-13 (Kevin, runs/2026-10-12-sbft-margins, 20,000 req/s): D 350 -> 550 and lag 80 -> 60 (source 130 -> 110; lag = source minus the global delay); 550/150 +0.29 vs 1200/150 +0.12 over 10 draws. -->
         <phase>
             <atTime>900</atTime>
             <network>
@@ -92,7 +91,7 @@
                 <sources>
                     <source>
                         <src>2</src>
-                        <delayMs>130</delayMs>
+                        <delayMs>110</delayMs>
                         <burstDurationMs>10000</burstDurationMs>
                         <burstIntervalMs>10000</burstIntervalMs>
                     </source>
@@ -104,7 +103,7 @@
                     <replicas>
                         <replica>
                             <id>leader</id>
-                            <delayMs>350</delayMs>
+                            <delayMs>550</delayMs>
                         </replica>
                     </replicas>
                 </proposalDelay>
@@ -141,7 +140,8 @@
                 </proposalDelay>
             </sbft>
         </phase>
-        <!-- t=1500: best (1100, 150). 5+150 + S=100: 250 and 525 storm (floor 600), W=150 catches -->
+        <!-- t=1500: best (1200, 150). 5+150 + S=60: 250 and 550 storm at the onset (floor 620), W=150 catches the 60 ms lag.
+             2026-10-13 (Kevin, runs/2026-10-12-sbft-margins, 20,000 req/s): lag 100 -> 60 (source 250 -> 210; lag = source minus the global delay; measured at source 215); entering from the oracle's state 1200/150 +0.36 vs 1200/50 +0.06 over 10 draws. -->
         <phase>
             <atTime>1500</atTime>
             <network>
@@ -154,7 +154,7 @@
                 <sources>
                     <source>
                         <src>2</src>
-                        <delayMs>250</delayMs>
+                        <delayMs>210</delayMs>
                         <burstDurationMs>10000</burstDurationMs>
                         <burstIntervalMs>10000</burstIntervalMs>
                     </source>
@@ -166,7 +166,7 @@
                 </proposalDelay>
             </sbft>
         </phase>
-        <!-- t=1800: best (1100, 50). 5+150 + S=300: 250 and 525 storm (floor 600), both waits miss, W=50 cheapest. A crash (S=5000) here stalls the low rungs on a still-open view-change split; see the run log. -->
+        <!-- t=1800: 5+150 + S=450 (source 600 over the 150 ms link, 2026-10-17, runs/2026-10-16-sbft-stability; was S=300, source 450). The slow path wins: fast with the straggler 100 + 3h + S = 1015 against slow 125 + 5h + W = 910-950, so every wait that catches the n-th prepare (W > 450) loses and the lowest wait is best. At S=300 a W of 500 caught it (865 vs 950) and the oracle's ladder had no such value. A crash (S=5000) here stalls the low rungs on a still-open view-change split; see the run log. -->
         <phase>
             <atTime>1800</atTime>
             <network>
@@ -179,7 +179,7 @@
                 <sources>
                     <source>
                         <src>2</src>
-                        <delayMs>450</delayMs>
+                        <delayMs>600</delayMs>
                         <burstDurationMs>10000</burstDurationMs>
                         <burstIntervalMs>10000</burstIntervalMs>
                     </source>

@@ -20,31 +20,71 @@ fit to run data. One height is simulated round by round, all four nodes in step:
   everything pending.
 
 Episodes follow the wall-clock learning windows in config.toml: 7 s features,
-2 s reply wait, 4 s warm-up, 7 s reward. Reports carry the same fields, with
-the same round-0 definitions, as ``consensus/adaptive_timer.go``, seen from
-node 0 (replica 0's agent reads its own node's report): in the heights node 0
-proposes, its propose step ends when it sends its own proposal, and its
-prevote step runs from then until the others' prevotes reach it.
+2 s reply wait, 4 s warm-up, 7 s reward. Reports carry every TendermintReport
+field (proto/agent.proto), with the same round-0 definitions as
+``consensus/adaptive_timer.go``, as the agent reads them in sharing mode,
+where every row runs: the median over the four nodes' reports, a window
+statistic taken over the nodes that measured it, 0 only when none did
+(aggregator.measured_only_fields). Until 2026-10-19 (restart D11) they were
+node 0's own report, and node 0 is the maverick: in the heights it proposes,
+its propose step ends when it sends its own proposal (after the hold, as
+``delayedSendPreparedProposal`` enters prevote only then) and its prevote step
+carries the block transfer that the other nodes' propose steps carry, and
+under --peer-spread its nil prevotes follow its own timer. The nodes run in
+step, so the consensus latency, batch and inter-commit gap statistics are the
+same on every node; only the propose and prevote steps and, under
+--peer-spread, the timeout differ between them.
 
-Constants the mechanics do not fix are drawn per simulated run, so the prior
-learned from it has to hold across them: the ones the blind fit sets
-(FREE in scripts/cloudlab/tmp/cal/blindall/tendermint/fit/sim_fit.py) 0.5-2x
-around their SimConstants defaults, the rest (link, jitter, fixed processing
-costs, the peer-state hop count, the load) from ranges wider than the real
-setup.
+Training runs draw from the shared pretraining recipe (sim_common; Kevin,
+2026-10-19, restart D11):
+
+- the offered load with draw_load_tps around N = 5,000 (reward_normalizer_tps),
+  the fault onsets with fault_start_times after the base phase at 0, the extra
+  link delay with draw_link_extra_ms, the base one-way delay with
+  draw_base_delay_ms, no netem jitter (JITTER_RATIO), and the initial propose
+  timeout with draw_initial_timeout_ms;
+- this simulator's own fault mix (none 0.2, delayed proposer 0.35, link 0.35,
+  both 0.1). A delayed proposer holds draw_hold_ms (60%) or is silent (40%): a
+  hold 0.5-2x around the spec's 10 s, longer than any propose timeout in the
+  action range, so its proposal is always dropped. 40% is the share of the old
+  log-uniform 100-30,000 ms hold above the 3,000 ms action bound, so the silent
+  proposer the spec runs stays in training;
+- every constant 0.5-2x around its SimConstants value (around): the fitted
+  ones (FREE in scripts/cloudlab/tmp/cal/blindall/tendermint/fit/sim_fit.py) as
+  before, and the unfitted create_ms and exec_ms (5 ms, eyeballed from
+  b1_codex) and peer_hops (1, now a float hop multiplier) in place of their old
+  wide ranges;
+- no initial backlog: a block takes the whole mempool, so a backlog drains in
+  the first height.
+
+spec_schedule() reads config/tendermint/failure_spec.xml and raises on anything
+the simulator cannot represent.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import math
 import os
-from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+import xml.etree.ElementTree as ET
+from dataclasses import asdict, dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from prior_windows import PriorWindows, check_prior_windows
+from sim_common import schedule_rows, scheduled_action
+from sim_common import (
+    JITTER_RATIO,
+    around,
+    draw_base_delay_ms,
+    draw_hold_ms,
+    draw_initial_timeout_ms,
+    draw_link_extra_ms,
+    draw_load_tps,
+    fault_start_times,
+)
 
 N_NODES = 4
 QUORUM = 3  # 2f+1 of 4: accepting nodes for a block, nil prevotes to end a round
@@ -60,34 +100,39 @@ SIM_WINDOWS = PriorWindows.from_seconds(FEATURE_S, REPLY_S, WARMUP_S, REWARD_S)
 
 
 @dataclass
-# Fitted defaults: blind best-by-loss candidate i=108 (loss 0.152) of fit7_tendermint_blind.jsonl, 7/2/4/7 calibration (blindall, 2026-10-09).
+# 5,000 tx/s refit (2026-10-12, runs/2026-10-12-tm-recal5k): 12,000 fresh candidates (seeds 2-9) on the bl5k_ blind runs;
+# real 5k check loss 0.068 (old 4k-fit constants: 0.125), regret 0.015. load_tps 5000, training draw 1250-10000.
+# Fitted defaults: blind best-by-loss candidate i=1342 (loss 0.105) of s3fit_tendermint_blind_s9.jsonl, restart S3 blind refit (seeds 7,8,9,10,11 x 1500, best of the seeds; real-spec mean regret 0.034 PASS, 2026-10-20).
 class SimConstants:
     """Defaults are an evaluation point eyeballed from b1_codex, used to
     pre-screen policies; training draws every field from sample_constants,
     the fitted ones around these defaults."""
 
     base_delay_ms: float = 5.0
-    vote_proc_ms: float = 4.883969
+    vote_proc_ms: float = 6.53284
     create_ms: float = 5.0
-    create_per_tx_ms: float = 0.017403
+    create_per_tx_ms: float = 0.001656
     exec_ms: float = 5.0
-    exec_per_tx_ms: float = 0.036707
-    peer_hops: int = 1
-    # netem jitter as a fraction of each hop's delay (apply_network_failures
-    # DEFAULT_NETWORK_DELAY_JITTER_RATIO, 0.2 when the spec sets none), plus
-    # the reactor's gossip sleep and flush before a proposal goes out.
-    jitter_ratio: float = 0.2
-    gossip_proc_ms: float = 6.588905
+    exec_per_tx_ms: float = 0.033648
+    # NewRoundStep gossip hops before a proposal can go to a peer, a multiplier
+    # of the hop time (a float drawn 0.5-2x since restart D11; 0, 1 or 2 until then).
+    peer_hops: float = 1.0
+    # netem jitter as a fraction of each hop's delay: 0, as every spec sets
+    # (sim_common.JITTER_RATIO, Kevin, 2026-10-19; the applier's 0.2 default
+    # until then, which the fitted constants were fit under).
+    jitter_ratio: float = JITTER_RATIO
+    # The reactor's gossip sleep and flush before a proposal goes out.
+    gossip_proc_ms: float = 7.087048
     # Block parts take longer to arrive the bigger the block, and more so on a
     # slow link (the transfer is window-limited, so it scales with the RTT).
-    propagate_per_tx_ms: float = 0.014701
-    propagate_per_tx_per_delay_ms: float = 4.8e-05
+    propagate_per_tx_ms: float = 0.005694
+    propagate_per_tx_per_delay_ms: float = 7e-06
     # Per-proposal lognormal spread of the transfer time: a timeout just above
     # the mean arrival still misses the slow tail.
-    propagate_sigma: float = 0.262992
-    load_tps: float = 4000.0
+    propagate_sigma: float = 0.211933
+    load_tps: float = 5000.0  # the harness's offered rate (5 connections x 25 x 40; 4000 before 2026-10-12)
     # Offered load falls when the client's own links slow down.
-    load_delay_sensitivity: float = 0.000284
+    load_delay_sensitivity: float = 0.000302
 
 
 @dataclass
@@ -106,43 +151,83 @@ class _Window:
     rounds_gt0: int = 0
     round_changes: int = 0
     lat: List[float] = field(default_factory=list)
-    prop: List[float] = field(default_factory=list)
-    prev: List[float] = field(default_factory=list)
+    # The round-0 propose and prevote steps per node, node 0 first: the only
+    # samples that differ between the nodes (module docstring).
+    prop: List[List[float]] = field(default_factory=lambda: [[] for _ in range(N_NODES)])
+    prev: List[List[float]] = field(default_factory=lambda: [[] for _ in range(N_NODES)])
     prec: List[float] = field(default_factory=list)
     batch: List[float] = field(default_factory=list)
+    commit_ms: List[float] = field(default_factory=list)
 
-    def report(self) -> Dict[str, float]:
+    def report(self, node_timeouts_ms: Sequence[float]) -> Dict[str, float]:
+        """Every TendermintReport field as the agent reads it in sharing mode
+        (module docstring); ``node_timeouts_ms`` are the propose timeouts in
+        force, node 0 first."""
         def avg(v):
-            return float(np.mean(v)) if v else 0.0
+            return float(np.mean(v)) if len(v) else 0.0
 
         def pct(v, q):
             # Nearest rank, sorted[ceil(q/100 n) - 1], as the engine's windowPercentile
             # (cometbft consensus/adaptive_timer.go).
-            return float(np.percentile(v, q, method="inverted_cdf")) if v else 0.0
+            return float(np.percentile(v, q, method="inverted_cdf")) if len(v) else 0.0
+
+        def family(v, avg_name: str, pct_name: str) -> Dict[str, float]:
+            # The avg/p50/p90/p95 family of one sample list under the proto's names.
+            out = {avg_name: avg(v)}
+            out.update({pct_name.format(q): pct(v, q) for q in (50, 90, 95)})
+            return out
+
+        def shared(values: Sequence[float]) -> float:
+            # aggregator.measured_only_fields: the median of the nodes that measured it.
+            measured = [x for x in values if x > 0.0]
+            return float(np.median(measured)) if measured else 0.0
 
         elapsed = self.end_s - self.start_s
         # main._fill_empty_window_latency: the agent gives a window in which
         # nothing committed its own length as its latency (the report gives 0).
         empty_ms = elapsed * 1000.0
-        return {
+        report = {
             "total_transactions": float(self.txs),
             "total_consensus_instances": float(self.heights),
-            "avg_consensus_latency_ms": avg(self.lat) if self.lat else empty_ms,
-            "p50_consensus_latency_ms": pct(self.lat, 50) if self.lat else empty_ms,
-            "p90_consensus_latency_ms": pct(self.lat, 90) if self.lat else empty_ms,
             "throughput_tps": self.txs / elapsed if elapsed > 0 else 0.0,
             "timeout_violation_rate": (
                 self.rounds_gt0 / self.heights if self.heights else 0.0
             ),
-            "avg_batch_size": avg(self.batch),
-            "p50_batch_size": pct(self.batch, 50),
-            "p90_batch_size": pct(self.batch, 90),
             "leader_change_count": float(self.rounds_gt0),
             "regency_change_count": float(self.round_changes),
-            "propose_latency_ms": avg(self.prop),
-            "prevote_latency_ms": avg(self.prev),
-            "precommit_latency_ms": avg(self.prec),
+            # Each node reports its own uint32 timeout; the plain median, rounded
+            # as aggregator._array_to_report rounds an integer field.
+            "timeout_ms": float(max(0, int(round(float(np.median(
+                [int(round(t)) for t in node_timeouts_ms])))))),
         }
+        latency = family(self.lat, "avg_consensus_latency_ms", "p{}_consensus_latency_ms")
+        report.update({k: (v if self.lat else empty_ms) for k, v in latency.items()})
+        report.update(family(self.batch, "avg_batch_size", "p{}_batch_size"))
+        report.update(family(list(np.diff(self.commit_ms)), "avg_inter_commit_gap_ms",
+                             "p{}_inter_commit_gap_ms"))
+        report.update(family(self.prec, "precommit_latency_ms", "p{}_precommit_latency_ms"))
+        per_node = [
+            {**family(self.prop[i], "propose_latency_ms", "p{}_propose_latency_ms"),
+             **family(self.prev[i], "prevote_latency_ms", "p{}_prevote_latency_ms")}
+            for i in range(N_NODES)
+        ]
+        report.update({k: shared([node[k] for node in per_node]) for k in per_node[0]})
+        return report
+
+
+@functools.lru_cache(maxsize=None)
+def check_report_fields() -> None:
+    """Raise unless the simulated report has exactly TendermintReport's fields."""
+    import agent_pb2
+    from models import get_report_field_names
+
+    have = set(_Window(0.0, 1.0).report([1.0] * N_NODES))
+    want = set(get_report_field_names(agent_pb2.PROTOCOL_TENDERMINT))
+    if have != want:
+        raise ValueError(
+            f"tendermint_sim report fields differ from TendermintReport: missing "
+            f"{sorted(want - have)}, extra {sorted(have - want)}"
+        )
 
 
 class TendermintSim:
@@ -174,8 +259,13 @@ class TendermintSim:
         self.peer_factors = np.ones(N_NODES - 1) if peer_factors is None else np.asarray(peer_factors, dtype=float)
         if self.peer_factors.shape != (N_NODES - 1,) or np.any(self.peer_factors <= 0.0):
             raise ValueError(f"peer_factors must be {N_NODES - 1} positive multipliers, got {peer_factors}")
+        check_report_fields()
         self.episode_start_s = float(start_offset_s)
         self._advance_to(start_offset_s * 1000.0, None)
+
+    def node_timeouts_ms(self) -> np.ndarray:
+        """The four nodes' propose timeouts, node 0 first."""
+        return self.timeout_ms * np.concatenate(([1.0], self.peer_factors))
 
     def phase_at(self, t_s: float) -> Tuple[int, Phase]:
         idx = 0
@@ -191,7 +281,7 @@ class TendermintSim:
         self.pending = min(float(MEMPOOL_CAP), self.pending + rate * dt / 1000.0)
         self.last_arrival_ms = now_ms
 
-    def _one_height(self) -> Tuple[float, Dict[str, float]]:
+    def _one_height(self) -> Tuple[float, Dict[str, Any]]:
         """Simulate the current height from self.t_ms; return commit time and sample."""
         c = self.c
         t0_first = self.t_ms
@@ -199,11 +289,11 @@ class TendermintSim:
         # Per-node propose timeouts, node 0 first; the quorum timer is the
         # third-lowest (2f+1 of 4): a block needs three accepting nodes, and a
         # nil round advances when the third nil prevote is cast.
-        Ts = self.timeout_ms * np.concatenate(([1.0], self.peer_factors))
+        Ts = self.node_timeouts_ms()
         T = float(Ts[0])
         Tq = float(np.sort(Ts)[QUORUM - 1])
         Tpc_q = float(max(1, (int(Tq) + 1) // 3))
-        sample: Dict[str, float] = {}
+        sample: Dict[str, Any] = {}
         r = 0
         while True:
             _, ph = self.phase_at(t0 / 1000.0)
@@ -233,11 +323,15 @@ class TendermintSim:
                 + data_hop + transfer + float(u(0.0, c.gossip_proc_ms))
             )
             # A node accepts the proposal if it arrives before its own timer;
-            # the block commits when a quorum accepts. Node 0 prevotes on its
-            # own proposal the moment it sends it, on anyone else's when it
-            # arrives, and nil when its timer fires first.
+            # the block commits when a quorum accepts. Each node's prevote ends
+            # its propose step: the proposer prevotes on its own proposal the
+            # moment it sends it, the others on it when it arrives, and a node
+            # whose timer fires first prevotes nil (node 0's rule before
+            # restart D11, now kept for every node).
             accepted = t_arr <= t0 + Ts_r
-            t_prevote0 = t_send if (proposer == 0 and accepted[0]) else (t_arr if accepted[0] else t0 + T_r)
+            t_prevote = np.where(accepted, t_arr, t0 + Ts_r)
+            if accepted[proposer]:
+                t_prevote[proposer] = t_send
             if int(np.count_nonzero(accepted)) >= QUORUM:
                 t_precommit = t_arr + d * (1.0 + jr * float(u(-1.0, 1.0))) + c.vote_proc_ms
                 t_commit = t_precommit + d * (1.0 + jr * float(u(-1.0, 1.0))) + c.vote_proc_ms
@@ -246,8 +340,8 @@ class TendermintSim:
                 t_done = t_commit + c.exec_ms + c.exec_per_tx_ms * ntx
                 self.pending -= ntx
                 if r == 0:
-                    sample["prop"] = t_prevote0 - t0_first
-                    sample["prev"] = t_precommit - t_prevote0
+                    sample["prop"] = t_prevote - t0_first
+                    sample["prev"] = t_precommit - t_prevote
                     sample["prec"] = t_done - t_precommit
                 else:
                     sample["prec"] = t_done - sample["_r0_precommit"]
@@ -265,11 +359,11 @@ class TendermintSim:
             t_precommit = t_prevote_q + d * (1.0 + jr * float(u(-1.0, 1.0))) + c.vote_proc_ms
             t_next = t_precommit + d * (1.0 + jr * float(u(-1.0, 1.0))) + c.vote_proc_ms + Tpc_r
             if r == 0:
-                sample["prop"] = t_prevote0 - t0_first
+                sample["prop"] = t_prevote - t0_first
                 # A node whose timer fires after the quorum already has +2/3
                 # prevotes when it casts its own: its prevote step is one
                 # processing time, not a negative interval.
-                sample["prev"] = max(t_precommit - t_prevote0, c.vote_proc_ms)
+                sample["prev"] = np.maximum(t_precommit - t_prevote, c.vote_proc_ms)
                 sample["_r0_precommit"] = t_precommit
             t0 = t_next
             r += 1
@@ -288,11 +382,16 @@ class TendermintSim:
                         w.rounds_gt0 += int(s["round"] > 0)
                         w.round_changes += int(s["round"])
                         w.lat.append(s["lat"])
-                        w.batch.append(s["ntx"])
-                        if "prop" in s:
-                            w.prop.append(s["prop"])
-                        if "prev" in s:
-                            w.prev.append(s["prev"])
+                        if s["ntx"] > 0:
+                            # accumulateHeight counts a batch only when txCount > 0
+                            # (Kevin, 2026-10-19, restart D11; every height until then).
+                            w.batch.append(s["ntx"])
+                        w.commit_ms.append(t_done)
+                        for i in range(N_NODES):
+                            if "prop" in s:
+                                w.prop[i].append(float(s["prop"][i]))
+                            if "prev" in s:
+                                w.prev[i].append(float(s["prev"][i]))
                         if "prec" in s:
                             w.prec.append(s["prec"])
             self.t_ms = t_done
@@ -307,7 +406,7 @@ class TendermintSim:
         s = self.episode_start_s
         wa = _Window(s, s + FEATURE_S)
         self._advance_to((s + FEATURE_S) * 1000.0, [wa])
-        features = wa.report()
+        features = wa.report(self.node_timeouts_ms())
         # The phase in force when the timeout applies, as main.py's dataset
         # phase: the onset episode carries the phase its reward window measures.
         phase_idx, _ = self.phase_at(s + FEATURE_S + REPLY_S)
@@ -319,42 +418,54 @@ class TendermintSim:
         wb = _Window(s + FEATURE_S + REPLY_S + WARMUP_S, s + EPISODE_S)
         self._advance_to((s + EPISODE_S) * 1000.0, [wb])
         self.episode_start_s = s + EPISODE_S
-        return features, new_timeout, wb.report(), phase_idx
+        return features, new_timeout, wb.report(self.node_timeouts_ms()), phase_idx
+
 
 
 # --- Randomized environments -------------------------------------------------
 
 
-def _around(rng: np.random.Generator, host: float, lo: float = 0.5, hi: float = 2.0) -> float:
-    """A host constant scaled by a log-uniform factor in [lo, hi]."""
-    if host <= 0:
-        raise ValueError(f"cannot draw around a non-positive default {host}")
-    return float(host * math.exp(rng.uniform(math.log(lo), math.log(hi))))
-
-
 def sample_constants(rng: np.random.Generator) -> SimConstants:
-    # The blind fit's FREE fields (blindall/tendermint/fit/sim_fit.py) are drawn
-    # around the SimConstants defaults; the others keep their wide ranges.
+    # Every constant 0.5-2x around its SimConstants value: the blind fit's FREE
+    # fields (blindall/tendermint/fit/sim_fit.py) as before, the unfitted
+    # create_ms, exec_ms and peer_hops in place of their wide ranges (until
+    # restart D11: 2-40, 2-40 and 0-2 hops); base delay, jitter and load from
+    # the shared recipe (Kevin, 2026-10-19, restart D11; module docstring).
+    from reward_utils import reward_normalizer_tps
+
     h = SimConstants()
     return SimConstants(
-        base_delay_ms=float(rng.uniform(1.0, 12.0)),
-        vote_proc_ms=_around(rng, h.vote_proc_ms),
-        create_ms=float(rng.uniform(2.0, 40.0)),
-        create_per_tx_ms=_around(rng, h.create_per_tx_ms),
-        exec_ms=float(rng.uniform(2.0, 40.0)),
-        exec_per_tx_ms=_around(rng, h.exec_per_tx_ms),
-        peer_hops=int(rng.integers(0, 3)),
-        jitter_ratio=float(rng.uniform(0.0, 0.3)),
-        gossip_proc_ms=_around(rng, h.gossip_proc_ms),
-        propagate_per_tx_ms=_around(rng, h.propagate_per_tx_ms),
-        propagate_per_tx_per_delay_ms=_around(rng, h.propagate_per_tx_per_delay_ms),
-        propagate_sigma=_around(rng, h.propagate_sigma),
-        load_tps=float(rng.uniform(1000.0, 8000.0)),
-        load_delay_sensitivity=_around(rng, h.load_delay_sensitivity),
+        base_delay_ms=draw_base_delay_ms(rng),
+        vote_proc_ms=around(rng, h.vote_proc_ms),
+        create_ms=around(rng, h.create_ms),
+        create_per_tx_ms=around(rng, h.create_per_tx_ms),
+        exec_ms=around(rng, h.exec_ms),
+        exec_per_tx_ms=around(rng, h.exec_per_tx_ms),
+        peer_hops=around(rng, h.peer_hops),
+        jitter_ratio=JITTER_RATIO,
+        gossip_proc_ms=around(rng, h.gossip_proc_ms),
+        propagate_per_tx_ms=around(rng, h.propagate_per_tx_ms),
+        propagate_per_tx_per_delay_ms=around(rng, h.propagate_per_tx_per_delay_ms),
+        propagate_sigma=around(rng, h.propagate_sigma),
+        load_tps=draw_load_tps(rng, reward_normalizer_tps("tendermint")),
+        load_delay_sensitivity=around(rng, h.load_delay_sensitivity),
     )
 
 
 NO_PROPOSAL_FAULTS = False  # train --no-proposal-faults: a prior that never saw a delayed or silent proposer
+
+# The silent proposer (module docstring): the spec's hold, longer than any
+# propose timeout in the action range, drawn 0.5-2x; the share of delayed
+# proposers that are silent is the old 100-30,000 ms hold's mass above 3,000 ms,
+# ln(10) / ln(300) (Kevin, 2026-10-19, restart D11).
+SPEC_PROPOSAL_DELAY_MS = 10000.0
+SILENT_PROPOSER_SHARE = 0.4
+
+
+def _proposal_delay_ms(rng: np.random.Generator) -> float:
+    if rng.random() < SILENT_PROPOSER_SHARE:
+        return around(rng, SPEC_PROPOSAL_DELAY_MS)
+    return draw_hold_ms(rng)
 
 
 def sample_phase(rng: np.random.Generator, start_s: float) -> Phase:
@@ -363,39 +474,91 @@ def sample_phase(rng: np.random.Generator, start_s: float) -> Phase:
     if kind < 0.2:
         pass
     elif kind < 0.55:
-        prop = float(math.exp(rng.uniform(math.log(100.0), math.log(30000.0))))
+        prop = _proposal_delay_ms(rng)
     elif kind < 0.9:
-        extra = float(rng.uniform(10.0, 300.0))
+        extra = draw_link_extra_ms(rng)
     else:
-        prop = float(math.exp(rng.uniform(math.log(100.0), math.log(30000.0))))
-        extra = float(rng.uniform(10.0, 300.0))
+        prop = _proposal_delay_ms(rng)
+        extra = draw_link_extra_ms(rng)
     if NO_PROPOSAL_FAULTS:
         prop = 0.0
     return Phase(start_s=start_s, extra_delay_ms=extra, proposal_delay_ms=prop)
 
 
 def sample_schedule(rng: np.random.Generator, total_s: float) -> List[Phase]:
-    phases = [Phase(start_s=0.0)]
-    t = float(rng.uniform(40.0, 400.0))
-    while t < total_s:
-        phases.append(sample_phase(rng, t))
-        t += float(rng.uniform(40.0, 400.0))
+    return [Phase(start_s=0.0)] + [sample_phase(rng, t) for t in fault_start_times(rng, total_s)]
+
+
+SPEC_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "config", "tendermint", "failure_spec.xml"
+)
+
+
+def _xml_float(node: ET.Element, path: str, where: str) -> float:
+    el = node.find(path)
+    if el is None or el.text is None or not el.text.strip():
+        raise ValueError(f"{where}: missing <{path}>")
+    return float(el.text.strip())
+
+
+def spec_schedule(path: str = SPEC_PATH) -> List[Phase]:
+    """config/tendermint/failure_spec.xml as simulator phases, read from the
+    file (Kevin, 2026-10-19, restart D11; literals until then): the atTime 0
+    phase at 0, every later one at warm-up + atTime. Raises on anything the
+    simulator cannot represent or that the spec runs' SimConstants defaults
+    contradict: another warm-up, base delay or jitter, a burst (not
+    continuous) link delay, per-source or per-edge delays, a protocol fault
+    other than one global <proposalDelay>, an unknown phase element, or report
+    injections. Used only to evaluate policies in simulation, never to train."""
+    root = ET.parse(path).getroot()
+    host = SimConstants()
+    expected = (
+        ("warmUpTime", WARMUP_PHASE_S),
+        ("globalNetworkDelay/delayMs", host.base_delay_ms),
+        ("globalNetworkDelay/jitterRatio", host.jitter_ratio),
+    )
+    for name, want in expected:
+        got = _xml_float(root, name, path)
+        if got != want:
+            raise ValueError(f"{path}: <{name}> is {got:g}, the simulator's spec runs use {want:g}")
+    phases: List[Phase] = []
+    for k, el in enumerate(root.findall("./phases/phase")):
+        where = f"{path} phase {k}"
+        unknown = sorted({child.tag for child in el} - {"atTime", "network", "tendermint", "agent"})
+        if unknown:
+            raise ValueError(f"{where}: the simulator does not model {unknown}")
+        at = _xml_float(el, "atTime", where)
+        if (k == 0) != (at == 0.0):
+            raise ValueError(f"{where}: only the first phase starts at atTime 0, got {at:g}")
+        start_s = 0.0 if at == 0.0 else WARMUP_PHASE_S + at
+        if phases and start_s <= phases[-1].start_s:
+            raise ValueError(f"{where}: atTime {at:g} does not follow the previous phase")
+        net = el.find("network")
+        if net is None:
+            raise ValueError(f"{where}: no <network>")
+        if net.find("./sources/source") is not None or net.find("./edges/edge") is not None:
+            raise ValueError(f"{where}: per-source and per-edge delays are not modeled")
+        extra = _xml_float(net, "global/delayMs", where)
+        duration = _xml_float(net, "global/burstDurationMs", where)
+        interval = _xml_float(net, "global/burstIntervalMs", where)
+        if extra > 0.0 and not (interval > 0.0 and duration >= interval):
+            raise ValueError(f"{where}: a burst link delay ({duration:g}/{interval:g} ms) is not modeled, "
+                             "only a continuous one")
+        prop = 0.0
+        tm = el.find("tendermint")
+        if tm is not None:
+            tags = [child.tag for child in tm]
+            if tags not in ([], ["proposalDelay"]):
+                raise ValueError(f"{where}: only one global <proposalDelay> is modeled, got {tags}")
+            if tags:
+                prop = _xml_float(tm, "proposalDelay/delayMs", where)
+        if el.find("./agent//id") is not None:
+            raise ValueError(f"{where}: report injections are not modeled")
+        phases.append(Phase(start_s, extra_delay_ms=extra, proposal_delay_ms=prop))
+    if not phases:
+        raise ValueError(f"{path}: no phases")
     return phases
 
-
-def spec_schedule() -> List[Phase]:
-    """config/tendermint/failure_spec.xml (six phases, p2/p3 +50 ms continuous):
-    warm-up 10 s, phases at warm-up + atTime. Used only to evaluate policies in
-    simulation, never to train."""
-    w = WARMUP_PHASE_S
-    return [
-        Phase(0.0),
-        Phase(w + 300.0, proposal_delay_ms=10000.0),
-        Phase(w + 600.0, extra_delay_ms=50.0),
-        Phase(w + 900.0, extra_delay_ms=50.0, proposal_delay_ms=10000.0),
-        Phase(w + 1200.0, extra_delay_ms=150.0),
-        Phase(w + 1500.0),
-    ]
 
 
 # --- Agent loop, data generation, prior training, evaluation -----------------
@@ -468,6 +631,8 @@ def training_sim(
     rng: np.random.Generator, seed: int, peer_spread: float = 0.0
 ) -> Tuple[TendermintSim, int]:
     """One randomized training run: (simulator, episodes)."""
+    import agent_pb2
+
     episodes = int(rng.integers(40, 120))
     # --peer-spread s > 0: the peers' timeouts are node 0's times fixed per-run
     # lognormal factors with sigma drawn from [0, s], so training covers the
@@ -479,7 +644,7 @@ def training_sim(
         sample_schedule(rng, episodes * EPISODE_S),
         seed=seed,
         start_offset_s=float(rng.uniform(0.0, 20.0)),
-        initial_timeout_ms=float(math.exp(rng.uniform(math.log(100), math.log(3000)))),
+        initial_timeout_ms=draw_initial_timeout_ms(rng, agent_pb2.PROTOCOL_TENDERMINT),
         peer_factors=peer_factors,
     )
     return sim, episodes
@@ -554,64 +719,13 @@ def generate(
     return np.vstack([p[0] for p in parts]), np.concatenate([p[1] for p in parts])
 
 
-def train_prior(
-    x: np.ndarray,
-    y: np.ndarray,
-    out_path: str,
-    seed: int,
-    design: str,
-    hold: int = 1,
-    target_floor: float = -math.inf,
-    peer_spread: float = 0.0,
-) -> float:
-    from sklearn.neural_network import MLPRegressor
-
-    # --target-floor: rewards below it are fit as the floor. reward_tps_latency
-    # scores a collapse at -5 and lower, and those tails dominate a squared-error
-    # fit, washing out the 0.1-sized structure between usable timeouts; with a
-    # floor a collapse is a collapse and the fit spends its error on the range
-    # that ranks actions. The model applies the same floor to the online reward.
-    y = np.maximum(y, target_floor)
-    x_mean, x_std = x.mean(axis=0), x.std(axis=0) + 1e-9
-    y_mean, y_std = float(y.mean()), float(y.std() + 1e-9)
-    rng = np.random.default_rng(seed)
-    order = rng.permutation(len(x))
-    cut = int(0.9 * len(x))
-    tr, va = order[:cut], order[cut:]
-    mlp = MLPRegressor(
-        hidden_layer_sizes=(128, 128, 64),
-        activation="relu",
-        alpha=1e-5,
-        batch_size=512,
-        learning_rate_init=1e-3,
-        max_iter=200,
-        early_stopping=True,
-        n_iter_no_change=10,
-        random_state=seed,
-    )
-    mlp.fit((x[tr] - x_mean) / x_std, (y[tr] - y_mean) / y_std)
-    pred = mlp.predict((x[va] - x_mean) / x_std) * y_std + y_mean
-    rmse = float(np.sqrt(np.mean((pred - y[va]) ** 2)))
-    arrays = {"n_layers": np.asarray(len(mlp.coefs_))}
-    for i, (w, b) in enumerate(zip(mlp.coefs_, mlp.intercepts_)):
-        arrays[f"W{i}"] = w
-        arrays[f"b{i}"] = b
-    arrays.update(
-        x_mean=x_mean,
-        x_std=x_std,
-        y_mean=np.asarray(y_mean),
-        y_std=np.asarray(y_std),
-        reward_design=np.asarray(design),
-        hold_episodes=np.asarray(int(hold)),
-        target_floor=np.asarray(float(target_floor)),
-        peer_spread=np.asarray(float(peer_spread)),
-    )
-    arrays.update(SIM_WINDOWS.arrays())
-    np.savez(out_path, **arrays)
-    return rmse
+# The floor the pretraining recipe fits the GP prior with (train --target-floor; Kevin,
+# 2026-10-19, restart D11; no floor by default until then).
+TARGET_FLOOR = -2.0
 
 
 from continuous_bandit import DEFAULT_TENDERMINT_PRIOR_PATH as DEFAULT_PRIOR_PATH  # noqa: E402
+from continuous_bandit import opening_action_ms, train_gp_prior  # noqa: E402
 
 
 def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
@@ -634,7 +748,7 @@ def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
     if kind == "heuristic":
         from model_builder import build_model
 
-        built = build_model(protocol, "continuous_heuristic")
+        built = build_model(protocol, "continuous_heuristic", prior_windows=SIM_WINDOWS)
         model, codec = built.model, built.action_codec
     elif kind == "discrete_linucb":
         codec = ProtocolTimeoutActionCodec(protocol)
@@ -689,10 +803,11 @@ def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
 def evaluate_spec(kind: str, constants: SimConstants, seed: int, **kwargs) -> np.ndarray:
     """Per-phase (tps, mean latency, median timeout) of one policy on the spec."""
     predict, update = make_policy(kind, **kwargs)
-    sim = TendermintSim(constants, spec_schedule(), seed=seed, start_offset_s=SPEC_START_OFFSET_S)
+    phases = spec_schedule()
+    sim = TendermintSim(constants, phases, seed=seed, start_offset_s=SPEC_START_OFFSET_S)
     rows = run_agent(sim, 90, predict, update)
-    out = np.zeros((6, 3))
-    for ph in range(6):
+    out = np.zeros((len(phases), 3))
+    for ph in range(len(phases)):
         sel = [r for r in rows if r[0] == ph]
         out[ph] = (
             np.mean([r[2]["throughput_tps"] for r in sel]),
@@ -706,13 +821,15 @@ def pretrain_adapter(peer_spread: float = 0.0):
     """This simulator as pretrain.py drives it: training runs as train draws
     them (peer factors only for ``peer_spread`` > 0, as train --peer-spread),
     spec runs as evaluate_spec builds them (host constants, lockstep peers, 90
-    episodes); the spec phase is run_agent's, and there is no oracle."""
+    episodes); the spec phase is run_agent's, and the oracle plays
+    learning_agent/config/schedule_tendermint.csv as ScheduledTimeoutModel does."""
     import agent_pb2
     from models import tendermint_timeouts_from_propose
     from pretrain import SimAdapter, timeout_message
 
     if not math.isfinite(peer_spread) or peer_spread < 0.0:
         raise ValueError(f"peer_spread must be >= 0, got {peer_spread}")
+    spec_phases = spec_schedule()
 
     def to_timeout(timeout_ms: float) -> agent_pb2.Timeout:
         p, v, c = tendermint_timeouts_from_propose(int(round(timeout_ms)))
@@ -725,12 +842,25 @@ def pretrain_adapter(peer_spread: float = 0.0):
     def from_timeout(timeout: agent_pb2.Timeout) -> float:
         return float(timeout_message(timeout, "tendermint").propose_timeout_milliseconds)
 
+    rows = schedule_rows("tendermint")
+
+    def oracle(sim) -> Callable[[np.ndarray], float]:
+        # The apply time: the decision at the feature deadline reaches the
+        # replicas a reply window later (Kevin, 2026-10-19, restart: the sim gate
+        # compares against the oracle on all six).
+        def predict(x: np.ndarray) -> float:
+            return scheduled_action(rows, sim.episode_start_s + FEATURE_S + REPLY_S, WARMUP_PHASE_S)[0]
+
+        return predict
+
     return SimAdapter(
         protocol=agent_pb2.PROTOCOL_TENDERMINT,
         simulator="tendermint_sim",
         training_run=lambda seed: training_sim(np.random.default_rng(seed), seed, peer_spread),
         spec_run=lambda seed: (
-            TendermintSim(SimConstants(), spec_schedule(), seed=seed, start_offset_s=SPEC_START_OFFSET_S), 90),
+            # The engine opens at the middle rung (config.toml timeout_propose, D10b).
+            TendermintSim(SimConstants(), spec_phases, seed=seed, start_offset_s=SPEC_START_OFFSET_S,
+                          initial_timeout_ms=float(opening_action_ms(agent_pb2.PROTOCOL_TENDERMINT)[0])), 90),
         run_agent=run_agent,
         # A training schedule's phase 0 is a real phase, so run_agent already
         # updates every decision from 10 s.
@@ -739,47 +869,57 @@ def pretrain_adapter(peer_spread: float = 0.0):
         from_timeout=from_timeout,
         row_phase=lambda row: row[0],
         row_reward=lambda row: episode_reward(row[2], row[1]),
-        spec_phase_count=6,
-        oracle=None,
+        spec_phase_count=len(spec_phases),
+        oracle=oracle,
     )
 
 
 def main() -> None:
+    import agent_pb2
+
+    from reward_utils import DEFAULT_REWARD_DESIGN, reward_normalizer_tps, set_reward_design
+
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
     t = sub.add_parser("train", help="generate randomized episodes and fit the prior")
+    t.add_argument("--code-hash", required=True,
+                   help="code_hash of the tree training the prior (scripts/cloudlab/code_state.py), recorded in the prior and compared with FREEZE by the harness")
     t.add_argument("--runs", type=int, default=4000)
     t.add_argument("--seed", type=int, default=1)
     t.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     t.add_argument("--out", default=DEFAULT_PRIOR_PATH)
-    t.add_argument("--reward-design", default="reward_mixed")
+    t.add_argument("--reward-design", default=DEFAULT_REWARD_DESIGN)
     t.add_argument("--no-proposal-faults", action="store_true",
                    help="train on network-delay phases only; the prior never sees a delayed or silent proposer")
+    # Tendermint rotates its proposer every height, so there is no leader pinned
+    # for 60 s to hold an action across (PBFT, SBFT and SmartBFT hold 3).
     t.add_argument("--hold-episodes", type=int, default=1,
                    help="hold each drawn action this many episodes and fit the mean reward over the hold; "
                         "1 fits one episode's reward")
-    t.add_argument("--target-floor", type=float, default=-math.inf,
+    t.add_argument("--target-floor", type=float, default=TARGET_FLOOR,
                    help="fit rewards below this value as this value (SimReturnGPModel applies the same "
-                        "floor online); default: no floor")
+                        f"floor online); default {TARGET_FLOOR:g}, as the pretraining recipe")
     t.add_argument("--peer-spread", type=float, default=0.0,
                    help="largest sigma of the per-run lognormal factors that set the peers' timeouts "
-                        "relative to node 0's; 0 keeps all nodes on one timeout")
+                        "relative to node 0's; 0 keeps all nodes on one timeout (every row runs in "
+                        "sharing mode, and the pretraining recipe passes 0)")
     e = sub.add_parser("eval", help="compare policies on the spec schedule in simulation")
     e.add_argument("--seeds", type=int, default=10)
     e.add_argument("--prior", default=DEFAULT_PRIOR_PATH)
     e.add_argument("--randomize", action="store_true", help="random constants per seed")
-    e.add_argument("--reward-design", default="reward_mixed",
-                   help="reward the candidate learns from; the baselines keep reward_mixed")
+    e.add_argument("--reward-design", default=DEFAULT_REWARD_DESIGN,
+                   help="reward every policy learns from (reward_mixed for the baselines until restart D11)")
     args = parser.parse_args()
-    from reward_utils import set_reward_design
 
     if args.cmd == "train":
         global NO_PROPOSAL_FAULTS
         NO_PROPOSAL_FAULTS = bool(args.no_proposal_faults)  # inherited by the forked workers
         x, y = generate(args.runs, args.seed, args.workers, args.reward_design, args.hold_episodes,
                         args.peer_spread)
-        rmse = train_prior(x, y, args.out, args.seed, args.reward_design, args.hold_episodes,
-                           args.target_floor, args.peer_spread)
+        rmse = train_gp_prior(
+            agent_pb2.PROTOCOL_TENDERMINT, x, y, args.out, seed=args.seed, design=args.reward_design,
+            hold=args.hold_episodes, target_floor=args.target_floor, windows=SIM_WINDOWS,
+            sim_constants=asdict(SimConstants()), code_hash=args.code_hash, extra={"peer_spread": float(args.peer_spread)})
         print(f"samples={len(x)} hold_episodes={args.hold_episodes} target_floor={args.target_floor} "
               f"peer_spread={args.peer_spread} reward_std={y.std():.4f} "
               f"floored_std={np.maximum(y, args.target_floor).std():.4f} "
@@ -787,29 +927,34 @@ def main() -> None:
         return
 
     rng = np.random.default_rng(12345)
+    spec_phases = spec_schedule()
+    set_reward_design(args.reward_design)
     for s in range(args.seeds):
         constants = sample_constants(rng) if args.randomize else SimConstants()
         if args.randomize:
-            constants.load_tps = 4000.0
+            constants.load_tps = reward_normalizer_tps("tendermint")
         res = {}
         for k in ("discrete_linucb", "heuristic", "candidate"):
-            set_reward_design(args.reward_design if k == "candidate" else "reward_mixed")
             res[k] = evaluate_spec(k, constants, s, **({"prior_path": args.prior} if k == "candidate" else {}))
         wins = 0
         line = []
-        for ph in range(6):
-            # The six-phase loop's rule (runs/2026-09-29-tendermint-continuous-6ph).
+        for ph, phase in enumerate(spec_phases):
+            # The six-phase loop's rule (runs/2026-09-29-tendermint-continuous-6ph):
+            # strictly lower latency in a fault phase, within 5% in a fault-free one.
+            faulty = phase.extra_delay_ms > 0.0 or phase.proposal_delay_ms > 0.0
             bt = max(res["discrete_linucb"][ph, 0], res["heuristic"][ph, 0])
             bl = min(res["discrete_linucb"][ph, 1], res["heuristic"][ph, 1])
             ct, cl = res["candidate"][ph, 0], res["candidate"][ph, 1]
-            ok = ct >= 0.95 * bt and (cl < bl if 1 <= ph <= 4 else cl <= 1.05 * bl)
+            ok = ct >= 0.95 * bt and (cl < bl if faulty else cl <= 1.05 * bl)
             wins += ok
             line.append(
                 f"p{ph} {ct:5.0f}/{cl:5.0f}@{res['candidate'][ph,2]:4.0f} "
                 f"[{res['heuristic'][ph,0]:5.0f}/{res['heuristic'][ph,1]:5.0f}@{res['heuristic'][ph,2]:4.0f} "
                 f"{res['discrete_linucb'][ph,0]:5.0f}/{res['discrete_linucb'][ph,1]:5.0f}@{res['discrete_linucb'][ph,2]:4.0f}]{'+' if ok else '-'}"
             )
-        print(f"seed {s} phases_ok={wins}/6 hops={constants.peer_hops} | " + " | ".join(line))
+        print(f"seed {s} phases_ok={wins}/{len(spec_phases)} hops={constants.peer_hops:.2f} | "
+              + " | ".join(line))
+
 
 
 if __name__ == "__main__":

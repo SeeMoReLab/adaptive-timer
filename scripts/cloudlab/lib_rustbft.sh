@@ -117,7 +117,10 @@ OVERLAY_OCTET_B=252
 OVERLAY_MASK_BITS=24
 OVERLAY_HOST_OFFSET=10
 ARTIFACT_FETCH_MAX_PARALLEL=4
-ARTIFACT_FETCH_MAX_ATTEMPTS=3
+# sshd throttles the burst of new connections at the end of a run (MaxStartups: "kex_exchange_identification:
+# Connection reset"); three tries 1-2 s apart lost the last-queued file, the single-host agent3.csv, in most
+# runs (2026-10-19, restart). Doubling waits give a throttled handshake about a minute to clear.
+ARTIFACT_FETCH_MAX_ATTEMPTS=6
 ARTIFACT_FETCH_RETRY_DELAY_S=1
 LOCAL_RUN_LOCK_DIRS=("")
 
@@ -125,6 +128,7 @@ cleanup_local_run_locks() {
   local lock_dir
   for lock_dir in "${LOCAL_RUN_LOCK_DIRS[@]}"; do
     [[ -z "${lock_dir}" ]] && continue
+    rm -f "${lock_dir}/pid"
     rmdir "${lock_dir}" 2>/dev/null || true
   done
 }
@@ -142,8 +146,20 @@ acquire_local_run_lock() {
   if ! mkdir "${lock_dir}" 2>/dev/null; then
     echo "Cannot start ${PROTOCOL_NAME} run: ${description} is already in use." >&2
     echo "Active-run lock: ${lock_dir}" >&2
+    # The holder (pid, start time, script), so a lock left by a dead process can be told
+    # from a live one; it is never taken over automatically (2026-10-19, restart).
+    if [[ -f "${lock_dir}/pid" ]]; then
+      local holder
+      holder="$(cat "${lock_dir}/pid")"
+      if kill -0 "${holder%% *}" 2>/dev/null; then
+        echo "Held by: ${holder} (running)" >&2
+      else
+        echo "Held by: ${holder} (not running here; remove the lock if no other machine holds it)" >&2
+      fi
+    fi
     return 1
   fi
+  printf '%s %s %s\n' "$$" "$(date +%FT%T)" "$0" > "${lock_dir}/pid"
   LOCAL_RUN_LOCK_DIRS+=("${lock_dir}")
 }
 
@@ -370,7 +386,7 @@ queue_artifact_download() {
         exit 0
       fi
       if (( attempt < ARTIFACT_FETCH_MAX_ATTEMPTS )); then
-        sleep $((ARTIFACT_FETCH_RETRY_DELAY_S * attempt))
+        sleep $((ARTIFACT_FETCH_RETRY_DELAY_S << attempt))
       fi
     done
 
@@ -673,8 +689,17 @@ rustbft_main() {
       continue
     fi
     acquire_target_lock "${user}" "${host}"
+    "${REPO_ROOT}/scripts/cloudlab/check_idle.sh" "${LOCAL_SSH_KEY_PATH}" "${user}@${host}" || exit 1
   done < "${TARGETS_FILE}"
 
+  # The frozen code state (Kevin, 2026-10-19, restart): refuse to launch when the code a run
+  # ships differs from FREEZE (scripts/cloudlab/code_state.py --check); ALLOW_UNFROZEN=1 marks
+  # a run outside the frozen pipeline, and run.env records it. Before the artifact directory
+  # is chosen, so runs with and without --output-dir are both checked.
+  if [[ "${ALLOW_UNFROZEN:-0}" != "1" ]]; then
+    python3 "${REPO_ROOT}/scripts/cloudlab/code_state.py" --check ${PRIOR_PATH:+--prior "${REPO_ROOT}/${PRIOR_PATH}"} > /dev/null \
+      || { echo "The code or the prior differs from ${REPO_ROOT}/FREEZE (reason above); refreeze or retrain, or set ALLOW_UNFROZEN=1 for a run outside the frozen pipeline." >&2; exit 1; }
+  fi
   if [[ -z "${OUTPUT_DIR}" ]]; then
     mkdir -p "${RUNS_ROOT}"
     while true; do
@@ -735,6 +760,8 @@ rustbft_main() {
     printf 'learning_reply_wait_ms=%q\n' "${LEARNING_REPLY_WAIT_MS}"
     printf 'learning_warmup_duration_ms=%q\n' "${LEARNING_WARMUP_DURATION_MS}"
     printf 'learning_reward_duration_ms=%q\n' "${LEARNING_REWARD_DURATION_MS}"
+    # The agent runs its default reward design here (no --reward-design is passed); record it.
+    printf 'reward_design=%q\n' "$(cd "${REPO_ROOT}/learning_agent" && python3 -c 'from reward_utils import DEFAULT_REWARD_DESIGN as d; print(d)' 2>/dev/null || echo unknown)"
     printf 'log_enabled=%q\n' "${LOG_ENABLED}"
     printf 'failure_spec_enabled=%q\n' "${FAILURE_SPEC_ENABLED}"
     printf 'targets_file=%q\n' "${TARGETS_FILE}"
@@ -742,6 +769,9 @@ rustbft_main() {
     printf 'git_dirty=%q\n' "$([[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=no 2>/dev/null)" ]] && echo 1 || echo 0)"
     printf 'autobahn_commit=%q\n' "$(git -C "${AUTOBAHN_SRC}" rev-parse HEAD 2>/dev/null || echo unknown)"
     printf 'autobahn_dirty=%q\n' "$([[ -n "$(git -C "${AUTOBAHN_SRC}" status --porcelain --untracked-files=no 2>/dev/null)" ]] && echo 1 || echo 0)"
+    printf 'freeze_name=%q\n' "$(sed -n 's/^freeze_name=//p' "${REPO_ROOT}/FREEZE" 2>/dev/null)"
+    printf 'allow_unfrozen=%q\n' "${ALLOW_UNFROZEN:-0}"
+    python3 "${REPO_ROOT}/scripts/cloudlab/code_state.py" ${PRIOR_PATH:+--prior "${REPO_ROOT}/${PRIOR_PATH}"}
     printf 'command='
     printf '%q ' "$0" "${ORIGINAL_ARGS[@]}"
     printf '\n'

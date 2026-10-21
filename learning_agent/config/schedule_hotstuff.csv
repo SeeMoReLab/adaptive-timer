@@ -1,24 +1,50 @@
 # time_s,timeout_ms
+# Current oracle (2026-10-19, restart from scratch; generated from this file's rows and
+# config/hotstuff/failure_spec.xml, values unchanged). Rows sit on the onsets (atTime); the oracle never
+# switches before a fault starts. Episode e applies at warmUpTime + 20*(e-1) and takes the last row
+# with time_s <= 20*(e-1); the leading -10 row is the warm-up row.
+#
+#   p0 @0     base                                   100
+#   p1 @300   base + slow leader (T - 100)           100
+#   p2 @600   5+50                                   300
+#   p3 @900   5+50 + slow leader (T - 400)           300
+#   p4 @1200  5+150                                  700
+#   p5 @1500  base                                   100
+#
+# History (older ladders, rates and specs; superseded where it disagrees with the block above):
 # may be any integer from 1 through 4294967295
 #
-# Oracle for config/hotstuff/failure_spec.xml: the best timeout per phase
-# (models.py 160 / 460 / 760; in a no-attack phase the lowest rung that
-# clears the floor), switched on each phase boundary, never before the fault
-# starts. ScheduledTimeoutModel shifts the schedule so its first row lands at
-# elapsed 0, so with the leading -10 row (warmUpTime=10) a switch written at
-# T fires at warmUpTime + T: each phase's atTime lands on its boundary, and
-# the agent applies it at its next decision.
+# Oracle for config/hotstuff/failure_spec.xml: the best timeout per phase,
+# switched on each phase boundary, never before the fault starts.
+# ScheduledTimeoutModel picks the row by episode number: episode e applies at
+# warmUpTime + P*(e-1) (P = --episode-ms, 20 s) and takes the last row with
+# time_s <= P*(e-1), so a switch written at T fires at warmUpTime + T and each
+# phase's atTime lands on its boundary. Non-negative rows must be multiples of P;
+# the leading -10 row is the warm-up row and counts for every episode.
 #
-#   p0 @0     base, no attack            160
-#   p1 @300   base + slow leader         160
-#   p2 @600   5+50, no attack            460
-#   p3 @900   5+50 + slow leader         460
-#   p4 @1200  5+150, no attack           760
-#   p5 @1500  base, no attack            160
--10,160
-0,160
-300,160
-600,460
-900,460
-1200,760
-1500,160
+# One models.py rung per link level (2026-10-08, Kevin): 100 at base, 300 at 5+50,
+# 700 at 5+150, replacing 160 / 460 / 760. The lower rungs
+# win where a slow leader holds the round and tie elsewhere; 700 ties 760 at
+# 5+150, whose floor is between 460 (storms, R -2.024) and 530 (clean, -0.398;
+# 600 -0.409, 760 -0.403). Constant-T
+# cells (client R over t > 60 s): base T100 0.793 vs T160 0.787; base + slow
+# leader T100 0.798 vs T160 0.761; 5+50 T300 0.452 vs T460 0.463 (tie); 5+50 +
+# slow leader T300 0.469 vs T460 0.398. Full-spec oracle, 3 draws each with p1 at
+# 100 and p3 at 300 (runs/2026-10-08-six-protocol-comparison,
+# scripts/cloudlab/tmp/runs/hotstuff/ob_oracle_*): p1 0.789 vs 0.741, p3 0.457 vs
+# 0.397, mean R 0.476 vs 0.459. The p0/p2/p4/p5 moves are not yet drawn in the
+# full spec.
+#
+#   p0 @0     base, no attack            100
+#   p1 @300   base + slow leader         100
+#   p2 @600   5+50, no attack            300
+#   p3 @900   5+50 + slow leader         300
+#   p4 @1200  5+150, no attack           700
+#   p5 @1500  base, no attack            100
+-10,100
+0,100
+300,100
+600,300
+900,300
+1200,700
+1500,100

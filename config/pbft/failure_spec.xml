@@ -122,7 +122,7 @@
                     <replicas>
                         <replica>
                             <id>leader</id>
-                            <delayMs>120</delayMs>
+                            <delayMs>300</delayMs>
                         </replica>
                     </replicas>
                 </proposalDelay>
@@ -144,7 +144,7 @@
                     <replicas>
                         <replica>
                             <id>leader</id>
-                            <delayMs>400</delayMs>
+                            <delayMs>550</delayMs>
                         </replica>
                     </replicas>
                 </proposalDelay>
@@ -155,7 +155,7 @@
             <network>
                 <directedEdges>true</directedEdges>
                 <global>
-                    <delayMs>75</delayMs>
+                    <delayMs>50</delayMs>
                     <burstDurationMs>10000</burstDurationMs>
                     <burstIntervalMs>10000</burstIntervalMs>
                 </global>
@@ -171,7 +171,7 @@
             <network>
                 <directedEdges>true</directedEdges>
                 <global>
-                    <delayMs>75</delayMs>
+                    <delayMs>50</delayMs>
                     <burstDurationMs>10000</burstDurationMs>
                     <burstIntervalMs>10000</burstIntervalMs>
                 </global>
@@ -193,7 +193,7 @@
             <network>
                 <directedEdges>true</directedEdges>
                 <global>
-                    <delayMs>175</delayMs>
+                    <delayMs>150</delayMs>
                     <burstDurationMs>10000</burstDurationMs>
                     <burstIntervalMs>10000</burstIntervalMs>
                 </global>

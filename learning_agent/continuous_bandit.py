@@ -2,14 +2,15 @@ from collections import deque
 from dataclasses import dataclass
 import math
 import os
-from typing import Any, Deque, Dict, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from scipy.linalg import solve_triangular
 from scipy.special import betaln, digamma, polygamma
 
 import agent_pb2
-from latency_floor import LatencyFloor
+from latency_floor import LatencyFloor, latency_indices, signal_fields
+from reward_utils import reward_normalizer_tps
 from models import (
     ActionCodec,
     PPOBase,
@@ -229,106 +230,6 @@ class ContinuousTimeoutActionCodec(ActionCodec[agent_pb2.Timeout]):
         return np.asarray(normalized, dtype=float)
 
 
-# Divisor for the fast-path wait derived from the election timeout, W = T / k.
-# Measured on sbft_sim check --mode cal (5 seeds, W swept 20..400 ms at each
-# rung): holding the phase's best T, k = 8 costs a mean 0.038 reward against
-# the best W at that T, worst phase 0.16. k = 12 costs 0.084, k = 5 0.289 and
-# k = 3 0.204. The simulator reproduces the hardware ranking in 2 of 5 phases,
-# so treat 8 as a starting point, not a calibration.
-DEFAULT_WAIT_DIVISOR = 8.0
-
-
-class DerivedWaitActionCodec(ActionCodec[agent_pb2.Timeout]):
-    """A two-dimensional codec presented as one, the second derived from the first.
-
-    SBFT's action is an election timeout T and a fast-path wait W.
-    ContinuousHeuristicTimeoutModel, ContinuousLinUCB and ContinuousPPO each
-    place one timeout on a line and refuse a 2-D codec,
-    so without this they cannot run on SBFT at all.
-
-    W = clamp(T / divisor, wait bounds). The two are not independent the way
-    the oracle's schedule is - schedule_sbft.csv plays W = 50, 150, 50 at the
-    same T = 525, which no function of T can express - so this does not
-    reproduce a per-phase joint optimum. It does not have to: these models
-    choose T by their own rule, and the only question left is which W to pair
-    with the T they chose. On that question a divisor is cheap, because both
-    quantities carry the same one-way-delay term (the extra round R is
-    2 * one_way + 25 ms), so a T that has tracked the delay drags W with it.
-
-    What it cannot track is the straggler-specific part of the lag, which
-    moves W without moving T. SBFT reports that directly as
-    nth_prepare_gap_ms, the n-th minus the 2f+1-th prepare; a rule reading it
-    would be strictly better informed and is the obvious next step.
-    """
-
-    def __init__(
-        self,
-        action_codec: ContinuousTimeoutActionCodec,
-        divisor: float = DEFAULT_WAIT_DIVISOR,
-    ) -> None:
-        if action_codec.action_dim != 2:
-            raise ValueError(
-                "DerivedWaitActionCodec derives the second of two dimensions, "
-                f"but the codec has {action_codec.action_dim}"
-            )
-        if not math.isfinite(divisor) or divisor <= 0.0:
-            raise ValueError(f"divisor must be > 0, got {divisor}")
-        self._inner = action_codec
-        self._divisor = float(divisor)
-        self._wait_bounds_ms = action_codec.bounds_ms[1]
-
-    @property
-    def divisor(self) -> float:
-        return self._divisor
-
-    @property
-    def action_dim(self) -> int:
-        return 1
-
-    @property
-    def protocol(self) -> int:
-        return self._inner.protocol
-
-    @property
-    def bounds_ms(self) -> Tuple[Tuple[int, int], ...]:
-        return (self._inner.bounds_ms[0],)
-
-    def wait_for_timeout_ms(self, timeout_ms: int) -> int:
-        """The fast-path wait this codec pairs with ``timeout_ms``."""
-        lower_ms, upper_ms = self._wait_bounds_ms
-        return int(min(upper_ms, max(lower_ms, round(int(timeout_ms) / self._divisor))))
-
-    def normalize_ms(self, timeout_ms: int, dimension: int = 0) -> float:
-        if dimension != 0:
-            raise ValueError(
-                f"DerivedWaitActionCodec exposes one dimension, got {dimension}"
-            )
-        return self._inner.normalize_ms(int(timeout_ms), 0)
-
-    def denormalize_ms(self, normalized: float, dimension: int = 0) -> int:
-        if dimension != 0:
-            raise ValueError(
-                f"DerivedWaitActionCodec exposes one dimension, got {dimension}"
-            )
-        return self._inner.denormalize_ms(float(normalized), 0)
-
-    def decode(self, action: np.ndarray) -> agent_pb2.Timeout:
-        values = np.asarray(action, dtype=float).reshape(-1)
-        if values.size != 1:
-            raise ValueError(
-                f"Expected 1 continuous action value, got {values.size}"
-            )
-        timeout_ms = self._inner.denormalize_ms(float(values[0]), 0)
-        wait_normalized = self._inner.normalize_ms(
-            self.wait_for_timeout_ms(timeout_ms), 1
-        )
-        return self._inner.decode(
-            np.array([values[0], wait_normalized], dtype=float)
-        )
-
-    def encode(self, action: object) -> np.ndarray:
-        return np.asarray(self._inner.encode(action), dtype=float).reshape(-1)[:1]
-
 class NormalizedLatencyFloor:
     """:class:`LatencyFloor` expressed in the codec's normalized action space.
 
@@ -340,15 +241,12 @@ class NormalizedLatencyFloor:
     def __init__(
         self,
         action_codec: ContinuousTimeoutActionCodec,
-        latency_index: int,
+        latency_index: Union[int, Sequence[int]],
         n_features: int,
         instances_index: Optional[int] = None,
         latency_floor: Optional[LatencyFloor] = None,
     ) -> None:
-        if not 0 <= int(latency_index) < int(n_features):
-            raise ValueError(
-                f"latency_index must be in [0, {n_features}), got {latency_index}"
-            )
+        latency_index = latency_indices(latency_index, n_features)
         if instances_index is not None and not 0 <= int(instances_index) < int(
             n_features
         ):
@@ -356,7 +254,7 @@ class NormalizedLatencyFloor:
                 f"instances_index must be in [0, {n_features}), got {instances_index}"
             )
         self._action_codec = action_codec
-        self._latency_index = int(latency_index)
+        self._latency_index = latency_index
         self._instances_index = (
             None if instances_index is None else int(instances_index)
         )
@@ -372,7 +270,7 @@ class NormalizedLatencyFloor:
         alive = True
         if self._instances_index is not None:
             alive = float(row[self._instances_index]) > 0.0
-        self._latency_floor.observe(float(row[self._latency_index]), alive=alive)
+        self._latency_floor.observe(sum(float(row[i]) for i in self._latency_index), alive=alive)
 
     def lower_bound(self) -> float:
         """Smallest normalized action the constraint permits, in [0, 1)."""
@@ -403,9 +301,12 @@ class HeuristicSpec:
 
     A window that committed sets T = ``multiplier`` x the ``quantile`` of
     ``signal`` over the last ``window`` committing windows, clamped to
-    ``bounds_ms``. A window with at least ``storm_view_changes`` view changes is
+    ``bounds_ms``. ``signal`` is one report field, or several joined by "+" and
+    summed per window (latency_floor.signal_fields; SBFT, 2026-10-14). A window with at least ``storm_view_changes`` view changes is
     a storm: T doubles, and the T that stormed is not played again until the
-    estimate falls by a third (a faster link). Any other window holds T. With
+    estimate falls by a third (a faster link). A window that committed nothing
+    takes the feature window's length as its latency (ContinuousHeuristicTimeoutModel,
+    2026-10-19). Any other window holds T. With
     ``storm_view_changes`` None the rule has no storm branch: on that protocol
     the signal itself rises steeply under a too-low T, and the view-change count
     is not a storm signal (Autobahn and HotStuff time out every few slots even
@@ -418,9 +319,10 @@ class HeuristicSpec:
     the cells (cal/pt/heur_replay.py) converge to the clean region from both
     sides at window 1 on SmartBFT, HotStuff and Autobahn. ``quantile`` has no
     effect at window 1. ``storm_view_changes`` 3 is a design choice, not a
-    value the cells separate per window. It is read per 7 s feature window
-    (2026-10-09; kept at 3: a storm's count per 7 s window is about 0.7 times
-    its 10 s count, so 3 is a slightly stricter test). The cells
+    value the cells separate per window. Since restart D14 (2026-10-19) the count
+    on PBFT, SBFT and SmartBFT covers the trailing 20 s episode, about 2x a 10 s
+    count and including the warm-up's hold re-pins, so 3 is a looser test than it
+    was per 7 s window (about 0.7x a 10 s count, 2026-10-09 to 10-19). The cells
     were measured per 10 s feature window: the SBFT storm cells run 2-16 view
     changes (c1 W500 dips to 2) and an escaping cell reaches 4 (c1 W150);
     SmartBFT storm cells run 0-20 per window and clean or best cells reach 5-7
@@ -444,6 +346,16 @@ class HeuristicSpec:
 # per k the median over the blind phases; k is the low edge of the plateau around the best (within
 # 0.01), rounded up to 2 decimals. The link phases bound k from below and are well sampled; the attack
 # phases that bound it from above are one or two draws. The real spec was a check only.
+# Tendermint refit at 5,000 tx/s (2026-10-12, runs/2026-10-12-tm-recal5k, blindall bl5k_ runs, tps/5000): low edge
+# 0.5146 -> 0.52 (was 0.53 at 4,000 tx/s; eval R +0.556 vs +0.557, indistinguishable).
+# HotStuff refit at 105,000 tx/s (2026-10-12, runs/2026-10-12-recal3, blindall bl512_ runs, tps/105000): low edge
+# 0.8276 -> 0.83 (was 0.96 at 10,000 tx/s; real-spec eval R +0.326 vs +0.315 at 0.96; Kevin approved the 0.13 move).
+# Autobahn refit at 140,000 tx/s (2026-10-12, runs/2026-10-12-recal3, bl512_ runs): low edge 0.8959 -> 0.90 (was 0.94;
+# real-spec eval R +0.3351 vs +0.3347, indistinguishable).
+# Restart refit (2026-10-20, scripts/cloudlab/tmp/cal/restart/s3/heur/SUMMARY.md; restart-cal S1 runs): the blind score
+# is the mean over the blind phases, not the median (RUNSPEC answer 12: the median let HotStuff and Tendermint fit
+# k = 0.01, T 100 everywhere), with k >= the latency floor's share c when the signal is the floor's; D7 low edge
+# unchanged; the signal is the hold-free one unless the end-to-end one has the strictly better blind mean (answer 11).
 HEURISTIC_SPECS: Dict[int, HeuristicSpec] = {
     # A request's age at execution (acceptance to execution, so a little under the
     # reported latency): clean at T = 0.85 x p95 at 5+75 (300 vs 354) and 0.93 x
@@ -452,13 +364,29 @@ HEURISTIC_SPECS: Dict[int, HeuristicSpec] = {
     # keeps it (base + D120: T 150 escapes, 250 keeps it at p95 244; + D400:
     # T <= 400 escapes, 600 keeps it at 569), so the estimate is the minimum
     # over 4 windows, which an escape window resets to the healthy latency.
+    # k 1.26 -> 1.21 (2026-10-13, runs/2026-10-13-recal-sbft-pbft S4): low edge of the blind
+    # plateau at 20,000 req/s with 512 B requests (bl20_ cells; eval-best on the real cells 1.33).
+    # Restart (2026-10-21, restart-cal7 calibration of the relay-on-skip engine, read as the 2f+1 aggregate the live rule
+    # sees): the phase sum (hold-free, the floor's signal) k 8.231107 -> 8.24, blind mean +0.756, real-spec
+    # +0.723; the p95 refit gave k 0.219597 (blind +0.752, real-spec +0.555) and the previous p95 k 1.21
+    # scored blind +0.716, real-spec +0.734. Kevin chose the hold-free signal so that every protocol with one
+    # uses it. Was p95 1.21.
     agent_pb2.PROTOCOL_PBFT: HeuristicSpec(
-        "p95_consensus_latency_ms", 1.26, 4, 0.0, (100, 3000), 3),
-    # T as PBFT but from the fast path: clean at 150 (p95 97) at base, 350 (p95
-    # 227) at 5+50 and 750 (p95 685) at 5+150. The slow-path bound and the wait W are
-    # in ContinuousHeuristicTimeoutModel (SBFT_* below).
+        "pre_prepare_latency_ms+prepare_latency_ms+commit_latency_ms", 8.24, 4, 0.0, (100, 3000), 3),
+    # The sum of the three phase latencies (pre-prepare, prepare, commit; window
+    # means, as the replicas report them) instead of the consensus p95 (Kevin,
+    # 2026-10-13, runs/2026-10-13-recal-sbft-pbft): a leader's proposal hold
+    # never enters the phase latencies (it precedes the pre-prepare), the link and
+    # the straggler do, so a held leader is deposed at every k and the +150 link is
+    # reached through the slow-path bound below. k 1.76 is the low edge of the blind
+    # plateau at 20,000 req/s with 512 B requests (bl20_ cells; the consensus-p95
+    # signal's blind low edge was 0.76, and its real-spec score was lower).
+    # The slow-path bound and the wait W are in ContinuousHeuristicTimeoutModel
+    # (SBFT_* below).
+    # Restart (2026-10-21, restart-cal7 calibration of the relay-on-skip engine): k 4.282058 -> 4.29 (the only signal),
+    # blind mean +0.581, real-spec 0.486. Was 1.76.
     agent_pb2.PROTOCOL_SBFT: HeuristicSpec(
-        "p95_consensus_latency_ms", 1.76, 4, 0.0, (100, 3000), 3),
+        "pre_prepare_latency_ms+prepare_latency_ms+commit_latency_ms", 4.29, 4, 0.0, (100, 3000), 3),
     # A request's timer from arrival (forward T/2, then complain T/2), closed-loop
     # client. Cells with a 50 s base lead-in: at 5+50 T <= 600 storms and 800 is
     # clean (p95 351); at 5+150 1000 storms, 1200-1800 stall for 3-15 s and 2400
@@ -466,11 +394,14 @@ HEURISTIC_SPECS: Dict[int, HeuristicSpec] = {
     # At base every T from 100 is clean (p95 41); under the 300 ms proposal delay
     # 300 is best and 800 keeps the slow leader. Storms run 3-18 view changes a
     # window, depositions 0-2.
+    # Restart: proposal_to_decision_ms (hold-free) k 5.21981 -> 5.22, blind mean +0.306 against the p95's +0.305
+    # (k 1.56); real-spec +0.218. Was p95 1.39.
     agent_pb2.PROTOCOL_SMARTBFT: HeuristicSpec(
-        "p95_consensus_latency_ms", 1.39, 1, 0.5, (100, 4000), 3),
+        "proposal_to_decision_ms", 5.22, 1, 0.5, (100, 3000), 3),
     # The propose timeout of each round (prevote and precommit at T/3). p50, not
     # the mean: under the proposer hold only the attacked heights are slow, and
     # p50 stays flat in T while the mean follows it.
+    # Restart: k 0.524849 -> 0.53 (the only signal; c 0.33 not binding), blind mean +0.566, real-spec +0.565.
     agent_pb2.PROTOCOL_TENDERMINT: HeuristicSpec(
         "p50_consensus_latency_ms", 0.53, 1, 0.5, (100, 3000), None),
     # One round is 2h (3h when a Nagle-delayed vote follows a timeout) and the
@@ -479,13 +410,19 @@ HEURISTIC_SPECS: Dict[int, HeuristicSpec] = {
     # floor sits at 0.5-0.6 x the latency; under the slow-leader hold (relative
     # to the live timeout) 200 still loses at 5+50 + X400 and 300 is best, and
     # at base the lowest T wins.
+    # Restart: proposal_to_qc_ms (hold-free) k 4.282058 -> 4.29, blind mean +0.292 against the avg's +0.290
+    # (k 0.62); real-spec -0.130 on both signals (avg k 0.83 scored +0.274 on the same eval runs: the fitted k lands
+    # T at 217-244 in the real spec's p2-p4 instead of about 300). Was avg 0.83.
     agent_pb2.PROTOCOL_HOTSTUFF: HeuristicSpec(
-        "avg_consensus_latency_ms", 0.96, 1, 0.5, (100, 2000), None),
+        "proposal_to_qc_ms", 4.29, 1, 0.5, (100, 3000), None),
     # Header first seen to commit, about one slot: the best measured T is 0.75 x
     # it at 5+50 (400 at 533) and 0.76 x at 5+150 (1000 at 1308); below the soft
     # floor the latency climbs steeply (250 at 5+50: 989). Base is flat in T (100-750).
+    # Restart: prepare_to_commit_ms (hold-free) k 1.229821 -> 1.23, blind mean +0.351, real-spec +0.255. The blind
+    # score kept the avg (+0.355, k 0.75, real-spec +0.245), but Kevin chose the hold-free signal so that every
+    # protocol with one uses it (2026-10-20). Was avg 0.90.
     agent_pb2.PROTOCOL_AUTOBAHN: HeuristicSpec(
-        "avg_consensus_latency_ms", 0.94, 1, 0.5, (100, 3000), None),
+        "prepare_to_commit_ms", 1.23, 1, 0.5, (100, 3000), None),
 }
 
 # SBFT's slow path takes about 125 + 5h + W (CLAUDE.md hop model); a T under it
@@ -513,9 +450,11 @@ SBFT_SLOW_SHARE = 0.05
 # The windows: the gap is seen only while a leader that receives the straggler's
 # prepare leads (c3 at W 50: seen in 2 of 6 windows, the others unseen), so the
 # catch is held across leader changes for 3 windows (one leader re-pin tick is 60 s).
-# The low rung of the SBFT ladder (SBFT_SLOW_PATH_VALUES_MS 50/150); the cells tie W 10
-# and W 50 (c1 1.30 vs 1.32, c4 1.12 vs 1.11), so this is a choice between equals.
-SBFT_WAIT_MIN_MS = 50
+# The low rung of the SBFT ladder (SBFT_SLOW_PATH_VALUES_MS 10/150 since 2026-10-17;
+# Kevin, 2026-10-19: minimum 10): with no lag to catch the 4th prepare lands 1-2 ms after
+# the 3rd, and giving up at once is about 40 ms faster than W 50 in the slow-path phases
+# (runs/2026-10-16-sbft-stability). The gap stays observable at W 10: up to about W + 2h.
+SBFT_WAIT_MIN_MS = 10
 SBFT_WAIT_SLACK_MS = 20
 SBFT_GAP_WINDOWS = 3
 
@@ -524,6 +463,74 @@ def heuristic_spec(protocol: int) -> HeuristicSpec:
     if protocol not in HEURISTIC_SPECS:
         raise ValueError(f"continuous_heuristic has no constants for protocol {protocol}")
     return HEURISTIC_SPECS[protocol]
+
+
+# The latency floor (Kevin, 2026-10-19, restart D8): a timeout below what a healthy request
+# needs elects on every request. Floor = multiplier x the protocol's hold-free signal +
+# offset, i.e. the protocol's share c of the time its timer covers, rebuilt by mechanics
+# from a signal a leader's proposal hold never enters (a tolerated hold enters every
+# end-to-end latency, lifts the floor over the timeout that would depose the leader and
+# locks the learner out of it; floorfix/floor_check.py, 2026-10-18). Not fitted. Checked on
+# the archived oracle runs (scripts/cloudlab/tmp/cal/restart/d8_floor.py): never above the
+# oracle's T in any phase, hold phases included.
+# - PBFT, SBFT (c 1, the timer runs from a request's arrival to its execution): the phase sum
+#   starts at the pre-prepare's receipt, so it carries 2 of the 3 hops; x 1.5 adds the
+#   pre-prepare hop, + 100 the proposal interval the oldest request waits (CLAUDE.md).
+# - SmartBFT (c 1): one proposal at a time (view.go inFlightProposal), so a request waits out
+#   the decision in flight and then its own, 3 hops each; the field carries 2: 2 x 1.5 = 3.
+# - HotStuff (c 1/3, one round of the three a block needs): a round is two hops and the
+#   field, the next leader's receipt of a block to its QC, is the second: x 2.
+# - Autobahn (c 1/2, one slot of two): the field, Prepare receipt to commit, is the slot.
+# - Tendermint (c 1/3): no hold-free field; the p50 never sees the one held height in four.
+# Every floor reads the last committing window: the 4-window minimum PBFT and SBFT used
+# existed only because p95 carried the hold.
+@dataclass(frozen=True)
+class FloorSpec:
+    signal: str
+    multiplier: float
+    offset_ms: float = 0.0
+
+
+FLOOR_SPECS: Dict[int, FloorSpec] = {
+    agent_pb2.PROTOCOL_PBFT: FloorSpec("pre_prepare_latency_ms+prepare_latency_ms+commit_latency_ms", 1.5, 100.0),
+    agent_pb2.PROTOCOL_SBFT: FloorSpec("pre_prepare_latency_ms+prepare_latency_ms+commit_latency_ms", 1.5, 100.0),
+    agent_pb2.PROTOCOL_SMARTBFT: FloorSpec("proposal_to_decision_ms", 3.0),
+    agent_pb2.PROTOCOL_TENDERMINT: FloorSpec("p50_consensus_latency_ms", 0.33),
+    agent_pb2.PROTOCOL_HOTSTUFF: FloorSpec("proposal_to_qc_ms", 2.0),
+    agent_pb2.PROTOCOL_AUTOBAHN: FloorSpec("prepare_to_commit_ms", 1.0),
+}
+
+
+def floor_spec(protocol: int) -> FloorSpec:
+    if protocol not in FLOOR_SPECS:
+        raise ValueError(f"no latency floor is defined for protocol {protocol}")
+    return FLOOR_SPECS[protocol]
+
+
+def opening_action_ms(protocol: int) -> Tuple[int, ...]:
+    """Every model's first action (Kevin, 2026-10-19): the ladder's middle rung, and on SBFT
+    the minimum wait."""
+    arms_ms = sorted(int(v) for v in get_timeout_values_ms(protocol))
+    opening = (arms_ms[len(arms_ms) // 2],)
+    if protocol == agent_pb2.PROTOCOL_SBFT:
+        opening = opening + (SBFT_WAIT_MIN_MS,)
+    return opening
+
+
+def make_latency_floor(protocol: int, scale: float = 1.0) -> LatencyFloor:
+    """The protocol's floor (FLOOR_SPECS) on the last committing window, ``scale`` x the
+    whole floor (1 = as defined; main.py and pretrain.py both build it here)."""
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"floor scale must be > 0, got {scale}")
+    spec = floor_spec(protocol)
+    return LatencyFloor(
+        multiplier=scale * spec.multiplier,
+        window=1,
+        quantile=0.5,
+        field=spec.signal,
+        offset_ms=scale * spec.offset_ms,
+    )
+
 
 
 class ContinuousHeuristicTimeoutModel(TensorModel):
@@ -539,8 +546,15 @@ class ContinuousHeuristicTimeoutModel(TensorModel):
     (None keeps them). ``latency_floor`` is the optional constraint every model
     takes (--latency-floor-multiplier): T is never below it.
 
-    Not a bandit: nothing is explored or learned. Until a window commits, and
-    while none does, T is held.
+    A window that committed nothing, or committed without a measurement of the
+    signal (restart D15), takes its own length (``empty_window_ms``, the
+    feature window) as its latency, as the reward does (Kevin, 2026-10-19): T =
+    multiplier x that length, clamped, at once, whatever the window and quantile (a
+    4-window minimum would otherwise wait out three more empty windows). The empty
+    window is not kept in the window, so the first committing window sets T again.
+
+    Not a bandit: nothing is explored or learned. Until a window commits, T is
+    the initial value.
     """
 
     def __init__(
@@ -553,7 +567,11 @@ class ContinuousHeuristicTimeoutModel(TensorModel):
         window: Optional[int] = None,
         quantile: Optional[float] = None,
         latency_floor: Optional[NormalizedLatencyFloor] = None,
+        empty_window_ms: Optional[float] = None,
     ):
+        if empty_window_ms is None or not math.isfinite(empty_window_ms) or empty_window_ms <= 0.0:
+            raise ValueError(f"empty_window_ms (the feature window) must be > 0, got {empty_window_ms}")
+        self._empty_window_ms = float(empty_window_ms)
         spec = heuristic_spec(protocol)
         spec = HeuristicSpec(
             spec.signal,
@@ -577,12 +595,13 @@ class ContinuousHeuristicTimeoutModel(TensorModel):
                 f"protocol, got {action_codec.action_dim}"
             )
         names = list(feature_names)
-        required = [spec.signal, "total_consensus_instances"]
+        self._signal_fields = signal_fields(spec.signal)
+        required = [*self._signal_fields, "total_consensus_instances"]
         if spec.storm_view_changes is not None:
             required.append("view_change_count")
         if self._sbft:
             required += ["p50_consensus_latency_ms", "fast_path_count", "slow_path_count",
-                         "slow_path_timeout_ms", "nth_prepare_gap_ms", "nth_prepare_seen_count"]
+                         "nth_prepare_gap_ms", "nth_prepare_seen_count"]
         missing = [f for f in required if f not in names]
         if missing:
             raise ValueError(f"continuous_heuristic needs report fields {missing}")
@@ -624,7 +643,9 @@ class ContinuousHeuristicTimeoutModel(TensorModel):
         if p50_min is None:
             return float(self._held[1]), None, None
         slow_in_use = bool(self._slow_shares) and max(self._slow_shares) >= SBFT_SLOW_SHARE
-        wait_now = self._field(row, "slow_path_timeout_ms") or float(self._held[1])
+        # The wait this window ran under is the one held since the last decision: the
+        # features carry no applied timeout (models.py, restart D9a).
+        wait_now = float(self._held[1])
         gaps = [g for g in self._gaps if g is not None]
         gap = max(gaps) if gaps else None
         # Design choice: the latest window's majority path picks the hop formula.
@@ -648,12 +669,16 @@ class ContinuousHeuristicTimeoutModel(TensorModel):
     def _step(self, row: np.ndarray) -> Tuple[int, ...]:
         spec = self._spec
         committed = self._field(row, "total_consensus_instances") > 0.0
-        signal = self._field(row, spec.signal)
-        if committed and signal > 0.0:
+        self._seen_commit = self._seen_commit or committed
+        signal = sum(self._field(row, name) for name in self._signal_fields)
+        p50 = self._field(row, "p50_consensus_latency_ms")
+        # main.py fills a window that committed without a latency sample with the window's
+        # own length in every consensus latency, so p50 at that length marks it as empty too
+        # (D15): it takes the empty branch and is not kept in the window.
+        measured = committed and signal > 0.0 and p50 < self._empty_window_ms
+        if measured:
             self._signals.append(signal)
-        if self._sbft and committed:
-            p50 = self._field(row, "p50_consensus_latency_ms")
-            if p50 > 0.0:
+            if self._sbft and p50 > 0.0:
                 self._p50s.append(p50)
         estimate = self._estimate(self._signals)
         held_t = self._held[0]
@@ -664,7 +689,12 @@ class ContinuousHeuristicTimeoutModel(TensorModel):
         wait_ms, bound, h = (
             self._sbft_wait_and_bound(row, committed) if self._sbft else (None, None, None)
         )
-        if storm:
+        if self._seen_commit and not measured:
+            # Nothing committed, or no measurement of the signal in a window that committed:
+            # the window's own length as its latency (class docstring).
+            timeout_ms = self._clamp_t(spec.multiplier * self._empty_window_ms)
+            wait_ms = self._held[1] if self._sbft else None
+        elif storm:
             self._storm_ms = max(self._storm_ms or 0, held_t)
             self._storm_estimate = estimate
             timeout_ms = self._clamp_t(2 * held_t)
@@ -721,6 +751,8 @@ class ContinuousHeuristicTimeoutModel(TensorModel):
         return 0.0
 
     def reset_model(self) -> None:
+        # Before the first commit an empty window is the start-up, not a stall.
+        self._seen_commit = False
         self._signals: Deque[float] = deque(maxlen=self._spec.window)
         self._p50s: Deque[float] = deque(maxlen=self._spec.window)
         self._gaps: Deque[Optional[float]] = deque(maxlen=SBFT_GAP_WINDOWS)
@@ -781,12 +813,13 @@ class ContextSpec:
 _TENDERMINT_CONTEXT_LOG_FIELDS: Tuple[str, ...] = (
     "avg_consensus_latency_ms",
     "p50_consensus_latency_ms",
-    "p90_consensus_latency_ms",
+    "p95_consensus_latency_ms",
     "propose_latency_ms",
     "prevote_latency_ms",
     "precommit_latency_ms",
     "throughput_tps",
     "avg_batch_size",
+    "p50_inter_commit_gap_ms",
 )
 # GP length scales per context dimension: 0.3 in log units is a factor of 1.35.
 # The GP tells contexts apart only by p50 latency, throughput and violation
@@ -798,16 +831,17 @@ _TENDERMINT_CONTEXT_LOG_FIELDS: Tuple[str, ...] = (
 _TENDERMINT_CONTEXT_LENGTH_SCALES: Tuple[float, ...] = (
     math.inf,  # avg_consensus_latency_ms
     0.3,  # p50_consensus_latency_ms
-    math.inf, math.inf, math.inf, math.inf,  # p90, propose, prevote, precommit
+    math.inf, math.inf, math.inf, math.inf,  # p95, propose, prevote, precommit
     0.2,  # throughput_tps
-    math.inf,  # avg_batch_size
+    math.inf, math.inf,  # avg_batch_size, p50_inter_commit_gap_ms
     0.15,  # timeout_violation_rate
 )
 
-# PBFT and SmartBFT share the 16-field report (PBFT_REPORT_FEATURE_FIELD_NAMES).
+# PBFT and SmartBFT share the 15 base report fields (PBFT_REPORT_FEATURE_FIELD_NAMES).
 # view_change_count stands in for Tendermint's violation rate. timeout_ms, the
 # applied election timeout, is left out on purpose: the model's own last pick
-# in the context drove a two-cycle (H15).
+# in the context drove a two-cycle (H15); since restart D9a no model's input
+# holds it.
 _PBFT_CONTEXT_LOG_FIELDS: Tuple[str, ...] = (
     "avg_consensus_latency_ms",
     "p50_consensus_latency_ms",
@@ -819,8 +853,9 @@ _PBFT_CONTEXT_LOG_FIELDS: Tuple[str, ...] = (
 )
 # Same reading as the Tendermint scales; 0.7 on the log1p count is a factor
 # of 2 in view changes (quiet windows report 0; measured per 10 s window, a
-# PBFT storm 3-5 and a SmartBFT storm about 18, about 0.7 times that in the 7 s
-# feature window).
+# PBFT storm 3-5 and a SmartBFT storm about 18; since restart D14 the count covers
+# the trailing 20 s episode on PBFT, SBFT and SmartBFT, about 2x that; on log1p a
+# factor of 2 is 0.7 whatever the window).
 _PBFT_CONTEXT_LENGTH_SCALES: Tuple[float, ...] = (
     math.inf,  # avg_consensus_latency_ms
     0.3,  # p50_consensus_latency_ms
@@ -828,6 +863,43 @@ _PBFT_CONTEXT_LENGTH_SCALES: Tuple[float, ...] = (
     0.2,  # throughput_tps
     math.inf, math.inf,  # avg_batch_size, p50_inter_commit_gap_ms
     0.7,  # view_change_count
+)
+# PBFT only: the phase latencies beside the consensus latency, read by the
+# prior and not by the kernel (as SBFT's). A proposal hold precedes the
+# pre-prepare, so under a hold the consensus latency rises and the phases do
+# not, while a slow link raises both: the one observable that separates the
+# two (Kevin, 2026-10-14, runs/2026-10-14-five-machine-models; the prior on the
+# base fields read a 200 ms hold at base as a +50 link and a 550 ms hold as a
+# +150 link, and played 800-2000 ms in every hold phase).
+_PBFT_PHASE_CONTEXT_LOG_FIELDS: Tuple[str, ...] = _PBFT_CONTEXT_LOG_FIELDS + (
+    "pre_prepare_latency_ms",
+    "prepare_latency_ms",
+    "commit_latency_ms",
+)
+_PBFT_PHASE_CONTEXT_LENGTH_SCALES: Tuple[float, ...] = _PBFT_CONTEXT_LENGTH_SCALES + (
+    math.inf, math.inf, math.inf,  # pre_prepare, prepare, commit latency: prior only
+)
+# SmartBFT: the same separation from its one phase field, proposal arrival ->
+# delivery (PBFT's three phases together; SMARTBFT_REPORT_FEATURE_FIELD_NAMES).
+_SMARTBFT_CONTEXT_LOG_FIELDS: Tuple[str, ...] = _PBFT_CONTEXT_LOG_FIELDS + (
+    "proposal_to_decision_ms",
+)
+_SMARTBFT_CONTEXT_LENGTH_SCALES: Tuple[float, ...] = _PBFT_CONTEXT_LENGTH_SCALES + (
+    math.inf,  # proposal_to_decision_ms: prior only
+)
+# HotStuff and Autobahn: the same separation from their hold-free fields (2026-10-19;
+# the base fields alone read a slow leader as a slow link).
+_HOTSTUFF_CONTEXT_LOG_FIELDS: Tuple[str, ...] = _PBFT_CONTEXT_LOG_FIELDS + ("proposal_to_qc_ms",)
+_AUTOBAHN_CONTEXT_LOG_FIELDS: Tuple[str, ...] = _PBFT_CONTEXT_LOG_FIELDS + ("prepare_to_commit_ms",)
+_HOLD_FREE_CONTEXT_LENGTH_SCALES: Tuple[float, ...] = _PBFT_CONTEXT_LENGTH_SCALES + (
+    math.inf,  # the hold-free field: prior only
+)
+# HotStuff and Autobahn count round timeouts as view changes: 43 a window at T about 100
+# and 0 at 200 or more in healthy HotStuff phases, 19-69 on Autobahn even at its best T, so
+# the count follows the model's own T, the self-feedback H15 removed by dropping the
+# applied timeout. Prior only there (Kevin, 2026-10-19, restart D9b).
+_ROUND_TIMEOUT_CONTEXT_LENGTH_SCALES: Tuple[float, ...] = (
+    _HOLD_FREE_CONTEXT_LENGTH_SCALES[:6] + (math.inf,) + _HOLD_FREE_CONTEXT_LENGTH_SCALES[7:]
 )
 
 # SBFT's report is PBFT's plus the phase latencies and path counts
@@ -852,6 +924,7 @@ _SBFT_CONTEXT_LOG_FIELDS: Tuple[str, ...] = (
     "view_change_count",
     "pre_prepare_latency_ms",
     "prepare_latency_ms",
+    "commit_latency_ms",  # completes the phase sum (2026-10-14; see _PBFT_PHASE_CONTEXT_LOG_FIELDS)
     "fast_path_count",
     "slow_path_count",
     "nth_prepare_gap_ms",
@@ -865,9 +938,11 @@ _SBFT_CONTEXT_LENGTH_SCALES: Tuple[float, ...] = (
     0.2,  # throughput_tps
     math.inf, math.inf,  # avg_batch_size, p50_inter_commit_gap_ms
     0.7,  # view_change_count
-    math.inf, math.inf,  # pre_prepare_latency_ms, prepare_latency_ms
-    0.7,  # fast_path_count
-    0.7,  # slow_path_count
+    math.inf, math.inf, math.inf,  # pre_prepare_latency_ms, prepare_latency_ms, commit_latency_ms
+    # The path counts follow the model's own W (and flip deep/shallow at 5+150):
+    # prior only (Kevin, 2026-10-19, restart D9c; 0.7 until then).
+    math.inf,  # fast_path_count
+    math.inf,  # slow_path_count
     math.inf, math.inf, math.inf,  # nth_prepare_gap_ms, _seen_count, _unseen_count
 )
 
@@ -882,19 +957,21 @@ CONTEXT_SPECS: Dict[int, ContextSpec] = {
     ),
     # Top rung 1200; base p50 94-168 across hosts, so 100 sits under the floor.
     agent_pb2.PROTOCOL_PBFT: ContextSpec(
-        log_fields=_PBFT_CONTEXT_LOG_FIELDS,
+        log_fields=_PBFT_PHASE_CONTEXT_LOG_FIELDS,
         raw_fields=(),
-        length_scales=_PBFT_CONTEXT_LENGTH_SCALES,
+        length_scales=_PBFT_PHASE_CONTEXT_LENGTH_SCALES,
         bounds_ms=(100, 3000),
         prior_path=os.path.join(_PRIOR_DIR, "continuous_pbft_prior.npz"),
         simulator="pbft_sim.py",
     ),
     # 1800 is the only rung that survives 5+150 and 800 still storms there.
+    # One range for every protocol and model, 100-3000 (Kevin, 2026-10-19; was 100-4000
+    # here, 100-2000 on HotStuff).
     agent_pb2.PROTOCOL_SMARTBFT: ContextSpec(
-        log_fields=_PBFT_CONTEXT_LOG_FIELDS,
+        log_fields=_SMARTBFT_CONTEXT_LOG_FIELDS,
         raw_fields=(),
-        length_scales=_PBFT_CONTEXT_LENGTH_SCALES,
-        bounds_ms=(100, 4000),
+        length_scales=_SMARTBFT_CONTEXT_LENGTH_SCALES,
+        bounds_ms=(100, 3000),
         prior_path=os.path.join(_PRIOR_DIR, "continuous_smartbft_prior.npz"),
         simulator="smartbft_sim.py",
     ),
@@ -911,12 +988,12 @@ CONTEXT_SPECS: Dict[int, ContextSpec] = {
     ),
     # HotStuff's report is PBFT's field for field (models.py). A healthy round
     # is 2h, so the 100 ms lower bound sits at the block-delay floor of a 5 ms
-    # link; 2000 is three times what 5+150 needs.
+    # link; the shared 100-3000 range (2026-10-19; 2000 until then).
     agent_pb2.PROTOCOL_HOTSTUFF: ContextSpec(
-        log_fields=_PBFT_CONTEXT_LOG_FIELDS,
+        log_fields=_HOTSTUFF_CONTEXT_LOG_FIELDS,
         raw_fields=(),
-        length_scales=_PBFT_CONTEXT_LENGTH_SCALES,
-        bounds_ms=(100, 2000),
+        length_scales=_ROUND_TIMEOUT_CONTEXT_LENGTH_SCALES,
+        bounds_ms=(100, 3000),
         prior_path=os.path.join(_PRIOR_DIR, "continuous_hotstuff_prior.npz"),
         simulator="hotstuff_sim.py",
     ),
@@ -924,9 +1001,9 @@ CONTEXT_SPECS: Dict[int, ContextSpec] = {
     # PBFT context fields all exist. Healthy Autobahn has no floor; under vote
     # withholding 5+150 needs about 1000 ms, and 3000 is three times that.
     agent_pb2.PROTOCOL_AUTOBAHN: ContextSpec(
-        log_fields=_PBFT_CONTEXT_LOG_FIELDS,
+        log_fields=_AUTOBAHN_CONTEXT_LOG_FIELDS,
         raw_fields=(),
-        length_scales=_PBFT_CONTEXT_LENGTH_SCALES,
+        length_scales=_ROUND_TIMEOUT_CONTEXT_LENGTH_SCALES,
         bounds_ms=(100, 3000),
         prior_path=os.path.join(_PRIOR_DIR, "continuous_autobahn_prior.npz"),
         simulator="autobahn_sim.py",
@@ -979,16 +1056,25 @@ class NumpyMLP:
         self._x_std = data["x_std"]
         self._y_mean = float(data["y_mean"])
         self._y_std = float(data["y_std"])
+        # Every prior is written by train_gp_prior, which records all of these; a file
+        # without them predates the 2026-10-19 restart and is refused, not read with
+        # defaults.
+        missing = sorted(set(GP_PRIOR_KEYS) - set(data.files))
+        if missing:
+            raise ValueError(f"Prior {path} lacks {missing}; retrain it (train_gp_prior)")
+        self.protocol = str(data["protocol"])
+        self.input_names = tuple(str(v) for v in data["input_names"])
+        self.action_bounds_ms = tuple(tuple(int(v) for v in row) for row in data["action_bounds_ms"])
+        self.code_hash = str(data["code_hash"])
         self.reward_design = str(data["reward_design"])
-        if "target_log" in data:
-            raise ValueError(f"{path}: fit on log(reward), which cannot represent a negative reward; retrain it")
-        # Episodes the action was held for in training (tendermint_sim train
-        # --hold-episodes); the target was the mean reward over the hold. 1 = one
-        # episode's reward, the SimPriorGPModel prior.
-        self.hold_episodes = int(data["hold_episodes"]) if "hold_episodes" in data else 1
-        # Rewards below this were fit as this value (tendermint_sim train
-        # --target-floor); -inf when the prior was fit to the raw reward.
-        self.target_floor = float(data["target_floor"]) if "target_floor" in data else -math.inf
+        # N of reward_tps_latency the prior was fit under (reward_utils.REWARD_NORMALIZER_TPS).
+        self.reward_normalizer_tps = float(data["reward_normalizer_tps"])
+        # Episodes the action was held for in training (<sim> train --hold-episodes);
+        # the target was the mean reward over the hold.
+        self.hold_episodes = int(data["hold_episodes"])
+        # Rewards below this were fit as this value (<sim> train --target-floor); -inf
+        # when the prior was fit to the raw reward.
+        self.target_floor = float(data["target_floor"])
 
     @property
     def input_dim(self) -> int:
@@ -1007,6 +1093,111 @@ class NumpyMLP:
                 h = np.maximum(h, 0.0)
         out = h.reshape(-1) * self._y_std + self._y_mean
         return out
+
+
+# What every GP prior records besides its weights (NumpyMLP refuses a file without them).
+GP_PRIOR_KEYS: Tuple[str, ...] = (
+    "protocol", "input_names", "action_bounds_ms", "code_hash", "sim_constants",
+    "reward_design", "reward_normalizer_tps", "hold_episodes", "target_floor",
+)
+
+
+def gp_prior_input_names(protocol: int) -> Tuple[str, ...]:
+    """The prior's input columns: the protocol's context, then its normalised action(s)."""
+    spec = CONTEXT_SPECS[int(protocol)]
+    actions = ("timeout_position", "wait_position") if spec.wait_bounds_ms else ("timeout_position",)
+    return tuple(spec.log_fields) + tuple(spec.raw_fields) + actions
+
+
+def train_gp_prior(
+    protocol: int,
+    x: np.ndarray,
+    y: np.ndarray,
+    out_path: str,
+    *,
+    seed: int,
+    design: str,
+    hold: int,
+    target_floor: float,
+    windows: Any,
+    sim_constants: Dict[str, Any],
+    code_hash: str,
+    hidden: Tuple[int, ...] = (128, 128, 64),
+    extra: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Fit the MLP prior of the GP models on simulator samples and write it; returns
+    the validation RMSE. The one writer for all six simulators (Kevin, 2026-10-19,
+    restart): the file records what NumpyMLP and the GP check on load (protocol,
+    input columns, the action range the positions are normalised over, reward,
+    hold and floor) and, for the record, the simulator constants the runs were
+    drawn around and the code_hash of the tree (scripts/cloudlab/code_state.py)
+    that trained it, which the harness compares with FREEZE. ``windows`` is the
+    simulator's PriorWindows; ``extra`` adds simulator-specific scalars.
+    """
+    from sklearn.neural_network import MLPRegressor
+    import json
+
+    if not str(code_hash).strip():
+        raise ValueError("code_hash is required (scripts/cloudlab/code_state.py)")
+    if int(hold) < 1:
+        raise ValueError(f"hold must be >= 1, got {hold}")
+    spec = CONTEXT_SPECS[int(protocol)]
+    names = gp_prior_input_names(protocol)
+    if x.ndim != 2 or x.shape[1] != len(names):
+        raise ValueError(f"x has shape {x.shape}; the prior takes {len(names)} inputs {names}")
+    # Rewards below the floor are fit as the floor. SimReturnGPModel applies the
+    # same floor to the online reward, so the residual compares like with like, and
+    # the fit stops spending its error on collapses instead of on the structure that
+    # ranks the usable timeouts.
+    y = np.maximum(y, target_floor)
+    x_mean, x_std = x.mean(axis=0), x.std(axis=0) + 1e-9
+    y_mean, y_std = float(y.mean()), float(y.std() + 1e-9)
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(x))
+    cut = int(0.9 * len(x))
+    tr, va = order[:cut], order[cut:]
+    mlp = MLPRegressor(
+        hidden_layer_sizes=tuple(hidden),
+        activation="relu",
+        alpha=1e-5,
+        batch_size=512,
+        learning_rate_init=1e-3,
+        max_iter=200,
+        early_stopping=True,
+        n_iter_no_change=10,
+        random_state=seed,
+    )
+    mlp.fit((x[tr] - x_mean) / x_std, (y[tr] - y_mean) / y_std)
+    pred = mlp.predict((x[va] - x_mean) / x_std) * y_std + y_mean
+    rmse = float(np.sqrt(np.mean((pred - y[va]) ** 2)))
+    protocol_name = agent_pb2.Protocol.Name(int(protocol))[len("PROTOCOL_"):].lower()
+    bounds = [spec.bounds_ms] + ([spec.wait_bounds_ms] if spec.wait_bounds_ms else [])
+    arrays: Dict[str, Any] = {"n_layers": np.asarray(len(mlp.coefs_))}
+    for i, (w, b) in enumerate(zip(mlp.coefs_, mlp.intercepts_)):
+        arrays[f"W{i}"] = w
+        arrays[f"b{i}"] = b
+    arrays.update(
+        x_mean=x_mean,
+        x_std=x_std,
+        y_mean=np.asarray(y_mean),
+        y_std=np.asarray(y_std),
+        protocol=np.asarray(protocol_name),
+        input_names=np.asarray(names),
+        action_bounds_ms=np.asarray(bounds, dtype=np.int64),
+        code_hash=np.asarray(str(code_hash)),
+        sim_constants=np.asarray(json.dumps(sim_constants, sort_keys=True, default=float)),
+        reward_design=np.asarray(design),
+        reward_normalizer_tps=np.asarray(reward_normalizer_tps(protocol_name)),
+        hold_episodes=np.asarray(int(hold)),
+        target_floor=np.asarray(float(target_floor)),
+    )
+    for key, value in (extra or {}).items():
+        if key in arrays:
+            raise ValueError(f"extra key {key} would overwrite a prior field")
+        arrays[key] = np.asarray(value)
+    arrays.update(windows.arrays())
+    np.savez(out_path, **arrays)
+    return rmse
 
 
 # Default floor for an untrained prior. SimReturnGPModel needs a finite one -
@@ -1151,12 +1342,36 @@ class SimPriorGPModel(TensorModel):
             )
         else:
             self._prior = NumpyMLP(prior_path)
+        if prior_path is not None:
+            protocol_name = agent_pb2.Protocol.Name(int(action_codec.protocol))[len("PROTOCOL_"):].lower()
+            expected_bounds = tuple(tuple(int(v) for v in b) for b in action_codec.bounds_ms)
+            for what, found, wanted in (
+                ("protocol", self._prior.protocol, protocol_name),
+                ("input_names", self._prior.input_names, gp_prior_input_names(action_codec.protocol)),
+                ("action_bounds_ms", self._prior.action_bounds_ms, expected_bounds),
+            ):
+                if found != wanted:
+                    raise ValueError(
+                        f"Prior {prior_path} has {what} {found}, the agent has {wanted}; retrain it "
+                        f"with {self._spec.simulator} train"
+                    )
         if self._prior.reward_design != reward_design:
             raise ValueError(
                 f"Prior {prior_path} was trained on {self._prior.reward_design}, "
                 f"but the agent runs {reward_design}; retrain it with "
                 f"{self._spec.simulator} train --reward-design {reward_design}"
             )
+        if reward_design == "reward_tps_latency" and prior_path is not None:
+            expected = reward_normalizer_tps(
+                agent_pb2.Protocol.Name(int(action_codec.protocol))[len("PROTOCOL_"):].lower()
+            )
+            if self._prior.reward_normalizer_tps != expected:
+                raise ValueError(
+                    f"Prior {prior_path} was fit under reward_tps_latency with tps / "
+                    f"{self._prior.reward_normalizer_tps:g}, but the agent "
+                    f"divides by {expected:g}; retrain it with {self._spec.simulator} train "
+                    f"--reward-design {reward_design}"
+                )
         context_dim = self._spec.context_dim
         if self._prior.input_dim != context_dim + action_dim:
             raise ValueError(
@@ -1173,17 +1388,22 @@ class SimPriorGPModel(TensorModel):
                 np.array([action_codec.normalize_ms(ms, dim) for ms in axis], dtype=float)
                 for dim, axis in enumerate(axes_ms)
             )
+        # Where a flat prior opens: the grid point nearest the ladder's middle rung (and on
+        # SBFT the minimum wait), as the heuristic and discrete models open (Kevin,
+        # 2026-10-19; the middle of the log grid until then, above Tendermint's top rung).
+        opening = opening_action_ms(action_codec.protocol)
         if action_dim == 1:
             self._grid = axes[0]
-            self._mid_index = axes[0].size // 2
+            self._mid_index = int(np.argmin(np.abs(axes[0] - action_codec.normalize_ms(opening[0], 0))))
         else:
             # One (T, W) row per pair, T major.
             timeouts, waits = axes
             self._grid = np.column_stack(
                 (np.repeat(timeouts, waits.size), np.tile(waits, timeouts.size))
             )
-            # T major, W minor: the middle of both axes, not of the flat index.
-            self._mid_index = (timeouts.size // 2) * waits.size + waits.size // 2
+            t_index = int(np.argmin(np.abs(timeouts - action_codec.normalize_ms(opening[0], 0))))
+            w_index = int(np.argmin(np.abs(waits - action_codec.normalize_ms(opening[1], 1))))
+            self._mid_index = t_index * waits.size + w_index
             self._grid_axes = (timeouts, waits)
         self._signal_var = float(signal_std) ** 2
         self._noise_var = float(noise_std) ** 2
@@ -1342,11 +1562,14 @@ class SimReturnGPModel(SimPriorGPModel):
     floor the reward is untouched, so the ranking of usable timeouts is the
     reward's own.
 
-    The GP residual, its kernel variances and the confidence bound are in units
-    of the prior's training-target standard deviation, so the same constants
-    serve a reward of any scale; H18's constants (signal 0.08, noise 0.04,
-    level 0.2 on a reward of spread 0.6) are 0.13, 0.066 and 0.33 in these
-    units, and level_std is wider here because this prior fits worse.
+    The GP residual, its kernel variances and the confidence bound are in reward
+    units (Kevin, 2026-10-19, restart D9e: every protocol's reward is tps / N minus
+    latency in seconds, one scale, so one set of constants means the same on all
+    six). Until then they were in units of each prior's training-target standard
+    deviation (0.83-1.23 across the protocols' priors, 1.0 untrained), so the same
+    constants meant a different width on each protocol and between a pretrained
+    row and its untrained pair; the values (signal 0.13, noise 0.066, level 0.5)
+    are those constants at the mean of that spread, about 1.
 
     The prior may also be fit to the held-action return (--hold-episodes h >
     1): the mean reward of holding the action h episodes from the context. On
@@ -1403,9 +1626,8 @@ class SimReturnGPModel(SimPriorGPModel):
                 f"--reward-design {reward_design}"
             )
         self._floor = float(self._prior.target_floor)
-        self._y_scale = float(self._prior.y_std)
-        if not math.isfinite(self._y_scale) or self._y_scale <= 0.0:
-            raise ValueError(f"Prior {prior_path} has a non-positive y_std")
+        # Reward units on every protocol (class docstring); the prior predicts in them.
+        self._y_scale = 1.0
         self._hold = int(self._prior.hold_episodes)
         if self._hold < 1:
             raise ValueError(f"Prior {prior_path} has hold_episodes {self._hold}")
@@ -1490,20 +1712,23 @@ class SimReturnGPModel(SimPriorGPModel):
 DEFAULT_CANDIDATE_COUNT = 65
 
 
-def _refined_ladder_ms(arms_ms: Sequence[int]) -> Tuple[int, ...]:
-    """The arm ladder with the geometric midpoint of each pair inserted.
+# Basis centres over the action range (Kevin, 2026-10-19: every continuous model plays the
+# protocol's whole range, 100-3000, not the ladder's span): log-spaced, nine across 100-3000
+# (a ratio of 1.53 between neighbours, the density of the refined three-rung ladder it replaces).
+LINUCB_BASIS_CENTERS = 9
+# SBFT's fast-path wait W (Kevin, 2026-10-19, restart D10c: the continuous models choose W
+# too): a separate basis over the wait range, added to the T basis (option b, so T and W
+# enter the reward additively), 4 log-spaced centres across 10-500, and 16 candidate waits.
+LINUCB_WAIT_BASIS_CENTERS = 4
+LINUCB_WAIT_CANDIDATES = 16
 
-    Geometric rather than arithmetic because the action space is log-spaced:
-    the midpoint of 250 and 550 is the timeout equidistant from both in the
-    coordinate the model actually searches.
-    """
-    arms = sorted(int(value) for value in arms_ms)
-    refined = []
-    for lower, upper in zip(arms, arms[1:]):
-        refined.append(lower)
-        refined.append(int(round(math.sqrt(float(lower) * float(upper)))))
-    refined.append(arms[-1])
-    return tuple(sorted(set(refined)))
+
+def _log_grid_ms(lower_ms: int, upper_ms: int, count: int) -> Tuple[int, ...]:
+    """``count`` timeouts spaced evenly in log from ``lower_ms`` to ``upper_ms``."""
+    if count < 2:
+        raise ValueError(f"count must be >= 2, got {count}")
+    ratio = (float(upper_ms) / float(lower_ms)) ** (1.0 / (count - 1))
+    return tuple(sorted({int(round(lower_ms * ratio ** i)) for i in range(count)}))
 
 
 class ContinuousLinUCB(TensorModel):
@@ -1546,14 +1771,14 @@ class ContinuousLinUCB(TensorModel):
     at 370ms - a timeout no baseline plays - for 104 of 107 episodes and cost
     4600 tps against the same model's heuristic.
 
-    **The centres are the arms plus the midpoint between each pair.** With
-    centres only at the arms, an average over them is maximised at an arm and
-    the continuous action space buys nothing; with the ladder refined one
-    level the model can settle between two arms when that is where the reward
-    is (measured on a synthetic reward paying only in 700-900ms: 90% of
-    decisions inside it with the midpoints, 0% without). Each centre costs
-    ``n_features + 1`` coefficients, which is what limits how fine the ladder
-    can get: five centres is 85 against discrete_linucb's 51.
+    **The centres are LINUCB_BASIS_CENTERS log-spaced timeouts across the
+    action range** (2026-10-19; the arms plus the midpoint between each pair
+    until then, at the same density). With centres only at the arms, an average
+    over them is maximised at an arm and the continuous action space buys
+    nothing; at this density the model can settle between two of them when
+    that is where the reward is (measured on a synthetic reward paying only in
+    700-900ms: 90% of decisions inside it with the ladder midpoints, 0%
+    without). Each centre costs ``n_features + 1`` coefficients.
 
     The bumps are half a centre-spacing wide, so neighbours overlap at about
     14%: wide enough to share evidence, narrow enough that adjacent centres
@@ -1573,9 +1798,8 @@ class ContinuousLinUCB(TensorModel):
     phase change. Subtracting a discounted mean of recent rewards makes the
     prior mean "average", which is what optimism in the face of uncertainty
     assumes: a timeout not tried lately is worth finding out about, not
-    written off. discrete_linucb has the same pathology and is deliberately left
-    alone, so the ladder it plays is the one it has always played; pass
-    ``center_rewards=False`` to reproduce it here.
+    written off. discrete_linucb centres the same way since 2026-10-19 (restart
+    D9d); pass ``center_rewards=False`` to reproduce the uncentred model here.
 
     Centring is also why the discount is 0.90 rather than discrete_linucb's 0.95.
     The effective memory is ``1 / (1 - gamma)`` observations, and a phase of
@@ -1610,10 +1834,10 @@ class ContinuousLinUCB(TensorModel):
     exploration floor over the centres rather than over the candidate grid,
     are the two things that would change that; neither is done here.
 
-    The action space is the arm range, not the codec's 100..10000ms bounds, for
-    the reason the agent clamps ContinuousHeuristicTimeoutModel to it: a
-    timeout no discrete baseline can play makes the comparison against those
-    baselines a comparison of two different action spaces. A latency floor, when one is configured,
+    The action space is the protocol's whole range (the codec's ContextSpec
+    bounds, 100-3000 ms on every protocol; Kevin, 2026-10-19), as for every
+    continuous model; until then it was the ladder's span, so that it played no
+    timeout a discrete baseline could not. A latency floor, when one is configured,
     trims the bottom of that range exactly as ``feasible_timeout_mask`` trims
     the ladder - the model is not otherwise aware of it, and with no floor
     configured it is a bandit over the range and nothing else.
@@ -1627,8 +1851,11 @@ class ContinuousLinUCB(TensorModel):
         clamp_ms: Optional[Tuple[int, int]] = None,
         candidate_count: int = DEFAULT_CANDIDATE_COUNT,
         confidence_scale: float = 1.0,
-        discount_factor: float = 0.90,
-        exploration_floor: float = 0.05,
+        # 0.95 and no random share since 2026-10-19 (were 0.90 / 0.05; Kevin, runs/2026-10-19-linucb-discount):
+        # one discount for both LinUCB models (0.90-0.98 within 0.01); the random share cost
+        # HotStuff about 0.10 and nothing measurable elsewhere.
+        discount_factor: float = 0.95,
+        exploration_floor: float = 0.0,
         ridge: float = 1.0,
         reward_scale: float = 1.0,
         center_rewards: bool = True,
@@ -1638,10 +1865,10 @@ class ContinuousLinUCB(TensorModel):
     ) -> None:
         if n_features <= 0:
             raise ValueError(f"n_features must be > 0, got {n_features}")
-        if action_codec.action_dim != 1:
+        if action_codec.action_dim not in (1, 2):
             raise ValueError(
-                "ContinuousLinUCB places one timeout on a line, so it needs a "
-                f"1-dimensional codec, got {action_codec.action_dim}"
+                "ContinuousLinUCB places a timeout (and on SBFT a wait) on a line, so it "
+                f"needs a 1- or 2-dimensional codec, got {action_codec.action_dim}"
             )
         if candidate_count < 2:
             raise ValueError(
@@ -1664,12 +1891,10 @@ class ContinuousLinUCB(TensorModel):
         if reward_scale <= 0.0:
             raise ValueError(f"reward_scale must be > 0, got {reward_scale}")
 
-        arms_ms = tuple(
-            sorted(int(value) for value in get_timeout_values_ms(action_codec.protocol))
-        )
         codec_lower_ms, codec_upper_ms = action_codec.bounds_ms[0]
         if clamp_ms is None:
-            clamp_ms = (min(arms_ms), max(arms_ms))
+            # The protocol's whole range, as every continuous model (2026-10-19).
+            clamp_ms = (codec_lower_ms, codec_upper_ms)
         lower_ms, upper_ms = (int(clamp_ms[0]), int(clamp_ms[1]))
         if upper_ms <= lower_ms:
             raise ValueError(f"Invalid clamp bounds: {lower_ms}..{upper_ms}ms")
@@ -1682,7 +1907,7 @@ class ContinuousLinUCB(TensorModel):
         centers_ms = tuple(
             sorted(
                 int(value)
-                for value in (basis_centers_ms or _refined_ladder_ms(arms_ms))
+                for value in (basis_centers_ms or _log_grid_ms(lower_ms, upper_ms, LINUCB_BASIS_CENTERS))
             )
         )
         if not centers_ms:
@@ -1726,7 +1951,30 @@ class ContinuousLinUCB(TensorModel):
         )
         if self._basis_width <= 0.0:
             self._basis_width = 1.0
-        self._feature_dim = self._n_basis * self._context_dim
+        # SBFT: the wait W on its own basis, added to the timeout's (LINUCB_WAIT_BASIS_CENTERS).
+        self._two_d = action_codec.action_dim == 2
+        self._n_wait_basis = 0
+        self._held_wait_ms: Optional[int] = None
+        if self._two_d:
+            self._wait_lower_ms, self._wait_upper_ms = (int(v) for v in action_codec.bounds_ms[1])
+            self._wait_centers_ms = _log_grid_ms(
+                self._wait_lower_ms, self._wait_upper_ms, LINUCB_WAIT_BASIS_CENTERS
+            )
+            self._wait_centers = np.asarray(
+                [self._wait_position_of(v) for v in self._wait_centers_ms], dtype=np.float64
+            )
+            self._n_wait_basis = len(self._wait_centers)
+            self._wait_basis_width = float(
+                0.5 * (self._wait_centers[-1] - self._wait_centers[0]) / (self._n_wait_basis - 1)
+            )
+            self._wait_positions = np.linspace(0.0, 1.0, LINUCB_WAIT_CANDIDATES, dtype=np.float64)
+            opening = opening_action_ms(action_codec.protocol)
+            # The design sweep holds the other dimension at the opening action.
+            self._opening_positions = (
+                self._position_of(opening[0]), self._wait_position_of(opening[1])
+            )
+        self._opening_position = self._position_of(opening_action_ms(action_codec.protocol)[0])
+        self._feature_dim = (self._n_basis + self._n_wait_basis) * self._context_dim
         self._positions = np.linspace(
             0.0, 1.0, self._candidate_count, dtype=np.float64
         )
@@ -1765,32 +2013,18 @@ class ContinuousLinUCB(TensorModel):
         rows = np.asarray(features, dtype=float)
         if rows.ndim == 1:
             rows = rows.reshape(1, -1)
-        action_values = np.asarray(actions, dtype=np.float64).reshape(-1)
+        positions = self._action_positions(actions, len(rows))
         reward_values = np.asarray(rewards, dtype=np.float64).reshape(-1)
-        if action_values.size != len(rows) or reward_values.size != len(rows):
+        if reward_values.size != len(rows):
             raise ValueError(
-                f"{len(rows)} feature rows, {action_values.size} actions "
-                f"and {reward_values.size} rewards"
+                f"{len(rows)} feature rows and {reward_values.size} rewards"
             )
-        if not np.all(np.isfinite(action_values)):
-            raise ValueError("actions must contain only finite values")
-        if np.any(action_values < 0.0) or np.any(action_values > 1.0):
-            raise ValueError("Continuous actions must be normalized to [0, 1]")
         if not np.all(np.isfinite(reward_values)):
             raise ValueError("rewards must contain only finite values")
         inputs = np.vstack(
             [
-                self._joint(
-                    self._context(row),
-                    np.asarray(
-                        [
-                            self._position_of(
-                                self._action_codec.denormalize_ms(float(action))
-                            )
-                        ]
-                    ),
-                ).reshape(-1)
-                for row, action in zip(rows, action_values)
+                self._joint(self._context(row), position[None]).reshape(-1)
+                for row, position in zip(rows, positions)
             ]
         )
         targets = reward_values
@@ -1820,6 +2054,51 @@ class ContinuousLinUCB(TensorModel):
         return min(
             self._upper_ms, max(self._lower_ms, int(round(math.exp(log_value))))
         )
+
+    def _wait_position_of(self, wait_ms: float) -> float:
+        """SBFT: where a wait sits in the wait range, in [0, 1] log-space."""
+        value = float(wait_ms)
+        if not math.isfinite(value) or value <= 0.0:
+            return 0.0
+        position = (math.log(value) - math.log(float(self._wait_lower_ms))) / (
+            math.log(float(self._wait_upper_ms)) - math.log(float(self._wait_lower_ms))
+        )
+        return float(min(1.0, max(0.0, position)))
+
+    def _wait_of(self, position: float) -> int:
+        bounded = min(1.0, max(0.0, float(position)))
+        log_value = math.log(float(self._wait_lower_ms)) + bounded * (
+            math.log(float(self._wait_upper_ms)) - math.log(float(self._wait_lower_ms))
+        )
+        return min(self._wait_upper_ms, max(self._wait_lower_ms, int(round(math.exp(log_value)))))
+
+    def _action_positions(self, actions: np.ndarray, batch_size: int) -> np.ndarray:
+        """Codec-normalised actions -> positions: (n, 1), or (n, 2) with the wait on SBFT.
+
+        The agent trains on the timeout the replicas actually ran with, which is not
+        always the one this model asked for; a value outside the action range lands on
+        the nearest end of it."""
+        width = 2 if self._two_d else 1
+        values = np.asarray(actions, dtype=np.float64).reshape(-1)
+        if values.size == width and batch_size > 1:
+            values = np.tile(values, batch_size)
+        if values.size != batch_size * width:
+            raise ValueError(
+                f"actions batch size mismatch: expected {batch_size} x {width}, got {values.size}"
+            )
+        if not np.all(np.isfinite(values)):
+            raise ValueError("actions must contain only finite values")
+        if np.any(values < 0.0) or np.any(values > 1.0):
+            raise ValueError("Continuous actions must be normalized to [0, 1]")
+        values = values.reshape(batch_size, width)
+        positions = np.empty_like(values)
+        for i, row in enumerate(values):
+            positions[i, 0] = self._position_of(self._action_codec.denormalize_ms(float(row[0]), 0))
+            if self._two_d:
+                positions[i, 1] = self._wait_position_of(
+                    self._action_codec.denormalize_ms(float(row[1]), 1)
+                )
+        return positions
 
     def _lower_position(self) -> float:
         """Smallest position the latency floor permits, in [0, 1].
@@ -1866,8 +2145,24 @@ class ContinuousLinUCB(TensorModel):
         totals = np.sum(weights, axis=1, keepdims=True)
         return weights / np.maximum(totals, 1e-12)
 
+    def _wait_basis(self, positions: np.ndarray) -> np.ndarray:
+        values = np.asarray(positions, dtype=np.float64).reshape(-1, 1)
+        distances = (values - self._wait_centers.reshape(1, -1)) / self._wait_basis_width
+        weights = np.exp(-0.5 * distances * distances)
+        totals = np.sum(weights, axis=1, keepdims=True)
+        return weights / np.maximum(totals, 1e-12)
+
     def _joint(self, context: np.ndarray, positions: np.ndarray) -> np.ndarray:
-        basis = self._basis(positions)
+        """Inputs for positions (n,) / (n, 1), or (n, 2) on SBFT: the timeout's basis
+        and, on SBFT, the wait's basis beside it, each times the context."""
+        values = np.asarray(positions, dtype=np.float64)
+        if self._two_d:
+            values = values.reshape(-1, 2)
+            basis = np.concatenate(
+                (self._basis(values[:, 0]), self._wait_basis(values[:, 1])), axis=1
+            )
+        else:
+            basis = self._basis(values.reshape(-1))
         return basis[:, :, None] * context[None, None, :]
 
     def _scores(self, context: np.ndarray, positions: np.ndarray) -> np.ndarray:
@@ -1890,25 +2185,48 @@ class ContinuousLinUCB(TensorModel):
     def _select_position(
         self, context: np.ndarray, lower_position: float
     ) -> float:
-        if self._design_index < self._n_basis:
+        if self._design_index == 0:
+            # The opening action first (the ladder's middle rung, and on SBFT the minimum
+            # wait; Kevin, 2026-10-19, restart D10b: every model opens there).
+            self._design_index += 1
+            if not self._two_d:
+                return np.asarray([max(lower_position, self._opening_position)])
+            return np.asarray([max(lower_position, self._opening_positions[0]), self._opening_positions[1]])
+        if self._design_index <= self._n_basis + self._n_wait_basis:
             # One decision per basis centre before anything is fitted: the
             # continuous form of discrete_linucb scoring an unpulled arm at +inf, and
             # deterministic, so replicas sharing a feature vector still draw
-            # the same action.
-            position = float(self._centers[self._design_index])
+            # the same action. On SBFT each timeout centre at the opening wait, then
+            # each wait centre at the opening timeout.
+            index = self._design_index - 1
             self._design_index += 1
-            return max(lower_position, position)
+            if index < self._n_basis:
+                centre = float(self._centers[index])
+                if not self._two_d:
+                    return np.asarray([max(lower_position, centre)])
+                return np.asarray([max(lower_position, centre), self._opening_positions[1]])
+            return np.asarray([
+                max(lower_position, self._opening_positions[0]),
+                float(self._wait_centers[index - self._n_basis]),
+            ])
 
-        candidates = self._candidates(lower_position)
+        timeouts = self._candidates(lower_position)
+        if self._two_d:
+            candidates = np.column_stack((
+                np.repeat(timeouts, len(self._wait_positions)),
+                np.tile(self._wait_positions, len(timeouts)),
+            ))
+        else:
+            candidates = timeouts.reshape(-1, 1)
         if self._exploration_floor > 0.0 and self._rng.random() < (
             self._exploration_floor
         ):
-            return float(candidates[int(self._rng.integers(len(candidates)))])
+            return candidates[int(self._rng.integers(len(candidates)))].copy()
 
         scores = self._scores(context, candidates)
         best = float(np.max(scores))
         tied = np.flatnonzero(scores >= best - 1e-12)
-        return float(candidates[int(self._rng.choice(tied))])
+        return candidates[int(self._rng.choice(tied))].copy()
 
     def predict_action(self, features: np.ndarray) -> np.ndarray:
         rows = np.asarray(features, dtype=float)
@@ -1927,8 +2245,12 @@ class ContinuousLinUCB(TensorModel):
             position = self._select_position(
                 self._context(row), self._lower_position()
             )
-            self._held_timeout_ms = self._timeout_of(position)
-            actions.append([self._action_codec.normalize_ms(self._held_timeout_ms)])
+            self._held_timeout_ms = self._timeout_of(float(position[0]))
+            action = [self._action_codec.normalize_ms(self._held_timeout_ms, 0)]
+            if self._two_d:
+                self._held_wait_ms = self._wait_of(float(position[1]))
+                action.append(self._action_codec.normalize_ms(self._held_wait_ms, 1))
+            actions.append(action)
 
         result = np.asarray(actions, dtype=float)
         return result[0] if single else result
@@ -1936,8 +2258,7 @@ class ContinuousLinUCB(TensorModel):
     def _baseline(self) -> float:
         """What an unmeasured timeout is assumed to be worth.
 
-        Zero - the ridge prior itself - when centring is off, which is what
-        discrete_linucb does.
+        Zero - the ridge prior itself - when centring is off.
         """
         if not self._center_rewards or self._baseline_weight <= 0.0:
             return 0.0
@@ -1988,39 +2309,25 @@ class ContinuousLinUCB(TensorModel):
                 f"Expected {self._obs_dim} features, got {rows.shape[1]}"
             )
 
-        action_values = np.asarray(actions, dtype=np.float64).reshape(-1)
-        reward_values = np.asarray(rewards, dtype=np.float64).reshape(-1)
         batch_size = len(rows)
-        if action_values.size == 1 and batch_size > 1:
-            action_values = np.repeat(action_values, batch_size)
+        positions = self._action_positions(actions, batch_size)
+        reward_values = np.asarray(rewards, dtype=np.float64).reshape(-1)
         if reward_values.size == 1 and batch_size > 1:
             reward_values = np.repeat(reward_values, batch_size)
-        if action_values.size != batch_size:
-            raise ValueError(
-                f"actions batch size mismatch: expected {batch_size}, "
-                f"got {action_values.size}"
-            )
         if reward_values.size != batch_size:
             raise ValueError(
                 f"rewards batch size mismatch: expected {batch_size}, "
                 f"got {reward_values.size}"
             )
-        if not np.all(np.isfinite(action_values)):
-            raise ValueError("actions must contain only finite values")
-        if np.any(action_values < 0.0) or np.any(action_values > 1.0):
-            raise ValueError("Continuous actions must be normalized to [0, 1]")
         if not np.all(np.isfinite(reward_values)):
             raise ValueError("rewards must contain only finite values")
 
-        for row, action, reward in zip(rows, action_values, reward_values):
-            # The agent trains on the timeout the replicas actually ran with,
-            # which is not always the one this model asked for; a timeout
-            # outside the action range lands on the nearest end of it.
-            timeout_ms = self._action_codec.denormalize_ms(float(action))
-            inputs = self._joint(
-                self._context(row), np.asarray([self._position_of(timeout_ms)])
-            ).reshape(-1)
-            centered = float(reward) - self._baseline()
+        for row, position, reward in zip(rows, positions, reward_values):
+            inputs = self._joint(self._context(row), position[None]).reshape(-1)
+            # With centring, the first reward is centred on itself (no baseline yet), so
+            # the first timeout played is not credited the whole raw reward.
+            first = self._center_rewards and self._baseline_weight <= 0.0
+            centered = 0.0 if first else float(reward) - self._baseline()
             self._discount()
             self._precision += np.outer(inputs, inputs)
             self._covariance += np.outer(inputs, inputs)
@@ -2041,6 +2348,8 @@ class ContinuousLinUCB(TensorModel):
         self._baseline_total = 0.0
         self._baseline_weight = 0.0
         self._held_timeout_ms = self._lower_ms
+        if self._two_d:
+            self._held_wait_ms = self._wait_lower_ms
 
 
 class ContinuousPPO(PPOBase):
@@ -2072,10 +2381,9 @@ class ContinuousPPO(PPOBase):
     recovered. A broad policy keeps sampling the whole range as the phases go
     by, so the long timeouts get tried inside the phases that pay for them.
 
-    **The action space is the arm range, not the codec's 100..10000ms.** Same
-    reason :class:`ContinuousLinUCB` gives: a
-    timeout no discrete baseline can reach turns a comparison against those
-    baselines into a comparison of two different action spaces. A latency
+    **The action space is the protocol's whole range** (the codec's ContextSpec
+    bounds, 100-3000 ms; 2026-10-19, the ladder's span until then), as for
+    :class:`ContinuousLinUCB`. A latency
     floor, when configured, raises the bottom of the range; the sampled
     position is clamped up to it, which puts a small atom on the floor itself,
     and that is treated as part of the environment in the same way the discrete
@@ -2092,21 +2400,27 @@ class ContinuousPPO(PPOBase):
         initial_concentration_bias: float = -2.0,
         **kwargs: Any,
     ) -> None:
-        if action_codec.action_dim != 1:
+        if action_codec.action_dim not in (1, 2):
             raise ValueError(
-                "ContinuousPPO places one timeout on a line, so it needs a "
-                f"1-dimensional codec, got {action_codec.action_dim}"
+                "ContinuousPPO draws a timeout (and on SBFT a wait), so it needs a "
+                f"1- or 2-dimensional codec, got {action_codec.action_dim}"
             )
+        # SBFT (Kevin, 2026-10-19, restart D10c): a second, independent Beta over the wait
+        # range; the action's log-probability and entropy are the sums over the two.
+        self._two_d = action_codec.action_dim == 2
+        self._action_width = action_codec.action_dim
+        if self._two_d:
+            self._wait_lower_ms, self._wait_upper_ms = (int(v) for v in action_codec.bounds_ms[1])
+            self._wait_log_lower = math.log(float(self._wait_lower_ms))
+            self._wait_log_span = math.log(float(self._wait_upper_ms)) - self._wait_log_lower
         self._action_codec = action_codec
         self._latency_floor = latency_floor
         self._initial_concentration_bias = float(initial_concentration_bias)
 
         codec_lower_ms, codec_upper_ms = action_codec.bounds_ms[0]
         if clamp_ms is None:
-            arms_ms = tuple(
-                int(value) for value in get_timeout_values_ms(action_codec.protocol)
-            )
-            clamp_ms = (min(arms_ms), max(arms_ms))
+            # The protocol's whole range, as every continuous model (2026-10-19).
+            clamp_ms = (codec_lower_ms, codec_upper_ms)
         lower_ms, upper_ms = int(clamp_ms[0]), int(clamp_ms[1])
         if lower_ms < codec_lower_ms or upper_ms > codec_upper_ms:
             raise ValueError(
@@ -2124,7 +2438,7 @@ class ContinuousPPO(PPOBase):
 
         super().__init__(
             n_features=n_features,
-            head_dim=2,
+            head_dim=2 * action_codec.action_dim,  # (alpha, beta) per dimension
             hidden_sizes=hidden_sizes,
             **kwargs,
         )
@@ -2167,17 +2481,32 @@ class ContinuousPPO(PPOBase):
     # -- Beta head ----------------------------------------------------------
 
     def _concentrations(self, head: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """(alpha, beta) = 1 + softplus(head), computed without overflow."""
+        """(alpha, beta) = 1 + softplus(head), computed without overflow; each (n, d),
+        the head laid out alpha, beta per dimension."""
         values = np.asarray(head, dtype=np.float64)
         softplus = np.logaddexp(0.0, values)
         concentrations = 1.0 + softplus
-        return concentrations[:, 0], concentrations[:, 1]
+        return concentrations[:, 0::2], concentrations[:, 1::2]
+
+    def _wait_position_of(self, wait_ms: float) -> float:
+        value = float(wait_ms)
+        if not math.isfinite(value) or value <= 0.0:
+            return 0.0
+        position = (math.log(value) - self._wait_log_lower) / self._wait_log_span
+        return float(min(1.0, max(0.0, position)))
+
+    def _wait_of(self, position: float) -> int:
+        bounded = min(1.0, max(0.0, float(position)))
+        value = math.exp(self._wait_log_lower + bounded * self._wait_log_span)
+        return min(self._wait_upper_ms, max(self._wait_lower_ms, int(round(value))))
 
     def _head_terms(
         self, head: np.ndarray, actions: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         alpha, beta = self._concentrations(head)
-        positions = np.clip(np.asarray(actions, dtype=np.float64), 1e-6, 1.0 - 1e-6)
+        positions = np.clip(
+            np.asarray(actions, dtype=np.float64).reshape(len(alpha), -1), 1e-6, 1.0 - 1e-6
+        )
         log_u = np.log(positions)
         log_1mu = np.log1p(-positions)
 
@@ -2217,13 +2546,15 @@ class ContinuousPPO(PPOBase):
 
         # Chain through alpha = 1 + softplus(z): d alpha / d z = sigmoid(z).
         slope = 1.0 / (1.0 + np.exp(-np.asarray(head, dtype=np.float64)))
-        d_log_probs = np.stack(
-            (d_log_alpha * slope[:, 0], d_log_beta * slope[:, 1]), axis=1
-        )
-        d_entropy = np.stack(
-            (d_entropy_alpha * slope[:, 0], d_entropy_beta * slope[:, 1]), axis=1
-        )
-        return log_probs, entropy, d_log_probs, d_entropy
+        # Per dimension above, each (n, d); the action's terms are the sums over the
+        # dimensions (independent Betas), the gradients back in the head's layout.
+        d_log_probs = np.empty_like(slope)
+        d_log_probs[:, 0::2] = d_log_alpha * slope[:, 0::2]
+        d_log_probs[:, 1::2] = d_log_beta * slope[:, 1::2]
+        d_entropy = np.empty_like(slope)
+        d_entropy[:, 0::2] = d_entropy_alpha * slope[:, 0::2]
+        d_entropy[:, 1::2] = d_entropy_beta * slope[:, 1::2]
+        return log_probs.sum(axis=1), entropy.sum(axis=1), d_log_probs, d_entropy
 
     # -- TensorModel --------------------------------------------------------
 
@@ -2243,40 +2574,62 @@ class ContinuousPPO(PPOBase):
                 self._latency_floor.observe_features(row)
             head = self._actor_head(self._contexts(row.reshape(1, -1)))
             alpha, beta = self._concentrations(head)
-            if (
-                self._exploration_floor > 0.0
-                and self._rng.random() < self._exploration_floor
-            ):
-                position = float(self._rng.random())
-            else:
-                position = float(self._rng.beta(float(alpha[0]), float(beta[0])))
-            position = max(position, self._lower_position())
-            self._held_timeout_ms = self._timeout_of(position)
-            actions.append(
-                [self._action_codec.normalize_ms(self._held_timeout_ms)]
-            )
+            positions = []
+            if not self._opened:
+                # The opening action (the ladder's middle rung, and on SBFT the minimum
+                # wait; D10b) as the first decision.
+                opening = opening_action_ms(self._action_codec.protocol)
+                positions.append(self._position_of(opening[0]))
+                if self._two_d:
+                    positions.append(self._wait_position_of(opening[1]))
+                self._opened = True
+            for d in range(len(positions), self._action_width):
+                if (
+                    self._exploration_floor > 0.0
+                    and self._rng.random() < self._exploration_floor
+                ):
+                    positions.append(float(self._rng.random()))
+                else:
+                    positions.append(float(self._rng.beta(float(alpha[0, d]), float(beta[0, d]))))
+            # The latency floor bounds the timeout only.
+            positions[0] = max(positions[0], self._lower_position())
+            self._held_timeout_ms = self._timeout_of(positions[0])
+            action = [self._action_codec.normalize_ms(self._held_timeout_ms, 0)]
+            if self._two_d:
+                self._held_wait_ms = self._wait_of(positions[1])
+                action.append(self._action_codec.normalize_ms(self._held_wait_ms, 1))
+            actions.append(action)
 
         result = np.asarray(actions, dtype=float)
         return result[0] if single else result
 
-    def _store_action(self, action: float) -> float:
-        """Codec-normalized action -> position in the arm range.
+    def _store_action(self, action: "float | np.ndarray") -> "float | np.ndarray":
+        """Codec-normalized action -> position in the action range (on SBFT a
+        (timeout, wait) pair of positions).
 
         The agent reports the timeout the replicas ran with, normalized against
-        the codec's own 100..10000ms bounds. The policy lives on the arm range,
-        so the millisecond value is recovered and re-expressed there; a timeout
-        outside the arm range lands on the nearest end of it, which is what
-        clamping already did on the way out.
+        the codec's bounds; the millisecond value is recovered and re-expressed
+        on the policy's range, and a value outside it lands on the nearest end,
+        which is what clamping already did on the way out.
         """
-        value = float(action)
-        if not 0.0 <= value <= 1.0:
+        values = np.asarray(action, dtype=np.float64).reshape(-1)
+        if values.size != self._action_width:
+            raise ValueError(f"expected {self._action_width} action values, got {values.size}")
+        if np.any(values < 0.0) or np.any(values > 1.0) or not np.all(np.isfinite(values)):
             raise ValueError(
-                f"Continuous actions must be normalized to [0, 1], got {value}"
+                f"Continuous actions must be normalized to [0, 1], got {values.tolist()}"
             )
-        return self._position_of(self._action_codec.denormalize_ms(value))
+        position = self._position_of(self._action_codec.denormalize_ms(float(values[0]), 0))
+        if not self._two_d:
+            return position
+        return np.asarray(
+            [position, self._wait_position_of(self._action_codec.denormalize_ms(float(values[1]), 1))]
+        )
 
     def reset_model(self) -> None:
         super().reset_model()
         if self._latency_floor is not None:
             self._latency_floor.reset()
         self._held_timeout_ms = self._lower_ms
+        if self._two_d:
+            self._held_wait_ms = self._wait_lower_ms

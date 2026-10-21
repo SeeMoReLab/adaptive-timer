@@ -1,7 +1,26 @@
 # time_s,election_timeout_ms,slow_path_timeout_ms
-# Rows sit on the phase boundaries (atTime; with the leading -10 row a switch
-# written at T fires at warmUpTime + T): Kevin's rule, the oracle switches at
-# onset, never before (2026-10-07; it switched 10 s early before).
+# Current oracle (2026-10-19, restart from scratch; generated from this file's rows and
+# config/sbft/failure_spec.xml, values unchanged). Rows sit on the onsets (atTime); the oracle never
+# switches before a fault starts. Episode e applies at warmUpTime + 20*(e-1) and takes the last row
+# with time_s <= 20*(e-1); the leading -10 row is the warm-up row.
+#
+#   p0 @0     base                                   250/10
+#   p1 @300   base + hold D300                       250/10
+#   p2 @600   5+50                                   650/10
+#   p3 @900   5+50 + straggler 60 + hold D550        650/150
+#   p4 @1200  5+50 + straggler 300 + hold D350       650/10
+#   p5 @1500  5+150 + straggler 60                   1600/150
+#   p6 @1800  5+150 + straggler 450                  1600/10
+#   p7 @2100  base                                   1600/10, 250/10 from 2120
+#
+# History (older ladders, rates and specs; superseded where it disagrees with the block above):
+# Rows sit on the phase boundaries (atTime). Kevin's rule is only that the oracle
+# never switches before a fault starts (it switched 10 s early before 2026-10-07);
+# switching later than the onset is allowed (2026-10-16). The row is
+# picked by episode number: episode e applies at warmUpTime + P*(e-1) (P =
+# --episode-ms, 20 s) and takes the last row with time_s <= P*(e-1), so a switch
+# written at T fires at warmUpTime + T. Non-negative rows must be multiples of P;
+# the leading -10 row is the warm-up row and counts for every episode.
 # CppBedrock SBFT oracle for config/sbft/failure_spec.xml: the best pair per phase,
 # switched on each boundary. Calibrated in runs/2026-09-27-sbft-pairs at
 # 15,000 req/s, 3 draws per pair per phase; throughput ties everywhere, so pairs are
@@ -18,6 +37,21 @@
 # the lowest election rung that clears the link's floor, and W=50: with no straggler
 # the fast path always completes, so the wait never engages.
 #
+# 2026-10-10 (Kevin): t=1800 back on the ladder at (1100, 50). The re-derived oracle
+# (scripts/cloudlab/tmp/cal/blindall/oracle_derive.py: best ladder pair per phase, mean
+# client R over the compressed real spec, 5+ draws per pair) has (1100, 50) +0.584 vs
+# (1100, 150) +0.475; it agrees with every other row here except ties in the no-fault
+# phases, which stay as they are. The 2026-10-08 W=500 trial below is kept for the record.
+#
+# 2026-10-08 (Kevin: try the suggested pairs, do not change the spec): t=1800 now
+# waits W=500, which catches the 300 ms straggler (100% fast path). Single-phase
+# cells at 15k on the current hosts, client R over t>60 s, 4 draws each
+# (scripts/cloudlab/tmp/cal/pt/sbcal, runs/2026-10-08-six-protocol-comparison):
+# (1100, 500) 0.656/0.659/0.679/0.633 against (1100, 50) 0.595/0.586/0.573/0.570. The
+# other suggestions stayed under the 0.03 adoption margin: t=900 (525, 300) 1.135 vs
+# (525, 150) 1.108; t=1500 (750, 150) 0.857 vs (1100, 150) 0.852. W=500 is off the
+# 50/150 ladder; the discrete models still choose from the ladder.
+#
 #   phase                            election  slow  p50 vs runner-up
 #   t=0     base, no faults            250      50   (uncalibrated)
 #   t=300   base + crash + D=150       250      50   191 vs 286
@@ -25,15 +59,50 @@
 #   t=900   5+50 + S=80 + D=350        525     150   362 vs 425
 #   t=1200  5+50 + S=300 + D=350       525      50   417 vs 527
 #   t=1500  5+150 + S=100             1100     150   759 vs 941
-#   t=1800  5+150 + S=300             1100      50   927 vs 1050
+#   t=1800  5+150 + S=300             1100      50   R 0.584 vs 0.475 (1100, 150), 2026-10-10
 #   t=2100  base, no faults            250      50   (uncalibrated)
 #
--10,250,50
-0,250,50
-300,250,50
-600,525,50
-900,525,150
-1200,525,50
-1500,1100,150
-1800,1100,50
-2100,250,50
+# 2026-10-13 (Kevin, runs/2026-10-12-sbft-margins): ladder 250/550/1200 x 50/150 at
+# 20,000 req/s with 512 B requests on the revised spec (p1 crash removed, p3 D=550 and
+# lag 60, p5 lag 60). Winner per phase by mean client R over 20 s chunks, 5-10 draws,
+# compressed spec real_c120_r20.xml; p5 and p6 entered from this schedule's state.
+#   t=300   base + D=150              250      50   +0.90 vs +0.76 (550/50)
+#   t=900   5+50 + S=60 + D=550       550     150   +0.29 vs +0.12 (1200/150)
+#   t=1200  5+50 + S=300 + D=350      550      50   +0.53 vs +0.39 (550/150)
+#   t=1500  5+150 + S=60             1200     150   +0.36 vs +0.06 (1200/50)
+#   t=1800  5+150 + S=300            1200      50   +0.06 vs -0.05 (1200/150)
+# The no-fault phases keep the lowest rung that clears the link's floor, W=50.
+#
+# 2026-10-17 (runs/2026-10-16-sbft-stability, CppBedrock 7f37776 + 6d7ac54 + 73b9f08, p6
+# straggler S=450; adopted by Kevin 2026-10-17): T 250 / 650 / 1300 / 1600, W 10 / 150.
+# 650 at 5+50: 550 was 1.0x p3's slow-path bound (125 + 5x55 + 150 = 550), under the
+# 1.1x rule; 650 deposes both holds. 1300 at p5: the +150 onset pushes request ages to
+# 1100-1200 ms and 1200 let a backup elect alone there. 1600 at p6: healthy p6 ages (slow
+# path ~910 plus queueing) reach 1300, where the straggler elected alone 12-16 s after
+# the onset in 13 of 13 runs and sat out p6 and p7. W 10 wherever no lag needs catching
+# (4th prepare 1-2 ms after the 3rd with no straggler; giving up at once is 40 ms faster
+# than 50 in the slow-path phases p4 and p6); W 150 catches p3's and p5's 60 ms lag.
+# p7 keeps p6's 1600 for its first 20 s: batches in flight from 5+150 still need it.
+# 5-machine draws +0.644 / +0.643 (before the stability work: +0.606 / +0.621).
+#   t=0     base, no faults            250      10
+#   t=300   base + D=300               250      10
+#   t=600   5+50, no faults            650      10
+#   t=900   5+50 + S=60 + D=550        650     150
+#   t=1200  5+50 + S=300 + D=350       650      10
+#   t=1500  5+150 + S=60              1600     150   (1300 until 2026-10-19, see below)
+#   t=1800  5+150 + S=450             1600      10
+#   t=2100  base, no faults           1600 for 20 s, then 250
+#
+# 2026-10-19 (Kevin, restart from scratch): p5 at 1600 instead of 1300, so the oracle stays on the
+# 250/650/1600 ladder like the other five (= ladder16_sbft.csv, label oracle_l16: 5-machine draws
+# +0.638 / +0.636 against +0.644 / +0.643 with 1300; p5 +0.36 either way).
+-10,250,10
+0,250,10
+300,250,10
+600,650,10
+900,650,150
+1200,650,10
+1500,1600,150
+1800,1600,10
+2100,1600,10
+2120,250,10

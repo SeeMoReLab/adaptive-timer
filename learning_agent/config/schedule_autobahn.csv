@@ -1,25 +1,51 @@
 # time_s,timeout_delay_ms
+# Current oracle (2026-10-19, restart from scratch; generated from this file's rows and
+# config/autobahn/failure_spec.xml, values unchanged). Rows sit on the onsets (atTime); the oracle never
+# switches before a fault starts. Episode e applies at warmUpTime + 20*(e-1) and takes the last row
+# with time_s <= 20*(e-1); the leading -10 row is the warm-up row.
+#
+#   p0 @0     base                                   250
+#   p1 @300   base + slow leader (T - 190)           250
+#   p2 @600   5+50                                   500
+#   p3 @900   5+50 + slow leader (T - 690)           500
+#   p4 @1200  5+150                                  500, 1250 from 1220
+#   p5 @1500  base                                   250
+#
+# History (older ladders, rates and specs; superseded where it disagrees with the block above):
 # may be any integer from 1 through 4294967295
 #
-# Oracle for config/autobahn/failure_spec.xml: the best timeout per phase
-# (models.py 250 / 750 / 1250; in a no-attack phase the lowest rung that
-# clears the floor), switched on each phase boundary, never before the fault
-# starts. ScheduledTimeoutModel shifts the schedule so its first row lands at
-# elapsed 0, so with the leading -10 row (warmUpTime=10) a switch written at
-# T fires at warmUpTime + T: each phase's atTime lands on its boundary, and
-# the agent applies it at its next decision. Replica 3 withholds its votes in
-# every phase.
+# Oracle for config/autobahn/failure_spec.xml: the best timeout per phase,
+# switched on each phase boundary, never before the fault starts.
+# ScheduledTimeoutModel picks the row by episode number: episode e applies at
+# warmUpTime + P*(e-1) (P = --episode-ms, 20 s) and takes the last row with
+# time_s <= P*(e-1), so a switch written at T fires at warmUpTime + T and each
+# phase's atTime lands on its boundary. Non-negative rows must be multiples of P;
+# the leading -10 row is the warm-up row and counts for every episode.
+# Replica 3 withholds its votes in every phase.
+#
+# One models.py rung per link level (250 / 500 / 1250, 2026-10-08, Kevin; 500
+# replaced 750). Constant-T cells (client R over t > 60 s): 5+50 T400 0.260, T500
+# 0.247, T750 0.176; 5+50 + slow leader 0.259 / 0.249 / 0.169. Full-spec oracle,
+# 3 draws each with 400 at 5+50 (runs/2026-10-08-six-protocol-comparison,
+# scripts/cloudlab/tmp/runs/autobahn/ob_oracle_*): p2 0.242 vs 0.175, p3 0.246 vs
+# 0.168, mean R 0.335 vs 0.310; 500 is not yet drawn in the full spec. 5+150 stays
+# 1250: 1000 tied in the full spec (-0.839 vs -0.843) and its cell stalled 3 s.
+# p4 keeps the p3 rung 500 for its first 20 s and switches to 1250 at 1220
+# (2026-10-16, Kevin; runs/2026-10-16-autobahn-oracle): 5+150 stalls for about
+# 20 s after the onset whichever rung runs, and 500 recovers faster from it. Two
+# draws each: switch at 1200 +0.359/+0.358, at 1220 +0.367/+0.364, at 1240
+# +0.357/+0.349 (500 is too short for healthy 5+150 slots after the stall).
 #
 #   p0 @0     base, no attack            250
 #   p1 @300   base + slow leader         250
-#   p2 @600   5+50, no attack            750
-#   p3 @900   5+50 + slow leader         750
-#   p4 @1200  5+150, no attack           1250
+#   p2 @600   5+50, no attack            500
+#   p3 @900   5+50 + slow leader         500
+#   p4 @1200  5+150, no attack           500 for 20 s, then 1250
 #   p5 @1500  base, no attack            250
 -10,250
 0,250
 300,250
-600,750
-900,750
-1200,1250
+600,500
+900,500
+1220,1250
 1500,250

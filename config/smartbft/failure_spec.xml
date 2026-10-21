@@ -31,9 +31,12 @@
     <!-- Warm-up period in seconds: no failure behavior is active during this time. -->
     <warmUpTime>10</warmUpTime>
 
-    <!-- Constant one-way packet delay applied for the whole experiment. -->
+    <!-- Constant one-way packet delay applied for the whole experiment. Jitter 0 on every
+         protocol (Kevin, 2026-10-19: one value for all six specs; 20% until then, from the
+         applier's default when this element was absent). -->
     <globalNetworkDelay>
         <delayMs>5</delayMs>
+        <jitterRatio>0</jitterRatio>
     </globalNetworkDelay>
 
     <phases>

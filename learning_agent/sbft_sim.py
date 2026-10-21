@@ -17,8 +17,8 @@ proposal-tick phase, execution pointer and links:
   NewView hop after its leader and its timer sees ``100 - (hop mod 100)`` ms of the
   oldest request's wait, not all of it.
 - The leader of view v (v mod 4) proposes at its tick, while fewer than 64 batches are
-  unexecuted at it, the oldest pending requests up to the 512 KiB byte budget
-  (``batch_cap`` requests). A pinned leader holds the proposal D ms (the slot is taken);
+  unexecuted at it, the oldest pending requests up to ``batch_cap`` (a fitted effective
+  cap; the harness allows 8192 requests and 4.5 MiB since 2026-10-11). A pinned leader holds the proposal D ms (the slot is taken);
   a view change drops held proposals.
 - Each directed link is a FIFO that sends at most one congestion window per RTT: it
   starts at the TCP initial window, slow-starts while a send has to wait, up to
@@ -34,10 +34,26 @@ proposal-tick phase, execution pointer and links:
   certificate each wait an exponential lock time, ``slow_lock_ms``). Fewer than three
   live voters: no certificate. Execution is in sequence order on every replica and needs the batch
   bytes; the window slot frees at the leader's execution.
-- Request timer: deadline = max(admission tick of the oldest unexecuted request, floor)
-  + min(T << backoff, max(T, 30 s)). Expiry raises the backoff and starts a view change:
-  the replica stops voting and executing consensus and sends ViewChange(v+1). Another
-  replica joins at f+1 = 2 distinct senders above its view; the next leader builds the
+- Request timer (PendingRequestTimer.cpp): a replica watches the oldest unexecuted
+  request, timed from its admission tick, or, when admitted before the floor, from the
+  later of the floor and when it became the watched head (an inherited backlog owes one
+  timeout per head, ec31a88); deadline = max(that, floor) + min(T << backoff, max(T,
+  30 s)). When a floored backlog drains the floor moves once to that moment (6d7ac54).
+  The watch moves only when its request executes; when a batch executes whose oldest request
+  arrived after the watched one, a backup relays the watched request to the leader once per
+  view and times it from the relay (relaySkippedHead, CppBedrock relay-on-skip, 2026-10-20;
+  until then the expiry re-armed it from the last execution, which left a follower holding
+  requests the leader shed at the pending cap blind to a late leader, PBFT T 800 under a
+  750 ms hold). An expiry suspects the leader (suspectLeader, 5c0a3cf): the replica stays in the view, voting and executing, re-arms its timer from now and
+  sends every peer a Suspect, a small message on the ViewChange's channel; the backoff does
+  not move. A suspicion stands until the view moves, even after its request executes
+  (de44bee; until then it lapsed two of its sender's intervals after send or receipt, so
+  replicas disagreed on who suspected). A replica starts a view change once f+1 = 2
+  replicas, itself included, suspect the leader of its view, a sender of a stored ViewChange above its
+  view counting as one: it raises the backoff, stops voting and executing consensus and
+  sends ViewChange(v+1). Suspicions are dropped whenever its view moves. Another replica
+  joins at f+1 = 2 distinct ViewChange senders above its view, with the same backoff step
+  (48048a0); the next leader builds the
   NewView at 2f+1 = 3 (``nv_build_ms``), followers install it one hop later plus
   ``nv_val_ms``; install floors the timer. Undecided batches with f+1 votes are
   re-proposed inside the NewView, headers only: each replica installs them one after
@@ -45,31 +61,46 @@ proposal-tick phase, execution pointer and links:
   pre-prepare asks every peer for the bytes as it handles the header, each holder
   answers with the full batch on its link, and it votes, acks and commits only once it
   holds them. The rest go back to pending. The view-change wait resends below 2f+1 senders and escalates at 2f+1
-  (e522af3). Backoff resets when the watched request completes before an unfloored
-  deadline, or nothing is left to watch; a deadline already past then fires at once.
-  Lowering T floors every timer.
-- A lone replica in a view change stays there until the others move up; meanwhile it
-  executes only through recovery (once a second, the newest committed batch counted
-  without a latency sample: p50 0, about a tenth of the throughput).
+  (e522af3). The backoff resets when the replica, outside a view change, executes a
+  batch carrying a request admitted at or after the floor, and a raised backoff re-floors
+  the timer there (73b9f08; these timer rules ported 2026-10-19, restart D11). Lowering T
+  floors every timer.
+- A lone expiry leaves no one in a view change: the replica keeps taking part and repeats
+  its Suspect at each expiry. A replica that does end up alone in a view change (the
+  others hold its ViewChange but no live suspicion to pair it with, or its NewView wait
+  escalates alone) stays there until the others move up; meanwhile it executes only
+  through recovery (once a second, the newest committed batch counted without a latency
+  sample: p50 0, about a tenth of the throughput).
 - Faults per phase: extra one-way link delay with jitter; a straggler replica with extra
   outgoing delay S. S >= 2,000 ms is a dead peer: its consensus channel is dead both
   ways (no pre-prepares reach it, its votes and acks never count, its NewView installs
-  nowhere), but its ViewChanges arrive S late and it installs the others' NewViews. It
-  watches the oldest request it admitted, which consensus never completes for it, so it
-  times out T << backoff after each install and waits alone in its view change, and its
-  standing claim turns any single live timeout into a view change (20260928_133956,
-  160921, 162044). Outside a view change it recovers through checkpoints, so once
-  T << backoff outlasts that lag it stops timing out (the 1500 s sharing runs). A leader
+  nowhere), but its Suspects and ViewChanges arrive S late and it installs the others'
+  NewViews. It watches the oldest request it admitted, which consensus never completes for
+  it. Before 5c0a3cf it timed out T << backoff after each install and waited alone in its
+  view change, its standing claim turning any single live timeout into a view change
+  (20260928_133956, 160921, 162044), and since it recovered through checkpoints outside a
+  view change, it stopped timing out once T << backoff outlasted that lag (the 1500 s
+  sharing runs). Now it stays in its view and, while the lag exceeds T << backoff (backoff
+  0 unless a view change raised it), repeats a Suspect every T << backoff that the others
+  keep live for twice that, so any single live expiry elects; lone expiries no longer
+  raise its backoff. This is predicted from the mechanics, not measured: no spec has a
+  dead peer (the largest S is 720), but training draws one in 20% of fault phases. A leader
   proposal delay D is re-pinned to whoever leads at the first observation of each
   (phase, interval) key. Where the appliers first install netem (a qdisc replace) every
   link stalls for ``onset_stall_ms`` and the links in use lose their windows; later
   phases change the delay in place (tc qdisc change), which drops nothing. The harness
   now pre-applies the base netem, so no fault onset is a qdisc replace and
   ``onset_stall_ms`` defaults to 0 (no stall, no window loss).
-- A straggler that times out alone while T is above the slow-path latency stays exiled
-  until another replica times out, with no fast path for anyone: the 5+150 deep state
-  (agent 2 at p50 0 and 0% fast at the others in the deep 15k draw 20260928_123338; the
-  codex sharing run exiled it from 918 s to 1152 s).
+- Before 5c0a3cf a straggler that timed out alone while T was above the slow-path latency
+  stayed exiled until another replica timed out, with no fast path for anyone, as the
+  fast path needs all n prepares (agent 2 at p50 0 and 0% fast at the others in the deep
+  15k draw 20260928_123338; the codex sharing run exiled it from 918 s to 1152 s; a
+  parked replica in every T 1600 cell of restart S1/S2). Now its lone expiry only
+  suspects and it keeps voting, so it is no longer exiled: leaving the view takes a second
+  replica's live suspicion. Whether the fast path holds while the straggler lasts is still
+  the race between its prepare and W. The restart's cal2 S1 rerun showed no parked replica
+  in 38 runs and the T 1600 fast path back after the straggler phase; the constants are
+  refit on the rerun's data.
 
 Reports follow AgentClient::MetricsWindow on each replica (the 22 SbftReport fields):
 one latency sample per executed batch, dated from its oldest request (none without a
@@ -78,30 +109,46 @@ firstSeen: lone recovery); nearest-rank percentiles; inter-commit gaps within th
 above 0 (pre-prepare stamp to certificate, certificate to commit, commit to execution;
 a fast instance's certificate-to-commit is microseconds, and counts; none for batches
 executed after a later install); fast and slow counts on every replica; view changes
-started (expiry, join, escalation; not resends); new views installed. The model sees
+started (f+1 suspicions, join, escalation; not resends or Suspects); new views installed. The model sees
 the field-wise median of the first 2f+1 reports, as the sharing agents seal an episode
 at the third report: the straggler's or dead peer's report is never among them.
 
-``train`` draws every constant per run from a range that includes the host's value and
-every fault from wide ranges; it never sees config/sbft/failure_spec.xml, which only
-``check`` and ``eval`` use (``spec_schedule()``).
+Training distribution (Kevin, 2026-10-19, restart D11; sim_common.py): the offered load
+(0.5-1.5 x the 20,000 req/s rate), the fault onsets and gaps, the extra link delay, the
+proposal hold, the base one-way delay, the initial timeout and the initial backlog are the
+shared draws, and netem jitter is 0 as in every real spec. The constants the blind fit sets
+(sim_fit FREE) and the unfitted ones (proc_sigma, vc_sigma, and init_window_bytes around the
+Linux initcwnd) are drawn 0.5-2 x their SimConstants values; onset_stall_ms stays 0. SBFT's
+own fault kinds keep their mix: per fault phase no extra link delay in 35%, a straggler
+(S 20-800 ms) in 45% and a dead peer (S 2-10 s) in 20%, a proposal hold in 55%, re-pinned
+every 20-120 s in 80% of those. The initial wait is the opening wait (10 ms) in the runs
+that start at the opening T, log-uniform over W_BOUNDS_MS otherwise. Training never sees
+config/sbft/failure_spec.xml: ``check``, ``eval`` and the pretrain spec runs build their
+phases from it (``spec_phases()``) and play the oracle from
+learning_agent/config/schedule_sbft.csv (``oracle_pair()``).
 """
 
 from __future__ import annotations
 
 import argparse
 import bisect
+import functools
 import heapq
 import math
 import os
 import time
+import xml.etree.ElementTree as ET
 from collections import deque
-from dataclasses import dataclass, replace
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from dataclasses import asdict, dataclass, replace
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
 from prior_windows import PriorWindows, check_prior_windows
+from reward_utils import DEFAULT_REWARD_DESIGN, reward_normalizer_tps
+from sim_common import (JITTER_RATIO, LOAD_FACTOR_RANGE, around, draw_base_delay_ms,
+                        draw_hold_ms, draw_initial_backlog, draw_initial_action_ms,
+                        draw_link_extra_ms, draw_load_tps, fault_start_times, log_uniform)
 
 N = 4
 F = 1
@@ -113,10 +160,10 @@ RECOVERY_MIN_MS = 1000.0  # requestRecovery at most once per second
 OBSERVE_MS = 200.0  # leader observation for the proposal-delay pin
 WINDOW_BATCHES = 64  # run_sbft.sh MAX_INFLIGHT_BATCHES
 MAX_PENDING_REQUESTS = 32768
-BATCH_MAX_REQUESTS = 8192  # --batch-max-requests; the byte budget binds first (batch_cap)
+BATCH_MAX_REQUESTS = 8192  # --batch-max-requests; with 512 B requests it binds with the byte budget (batch_cap)
 MAX_ELECTION_BACKOFF_MS = 30000.0
-BATCH_MAX_BYTES = 524288.0  # --batch-max-bytes
-DEFAULT_ELECTION_TIMEOUT_MS = 8000.0  # config.sbft.yaml, before the first decision
+BATCH_MAX_BYTES = 4718592.0  # --batch-max-bytes (lib_bedrock.sh, 4.5 MiB: 8192 x 576 B with 512 B requests; 512 KiB before 2026-10-11)
+DEFAULT_ELECTION_TIMEOUT_MS = 8000.0  # config.sbft.yaml default; the restart's runs open at the opening pair (D10b)
 DEFAULT_SLOW_PATH_TIMEOUT_MS = 20.0
 FAST_PREP_MS = 0.0033  # prepare_latency_ms of an all-fast window (agent CSVs: 0.0032-0.0035)
 CRASH_DELAY_MS = 2000.0  # a straggler this slow is a dead peer (gRPC keepalive 5 s)
@@ -143,6 +190,7 @@ SBFT_CONTEXT_FIELDS: Tuple[str, ...] = (
     "view_change_count",
     "pre_prepare_latency_ms",
     "prepare_latency_ms",
+    "commit_latency_ms",
     "fast_path_count",
     "slow_path_count",
     "nth_prepare_gap_ms",
@@ -156,7 +204,7 @@ DEFAULT_PRIOR_PATH = os.path.join(
 
 
 @dataclass
-# Fitted defaults: blind best-by-loss candidate i=950 (loss 0.685) of fit7m_sbft_blind.jsonl, 7/2/4/7 calibration, replica-median targets (blindall, 2026-10-10).
+# Fitted defaults: blind best-by-loss candidate i=1399 (loss 0.239) of s3fit_sbft_blind_s9.jsonl, restart S3 blind refit (seeds 7,8,9,10,11 x 1500, best of the seeds; real-spec mean regret 0.022 PASS, 2026-10-21).
 class SimConstants:
     """Defaults are the calibration host (clnode384, 20k req/s), except load_tps.
     Training draws every field from sample_constants."""
@@ -164,12 +212,12 @@ class SimConstants:
     base_ms: float = 5.0  # one-way base link (h = 5)
     # Follower pre-prepare transfer and parse: about 12 ms at 2,000 requests (leader minus
     # follower pre_prepare_latency at every link level, 20k revalidation reports).
-    per_tx_ms: float = 0.002679
+    per_tx_ms: float = 0.005928
     # Spread of that transfer across replicas and batches; follower stamps agree within
     # 1-2 ms at 2,000 requests.
-    proc_spread: float = 0.123384
+    proc_spread: float = 0.144977
     # Prepare processing after the stamp (fast t4 - t0 = 2h + 14-15 ms).
-    proc_base_ms: float = 1.989537
+    proc_base_ms: float = 1.14945
     proc_sigma: float = 0.3
     # Slow path: commitAck processing and the follower's handling of the execute
     # certificate (follower minus leader prepare_latency, measured 4-6 ms; 3 keeps the
@@ -177,8 +225,8 @@ class SimConstants:
     # with 5, p0 (250, 50) sat 30 ms under T and cascaded).
     # With the execute certificate's lock wait, the leader's prepare_latency is 2h + 6
     # (measured 2h + 4-7 at h = 5 / 55 / 155).
-    ack_proc_ms: float = 1.175323
-    exe_proc_ms: float = 2.331944
+    ack_proc_ms: float = 1.675312
+    exe_proc_ms: float = 1.442682
     # The slow path's two extra lock-bound leader events, the W expiry (a scheduled
     # task that needs the engine lock) and the execute certificate, each wait an
     # exponential time of this mean. The per-window p95 - p50 of the 20k slow cells is
@@ -189,19 +237,19 @@ class SimConstants:
     # election past T and cascaded it, where the measured cell has 0.3 elections per
     # window and recovers. It does grow with load: at 15k the measured slow spread is
     # 2.5-5 ms; training draws it per run, 0.5-2 x this, independently of load_tps.
-    slow_lock_ms: float = 6.085705
+    slow_lock_ms: float = 10.786384
     # Execution after commit: commit_latency 4-6 ms at 2,000 requests.
-    exec_base_ms: float = 0.86319
-    exec_per_tx_ms: float = 0.001778
+    exec_base_ms: float = 1.087831
+    exec_per_tx_ms: float = 0.002193
     # NewView build at the new leader after its 2f+1-th ViewChange (30-95 ms in the
     # server logs of v20_p1_250_50_2 and v20_p3_525_150_1) and the followers' install
     # after receipt (follower install = leader install + hop - 15..+13 ms).
-    nv_build_ms: float = 40.061676
-    nv_val_ms: float = 4.309705
+    nv_build_ms: float = 123.849166
+    nv_val_ms: float = 12.156723
     vc_sigma: float = 0.4
     # A straggler's prepare lands S plus this much after the others (catch cost S + 0-15
     # at 20k, S + 20-30 in the 09-27 pairs log).
-    strag_hold_ms: float = 4.266941
+    strag_hold_ms: float = 15.145972
     # Link stall where the appliers first install netem (a qdisc replace drops the
     # queue): a retransmission timeout, the Linux RTO floor 200 ms plus the RTT, about
     # 300 ms. 0: the harness pre-applies the base netem, so fault onsets only change it.
@@ -216,11 +264,18 @@ class SimConstants:
     # is the straggler: at 5+150 with S = 100 its links have a 410 ms RTT and still keep
     # the fast path at 20k (3/3 calibration draws, the oracle), which 0.8 MB (19.5k req/s)
     # cannot; 1.2 MB reproduces the measured catch rates of p1 and p3.
-    max_window_bytes: float = 1165717.324881
-    load_tps: float = 15000.0  # run_sbft.sh --rate of the calibration and experiment runs
-    # Requests per batch where the 512 KiB --batch-max-bytes budget binds: p95 batch size
-    # tops out at 5,566-5,569 across the 20k revalidation reports.
-    batch_cap: int = 7679
+    # 2026-10-13: 1.17 MB was fitted with tiny requests (68 B on the wire); with 512 B requests a
+    # batch of one tick's 2,000 arrivals is 1.15 MB, so a 1.17 MB window caps a link at one
+    # batch per RTT (10.6 MB/s at 5+50 against the 11.5 MB/s that 20k req/s needs) and the
+    # simulator storms in every delayed phase (first fit20 attempt: losses 87-180, 40-57 s a
+    # candidate). The real links carry 20k at 5+150 cleanly (W5-W9 1200/150 cells), so the
+    # window is at least 3.6 MB; 8 MB makes the fit's 0.5-2x bracket (4-16 MB) non-binding
+    # at 20k, and the fit decides from there.
+    max_window_bytes: float = 11641694.526049
+    load_tps: float = 20000.0  # run_sbft.sh --rate of the calibration and experiment runs (20,000 since 2026-10-12)
+    # Requests per batch: with 512 B requests the 4.5 MiB byte budget and the 8192 count
+    # limit bind together (p50 batch size at 20k is one tick's arrivals, 2,000).
+    batch_cap: int = 5062
     initial_backlog: int = 0
 
 
@@ -333,7 +388,8 @@ class _Replica:
     __slots__ = ("i", "view", "in_vc", "backoff", "floor", "anchors", "next_tick", "wait_armed",
                  "claims", "last_nv_sent", "installed", "stopped", "resume_t", "last_installed",
                  "next_seq", "last_exec", "commits_since_vc", "rec_req", "rec_due",
-                 "crashed", "dead_watch")
+                 "crashed", "dead_watch", "w_key", "w_acc", "w_since", "relayed", "passed_by", "repro_through", "ext_floor", "exec_arr",
+                 "suspects")
 
     def __init__(self, i: int, anchor: float):
         self.i = i
@@ -358,10 +414,26 @@ class _Replica:
         self.crashed = False
         # A dead peer's oldest unexecuted arrival among batches the log has dropped.
         self.dead_watch = INF
+        # The request timer's watch (PendingRequestTimer selectWatchLocked): the watched
+        # request's arrival (None: select anew), its admission tick, and the time its
+        # deadline is dated from; ext_floor: the floor moves once when its backlog drains.
+        self.w_key: Optional[float] = None
+        self.w_acc = INF
+        self.w_since = INF
+        self.relayed = None  # (view, watched key) of the one relay per view (relay-on-skip)
+        self.passed_by = -INF  # newest oldest-arrival of the view's executed batches (passedByUpTo_)
+        self.repro_through = 0  # highest seq the view's NewView re-proposed (reproposedThrough_)
+        self.ext_floor = False
+        # Oldest arrival of the newest batch executed with a firstSeen stamp
+        # (lastExecutedArrivalUs_), for the overtaken rule.
+        self.exec_arr = -INF
+        # Replicas suspecting the leader of the current view, itself included (suspects_,
+        # 5c0a3cf, de44bee); cleared whenever the view moves.
+        self.suspects: Set[int] = set()
 
 
 # Event kinds of the heap and of the per-iteration scan.
-_EV_VC, _EV_NV, _EV_BUILD = 0, 1, 2
+_EV_VC, _EV_NV, _EV_BUILD, _EV_SUS = 0, 1, 2, 3
 
 
 class SbftSim:
@@ -387,8 +459,12 @@ class SbftSim:
         self.W = float(initial_wait_ms)
         self._w_hist: List[Tuple[float, float]] = [(-INF, self.W)]
         rng = self.rng
+        self.repro_through = {}  # view -> highest seq its NewView re-proposed (reproposedThrough_)
         self.reps = [_Replica(i, float(rng.uniform(-PROPOSAL_INTERVAL_MS, 0.0))) for i in range(N)]
-        self.heap: List[Tuple[float, int, int, int, int, int]] = []
+        # Per replica, (time ms, no commit since its previous election) of every election
+        # it started, for the reports' counts over the last episode (_count_view_changes).
+        self._vc_log: List[List[Tuple[float, bool]]] = [[] for _ in range(N)]
+        self.heap: List[Tuple[float, int, int, int, int, int, float]] = []
         self._hseq = 0
         self.log: Dict[int, _Batch] = {}
         self.log_seqs: List[int] = []
@@ -402,6 +478,9 @@ class SbftSim:
         self.pinned = -1
         self.next_obs = float(rng.uniform(0.0, OBSERVE_MS))
         self.late_reporter = int(np.random.default_rng([seed, 1]).integers(0, N))  # own stream
+        # Suspect jitter has its own stream, so a run that never suspects draws the main
+        # stream exactly as before 5c0a3cf.
+        self.sus_rng = np.random.default_rng([seed, 2])
         # Links stall for onset_stall_ms where the appliers first install netem: that
         # is a qdisc replace, which drops the queue (apply_network_failures.py). Later
         # phases rewrite the delay in place (tc qdisc change), which drops nothing.
@@ -445,9 +524,9 @@ class SbftSim:
     def _ph(self, t_ms: float) -> Phase:
         return self.phases[bisect.bisect_right(self._starts, t_ms) - 1]
 
-    def _push(self, t: float, kind: int, a: int, b: int = 0, c: int = 0) -> None:
+    def _push(self, t: float, kind: int, a: int, b: int = 0, c: int = 0, d: float = 0.0) -> None:
         self._hseq += 1
-        heapq.heappush(self.heap, (t, self._hseq, kind, a, b, c))
+        heapq.heappush(self.heap, (t, self._hseq, kind, a, b, c, d))
 
     def _teff(self, backoff: int) -> float:
         base = max(1.0, self.T)
@@ -564,10 +643,12 @@ class SbftSim:
 
     def _apply_crash(self, ph: Phase) -> None:
         """A dead peer (S >= 2 s, past the gRPC keepalive) still times out, sends its
-        ViewChange (S late) and installs NewViews, but its consensus channel is dead: it
-        executes nothing through consensus, only through recovery (server logs of the 20k
-        crash phase: replica 2 alone in view 1 from 12.6 s, its claim counted by the others,
-        so one more timeout anywhere moves everyone). Leaving the phase it catches up."""
+        Suspects and ViewChanges (S late) and installs NewViews, but its consensus channel
+        is dead: it executes nothing through consensus, only through recovery (server logs
+        of the 20k crash phase, before 5c0a3cf: replica 2 alone in view 1 from 12.6 s, its
+        claim counted by the others, so one more timeout anywhere moved everyone; now its
+        live Suspect does the same, predicted, not measured). Leaving the phase it catches
+        up."""
         dead = ph.crashed
         for r in self.reps:
             if r.i == dead:
@@ -869,9 +950,10 @@ class SbftSim:
     def _watched(self, k: int) -> float:
         """Arrival of the oldest request replica k admitted and has not executed. A dead
         peer executes nothing through consensus, so that is the oldest batch the live
-        replicas executed past it (dead_watch, once the log has dropped it): it times
-        out T << backoff after each install and waits in its view change, as replica 2
-        did in the 20k crash phase (20260928_133956: alone in view 1 from 12.6 s)."""
+        replicas executed past it (dead_watch, once the log has dropped it): it expires
+        T << backoff after each install, which before 5c0a3cf left it waiting in its view
+        change, as replica 2 did in the 20k crash phase (20260928_133956: alone in view 1
+        from 12.6 s), and now repeats its Suspect while it stays in the view."""
         b = self._head(k)
         a1 = b.oldest if b is not None else INF
         a2 = self.pending[0][0] if self.pending else INF
@@ -879,25 +961,49 @@ class SbftSim:
         r = self.reps[k]
         return min(a, r.dead_watch) if r.crashed else a
 
-    def _deadline(self, k: int) -> Tuple[float, float, bool]:
+    def _select_watch(self, k: int, now: float) -> None:
+        """PendingRequestTimer::selectWatchLocked when replica k's watched request changed:
+        a request admitted before the floor is timed from max(floor, now), a later one from
+        its admission, and the floor moves once to now when a floored watch gives way to an
+        unfloored one after a setFloor (2026-10-19, restart D11)."""
         r = self.reps[k]
         a = self._watched(k)
+        if a == r.w_key:
+            return
+        prev_floored = r.w_key is not None and r.w_key < INF and r.w_acc < r.floor
+        r.w_key = a
         if a == INF:
-            return INF, INF, False
+            r.w_acc = r.w_since = INF
+            return
         acc = self._accept_time(r, a)
-        floored = r.floor > acc
-        return max(acc, r.floor) + self._teff(r.backoff), acc, floored
+        if r.ext_floor and prev_floored and acc >= r.floor:
+            r.floor = now
+            r.ext_floor = False
+        r.w_acc = acc
+        r.w_since = max(r.floor, now) if acc < r.floor else acc
+
+    def _set_floor(self, k: int) -> None:
+        """PendingRequestTimer::setFloor(now): the watch is not re-selected."""
+        r = self.reps[k]
+        r.floor = self.t
+        r.ext_floor = True
+
+    def _deadline(self, k: int) -> Tuple[float, float, bool]:
+        r = self.reps[k]
+        self._select_watch(k, self.t)
+        if r.w_key == INF:
+            return INF, INF, False
+        floored = r.floor > r.w_acc
+        return max(r.w_since, r.floor) + self._teff(r.backoff), r.w_acc, floored
 
     def _execute(self, k: int, b: _Batch, mode: int, t: float, sample: bool = True,
                  count: bool = True) -> None:
         r = self.reps[k]
-        if mode != 0 and not r.in_vc and r.backoff:
-            dl, _, floored = self._deadline(k)
-            watched = self._watched(k)
-        else:
-            dl, floored, watched = INF, True, INF
         if count:
-            lat_ok = sample and self._accepted(k, b) and t > b.oldest
+            stamped = sample and self._accepted(k, b)
+            if stamped and b.oldest > r.exec_arr:
+                r.exec_arr = b.oldest
+            lat_ok = stamped and t > b.oldest
             for w in self._in_windows(k, t):
                 w.txs += b.size
                 w.batch.append(b.size)
@@ -940,21 +1046,42 @@ class SbftSim:
             ch = self._client_hop(k, t)
             if ch < INF:
                 b.replies.append(t + ch)
-        # Backoff restores when the watched request completed in time on an unfloored
-        # deadline, or nothing is left to watch (EntityRequests.cpp completeSequence).
-        if r.backoff and mode != 0 and not r.in_vc and b.oldest <= watched:
-            after = self._watched(k)
-            if after == INF or (not floored and t < dl):
-                r.backoff = 0
-                if self.trace is not None:
-                    dl2, acc2, fl2 = self._deadline(k)
-                    hb = self._head(k)
-                    self._log(f"r{k} backoff reset at exec seq {b.seq} (view {b.view}, oldest {b.oldest / 1000.0:.3f}); "
-                              f"next deadline {dl2 / 1000.0:.3f} acc {acc2 / 1000.0:.3f} head seq "
-                              f"{hb.seq if hb else None} oldest {hb.oldest / 1000.0 if hb else 0:.3f} "
-                              f"dec {hb.t_dec / 1000.0 if hb else 0:.3f} pend0 "
-                              f"{self.pending[0][0] / 1000.0 if self.pending else 0:.3f}")
         self._prune()
+        # completeSequence (EntityRequests.cpp, 73b9f08): the timer completes the batch (the
+        # watch moves on, the floor with it once a floored backlog drains), then the backoff
+        # restores when, outside a view change, the batch carried a request admitted at or
+        # after the floor; a raised backoff re-floors the timer, so what is still pending
+        # gets a fresh timeout per head. A checkpoint skip (count False) is no execution.
+        # Recovery executions count too: they drain through completeSequence
+        # (EntityConsensus.cpp drainExecution). (2026-10-19, restart D11.)
+        if count and not r.in_vc:
+            self._select_watch(k, t)
+            # relaySkippedHead (relay-on-skip): a batch executed this view whose oldest request
+            # arrived after the watched one, so the leader has passed it by (the evidence is
+            # kept over the view's batches, passedByUpTo_); a backup relays it once per view
+            # and times it from the relay. The pool is shared here, so the leader holds it and
+            # the relay itself is a no-op; the re-date fires only after a view change re-queued
+            # older requests behind executed later ones (about once in 4.6M expiries in 400
+            # training seeds, review 2026-10-20), and never for a proposed head.
+            if b.seq > r.repro_through:  # a carried-over batch is the old leader's order
+                r.passed_by = max(r.passed_by, b.oldest)
+            if (r.view % N != k and r.w_key < INF and r.passed_by > r.w_key
+                    and r.relayed != (r.view, r.w_key)):
+                hb = self._head(k)
+                if hb is None or hb.oldest != r.w_key:
+                    r.relayed = (r.view, r.w_key)
+                    r.w_since = t
+                    if self.trace is not None:
+                        self._log(f"r{k} relays skipped head {r.w_key / 1000.0:.3f}, timed from {t / 1000.0:.3f}")
+            newest = max(ch[3] for ch in b.chunks)
+            if self._accept_time(r, newest) >= r.floor:
+                if r.backoff:
+                    r.floor = t
+                    r.ext_floor = True
+                    if self.trace is not None:
+                        self._log(f"r{k} backoff reset at exec seq {b.seq} (view {b.view}, "
+                                  f"oldest {b.oldest / 1000.0:.3f}), re-floored")
+                r.backoff = 0
 
     def _prune(self) -> None:
         live = [r.next_seq for r in self.reps if not r.crashed]
@@ -1020,11 +1147,17 @@ class SbftSim:
 
     def _count_vc(self, k: int) -> None:
         r = self.reps[k]
-        for w in self._in_windows(k, self.t):
-            w.vcs += 1
-            if r.commits_since_vc == 0:
-                w.noprog += 1
+        # Counted at the report over the last episode (the elections of the episode before the window's end, as AgentClient counts them (2026-10-19, restart D14)).
+        self._vc_log[k].append((self.t, r.commits_since_vc == 0))
         r.commits_since_vc = 0
+
+    def _count_view_changes(self, windows: Sequence["_Window"], end_ms: float) -> None:
+        """Each replica's window counts: its elections in the episode ending at end_ms."""
+        from_ms = end_ms - EPISODE_S * 1000.0
+        for k, w in enumerate(windows):
+            recent = [stalled for t, stalled in self._vc_log[k] if from_ms < t <= end_ms]
+            w.vcs, w.noprog = len(recent), sum(recent)
+            self._vc_log[k] = [(t, st) for t, st in self._vc_log[k] if t > from_ms]
 
     def _send_vc(self, s: int, v: int) -> None:
         for j in range(N):
@@ -1032,6 +1165,13 @@ class SbftSim:
                 ta = self._hop(s, j, self.t, float(self.rng.uniform(-1.0, 1.0)))
                 if ta < INF:
                     self._push(ta, _EV_VC, j, s, v)
+
+    def _send_suspect(self, s: int, v: int) -> None:
+        for j in range(N):
+            if j != s:
+                ta = self._hop(s, j, self.t, float(self.sus_rng.uniform(-1.0, 1.0)))
+                if ta < INF:
+                    self._push(ta, _EV_SUS, j, s, v)
 
     def _log(self, msg: str) -> None:
         """Debugging trace (sim.trace = [] to enable); callers build msg only when enabled."""
@@ -1048,6 +1188,8 @@ class SbftSim:
             self._stop(k, r.view)
         r.view = nv
         r.in_vc = True
+        r.suspects.clear()
+        r.passed_by = -INF  # startViewChange: the next primary is judged on its own batches
         self._count_vc(k)
         self._anchor(k)
         for v in list(r.claims):
@@ -1090,9 +1232,41 @@ class SbftSim:
                 smallest = vv if smallest is None else min(smallest, vv)
                 higher |= sv
         if len(higher) >= F + 1:
+            # A join takes the backoff step a view change on f+1 suspicions takes (48048a0; 2026-10-19, restart D11).
+            r.backoff = min(r.backoff + 1, 31)
             self._start_vc(k, smallest, "join")
             return
+        if not r.in_vc and v > r.view:
+            # A sender of a ViewChange above this view counts as suspecting its leader (5c0a3cf).
+            self._suspect_check(k, "suspects+vc")
+            if r.in_vc:
+                return
         self._try_build(k, v)
+
+    def _on_suspect(self, k: int, s: int, v: int) -> None:
+        """onSuspectMessage: a Suspect counts only for k's current view, outside a view
+        change and from another replica; it stands until the view moves."""
+        r = self.reps[k]
+        if r.in_vc or v != r.view or s == k:
+            return
+        r.suspects.add(s)
+        self._suspect_check(k, "suspects")
+
+    def _suspect_check(self, k: int, why: str) -> None:
+        """startViewChangeOnSuspects: f+1 suspicions, a sender of a stored ViewChange above
+        k's view counting as one, start the view change to view + 1 with the backoff step
+        an expiry used to take."""
+        r = self.reps[k]
+        live = set(r.suspects)
+        for vv, ss in r.claims.items():
+            if vv > r.view:
+                live |= ss
+        if self.trace is not None:
+            self._log(f"r{k} suspects of view {r.view}: {len(live)}/{F + 1} ({why})")
+        if len(live) < F + 1:
+            return
+        r.backoff = min(r.backoff + 1, 31)
+        self._start_vc(k, r.view + 1, why)
 
     def _try_build(self, k: int, v: int) -> None:
         r = self.reps[k]
@@ -1115,18 +1289,26 @@ class SbftSim:
 
     def _expire(self, k: int) -> None:
         r = self.reps[k]
+        # No overtaken re-arm (relay-on-skip): the one re-date of a watched request the
+        # leader has passed by is in _execute.
         if self.trace is not None:
             dl, acc, floored = self._deadline(k)
             self._log(f"r{k} deadline {dl / 1000.0:.3f} acc {acc / 1000.0:.3f} floor {r.floor / 1000.0:.3f} "
                       f"watched {self._watched(k) / 1000.0:.3f} T={self.T:.0f}")
-        r.backoff = min(r.backoff + 1, 31)
-        self._start_vc(k, r.view + 1, "expire")
+        # suspectLeader (5c0a3cf): stay in the view, re-arm from now (rearm re-selects the
+        # watch first), tell the others; a lone suspicion moves no one.
+        self._select_watch(k, self.t)
+        r.suspects.add(k)
+        r.w_since = self.t
+        self._send_suspect(k, r.view)
+        self._suspect_check(k, "expire")
 
     def _on_build(self, k: int, v: int) -> None:
         r = self.reps[k]
         if not r.in_vc or r.view != v:
             return
         repro = self._classify_orphans(v)
+        self.repro_through[v] = max((b.seq for b in repro), default=0)
         self._install(k, v)
         installs = [INF] * N
         installs[k] = self.t
@@ -1250,6 +1432,8 @@ class SbftSim:
         prev_sched = r.installed.get(v, INF)
         r.view = v
         r.in_vc = False
+        r.passed_by = -INF  # finishNewView
+        r.repro_through = self.repro_through.get(v, 0)
         r.installed[v] = self.t
         r.stopped.pop(v, None)
         r.wait_armed = None
@@ -1257,10 +1441,13 @@ class SbftSim:
         r.last_installed = max(r.last_installed, v)
         r.rec_due = self.t + RECOVERY_MIN_MS + self._rtt(k) if r.crashed else INF
         self._anchor(k)
-        r.floor = self.t
+        # finishNewView: requestTimer_.reset(pending) re-selects the watch, then setFloor(now).
+        self._set_floor(k)
+        r.w_key = None
         for vv in list(r.claims):
             if vv <= v:
                 del r.claims[vv]
+        r.suspects.clear()
         for w in self._in_windows(k, self.t):
             w.nvs += 1
         if abs(prev_sched - self.t) > 1e-6:
@@ -1303,11 +1490,13 @@ class SbftSim:
             self._arrive(best)
             self.t = best
             if kind == 0:
-                _, _, ev, a, b2, c2 = heapq.heappop(self.heap)
+                _, _, ev, a, b2, c2, d2 = heapq.heappop(self.heap)
                 if ev == _EV_VC:
                     self._on_vc(a, b2, c2)
                 elif ev == _EV_NV:
                     self._on_nv(a, b2)
+                elif ev == _EV_SUS:
+                    self._on_suspect(a, b2, c2)
                 else:
                     self._on_build(a, b2)
             elif kind == 1:
@@ -1334,7 +1523,7 @@ class SbftSim:
         """applyAgentTimeouts: a lower T floors every request timer at the change."""
         if timeout_ms < self.T:
             for r in self.reps:
-                r.floor = self.t
+                self._set_floor(r.i)
         self.T = float(timeout_ms)
         if float(wait_ms) != self.W:
             self.W = float(wait_ms)
@@ -1365,9 +1554,19 @@ class SbftSim:
                                            + reports[k]["nth_prepare_unseen_count"]), k))
         for name in NTH_PREPARE_FIELDS:
             med[name] = reports[lead][name]
-        # An aggregate in which no batch executed takes the window's length as its latency,
-        # as main.py sets it on the report the model reads (CppBedrock reports 0 there).
-        if med["total_consensus_instances"] == 0.0:
+        # Latency, gap, batch and phase fields: the median of the reports that measured them
+        # (> 0), 0 when none did, as aggregator.py takes them (measured_only_fields).
+        import agent_pb2
+        from aggregator import measured_only_fields
+
+        for name in measured_only_fields(agent_pb2.PROTOCOL_SBFT):
+            if name in med:
+                measured = [reports[k][name] for k in avail if reports[k][name] > 0.0]
+                med[name] = float(np.median(measured)) if measured else 0.0
+        # An aggregate in which no batch executed, or that has no latency sample, takes the
+        # window's length as its latency, as main.py sets it on the report the model reads
+        # (CppBedrock reports 0 there; D15).
+        if med["total_consensus_instances"] == 0.0 or med["p50_consensus_latency_ms"] <= 0.0:
             for name in ("avg_consensus_latency_ms", "p50_consensus_latency_ms", "p95_consensus_latency_ms"):
                 med[name] = windows[0].end - windows[0].start
         return med, reports
@@ -1382,6 +1581,7 @@ class SbftSim:
         fw = [_Window(s, s + FEATURE_S) for _ in range(N)]
         self.windows = [[w] for w in fw]
         self._advance_to((s + FEATURE_S) * 1000.0)
+        self._count_view_changes(fw, (s + FEATURE_S) * 1000.0)
         features, _ = self.median_report(fw, self.T, self.W, self.t)
         # The phase in force when the pair applies, as main.py labels an episode, so the
         # onset episode carries the phase its reward window measures.
@@ -1393,6 +1593,7 @@ class SbftSim:
         rw = [_Window(s + FEATURE_S + REPLY_S + WARMUP_S, s + EPISODE_S) for _ in range(N)]
         self.windows = [[w] for w in rw]
         self._advance_to((s + EPISODE_S) * 1000.0)
+        self._count_view_changes(rw, (s + EPISODE_S) * 1000.0)
         reward, per_rep = self.median_report(rw, new_t, new_w, self.t)
         self.windows = None
         self.episode_start_s = s + EPISODE_S
@@ -1402,61 +1603,47 @@ class SbftSim:
 # --- Randomized environments ---------------------------------------------------
 
 
-def _log_uniform(rng: np.random.Generator, lo: float, hi: float) -> float:
-    return float(math.exp(rng.uniform(math.log(lo), math.log(hi))))
-
-
-def _around(rng: np.random.Generator, host: float, lo: float = 0.5, hi: float = 2.0) -> float:
-    """A host constant scaled by a log-uniform factor in [lo, hi]."""
-    return float(host * math.exp(rng.uniform(math.log(lo), math.log(hi))))
-
-
-# Offered load the training draw is centred on: the client rate the CloudLab
-# calibration and experiment runs use (run_sbft.sh --rate 15000). Each run draws
-# load_tps uniformly over LOAD_DRAW_FACTORS x this, the same 0.5-1.25 x bracket the
-# draw had around the 20k calibration rate, so the deployment rate sits inside the
-# support rather than past its top edge. It matters because the arm ranking moves with
-# load: at 20k the 250 ms election wins phase 0 and at 30k it storms and loses to
-# 525/1100. train --rate sets it, and the fitted prior records it as load_tps. eval and
-# the pretrain spec runs use SPEC_RATE_TPS; check keeps MEASURED_RATE_TPS, the rate of
-# the MEASURED_20K fixture it is scored against.
-TRAIN_RATE_TPS = 15000.0
-LOAD_DRAW_FACTORS: Tuple[float, float] = (0.5, 1.25)
+# The rate N the training load is drawn around (sim_common.draw_load_tps: 0.5-1.5 x it):
+# the reward normaliser, which is the client rate of the CloudLab runs (run_sbft.sh --rate,
+# 20,000 req/s with 512 B requests since 2026-10-13). train --rate sets it, and the fitted
+# prior records it as load_tps. eval and the pretrain spec runs use SPEC_RATE_TPS.
+# (Kevin, 2026-10-19, restart D11: the shared 0.5-1.5 x draw replaces 0.5-1.25 x.)
+TRAIN_RATE_TPS = reward_normalizer_tps("sbft")
 
 
 def sample_constants(rng: np.random.Generator) -> SimConstants:
-    """Per-run physics. The processing, transfer and view-change constants, and every
-    constant the blind fit sets (sim_fit.py FREE, batch_cap and slow_lock_ms included),
-    are drawn within 0.5-2 x their SimConstants defaults (each cited there): wider draws
-    (up to 15 x) made a T just above the base floor storm in 15-17% of draws whose
-    context the prior could not tell apart from the host's, and the prior then preferred
-    a T that sleeps through a proposal delay. batch_cap stays an integer at most
-    BATCH_MAX_REQUESTS. Load, the base link, the initial window and the backlog stay
-    wide; onset_stall_ms stays at its default (the harness pre-applies the base netem);
-    the fault values (link extra, straggler, crash, proposal delay) are drawn in
-    sample_phase and never depend on the spec."""
+    """Per-run physics (Kevin, 2026-10-19, restart D11). Every constant the blind fit sets
+    (sim_fit.py FREE, batch_cap and slow_lock_ms included) and every unfitted one
+    (proc_sigma, vc_sigma, init_window_bytes around the Linux initcwnd of 10 segments) is
+    drawn 0.5-2 x its SimConstants value (each cited there): wider draws (up to 15 x) made a
+    T just above the base floor storm in 15-17% of draws whose context the prior could not
+    tell apart from the host's, and the prior then preferred a T that sleeps through a
+    proposal delay. batch_cap stays an integer at most BATCH_MAX_REQUESTS. The base link,
+    the load and the backlog are the shared draws (sim_common); onset_stall_ms stays at its
+    default (the harness pre-applies the base netem); the fault values (link extra,
+    straggler, crash, proposal delay) are drawn in sample_phase and never depend on the
+    spec."""
     h = SimConstants()
     return SimConstants(
-        base_ms=float(rng.uniform(3.0, 8.0)),
-        per_tx_ms=_around(rng, h.per_tx_ms),
-        proc_spread=_around(rng, h.proc_spread),
-        proc_base_ms=_around(rng, h.proc_base_ms),
-        proc_sigma=_around(rng, h.proc_sigma),
-        ack_proc_ms=_around(rng, h.ack_proc_ms),
-        slow_lock_ms=_around(rng, h.slow_lock_ms),
-        exe_proc_ms=_around(rng, h.exe_proc_ms),
-        exec_base_ms=_around(rng, h.exec_base_ms),
-        exec_per_tx_ms=_around(rng, h.exec_per_tx_ms),
-        nv_build_ms=_around(rng, h.nv_build_ms),
-        nv_val_ms=_around(rng, h.nv_val_ms),
-        vc_sigma=_around(rng, h.vc_sigma),
-        strag_hold_ms=_around(rng, h.strag_hold_ms),
-        init_window_bytes=1448.0 * float(rng.integers(4, 41)),
-        max_window_bytes=_around(rng, h.max_window_bytes),
-        load_tps=float(rng.uniform(LOAD_DRAW_FACTORS[0] * TRAIN_RATE_TPS,
-                                   LOAD_DRAW_FACTORS[1] * TRAIN_RATE_TPS)),
-        batch_cap=int(round(_around(rng, h.batch_cap, hi=min(2.0, BATCH_MAX_REQUESTS / h.batch_cap)))),
-        initial_backlog=int(rng.integers(0, MAX_PENDING_REQUESTS + 1)) if rng.random() < 0.3 else 0,
+        base_ms=draw_base_delay_ms(rng),
+        per_tx_ms=around(rng, h.per_tx_ms),
+        proc_spread=around(rng, h.proc_spread),
+        proc_base_ms=around(rng, h.proc_base_ms),
+        proc_sigma=around(rng, h.proc_sigma),
+        ack_proc_ms=around(rng, h.ack_proc_ms),
+        slow_lock_ms=around(rng, h.slow_lock_ms),
+        exe_proc_ms=around(rng, h.exe_proc_ms),
+        exec_base_ms=around(rng, h.exec_base_ms),
+        exec_per_tx_ms=around(rng, h.exec_per_tx_ms),
+        nv_build_ms=around(rng, h.nv_build_ms),
+        nv_val_ms=around(rng, h.nv_val_ms),
+        vc_sigma=around(rng, h.vc_sigma),
+        strag_hold_ms=around(rng, h.strag_hold_ms),
+        init_window_bytes=around(rng, h.init_window_bytes),
+        max_window_bytes=around(rng, h.max_window_bytes),
+        load_tps=draw_load_tps(rng, TRAIN_RATE_TPS),
+        batch_cap=int(round(around(rng, h.batch_cap, hi=min(2.0, BATCH_MAX_REQUESTS / h.batch_cap)))),
+        initial_backlog=draw_initial_backlog(rng, MAX_PENDING_REQUESTS),
     )
 
 
@@ -1467,30 +1654,28 @@ NO_PROPOSAL_FAULTS = False
 
 
 def sample_phase(rng: np.random.Generator, start_s: float) -> Phase:
-    extra = 0.0 if rng.random() < 0.35 else _log_uniform(rng, 10.0, 250.0)
-    jitter = 0.0 if rng.random() < 0.6 else float(rng.uniform(0.02, 0.15))
+    """One fault phase. The link extra and the proposal hold are the shared draws and jitter
+    is the shared 0 (restart D11); the mix (no extra in 35%, a straggler or dead peer in 65%,
+    a hold in 55%) and the straggler, dead-peer and re-pin ranges are SBFT's own."""
+    extra = 0.0 if rng.random() < 0.35 else draw_link_extra_ms(rng)
     kind = rng.random()
     straggler, s_ms = -1, 0.0
     if kind >= 0.35:
         straggler = int(rng.integers(0, N))
-        s_ms = _log_uniform(rng, 20.0, 800.0) if kind < 0.80 else _log_uniform(rng, CRASH_DELAY_MS, 10000.0)
+        s_ms = log_uniform(rng, 20.0, 800.0) if kind < 0.80 else log_uniform(rng, CRASH_DELAY_MS, 10000.0)
     delay, interval = 0.0, 0.0
     if rng.random() >= 0.45:
-        delay = _log_uniform(rng, 50.0, 1500.0)
+        delay = draw_hold_ms(rng)
         interval = float(rng.uniform(20.0, 120.0)) if rng.random() < 0.8 else 0.0
     if NO_PROPOSAL_FAULTS:
         straggler, s_ms, delay, interval = -1, 0.0, 0.0, 0.0
-    return Phase(start_s=start_s, extra_ms=extra, jitter=jitter, straggler=straggler,
+    return Phase(start_s=start_s, extra_ms=extra, jitter=JITTER_RATIO, straggler=straggler,
                  straggler_ms=s_ms, delay_ms=delay, interval_s=interval)
 
 
 def sample_schedule(rng: np.random.Generator, total_s: float) -> List[Phase]:
-    phases = [Phase(start_s=0.0)]
-    t = float(rng.uniform(0.0, 20.0))
-    while t < total_s:
-        phases.append(sample_phase(rng, t))
-        t += float(rng.uniform(40.0, 400.0))
-    return phases
+    """A clean base phase at 0, then fault phases at the shared onsets (restart D11)."""
+    return [Phase(start_s=0.0)] + [sample_phase(rng, t) for t in fault_start_times(rng, total_s)]
 
 
 NTH_PREPARE_FIELDS = ("nth_prepare_gap_ms", "nth_prepare_seen_count", "nth_prepare_unseen_count")
@@ -1498,27 +1683,131 @@ NTH_PREPARE_FIELDS = ("nth_prepare_gap_ms", "nth_prepare_seen_count", "nth_prepa
 SPEC_WARMUP_S = 10.0
 # Spec replays start here, so episode e applies at SPEC_WARMUP_S + EPISODE_S (e - 1), on the phase onsets.
 SPEC_START_OFFSET_S = SPEC_WARMUP_S - FEATURE_S - REPLY_S
-SPEC_RUN_S = 1510.0
-SPEC_RATE_TPS = 15000.0  # run_sbft.sh --rate of the calibration and experiment runs
-MEASURED_RATE_TPS = 20000.0  # the rate of the MEASURED_20K fixture check compares against
+SPEC_RUN_S = 2410.0  # warm-up 10 + last onset 2100 + 300 (1510 for the five-phase spec before 2026-10-13)
+SPEC_RATE_TPS = 20000.0  # run_sbft.sh --rate of the calibration and experiment runs (2026-10-13)
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+SPEC_PATH = os.path.join(_HERE, os.pardir, "config", "sbft", "failure_spec.xml")
+SCHEDULE_PATH = os.path.join(_HERE, "config", "schedule_sbft.csv")
+
+
+def _continuous_delay_ms(node: ET.Element, where: str) -> float:
+    """delayMs of a global or source rule, which must be on for the whole phase (burst
+    duration equal to its interval, or no burst fields); the simulator has no bursts."""
+    delay = float(node.findtext("delayMs", "0"))
+    dur, ivl = node.findtext("burstDurationMs"), node.findtext("burstIntervalMs")
+    if delay > 0.0:
+        # As apply_network_failures._parse_burst_delay reads it: no burst or probability
+        # field is continuous; equal positive duration and interval is continuous; anything
+        # else (a probability, 0/0 which applies nothing, a duty cycle) is not.
+        if dur is None and ivl is None:
+            if node.findtext("probability") is not None:
+                raise ValueError(f"{SPEC_PATH} {where}: a probabilistic delay has no sbft_sim mapping")
+        elif dur is None or ivl is None or not 0.0 < float(dur) == float(ivl):
+            raise ValueError(f"{SPEC_PATH} {where}: burst {dur}/{ivl} ms is not continuous; sbft_sim has no bursts")
+    return delay
+
+
+@functools.lru_cache(maxsize=1)
+def _spec_phases_from_xml() -> Tuple[Phase, ...]:
+    root = ET.parse(SPEC_PATH).getroot()
+    warm = float(root.findtext("warmUpTime"))
+    if warm != SPEC_WARMUP_S:
+        raise ValueError(f"{SPEC_PATH} warmUpTime {warm} differs from SPEC_WARMUP_S {SPEC_WARMUP_S}")
+    base = float(root.findtext("globalNetworkDelay/delayMs"))
+    if base != SimConstants().base_ms:
+        raise ValueError(f"{SPEC_PATH} base delay {base} differs from SimConstants.base_ms {SimConstants().base_ms}")
+    jitter = float(root.findtext("globalNetworkDelay/jitterRatio"))
+    phases = []
+    for el in root.find("phases").findall("phase"):
+        at = float(el.findtext("atTime"))
+        net = el.find("network")
+        unknown = sorted({c.tag for c in net} - {"directedEdges", "global", "sources"})
+        if unknown:
+            raise ValueError(f"{SPEC_PATH} phase at {at}: sbft_sim does not model {unknown}")
+        extra = _continuous_delay_ms(net.find("global"), f"phase at {at} global")
+        sources = net.findall("sources/source")
+        if len(sources) > 1:
+            raise ValueError(f"{SPEC_PATH} phase at {at}: sbft_sim models one straggler, got {len(sources)}")
+        straggler, s_ms = -1, 0.0
+        if sources:
+            # A source rule replaces the global delay on that replica's egress, so its lag
+            # is the source delay minus the global delay (the spec's comments).
+            straggler = int(sources[0].findtext("src"))
+            s_ms = _continuous_delay_ms(sources[0], f"phase at {at} source") - extra
+            if s_ms < 0.0:
+                raise ValueError(f"{SPEC_PATH} phase at {at}: source delay below the global delay")
+        delay, interval = 0.0, 0.0
+        sb = el.find("sbft")
+        pd = sb.find("proposalDelay") if sb is not None else None
+        # FailureSpec.cpp also reads intervalMs, count, a proposalDelay-level delayMs and
+        # bare <id> lists; this parser reads only the shape the spec uses, so anything else
+        # is an error rather than a silent misread (2026-10-19, restart D11 review).
+        odd = sorted(({c.tag for c in sb} - {"proposalDelay"} if sb is not None else set())
+                     | ({c.tag for c in pd} - {"interval", "replicas"} if pd is not None else set())
+                     | ({c.tag for c in pd.find("replicas")} - {"replica"}
+                        if pd is not None and pd.find("replicas") is not None else set()))
+        if odd:
+            raise ValueError(f"{SPEC_PATH} phase at {at}: sbft_sim does not read sbft elements {odd}")
+        reps = pd.findall("replicas/replica") if pd is not None else []
+        if len(reps) > 1 or (reps and reps[0].findtext("id") != "leader"):
+            raise ValueError(f"{SPEC_PATH} phase at {at}: sbft_sim models one leader proposal delay")
+        if reps:
+            delay = float(reps[0].findtext("delayMs"))
+            interval = float(pd.findtext("interval", "0"))
+        phases.append(Phase(at, extra_ms=extra, jitter=jitter, straggler=straggler, straggler_ms=s_ms,
+                            delay_ms=delay, interval_s=interval))
+    if not phases or phases[0].start_s != 0.0:
+        raise ValueError(f"{SPEC_PATH}: the first phase must be at 0 s")
+    if phases[-1].start_s >= SPEC_RUN_S - SPEC_WARMUP_S:
+        raise ValueError(f"{SPEC_PATH}: last phase at {phases[-1].start_s} s is past SPEC_RUN_S {SPEC_RUN_S}")
+    return tuple(phases)
 
 
 def spec_phases() -> List[Phase]:
-    """The five phases of config/sbft/failure_spec.xml at their atTime (s), replica 2 the
-    faulty source. Used only by check and eval, never by train."""
-    return [
-        Phase(0.0, straggler=2, straggler_ms=5000.0, delay_ms=150.0, interval_s=60.0),
-        Phase(300.0, extra_ms=50.0, straggler=2, straggler_ms=80.0, delay_ms=350.0, interval_s=60.0),
-        Phase(600.0, extra_ms=50.0, straggler=2, straggler_ms=300.0, delay_ms=350.0, interval_s=60.0),
-        Phase(900.0, extra_ms=150.0, straggler=2, straggler_ms=100.0),
-        Phase(1200.0, extra_ms=150.0, straggler=2, straggler_ms=300.0),
-    ]
+    """The phases of config/sbft/failure_spec.xml at their atTime (s), parsed from the file
+    (2026-10-19, restart D11; literals before, which had p6 at S 300 after the spec's
+    2026-10-17 move to S 450); a straggler's lag is its source delay minus the global
+    delay. Used only by check, eval and the pretrain spec runs, never by train."""
+    return list(_spec_phases_from_xml())
 
 
 def spec_schedule() -> List[Phase]:
     """Simulator schedule of the spec: a clean warm-up, then spec phase p at
     10 s + atTime (sim phase index p + 1)."""
     return [Phase(0.0)] + [replace(p, start_s=SPEC_WARMUP_S + p.start_s) for p in spec_phases()]
+
+
+@functools.lru_cache(maxsize=1)
+def oracle_schedule() -> Tuple[Tuple[float, float, float], ...]:
+    """(time_s, T, W) rows of learning_agent/config/schedule_sbft.csv, as the scheduled
+    agent reads them (2026-10-19, restart D11; per-phase literals before)."""
+    rows = []
+    with open(SCHEDULE_PATH) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            t_s, t_ms, w_ms = (float(v) for v in line.split(","))
+            if t_s >= 0.0 and abs(t_s / EPISODE_S - round(t_s / EPISODE_S)) > 1e-9:
+                raise ValueError(f"{SCHEDULE_PATH}: row at {t_s} s is not a multiple of the {EPISODE_S:g} s episode")
+            rows.append((t_s, t_ms, w_ms))
+    if not rows or [r[0] for r in rows] != sorted(r[0] for r in rows):
+        raise ValueError(f"{SCHEDULE_PATH}: rows missing or out of order")
+    return tuple(rows)
+
+
+def oracle_pair(apply_s: float) -> Tuple[float, float]:
+    """The oracle's (T, W) for a pair applied at sim time apply_s: the last row at or before
+    the spec time apply_s - SPEC_WARMUP_S (episode e applies at warmUpTime + P (e - 1) and
+    takes the last row with time_s <= P (e - 1)); the first row during the warm-up."""
+    x = apply_s - SPEC_WARMUP_S + 1e-6
+    rows = oracle_schedule()
+    pick = rows[0]
+    for row in rows:
+        if row[0] <= x:
+            pick = row
+    return pick[1], pick[2]
 
 
 # --- Context, reward, model interface ----------------------------------------------
@@ -1613,14 +1902,21 @@ def run_agent(
 # --- Training data and prior ---------------------------------------------------------
 
 
+def _initial_pair(rng: np.random.Generator) -> Tuple[float, float]:
+    """A training run's starting (T, W) (Kevin, 2026-10-19, restart D11): the opening
+    pair in a quarter of the runs, otherwise each log-uniform over its range
+    (sim_common.draw_initial_action_ms). This replaces a quarter on the engine
+    default (8000, 20)."""
+    import agent_pb2
+
+    t0, w0 = draw_initial_action_ms(rng, agent_pb2.PROTOCOL_SBFT)
+    return t0, w0
+
+
 def training_sim(rng: np.random.Generator, seed: int) -> Tuple[SbftSim, int]:
     """One randomized training run: (simulator, episodes)."""
     episodes = int(rng.integers(40, 120))
-    if rng.random() < 0.25:
-        t0, w0 = DEFAULT_ELECTION_TIMEOUT_MS, DEFAULT_SLOW_PATH_TIMEOUT_MS
-    else:
-        t0 = _log_uniform(rng, *T_BOUNDS_MS)
-        w0 = _log_uniform(rng, *W_BOUNDS_MS)
+    t0, w0 = _initial_pair(rng)
     sim = SbftSim(
         sample_constants(rng),
         sample_schedule(rng, episodes * EPISODE_S + 20.0),
@@ -1686,20 +1982,7 @@ def _generate_policy_one(args: Tuple[int, str, int, str, float]) -> Tuple[np.nda
     seed, design, hold, prior, probe = args
     set_reward_design(design)
     rng = np.random.default_rng(seed)
-    episodes = int(rng.integers(40, 120))
-    if rng.random() < 0.25:
-        t0, w0 = DEFAULT_ELECTION_TIMEOUT_MS, DEFAULT_SLOW_PATH_TIMEOUT_MS
-    else:
-        t0 = _log_uniform(rng, *T_BOUNDS_MS)
-        w0 = _log_uniform(rng, *W_BOUNDS_MS)
-    sim = SbftSim(
-        sample_constants(rng),
-        sample_schedule(rng, episodes * EPISODE_S + 20.0),
-        seed=seed,
-        start_offset_s=float(rng.uniform(0.0, 20.0)),
-        initial_timeout_ms=t0,
-        initial_wait_ms=w0,
-    )
+    sim, episodes = training_sim(rng, seed)
     predict, update = make_candidate(prior)
     xs, ys = [], []
     active: Dict[str, object] = {}
@@ -1756,83 +2039,23 @@ def generate(n_runs: int, seed: int, workers: int, design: str, hold: int = 1,
     return np.vstack([p[0] for p in parts]), np.concatenate([p[1] for p in parts])
 
 
-def train_prior(x: np.ndarray, y: np.ndarray, out_path: str, seed: int, design: str,
-                target_floor: float, hold: int = 1,
-                hidden: Tuple[int, ...] = (128, 128, 64),
-                rate_tps: Optional[float] = None) -> float:
-    from sklearn.neural_network import MLPRegressor
-
-    y = np.maximum(y, target_floor)
-    x_mean, x_std = x.mean(axis=0), x.std(axis=0) + 1e-9
-    y_mean, y_std = float(y.mean()), float(y.std() + 1e-9)
-    rng = np.random.default_rng(seed)
-    order = rng.permutation(len(x))
-    cut = int(0.9 * len(x))
-    tr, va = order[:cut], order[cut:]
-    mlp = MLPRegressor(
-        hidden_layer_sizes=tuple(hidden),
-        activation="relu",
-        alpha=1e-5,
-        batch_size=512,
-        learning_rate_init=1e-3,
-        max_iter=200,
-        early_stopping=True,
-        n_iter_no_change=10,
-        random_state=seed,
-    )
-    mlp.fit((x[tr] - x_mean) / x_std, (y[tr] - y_mean) / y_std)
-    pred = mlp.predict((x[va] - x_mean) / x_std) * y_std + y_mean
-    rmse = float(np.sqrt(np.mean((pred - y[va]) ** 2)))
-    arrays = {"n_layers": np.asarray(len(mlp.coefs_))}
-    for i, (w, b) in enumerate(zip(mlp.coefs_, mlp.intercepts_)):
-        arrays[f"W{i}"] = w
-        arrays[f"b{i}"] = b
-    arrays.update(
-        x_mean=x_mean,
-        x_std=x_std,
-        y_mean=np.asarray(y_mean),
-        y_std=np.asarray(y_std),
-        reward_design=np.asarray(design),
-        hold_episodes=np.asarray(int(hold)),
-        target_floor=np.asarray(float(target_floor)),
-        peer_spread=np.asarray(0.0),
-        action_dim=np.asarray(2),
-        # Centre of the load draw the episodes were generated at (train --rate), so a
-        # prior deployed at a different client rate is recognisable as one.
-        load_tps=np.asarray(float(TRAIN_RATE_TPS if rate_tps is None else rate_tps)),
-    )
-    arrays.update(SIM_WINDOWS.arrays())
-    np.savez(out_path, **arrays)
-    return rmse
-
-
 # --- Check: fixed pairs on the spec ----------------------------------------------------
 
-LADDER_PAIRS = [(250, 50), (250, 150), (525, 50), (525, 150), (1100, 50), (1100, 150)]
-OFF_LADDER_PAIRS = [(400, 100), (800, 100), (1600, 300), (2400, 30)]
+def ladder_pairs() -> List[Tuple[int, int]]:
+    """Every (T, W) of the discrete ladder, models.TIMEOUT_VALUES_MS x
+    SBFT_SLOW_PATH_VALUES_MS (250/650/1600 x 10/150 since 2026-10-17; read from models,
+    2026-10-19, restart D11)."""
+    from models import SBFT_SLOW_PATH_VALUES_MS, TIMEOUT_VALUES_MS
 
-# runs/2026-09-28-sbft-revalidation, 20k: agent (median report, episodes 3-5) p50 and tps,
-# client latency (cal/sb_v20_* client.log, t in [60, 125)); data.md section 3.
-MEASURED_20K = {
-    0: {(250, 50): (200, 19930, 191), (250, 150): (1763, 14238, 1022), (525, 50): (356, 20083, 272),
-        (525, 150): (442, 19868, 395), (1100, 50): (351, 20002, 322), (1100, 150): (457, 20002, 431)},
-    1: {(250, 50): (748, 19019, 858), (250, 150): (687, 17705, 825), (525, 50): (444, 19977, 425),
-        (525, 150): (382, 20000, 351), (1100, 50): (814, 19903, 787), (1100, 150): (738, 20002, 695)},
-    2: {(250, 50): (1286, 18636, 1487), (250, 150): (1211, 16994, 1305), (525, 50): (448, 19992, 445),
-        (525, 150): (963, 19273, 1064), (1100, 50): (818, 19989, 773), (1100, 150): (921, 19823, 885)},
-    3: {(250, 50): (2111, 15152, 2187), (250, 150): (1913, 13505, 2124), (525, 50): (1409, 19019, 1414),
-        (525, 150): (1048, 17652, 1194), (1100, 50): (955, 19914, 918), (1100, 150): (685, 20002, 652)},
-    4: {(250, 50): (2107, 15508, 3034), (250, 150): (2115, 14723, 3453), (525, 50): (2061, 16605, 2477),
-        (525, 150): (2177, 18002, 2461), (1100, 50): (963, 19968, 925), (1100, 150): (1070, 20050, 1029)},
-}
-# The ranking the check must reproduce (design_sim.md), best first; "storm" pairs last.
-MEASURED_RANKING = {
-    0: [(250, 50), (525, 50), (1100, 50)],
-    1: [(525, 150), (525, 50), (1100, 150), (1100, 50)],
-    2: [(525, 50), (1100, 50), (1100, 150), (525, 150)],
-    3: [(1100, 150), (1100, 50)],
-    4: [(1100, 50), (1100, 150)],
-}
+    return [(int(t), int(w)) for t in TIMEOUT_VALUES_MS for w in SBFT_SLOW_PATH_VALUES_MS]
+
+
+OFF_LADDER_PAIRS = [(400, 100), (800, 100), (1200, 300), (2400, 30)]
+
+# The MEASURED_20K fixture (runs/2026-09-28-sbft-revalidation: five-phase spec, the
+# 525/1100 x 50/150 ladder, tiny requests) is removed (2026-10-19, restart D11): no phase,
+# pair or rate of it is current. check now asks whether the oracle's pair
+# (schedule_sbft.csv) is the best ladder pair by reward in each phase interior.
 
 
 def _phase_window_s(p: int, mode: str) -> Tuple[float, float]:
@@ -1840,18 +2063,25 @@ def _phase_window_s(p: int, mode: str) -> Tuple[float, float]:
     into the run for phase 0, the steady-state rule) to the phase end."""
     if mode == "cal":
         return 60.0, 125.0
-    onset = SPEC_WARMUP_S + 300.0 * p
+    phases = spec_phases()
+    onset = SPEC_WARMUP_S + phases[p].start_s
     lo = max(onset + 40.0, 60.0)
-    return lo, onset + 300.0 if p < 4 else SPEC_RUN_S
+    return lo, SPEC_WARMUP_S + phases[p + 1].start_s if p < len(phases) - 1 else SPEC_RUN_S
+
+
+def _oracle_pair_of_phase(p: int) -> Tuple[int, int]:
+    """The oracle's pair over spec phase p's interior (p7 switches 20 s after its onset)."""
+    t, w = oracle_pair(_phase_window_s(p, "spec")[0])
+    return int(t), int(w)
 
 
 def _fixed_pair_run(pair: Tuple[int, int], seed: int, mode: str, phase: int,
                     constants: SimConstants) -> Dict[int, Dict[str, float]]:
-    """Run the spec (mode spec: all five phases; mode cal: one phase from 10 s, 130 s, as
+    """Run the spec (mode spec: every phase; mode cal: one phase from 10 s, 130 s, as
     the calibration runs did) with one pair from the first decision; per-phase means."""
     if mode == "spec":
         sim = SbftSim(constants, spec_schedule(), seed=seed, start_offset_s=SPEC_START_OFFSET_S)
-        episodes, phases = int(SPEC_RUN_S // EPISODE_S), range(5)
+        episodes, phases = int(SPEC_RUN_S // EPISODE_S), range(len(spec_phases()))
     else:
         ph = replace(spec_phases()[phase], start_s=SPEC_WARMUP_S)
         sim = SbftSim(constants, [Phase(0.0), ph], seed=seed, start_offset_s=SPEC_START_OFFSET_S)
@@ -1887,10 +2117,10 @@ def _check_job(args):
     pair, seed, mode, phase = args
     from reward_utils import set_reward_design
 
-    set_reward_design("reward_tps_latency")
+    set_reward_design(DEFAULT_REWARD_DESIGN)
     t0 = time.time()
     c = SimConstants()
-    c.load_tps = MEASURED_RATE_TPS
+    c.load_tps = SPEC_RATE_TPS
     res = _fixed_pair_run(pair, seed, mode, phase, c)
     return pair, seed, phase, res, time.time() - t0
 
@@ -1904,7 +2134,7 @@ def run_check(seeds: int, workers: int, mode: str, pairs: List[Tuple[int, int]],
             if mode == "spec":
                 jobs.append((pair, 1000 + s, mode, -1))
             else:
-                for p in range(5):
+                for p in range(len(spec_phases())):
                     jobs.append((pair, 1000 + s, mode, p))
     if workers <= 1:
         results = [_check_job(j) for j in jobs]
@@ -1917,13 +2147,14 @@ def run_check(seeds: int, workers: int, mode: str, pairs: List[Tuple[int, int]],
         secs.append(dt)
         for p, v in res.items():
             agg.setdefault((p, pair), []).append(v)
-    lines = [f"sbft_sim check mode={mode} seeds={seeds} rate={MEASURED_RATE_TPS:.0f} host constants "
+    sim_s = SPEC_RUN_S if mode == "spec" else 130.0
+    lines = [f"sbft_sim check mode={mode} seeds={seeds} rate={SPEC_RATE_TPS:.0f} host constants "
              f"{SimConstants()}",
              f"wall s per simulated run: mean {np.mean(secs):.1f} (max {np.max(secs):.1f}) for "
-             f"{'1510' if mode == 'spec' else '130'} s simulated",
-             f"phase pair        sim: p50   clat    tps  fast%   vc/{REWARD_S:g}s  zero%  reward | measured 20k: agent p50   tps  client"]
-    ranking_ok = []
-    for p in range(5):
+             f"{sim_s:.0f} s simulated",
+             f"phase pair        sim: p50   clat    tps  fast%   vc/{EPISODE_S:g}s  zero%  reward"]
+    oracle_ok = []
+    for p in range(len(spec_phases())):
         cells = {}
         for pair in pairs:
             vals = agg.get((p, pair))
@@ -1931,29 +2162,22 @@ def run_check(seeds: int, workers: int, mode: str, pairs: List[Tuple[int, int]],
                 continue
             m = {k: float(np.nanmean([v[k] for v in vals])) for k in vals[0]}
             cells[pair] = m
-            meas = MEASURED_20K[p].get(pair)
-            ms = f"{meas[0]:6.0f} {meas[1]:6.0f} {meas[2]:6.0f}" if meas else "     -      -      -"
             lines.append(
                 f"p{p}  ({pair[0]:4d},{pair[1]:3d})  {m['p50']:7.0f} {m['clat']:6.0f} {m['tps']:6.0f} "
-                f"{100 * m['fast']:5.0f} {m['vc']:7.1f} {100 * m['zero']:5.0f} {m['reward']:7.3f} | "
-                f"{ms}")
-        want = [q for q in MEASURED_RANKING[p] if q in cells]
-        by_reward = sorted(want, key=lambda q: -cells[q]["reward"])
-        by_p50 = sorted(want, key=lambda q: cells[q]["p50"])
-        # Adjacent pairs closer than TIE_REWARD (10 ms of p50 at equal tps) are ties, not an order.
-        ties = [f"{a}~{b}" for a, b in zip(want, want[1:])
-                if abs(cells[a]["reward"] - cells[b]["reward"]) < TIE_REWARD]
-        # Pairs the sim orders against the measurement, and whether all are ties anyway.
-        inverted = [(a, b) for i, a in enumerate(want) for b in want[i + 1:]
-                    if cells[a]["reward"] < cells[b]["reward"]]
-        tie_only = all(abs(cells[a]["reward"] - cells[b]["reward"]) < TIE_REWARD for a, b in inverted)
-        ok_r = by_reward == want and not ties
-        ok_l = by_p50 == want
-        ranking_ok.append(ok_r)
-        lines.append(f"p{p}  measured order {want}; sim by reward {by_reward} "
-                     f"{'OK' if ok_r else ('TIE ' + ','.join(ties) if tie_only and ties else 'DIFF')}; "
-                     f"sim by p50 {by_p50} {'OK' if ok_l else 'DIFF'}")
-    lines.append(f"rankings by reward reproduced in {sum(ranking_ok)}/5 phases")
+                f"{100 * m['fast']:5.0f} {m['vc']:7.1f} {100 * m['zero']:5.0f} {m['reward']:7.3f}")
+        want = _oracle_pair_of_phase(p)
+        if want not in cells:
+            lines.append(f"p{p}  oracle {want} not among the checked pairs")
+            continue
+        best = max(cells, key=lambda q: cells[q]["reward"])
+        rest = [cells[q]["reward"] for q in cells if q != want]
+        # A margin under TIE_REWARD (10 ms of latency at equal tps) is a tie, not an order.
+        margin = cells[want]["reward"] - max(rest) if rest else INF
+        verdict = "OK" if margin >= TIE_REWARD else ("TIE" if margin > -TIE_REWARD else "DIFF")
+        oracle_ok.append(verdict == "OK")
+        lines.append(f"p{p}  oracle {want} {cells[want]['reward']:+.3f}; sim best {best} "
+                     f"{cells[best]['reward']:+.3f}; {verdict}")
+    lines.append(f"oracle pair best by reward in {sum(oracle_ok)}/{len(oracle_ok)} phases")
     text = "\n".join(lines)
     if out:
         with open(out, "w") as fh:
@@ -1964,8 +2188,6 @@ def run_check(seeds: int, workers: int, mode: str, pairs: List[Tuple[int, int]],
 # --- Eval: SimReturnGPModel against the oracle on the spec -----------------------------
 
 TIE_REWARD = 0.01
-
-ORACLE_ROWS = [(250, 50), (525, 150), (525, 50), (1100, 150), (1100, 50)]
 
 
 def make_candidate(prior_path: str):
@@ -2004,9 +2226,8 @@ def _eval_rows(kind: str, seed: int, prior: str, rate_tps: float = SPEC_RATE_TPS
     episodes = int(SPEC_RUN_S // EPISODE_S)
     if kind == "oracle":
         def predict(x):
-            # The row of the phase the pair applies in (reply wait later): it switches at onset.
-            p = max(0, sim.phase_index(sim.t / 1000.0 + REPLY_S) - 1)
-            return tuple(float(v) for v in ORACLE_ROWS[p])
+            # The schedule row in force when the pair applies (reply wait later).
+            return oracle_pair(sim.t / 1000.0 + REPLY_S)
         update = None
     else:
         predict, update = make_candidate(prior)
@@ -2016,13 +2237,13 @@ def _eval_rows(kind: str, seed: int, prior: str, rate_tps: float = SPEC_RATE_TPS
 def run_eval(seeds: int, prior: str, rate_tps: float = SPEC_RATE_TPS) -> str:
     from reward_utils import set_reward_design
 
-    set_reward_design("reward_tps_latency")
+    set_reward_design(DEFAULT_REWARD_DESIGN)
     lines = [f"sbft_sim eval prior={prior} seeds={seeds} rate={rate_tps:.0f} "
              f"(phase: candidate p50/tps/reward @T,W | oracle)"]
     for s in range(seeds):
         res = {k: _eval_rows(k, 2000 + s, prior, rate_tps) for k in ("candidate", "oracle")}
         parts = []
-        for p in range(5):
+        for p in range(len(spec_phases())):
             out = []
             for k in ("candidate", "oracle"):
                 sel = [r for r in res[k] if r[0] == p + 1]
@@ -2043,6 +2264,7 @@ def pretrain_adapter():
     constants at SPEC_RATE_TPS, SPEC_START_OFFSET_S, SPEC_RUN_S). Sim phase p + 1 is
     spec phase p."""
     import agent_pb2
+    from continuous_bandit import opening_action_ms
     from pretrain import SimAdapter, timeout_message
 
     def to_timeout(pair: Tuple[float, float]) -> agent_pb2.Timeout:
@@ -2058,14 +2280,17 @@ def pretrain_adapter():
     def spec_run(seed: int) -> Tuple[SbftSim, int]:
         c = SimConstants()
         c.load_tps = SPEC_RATE_TPS
-        sim = SbftSim(c, spec_schedule(), seed=seed, start_offset_s=SPEC_START_OFFSET_S)
+        # The engine opens at the opening pair (--initial-timeout / --initial-slow-path-timeout
+        # in the rows, D10b).
+        t0, w0 = opening_action_ms(agent_pb2.PROTOCOL_SBFT)
+        sim = SbftSim(c, spec_schedule(), seed=seed, start_offset_s=SPEC_START_OFFSET_S,
+                      initial_timeout_ms=float(t0), initial_wait_ms=float(w0))
         return sim, int(SPEC_RUN_S // EPISODE_S)
 
     def oracle(sim: SbftSim) -> Callable[[np.ndarray], Tuple[float, float]]:
         def predict(x: np.ndarray) -> Tuple[float, float]:
-            # The row of the phase the pair applies in (reply wait later): it switches at onset.
-            p = max(0, sim.phase_index(sim.t / 1000.0 + REPLY_S) - 1)
-            return tuple(float(v) for v in ORACLE_ROWS[p])
+            # The schedule row in force when the pair applies (reply wait later).
+            return oracle_pair(sim.t / 1000.0 + REPLY_S)
 
         return predict
 
@@ -2089,6 +2314,9 @@ def pretrain_adapter():
 
 
 def main() -> None:
+    import agent_pb2
+    from continuous_bandit import train_gp_prior
+
     # Both are read by the forked generate() workers; declared here because argparse
     # reads TRAIN_RATE_TPS below for its defaults.
     global NO_PROPOSAL_FAULTS, TRAIN_RATE_TPS
@@ -2096,20 +2324,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
     t = sub.add_parser("train", help="generate randomized episodes and fit the prior")
+    t.add_argument("--code-hash", required=True,
+                   help="code_hash of the tree training the prior (scripts/cloudlab/code_state.py), recorded in the prior and compared with FREEZE by the harness")
     t.add_argument("--runs", type=int, default=4000)
     t.add_argument("--seed", type=int, default=1)
     t.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     t.add_argument("--out", default=DEFAULT_PRIOR_PATH)
-    t.add_argument("--reward-design", default="reward_tps_latency")
+    t.add_argument("--reward-design", default=DEFAULT_REWARD_DESIGN)
     t.add_argument("--no-proposal-faults", action="store_true",
                    help="train on network-delay phases only; the prior never "
                         "sees a delayed or silent proposer")
     t.add_argument("--target-floor", type=float, default=-2.0)
     t.add_argument("--rate", type=float, default=TRAIN_RATE_TPS,
                    help=f"client rate (req/s) the load draw is centred on; each run draws "
-                        f"load_tps over {LOAD_DRAW_FACTORS[0]}-{LOAD_DRAW_FACTORS[1]} x it "
+                        f"load_tps over {LOAD_FACTOR_RANGE[0]}-{LOAD_FACTOR_RANGE[1]} x it "
                         f"(default {TRAIN_RATE_TPS:.0f}, the rate the CloudLab blocks run at)")
-    t.add_argument("--hold-episodes", type=int, default=1,
+    # 3: the spec re-pins the held leader every 60 s, three episodes (2026-10-19, restart D11).
+    t.add_argument("--hold-episodes", type=int, default=3,
                    help="fit the mean reward of holding each action this many episodes")
     t.add_argument("--save-data", default=None, help="also save the generated (x, y) here")
     t.add_argument("--hidden", default="128,128,64", help="MLP hidden layer sizes")
@@ -2119,6 +2350,8 @@ def main() -> None:
     t.add_argument("--probe", type=float, default=0.35,
                    help="with --policy-prior: chance that a decision starts a held probe")
     f = sub.add_parser("fit", help="fit a prior from data saved by train --save-data")
+    f.add_argument("--code-hash", required=True,
+                   help="code_hash of the tree training the prior (scripts/cloudlab/code_state.py), recorded in the prior and compared with FREEZE by the harness")
     f.add_argument("--data", required=True)
     f.add_argument("--out", required=True)
     f.add_argument("--seed", type=int, default=1)
@@ -2128,17 +2361,16 @@ def main() -> None:
     c.add_argument("--seeds", type=int, default=3)
     c.add_argument("--workers", type=int, default=1)
     c.add_argument("--mode", choices=("spec", "cal"), default="spec",
-                   help="spec: the whole 1510 s spec per pair, phase interiors; cal: each phase alone "
+                   help=f"spec: the whole {SPEC_RUN_S:.0f} s spec per pair, phase interiors; cal: each phase alone "
                         "for 130 s from 10 s, episodes 3-5, as the calibration runs")
-    c.add_argument("--pairs", default="ladder", help="ladder | all | T:W,T:W,...")
+    c.add_argument("--pairs", default="ladder", help="ladder (models.py) | all (ladder + off-ladder) | T:W,T:W,...")
     c.add_argument("--out", default=None)
     e = sub.add_parser("eval", help="SimReturnGPModel against the oracle on the spec")
     e.add_argument("--seeds", type=int, default=3)
     e.add_argument("--prior", default=DEFAULT_PRIOR_PATH)
     e.add_argument("--rate", type=float, default=TRAIN_RATE_TPS,
                    help=f"client rate (req/s) to score the prior at (default "
-                        f"{TRAIN_RATE_TPS:.0f}); check stays at {MEASURED_RATE_TPS:.0f}, the "
-                        f"rate of the measured fixture it compares against")
+                        f"{TRAIN_RATE_TPS:.0f}); check stays at {SPEC_RATE_TPS:.0f}")
     args = parser.parse_args()
     from reward_utils import set_reward_design
 
@@ -2166,10 +2398,14 @@ def main() -> None:
                      policy_prior=np.asarray(args.policy_prior or ""), probe=np.asarray(args.probe),
                      **SIM_WINDOWS.arrays())
         hidden = tuple(int(v) for v in args.hidden.split(","))
-        rmse = train_prior(x, y, args.out, args.seed, args.reward_design, args.target_floor,
-                           args.hold_episodes, hidden, args.rate)
+        rmse = train_gp_prior(
+            agent_pb2.PROTOCOL_SBFT, x, y, args.out, seed=args.seed, design=args.reward_design,
+            hold=args.hold_episodes, target_floor=args.target_floor, windows=SIM_WINDOWS,
+            sim_constants=asdict(SimConstants()), code_hash=args.code_hash, hidden=hidden,
+            # Centre of the load draw the episodes were generated at (train --rate).
+            extra={"load_tps": float(args.rate)})
         print(f"samples={len(x)} input_dim={x.shape[1]} runs={args.runs} hold={args.hold_episodes} workers={args.workers} "
-              f"rate={args.rate:.0f} load_draw={LOAD_DRAW_FACTORS[0] * args.rate:.0f}-{LOAD_DRAW_FACTORS[1] * args.rate:.0f} "
+              f"rate={args.rate:.0f} load_draw={LOAD_FACTOR_RANGE[0] * args.rate:.0f}-{LOAD_FACTOR_RANGE[1] * args.rate:.0f} "
               f"gen_s={t_gen:.1f} reward_mean={y.mean():.4f} reward_std={y.std():.4f} "
               f"floored_std={np.maximum(y, args.target_floor).std():.4f} "
               f"floored_share={(y < args.target_floor).mean():.3f} holdout_rmse={rmse:.4f} -> {args.out}")
@@ -2183,16 +2419,18 @@ def main() -> None:
         x, y = data["x"], data["y"]
         hidden = tuple(int(v) for v in args.hidden.split(","))
         t0 = time.time()
-        rmse = train_prior(x, y, args.out, args.seed, str(data["reward_design"]), args.target_floor,
-                           int(data["hold_episodes"]), hidden)
+        rmse = train_gp_prior(
+            agent_pb2.PROTOCOL_SBFT, x, y, args.out, seed=args.seed, design=str(data["reward_design"]),
+            hold=int(data["hold_episodes"]), target_floor=args.target_floor, windows=SIM_WINDOWS,
+            sim_constants=asdict(SimConstants()), code_hash=args.code_hash, hidden=hidden)
         print(f"fit samples={len(x)} hidden={hidden} seed={args.seed} fit_s={time.time() - t0:.0f} "
               f"holdout_rmse={rmse:.4f} -> {args.out}")
         return
     if args.cmd == "check":
         if args.pairs == "ladder":
-            pairs = LADDER_PAIRS
+            pairs = ladder_pairs()
         elif args.pairs == "all":
-            pairs = LADDER_PAIRS + OFF_LADDER_PAIRS
+            pairs = ladder_pairs() + OFF_LADDER_PAIRS
         else:
             pairs = [tuple(int(v) for v in s.split(":")) for s in args.pairs.split(",")]
         print(run_check(args.seeds, args.workers, args.mode, pairs, args.out))

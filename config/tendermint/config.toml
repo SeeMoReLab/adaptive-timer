@@ -206,10 +206,10 @@ flush_throttle_timeout = "10ms"
 max_packet_msg_payload_size = 1024
 
 # Rate at which packets can be sent, in bytes/second
-send_rate = 5120000
+send_rate = 50000000
 
 # Rate at which packets can be received, in bytes/second
-recv_rate = 5120000
+recv_rate = 50000000
 
 # Set true to enable the peer-exchange reactor
 pex = true
@@ -329,16 +329,18 @@ version = "v0"
 
 wal_file = "data/cs.wal/wal"
 
-# How long we wait for a proposal block before prevoting nil
-timeout_propose = "300ms"
+# How long we wait for a proposal block before prevoting nil. The middle rung of the 100/200/400
+# ladder, where every model opens (Kevin, 2026-10-19, restart D10b); prevote and
+# precommit are propose / 3, as the agent derives them. In force until the first decision (~9 s).
+timeout_propose = "200ms"
 # How much timeout_propose increases with each round
 timeout_propose_delta = "150ms"
 # How long we wait after receiving +2/3 prevotes for “anything” (ie. not a single block or nil)
-timeout_prevote = "100ms"
+timeout_prevote = "67ms"
 # How much the timeout_prevote increases with each round
 timeout_prevote_delta = "50ms"
 # How long we wait after receiving +2/3 precommits for “anything” (ie. not a single block or nil)
-timeout_precommit = "100ms"
+timeout_precommit = "67ms"
 # How much the timeout_precommit increases with each round
 timeout_precommit_delta = "50ms"
 # How long we wait after committing a block, before starting on the new
@@ -355,10 +357,10 @@ double_sign_check_height = 0
 # Wall-clock learning window durations. Each episode collects features for
 # feature_duration, waits reply_wait for the agent's prediction, applies it and
 # discards warmup_duration, then collects the reward for reward_duration.
-adaptive_timer_feature_duration = "8s"
+adaptive_timer_feature_duration = "7s"
 adaptive_timer_reply_wait = "2s"
-adaptive_timer_warmup_duration = "2s"
-adaptive_timer_reward_duration = "8s"
+adaptive_timer_warmup_duration = "4s"
+adaptive_timer_reward_duration = "7s"
 
 # Make progress as soon as we have all the precommits (as if TimeoutCommit = 0)
 skip_timeout_commit = true
@@ -380,7 +382,7 @@ peer_query_maj23_sleep_duration = "2s"
 # considerable amount of disk space. Set to false to ensure ABCI responses are
 # persisted. ABCI responses are required for /block_results RPC queries, and to
 # reindex events in the command-line tool.
-discard_abci_responses = false
+discard_abci_responses = true
 
 #######################################################
 ###   Transaction Indexer Configuration Options     ###

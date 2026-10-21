@@ -1,4 +1,18 @@
 # time_s,timeout_ms
+# Current oracle (2026-10-19, restart from scratch; generated from this file's rows and
+# config/pbft/failure_spec.xml, values unchanged). Rows sit on the onsets (atTime); the oracle never
+# switches before a fault starts. Episode e applies at warmUpTime + 20*(e-1) and takes the last row
+# with time_s <= 20*(e-1); the leading -10 row is the warm-up row.
+#
+#   p0 @0     base                                   250
+#   p1 @300   base + hold D300                       250
+#   p2 @600   base + hold D550                       250
+#   p3 @900   5+50                                   550
+#   p4 @1200  5+50 + hold D500                       550
+#   p5 @1500  5+150                                  1200
+#   p6 @1800  base                                   250
+#
+# History (older ladders, rates and specs; superseded where it disagrees with the block above):
 # CppBedrock PBFT: election (view-change) timeout.
 # Best value per phase of config/pbft/failure_spec.xml. Calibrated at
 # 20,000 requests/s on CloudLab with the consensus window at 16 batches in
@@ -37,9 +51,12 @@
 # 778 tps across two runs, against 19,604 and worse-case-19,994 for 600, and
 # mean reward is 3.18 to 3.27 against 3.47 to 3.66. The phase is labelled 600.
 #
-# Rows sit on the phase boundaries (atTime; with the leading -10 row a switch
-# written at T fires at warmUpTime + T): Kevin's rule, the oracle switches at
-# onset, never before (2026-10-07; it switched 10 s early before).
+# Rows sit on the phase boundaries (atTime): Kevin's rule, the oracle switches at
+# onset, never before (2026-10-07; it switched 10 s early before). The row is
+# picked by episode number: episode e applies at warmUpTime + P*(e-1) (P =
+# --episode-ms, 20 s) and takes the last row with time_s <= P*(e-1), so a switch
+# written at T fires at warmUpTime + T. Non-negative rows must be multiples of P;
+# the leading -10 row is the warm-up row and counts for every episode.
 -10,250
 0,250
 900,550

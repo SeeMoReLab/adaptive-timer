@@ -1,7 +1,7 @@
 from collections import deque
 import inspect
 import math
-from typing import Deque, Optional, Sequence, Tuple
+from typing import Deque, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -71,6 +71,7 @@ class LatencyFloor:
         quantile: float = DEFAULT_LATENCY_FLOOR_QUANTILE,
         max_floor_ms: Optional[float] = None,
         field: str = "avg_consensus_latency_ms",
+        offset_ms: float = 0.0,
     ) -> None:
         if not math.isfinite(multiplier) or multiplier <= 0.0:
             raise ValueError(f"multiplier must be > 0, got {multiplier}")
@@ -80,11 +81,16 @@ class LatencyFloor:
             raise ValueError(f"quantile must be in [0, 1], got {quantile}")
         if max_floor_ms is not None and max_floor_ms <= 0.0:
             raise ValueError(f"max_floor_ms must be > 0, got {max_floor_ms}")
+        if not math.isfinite(offset_ms) or offset_ms < 0.0:
+            raise ValueError(f"offset_ms must be >= 0, got {offset_ms}")
 
         self._multiplier = float(multiplier)
         self._window = int(window)
         self._quantile = float(quantile)
         self._max_floor_ms = None if max_floor_ms is None else float(max_floor_ms)
+        # A constant part of the time the timer covers that the signal does not carry
+        # (continuous_bandit.FLOOR_SPECS: PBFT/SBFT's proposal interval).
+        self._offset_ms = float(offset_ms)
         self.field = field  # the report field observe() is fed from (model_builder)
         self.reset()
 
@@ -110,7 +116,7 @@ class LatencyFloor:
         healthy_ms = float(
             np.quantile(np.asarray(self._latencies, dtype=float), self._quantile)
         )
-        floor_ms = self._multiplier * healthy_ms
+        floor_ms = self._multiplier * healthy_ms + self._offset_ms
         if self._max_floor_ms is not None:
             floor_ms = min(floor_ms, self._max_floor_ms)
         return floor_ms
@@ -157,17 +163,14 @@ class LatencyFloorPolicy(TensorModel):
         self,
         model: TensorModel,
         timeouts_ms: Sequence[int],
-        latency_index: int,
+        latency_index: Union[int, Sequence[int]],
         n_features: int,
         instances_index: Optional[int] = None,
         latency_floor: Optional[LatencyFloor] = None,
     ) -> None:
         if n_features <= 0:
             raise ValueError(f"n_features must be > 0, got {n_features}")
-        if not 0 <= int(latency_index) < n_features:
-            raise ValueError(
-                f"latency_index must be in [0, {n_features}), got {latency_index}"
-            )
+        latency_index = latency_indices(latency_index, n_features)
         if instances_index is not None and not 0 <= int(instances_index) < n_features:
             raise ValueError(
                 f"instances_index must be in [0, {n_features}), got {instances_index}"
@@ -178,7 +181,7 @@ class LatencyFloorPolicy(TensorModel):
 
         self._model = model
         self._timeouts = timeouts
-        self._latency_index = int(latency_index)
+        self._latency_index = latency_index
         self._instances_index = (
             None if instances_index is None else int(instances_index)
         )
@@ -198,7 +201,7 @@ class LatencyFloorPolicy(TensorModel):
         alive = True
         if self._instances_index is not None:
             alive = float(row[self._instances_index]) > 0.0
-        self._latency_floor.observe(float(row[self._latency_index]), alive=alive)
+        self._latency_floor.observe(sum(float(row[i]) for i in self._latency_index), alive=alive)
 
     def _preferred_index(self, scores: np.ndarray) -> int:
         if scores.size == 1:
@@ -284,13 +287,31 @@ class LatencyFloorPolicy(TensorModel):
         self._model.reset_model()
 
 
+def signal_fields(signal: str) -> Tuple[str, ...]:
+    """The report fields of a latency signal: one field name, or several joined by
+    "+" and summed per window (SBFT's three phase latencies, 2026-10-14)."""
+    fields = tuple(name.strip() for name in signal.split("+"))
+    if not signal or any(not name for name in fields):
+        raise ValueError(f"signal must be report field names joined by '+', got {signal!r}")
+    return fields
+
+
+def latency_indices(latency_index: Union[int, Sequence[int]], n_features: int) -> Tuple[int, ...]:
+    """The feature indices a floor sums for its latency, each checked against n_features."""
+    indices = (int(latency_index),) if isinstance(latency_index, int) else tuple(int(i) for i in latency_index)
+    if not indices or any(not 0 <= i < int(n_features) for i in indices):
+        raise ValueError(f"latency_index must be in [0, {n_features}), got {latency_index}")
+    return indices
+
+
 def latency_feature_indices(
     feature_names: Sequence[str],
     latency_field: str = "avg_consensus_latency_ms",
-) -> Tuple[int, Optional[int]]:
-    """(latency index, liveness index) for a protocol's feature vector."""
+) -> Tuple[Tuple[int, ...], Optional[int]]:
+    """(latency indices, liveness index) for a protocol's feature vector; the
+    latency is the sum of the fields of ``latency_field`` (see signal_fields)."""
     names = list(feature_names)
-    latency_index = names.index(latency_field)
+    latency_index = tuple(names.index(name) for name in signal_fields(latency_field))
     instances_index = (
         names.index("total_consensus_instances")
         if "total_consensus_instances" in names

@@ -22,11 +22,7 @@ from threadpoolctl import threadpool_limits
 import agent_pb2
 import agent_pb2_grpc
 from aggregator import BaseAggregator, MedianAggregator, WeightedMedianAggregator
-from continuous_bandit import (
-    DEFAULT_WAIT_DIVISOR,
-    heuristic_spec,
-)
-from latency_floor import LatencyFloor
+from continuous_bandit import make_latency_floor
 from model_builder import PRETRAINABLE_MODEL_TYPES, build_model
 from prior_windows import PriorWindows
 from models import (
@@ -38,6 +34,7 @@ from models import (
     get_report_field_names,
     reject_renamed_model_type,
     report_to_values,
+    set_pbft_timeout_ladder,
 )
 from reward_utils import (
     DEFAULT_REWARD_DESIGN,
@@ -351,20 +348,19 @@ def _fill_empty_window_latency(
     waited at least the window whenever one was pending at its start. Kevin
     ruled it for SBFT (2026-10-01), HotStuff (2026-10-02), and Autobahn,
     PBFT, SmartBFT and Tendermint (2026-10-07, after a SmartBFT prior learned
-    to stall at 5+150). In a SmartBFT reward window, one that decided
-    something but has no latency sample counts as empty too: a decision
-    reached through sync carries no submit mark on the replica, and those
-    windows are stalls (one batch in 5 s). Only the reward window: a feature
-    report with commits is read as a measurement by the latency floor and
-    continuous_heuristic, which drop only windows without commits, so there
-    it keeps its 0. Applied to the report the model reads - the 2f+1 median in
-    sharing mode - so it marks a stall of the cluster; a lone replica that
-    executed nothing while the others served keeps its 0 in the median.
-    Returns whether the window was empty.
+    to stall at 5+150). A window that committed something but has no latency
+    sample counts as empty too, on every protocol and in feature and reward
+    windows alike (Kevin, 2026-10-19, restart D15; until then only a SmartBFT
+    reward window, where a decision reached through sync carries no submit mark
+    and those windows are stalls, one batch in 5 s). Applied to the report the
+    model reads - the 2f+1 median in sharing mode - so it marks a stall of the
+    cluster; a lone replica that executed nothing while the others served keeps
+    its 0 in the median. Returns whether the window was empty.
     """
-    empty = int(state.total_consensus_instances) == 0
-    if reward_window and protocol == agent_pb2.PROTOCOL_SMARTBFT:
-        empty = empty or float(state.p50_consensus_latency_ms) <= 0.0
+    empty = (
+        int(state.total_consensus_instances) == 0
+        or float(state.p50_consensus_latency_ms) <= 0.0
+    )
     if not empty:
         return False
     # Every report carries all four consensus-latency statistics.
@@ -790,6 +786,8 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
         self._dataset_timeout_field_names = _dataset_timeout_field_names(self._protocol)
         self._dataset_handle = None
         self._dataset_writer = None
+        # episode -> this replica's own feature-window transactions, until the row is written.
+        self._local_feature_transactions: Dict[int, int] = {}
         self._setup_dataset_csv(dataset_csv)
 
     def _setup_dataset_csv(self, dataset_csv: Optional[Path]) -> None:
@@ -810,6 +808,11 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 for field_name in self._report_field_names
             ),
             *self._dataset_timeout_field_names,
+            # This replica's own feature report, before any aggregation: in sharing mode the
+            # feature_/reward_ columns are the 2f+1 aggregate, the same on every replica, so a
+            # replica that stops delivering shows only here (validate.py's stuck-replica flag;
+            # 2026-10-19, restart).
+            "local_feature_total_transactions",
         ]
         write_header = not dataset_csv.exists() or dataset_csv.stat().st_size == 0
         if not write_header:
@@ -932,7 +935,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 setattr(dirty_report, field, previous)
 
     def _dirty_pbft_state(self, state: object) -> object:
-        """Dirty the layout PbftReport, SbftReport and SmartbftReport share (no phases)."""
+        """Dirty the layout PbftReport, SbftReport and SmartbftReport share (no phase fields)."""
         baseline_total_tx = max(int(state.total_transactions), 1)
         baseline_total_cons = max(int(state.total_consensus_instances), 1)
         dirty_report = state.__class__()
@@ -1305,15 +1308,27 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             self._dirty_phase_latencies(dirty_report, state, ("pre_prepare", "prepare", "commit"))
             return dirty_report
         if self._protocol == agent_pb2.PROTOCOL_SMARTBFT:
-            return self._dirty_pbft_state(state)
+            dirty_report = self._dirty_pbft_state(state)
+            dirty_report.proposal_to_decision_ms = float(
+                max(0.0, float(state.proposal_to_decision_ms) * self._rng.uniform(0.4, 2.0))
+            )
+            return dirty_report
         if self._protocol == agent_pb2.PROTOCOL_SBFT:
             return self._dirty_sbft_state(state)
         if self._protocol == agent_pb2.PROTOCOL_TENDERMINT:
             return self._dirty_tendermint_state(state)
         if self._protocol == agent_pb2.PROTOCOL_HOTSTUFF:
-            return self._dirty_hotstuff_state(state)
+            dirty_report = self._dirty_hotstuff_state(state)
+            dirty_report.proposal_to_qc_ms = float(
+                max(0.0, float(state.proposal_to_qc_ms) * self._rng.uniform(0.4, 2.0))
+            )
+            return dirty_report
         if self._protocol == agent_pb2.PROTOCOL_AUTOBAHN:
-            return self._dirty_autobahn_state(state)
+            dirty_report = self._dirty_autobahn_state(state)
+            dirty_report.prepare_to_commit_ms = float(
+                max(0.0, float(state.prepare_to_commit_ms) * self._rng.uniform(0.4, 2.0))
+            )
+            return dirty_report
         raise ValueError(f"Unsupported protocol: {self._protocol}")
 
     def _log_completed_episode_row_locked(
@@ -1339,6 +1354,7 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
                 *feature_values,
                 *reward_values,
                 *timeout_values,
+                self._local_feature_transactions.pop(episode, ""),
             ]
         )
         self._dataset_handle.flush()
@@ -1369,6 +1385,8 @@ class LearningAgentServicer(agent_pb2_grpc.LearningAgentServicer):
             window_consensus_count=request.window_consensus_count,
         )
         _set_state(local_report, self._protocol, incoming_state)
+        with self._lock:
+            self._local_feature_transactions[int(request.episode)] = int(incoming_state.total_transactions)
         if self._sharing and request.HasField("reward"):
             # In sharing mode the reward travels with the report so that it is
             # aggregated by the same consensus batch that carries the features.
@@ -2042,7 +2060,6 @@ def serve(
     heuristic_quantile: float,
     latency_floor_multiplier: float,
     prior_path: Optional[str],
-    wait_divisor: float,
     dataset_csv: Optional[Path],
     failure_spec: Optional[Path],
     injection_start_unix_ms: Optional[int],
@@ -2087,22 +2104,12 @@ def serve(
         )
         consensus_stub = agent_pb2_grpc.ConsensusStub(consensus_channel)
 
-    # The floor reads continuous_heuristic's latency estimate (its signal, window
-    # and quantile, HEURISTIC_SPECS): those were chosen to resist the latency a
-    # badly chosen timeout causes (Tendermint's p50 stays flat under the delayed
-    # proposer while the mean follows T; PBFT's 4-window minimum resets on an
-    # escape). Kevin 2026-10-10; the window mean it read before locked the floor
-    # high under the proposer attack (E1/E1v2, Tendermint p3).
-    hspec = heuristic_spec(protocol) if latency_floor_multiplier > 0.0 else None
+    # The protocol's floor (continuous_bandit.FLOOR_SPECS: its hold-free signal, multiplier
+    # and offset, last window; Kevin 2026-10-19), scaled by --latency-floor-multiplier.
     latency_floor = (
-        None
-        if hspec is None
-        else LatencyFloor(
-            multiplier=latency_floor_multiplier,
-            window=hspec.window if heuristic_window is None else heuristic_window,
-            quantile=hspec.quantile if heuristic_quantile is None else heuristic_quantile,
-            field=hspec.signal,
-        )
+        make_latency_floor(protocol, latency_floor_multiplier)
+        if latency_floor_multiplier > 0.0
+        else None
     )
     built = build_model(
         protocol,
@@ -2120,7 +2127,6 @@ def serve(
         heuristic_multiplier=heuristic_multiplier,
         heuristic_window=heuristic_window,
         heuristic_quantile=heuristic_quantile,
-        wait_divisor=wait_divisor,
     )
     model = built.model
     action_codec = built.action_codec
@@ -2137,8 +2143,8 @@ def serve(
         threadpool_limits(limits=1, user_api="blas")
     if latency_floor is not None:
         print(
-            f"[latency_floor] multiplier={latency_floor_multiplier:g} "
-            f"signal={latency_floor.field} window={latency_floor._window} quantile={latency_floor._quantile:g} "
+            f"[latency_floor] scale={latency_floor_multiplier:g} floor={latency_floor._multiplier:g} x "
+            f"{latency_floor.field} + {latency_floor._offset_ms:g} ms, window={latency_floor._window} "
             f"applied to {model_type}"
         )
 
@@ -2397,30 +2403,22 @@ def main():
         default=0.0,
         help=(
             "Domain constraint for every model except scheduled: never apply a "
-            "timeout below this multiplier times the consensus latency the "
-            "replicas are already achieving, estimated as continuous_heuristic "
-            "estimates it (the protocol's HEURISTIC_SPECS signal, window and "
-            "quantile). The multiplier is the share of that latency the "
-            "protocol's timer must cover: about 1/3 on Tendermint (the propose "
-            "timeout covers only the propose step), 1 for a request timer that "
-            "covers the whole commit. A timeout under it cannot be met, so it "
-            "buys view changes and stalls throughput. 0 disables the "
-            "constraint (default: 0)."
+            "timeout below the protocol's latency floor (continuous_bandit."
+            "FLOOR_SPECS: its share of the time its timer covers, rebuilt from "
+            "a signal a leader's proposal hold never enters, on the last "
+            "committing window), times this scale. 1 is the floor as defined; "
+            "0 disables the constraint (default: 0)."
         ),
     )
     parser.add_argument(
-        "--wait-divisor",
-        type=float,
-        default=DEFAULT_WAIT_DIVISOR,
+        "--timeout-ladder",
+        type=str,
+        default=None,
         help=(
-            "SBFT only: the models that control one timeout - "
-            "continuous_heuristic, continuous_linucb and continuous_ppo - pair their election timeout T with a "
-            "fast-path wait W = clamp(T / this, 10..500 ms). Both quantities "
-            "carry the same one-way-delay term, so a T that has tracked the "
-            "delay drags W with it. Measured on sbft_sim: holding the phase's "
-            "best T, 8 costs a mean 0.038 reward against the best W at that T "
-            "(12 costs 0.084, 5 costs 0.289). --model-type=continuous_gp and "
-            f"discrete_gp search both dimensions and ignore this (default: {DEFAULT_WAIT_DIVISOR:g})."
+            "PBFT only, discrete models only: comma-separated election timeout "
+            "rungs in ms replacing the 250,550,1200 ladder for this run "
+            "(runs/2026-10-18-pbft-ladder-variants). A discrete_linucb or "
+            "discrete_ppo prior must have been pretrained on the same ladder."
         ),
     )
     parser.add_argument(
@@ -2539,6 +2537,17 @@ def main():
         if not Path(prior_path).is_file():
             parser.error(f"--prior-path {prior_path} does not exist")
 
+    if args.timeout_ladder is not None:
+        if args.protocol != agent_pb2.PROTOCOL_PBFT:
+            parser.error("--timeout-ladder is supported only with --protocol pbft")
+        if not args.model_type.startswith("discrete_"):
+            parser.error(f"--timeout-ladder applies to the discrete models, not --model-type={args.model_type}")
+        try:
+            set_pbft_timeout_ladder([int(v) for v in args.timeout_ladder.split(",")])
+        except ValueError as exc:
+            parser.error(f"--timeout-ladder {args.timeout_ladder!r}: {exc}")
+        print(f"[ladder] pbft rungs={args.timeout_ladder}")
+
     # Process-wide, before any report is scored; see reward_utils.
     set_reward_design(args.reward_design)
     print(f"[reward] design={args.reward_design}")
@@ -2564,7 +2573,6 @@ def main():
         heuristic_quantile=args.heuristic_quantile,
         latency_floor_multiplier=args.latency_floor_multiplier,
         prior_path=prior_path,
-        wait_divisor=args.wait_divisor,
         dataset_csv=args.dataset_csv,
         failure_spec=args.failure_spec,
         injection_start_unix_ms=args.injection_start_unix_ms,

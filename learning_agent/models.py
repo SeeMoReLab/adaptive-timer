@@ -70,6 +70,25 @@ PBFT_TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
 }
 
 
+def set_pbft_timeout_ladder(values_ms: Sequence[int]) -> None:
+    """Replace the PBFT ladder for this process (main.py and pretrain.py
+    --timeout-ladder; runs/2026-10-18-pbft-ladder-variants). Every PBFT
+    accessor below reads these globals at call time, so the discrete models,
+    the codecs and the prior metadata all follow; call it before any model is
+    built. Rungs must be distinct, ascending and inside the PBFT context
+    bounds (100-3000 ms) that discrete_gp normalizes over."""
+    global PBFT_TIMEOUT_VALUES_MS, PBFT_TIMEOUT_MS_TO_INDEX
+    values = tuple(int(v) for v in values_ms)
+    if len(values) < 2:
+        raise ValueError(f"a PBFT ladder needs at least two rungs, got {values}")
+    if list(values) != sorted(set(values)):
+        raise ValueError(f"PBFT ladder rungs must be distinct and ascending, got {values}")
+    if values[0] < 100 or values[-1] > 3000:
+        raise ValueError(f"PBFT ladder rungs must lie in 100..3000 ms, got {values}")
+    PBFT_TIMEOUT_VALUES_MS = values
+    PBFT_TIMEOUT_MS_TO_INDEX = {value_ms: idx for idx, value_ms in enumerate(values)}
+
+
 class SmartbftTimeoutOption(IntEnum):
     # SmartBFT keeps its own ladder, Kevin 2026-09-29 23:41: 300/800/1800
     # (the schedule and the 2026-09-12 dataset use it).
@@ -92,17 +111,23 @@ SMARTBFT_TIMEOUT_MS_TO_INDEX: Dict[int, int] = {
 
 
 class TimeoutOption(IntEnum):
-    # Each rung sits just under the SBFT fast-path election floor of the next
-    # link level (150 / 275 / 600 at base / 5+50 / 5+150), so it survives its
-    # own level and storms one level up. See runs/2026-09-27-sbft-pairs.
+    # One rung per link level (base / 5+50 / 5+150). Each rung clears its own
+    # level's fast-path floor (150 / 275 / 620) and is punished one level down by
+    # the slow-leader hold it tolerates (D150 at base, D550 at 5+50) and one
+    # level up by the floor at the +150 onset. 525/1100 -> 550/1200 on
+    # 2026-10-13 (Kevin, runs/2026-10-12-sbft-margins at 20,000 req/s); the
+    # PBFT ladder uses the same values. 550/1200 -> 650/1600 on 2026-10-17 (Kevin,
+    # runs/2026-10-16-sbft-stability, the adopted oracle's rungs): 550 was 1.0x p3's
+    # slow-path bound (125 + 5x55 + 150), under the 1.1x rule; at 1300 healthy +150
+    # ages reached the deadline and the straggler elected alone. PBFT keeps 550/1200.
     TIMEOUT_250_MS = 250
-    TIMEOUT_525_MS = 525
-    TIMEOUT_1100_MS = 1100
+    TIMEOUT_650_MS = 650
+    TIMEOUT_1600_MS = 1600
 
 TIMEOUT_OPTIONS: Tuple[TimeoutOption, ...] = (
     TimeoutOption.TIMEOUT_250_MS,
-    TimeoutOption.TIMEOUT_525_MS,
-    TimeoutOption.TIMEOUT_1100_MS,
+    TimeoutOption.TIMEOUT_650_MS,
+    TimeoutOption.TIMEOUT_1600_MS,
 )
 TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(int(option) for option in TIMEOUT_OPTIONS)
 # The slow-path wait needs only two values, not the three the election timeout
@@ -112,12 +137,15 @@ TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(int(option) for option in TIMEOUT_OPT
 # A third value earns a place only when two different lags both fall inside
 # the window (floor, floor + R), and R, the extra round, is 2 * one_way + 25
 # ms, so that window is 39 ms wide at base delay. See adaptive_timers.MD.
+# The floor is 10 since 2026-10-17 (Kevin, runs/2026-10-16-sbft-stability): with no
+# straggler the n-th prepare lands 1-2 ms after the 2f+1-th, and where the slow path
+# wins giving up at once is 40 ms faster than at 50.
 class SbftSlowPathOption(IntEnum):
-    TIMEOUT_50_MS = 50
+    TIMEOUT_10_MS = 10
     TIMEOUT_150_MS = 150
 
 SBFT_SLOW_PATH_OPTIONS: Tuple[SbftSlowPathOption, ...] = (
-    SbftSlowPathOption.TIMEOUT_50_MS,
+    SbftSlowPathOption.TIMEOUT_10_MS,
     SbftSlowPathOption.TIMEOUT_150_MS,
 )
 SBFT_SLOW_PATH_VALUES_MS: Tuple[int, ...] = tuple(
@@ -218,7 +246,12 @@ AUTOBAHN_TIMEOUT_DELAY_MS_TO_INDEX: Dict[int, int] = {
 }
 
 
-PBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
+# The *_REPORT_FEATURE_FIELD_NAMES tuples are every model's input. None holds
+# the applied timeout (timeout_ms, SBFT's slow_path_timeout_ms): as an input, a
+# model's own last pick fed its next one (H15, the GP's two-cycle; Kevin,
+# 2026-10-19, restart D9a). The dataset, the reward and the action decoding read
+# it from the report itself, the SBFT heuristic from its own held action.
+_BASE_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "total_transactions",
     "total_consensus_instances",
     "avg_consensus_latency_ms",
@@ -229,44 +262,68 @@ PBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "p95_batch_size",
     "leader_change_count",
     "regency_change_count",
-    "timeout_ms",
     "avg_inter_commit_gap_ms",
     "p50_inter_commit_gap_ms",
     "p95_inter_commit_gap_ms",
     "view_change_count",
     "no_progress_view_change_count",
 )
-# SbftReport shares PbftReport's 16-field layout and adds the SBFT-specific
-# phase latencies and slow-path context (see proto/agent.proto). The n-th
-# prepare fields are measured by the leader only (aggregator.py takes them from
-# the report that led the most sequences).
-SBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = PBFT_REPORT_FEATURE_FIELD_NAMES + (
+# The 15 base fields plus the phase latencies (window means, proto fields
+# 17-19): a leader's proposal hold precedes the pre-prepare, so it enters the
+# consensus latency but none of the phases, and a model that reads both can
+# tell a held leader from a slow link (Kevin, 2026-10-14,
+# runs/2026-10-14-five-machine-models: the pretrained GP on the base fields
+# alone tolerated every hold).
+PBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = _BASE_REPORT_FEATURE_FIELD_NAMES + (
     "pre_prepare_latency_ms",
     "prepare_latency_ms",
     "commit_latency_ms",
-    "slow_path_timeout_ms",
+)
+# SmartBFT exports no per-phase stamps; its one phase field is proposal arrival
+# (a follower's VerifyProposal) -> delivery, PBFT's three phases together, for
+# the same reason (Kevin, 2026-10-18: at T 1800 the pretrained discrete GP read
+# the p4 hold, +50 with D300, exactly as the p5 +150 link, every base field
+# equal, and kept 1800 through p4; a26_discrete_gp_pre_setA_20261016_072711).
+SMARTBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = _BASE_REPORT_FEATURE_FIELD_NAMES + (
+    "proposal_to_decision_ms",
+)
+# SbftReport shares PbftReport's 16-field layout and adds the SBFT-specific
+# phase latencies and slow-path context (see proto/agent.proto), less the
+# applied wait (D9a, above). The n-th prepare fields are measured by the leader
+# only (aggregator.py takes them from the report that led the most sequences).
+SBFT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = _BASE_REPORT_FEATURE_FIELD_NAMES + (
+    "pre_prepare_latency_ms",
+    "prepare_latency_ms",
+    "commit_latency_ms",
     "fast_path_count",
     "slow_path_count",
     "nth_prepare_gap_ms",
     "nth_prepare_seen_count",
     "nth_prepare_unseen_count",
 )
+# The base fields' latency, batch and inter-commit-gap statistics (p95, not the
+# p90 the list read until 2026-10-19), the violation rate in place of the view
+# change counts, and the three step latencies (Kevin, 2026-10-19, restart: one
+# report shape on all six).
 TENDERMINT_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "total_transactions",
     "total_consensus_instances",
     "avg_consensus_latency_ms",
     "p50_consensus_latency_ms",
-    "p90_consensus_latency_ms",
+    "p95_consensus_latency_ms",
     "throughput_tps",
     "timeout_violation_rate",
     "avg_batch_size",
     "p50_batch_size",
-    "p90_batch_size",
+    "p95_batch_size",
     "leader_change_count",
     "regency_change_count",
     "propose_latency_ms",
     "prevote_latency_ms",
     "precommit_latency_ms",
+    "avg_inter_commit_gap_ms",
+    "p50_inter_commit_gap_ms",
+    "p95_inter_commit_gap_ms",
 )
 HOTSTUFF_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "total_transactions",
@@ -279,12 +336,15 @@ HOTSTUFF_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "p95_batch_size",
     "leader_change_count",
     "regency_change_count",
-    "timeout_ms",
     "avg_inter_commit_gap_ms",
     "p50_inter_commit_gap_ms",
     "p95_inter_commit_gap_ms",
     "view_change_count",
     "no_progress_view_change_count",
+    # The next leader's block receipt to its QC: a proposer's hold never enters it,
+    # so it separates a slow leader from a slow link (2026-10-19, as SmartBFT's
+    # proposal_to_decision_ms).
+    "proposal_to_qc_ms",
 )
 # AutobahnReport has HotstuffReport's layout without regency_change_count.
 AUTOBAHN_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
@@ -297,12 +357,13 @@ AUTOBAHN_REPORT_FEATURE_FIELD_NAMES: Tuple[str, ...] = (
     "avg_batch_size",
     "p95_batch_size",
     "leader_change_count",
-    "timeout_ms",
     "avg_inter_commit_gap_ms",
     "p50_inter_commit_gap_ms",
     "p95_inter_commit_gap_ms",
     "view_change_count",
     "no_progress_view_change_count",
+    # Prepare receipt to slot commit: the leader's hold never enters it (2026-10-19).
+    "prepare_to_commit_ms",
 )
 
 
@@ -328,8 +389,10 @@ def _validate_protocol(protocol: int) -> int:
 
 def get_report_feature_field_names(protocol: int) -> Tuple[str, ...]:
     protocol = _validate_protocol(protocol)
-    if protocol in (agent_pb2.PROTOCOL_PBFT, agent_pb2.PROTOCOL_SMARTBFT):
+    if protocol == agent_pb2.PROTOCOL_PBFT:
         return PBFT_REPORT_FEATURE_FIELD_NAMES
+    if protocol == agent_pb2.PROTOCOL_SMARTBFT:
+        return SMARTBFT_REPORT_FEATURE_FIELD_NAMES
     if protocol == agent_pb2.PROTOCOL_SBFT:
         return SBFT_REPORT_FEATURE_FIELD_NAMES
     if protocol == agent_pb2.PROTOCOL_HOTSTUFF:
@@ -365,7 +428,8 @@ def get_report_field_names(protocol: int) -> Tuple[str, ...]:
 
     The dataset columns and the sharing-mode median use this, so a report field
     added to proto/agent.proto reaches both with no hand list. The model inputs
-    are the *_REPORT_FEATURE_FIELD_NAMES tuples above, a subset of it.
+    are the *_REPORT_FEATURE_FIELD_NAMES tuples above, a subset of it without
+    the applied timeouts.
     """
     fields = report_message_class(protocol).DESCRIPTOR.fields
     return tuple(f.name for f in sorted(fields, key=lambda f: f.number))
@@ -1117,6 +1181,12 @@ class DiscountedLinUCB(TensorModel):
     signed-log and row normalization keeps the ridge system conditioned without
     requiring a fitted scaler whose changing coordinates would invalidate the
     accumulated sufficient statistics.
+
+    Rewards are centred on a discounted running mean (Kevin, 2026-10-19, restart D9d;
+    as ContinuousLinUCB): an unplayed arm's mean decays toward 0, which uncentred
+    reads as worthless in a phase with positive rewards and as good in one with
+    negative rewards, so exploration depended on the reward's sign. Centred, 0 is
+    "average". The prior fit centres on the mean of its samples.
     """
 
     def __init__(
@@ -1125,16 +1195,21 @@ class DiscountedLinUCB(TensorModel):
         n_features: int,
         confidence_scale: float = 1.0,
         discount_factor: float = 0.95,
-        exploration_floor: float = 0.05,
+        # 0 since 2026-10-19 (was 0.05; Kevin, runs/2026-10-19-linucb-discount): the random share cost HotStuff
+        # about 0.15 (a random low rung at 5+150 collapses rounds) and nothing measurable elsewhere.
+        exploration_floor: float = 0.0,
         ridge: float = 1.0,
         reward_scale: float = 1.0,
         seed: Optional[int] = None,
         prior_theta: Optional[np.ndarray] = None,
+        opening_arm: Optional[int] = None,
     ) -> None:
         if action_dim <= 0:
             raise ValueError(f"action_dim must be > 0, got {action_dim}")
         if n_features <= 0:
             raise ValueError(f"n_features must be > 0, got {n_features}")
+        if opening_arm is not None and not 0 <= opening_arm < action_dim:
+            raise ValueError(f"opening_arm must be in [0, {action_dim}), got {opening_arm}")
         if confidence_scale < 0.0:
             raise ValueError(
                 f"confidence_scale must be >= 0, got {confidence_scale}"
@@ -1161,6 +1236,12 @@ class DiscountedLinUCB(TensorModel):
         self._ridge = float(ridge)
         self._reward_scale = float(reward_scale)
         self._seed = seed
+        # Unplayed arms are tried first, the opening arm (the ladder's middle rung; Kevin,
+        # 2026-10-19, restart D10b: every model opens there) before the others in index order.
+        self._unplayed_order = (
+            ([int(opening_arm)] if opening_arm is not None else [])
+            + [a for a in range(self._action_dim) if a != opening_arm]
+        )
         # Prior mean of each arm's coefficients, in the _contexts space and in
         # reward / reward_scale units: b starts at ridge * theta0 and the
         # discount pulls it back there, so an unplayed arm's mean decays to
@@ -1213,7 +1294,7 @@ class DiscountedLinUCB(TensorModel):
             if not np.any(selected):
                 raise ValueError(f"arm {arm} has no samples to fit a prior on")
             x = contexts[selected]
-            y = reward_values[selected] / self._reward_scale
+            y = (reward_values[selected] - float(np.mean(reward_values))) / self._reward_scale
             theta[arm] = np.linalg.solve(self._ridge * identity + x.T @ x, x.T @ y)
         return theta
 
@@ -1273,8 +1354,12 @@ class DiscountedLinUCB(TensorModel):
 
             best = float(np.max(row))
             if not np.isfinite(best):
-                # Unseen arms deliberately retain equal +inf scores. Numpy's
-                # argmax initializes them in index order as rewards arrive.
+                # Unplayed arms score +inf; rank them in _unplayed_order with large finite
+                # scores so the codec's argmax (and a floor wrapper hiding arms under it)
+                # takes the first unplayed arm in that order.
+                unplayed = [a for a in self._unplayed_order if not np.isfinite(row[a])]
+                for rank, arm in enumerate(unplayed):
+                    row[arm] = 1e30 * (len(unplayed) - rank)
                 continue
             tied = np.flatnonzero(row == best)
             if len(tied) > 1:
@@ -1343,10 +1428,14 @@ class DiscountedLinUCB(TensorModel):
             observation = np.outer(context, context)
             self._precision[arm] += observation
             self._covariance[arm] += observation
-            self._reward_vectors[arm] += (
-                float(reward) / self._reward_scale
-            ) * context
+            # The first reward is centred on itself (no baseline yet), so the first arm
+            # played is not credited the whole raw reward.
+            centered = float(reward) - (self._baseline() if self._baseline_weight > 0.0 else float(reward))
+            self._reward_vectors[arm] += (centered / self._reward_scale) * context
             self._observation_counts[arm] += 1
+            # The baseline is discounted like everything else.
+            self._baseline_total = self._discount_factor * self._baseline_total + float(reward)
+            self._baseline_weight = self._discount_factor * self._baseline_weight + 1.0
 
         return 0.0
 
@@ -1361,6 +1450,15 @@ class DiscountedLinUCB(TensorModel):
         self._covariance = self._precision.copy()
         self._reward_vectors = self._ridge * self._prior_theta
         self._observation_counts = np.zeros(self._action_dim, dtype=np.int64)
+        self._baseline_total = 0.0
+        self._baseline_weight = 0.0
+
+    def _baseline(self) -> float:
+        """The discounted mean reward so far (0 before the first)."""
+        if self._baseline_weight <= 0.0:
+            return 0.0
+        return self._baseline_total / self._baseline_weight
+
 
 class RandomTimeoutModel(TensorModel):
     """Selects a random timeout action index each prediction."""
@@ -2586,7 +2684,9 @@ class PPOBase(TensorModel):
         entropy_coef: float = 0.3,
         max_grad_norm: float = 0.5,
         target_kl: float = 0.02,
-        exploration_floor: float = 0.05,
+        # 0 since 2026-10-19 (was 0.05; Kevin, runs/2026-10-19-linucb-discount): as LinUCB's, the uniform share
+        # cost HotStuff up to 0.38 and nothing measurable elsewhere.
+        exploration_floor: float = 0.0,
         seed: Optional[int] = None,
     ) -> None:
         if n_features <= 0:
@@ -2756,16 +2856,18 @@ class PPOBase(TensorModel):
             return 0.0
 
         contexts = self._contexts(features)
+        # Values per decision: 1, or 2 for ContinuousPPO on SBFT (timeout, wait).
+        width = int(getattr(self, "_action_width", 1))
         action_values = np.asarray(actions, dtype=np.float64).reshape(-1)
         reward_values = np.asarray(rewards, dtype=np.float64).reshape(-1)
         batch_size = len(contexts)
-        if action_values.size == 1 and batch_size > 1:
-            action_values = np.repeat(action_values, batch_size)
+        if action_values.size == width and batch_size > 1:
+            action_values = np.tile(action_values, batch_size)
         if reward_values.size == 1 and batch_size > 1:
             reward_values = np.repeat(reward_values, batch_size)
-        if action_values.size != batch_size:
+        if action_values.size != batch_size * width:
             raise ValueError(
-                f"actions batch size mismatch: expected {batch_size}, "
+                f"actions batch size mismatch: expected {batch_size} x {width}, "
                 f"got {action_values.size}"
             )
         if reward_values.size != batch_size:
@@ -2778,9 +2880,12 @@ class PPOBase(TensorModel):
         if not np.all(np.isfinite(reward_values)):
             raise ValueError("rewards must contain only finite values")
 
-        for context, action, reward in zip(contexts, action_values, reward_values):
+        rows = action_values.reshape(batch_size, width)
+        for context, action, reward in zip(contexts, rows, reward_values):
             self._buffer_contexts.append(context.reshape(1, -1))
-            self._buffer_actions.append(self._store_action(float(action)))
+            self._buffer_actions.append(
+                self._store_action(float(action[0]) if width == 1 else action)
+            )
             self._buffer_rewards.append(float(reward))
             if len(self._buffer_rewards) >= self._update_every:
                 self._flush()
@@ -2838,6 +2943,8 @@ class PPOBase(TensorModel):
             target[...] = loaded[name]
 
     def reset_model(self) -> None:
+        # The first decision after a reset is the opening action, not a sample (D10b).
+        self._opened = False
         self._rng = np.random.default_rng(self._seed)
         sizes = (self._context_dim,) + self._hidden_sizes
         self._actor = _TinyMLP(
@@ -2889,11 +2996,15 @@ class DiscretePPO(PPOBase):
         action_dim: int,
         n_features: int,
         hidden_sizes: Sequence[int] = (),
+        opening_arm: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         if action_dim <= 0:
             raise ValueError(f"action_dim must be > 0, got {action_dim}")
+        if opening_arm is not None and not 0 <= opening_arm < action_dim:
+            raise ValueError(f"opening_arm must be in [0, {action_dim}), got {opening_arm}")
         self._action_dim = int(action_dim)
+        self._opening_arm = opening_arm
         super().__init__(
             n_features=n_features,
             head_dim=self._action_dim,
@@ -2948,7 +3059,12 @@ class DiscretePPO(PPOBase):
         _, mixed = self._probabilities(self._actor_head(contexts))
         scores = np.array(mixed, dtype=np.float64, copy=True)
         for row in scores:
-            selected = int(self._rng.choice(self._action_dim, p=row / row.sum()))
+            if not self._opened and self._opening_arm is not None:
+                # The opening arm (the ladder's middle rung, D10b) as the first decision.
+                selected = int(self._opening_arm)
+                self._opened = True
+            else:
+                selected = int(self._rng.choice(self._action_dim, p=row / row.sum()))
             best = float(np.max(row))
             # The codec argmaxes this row, so the sample has to be its maximum.
             row[selected] = np.nextafter(best, np.inf)

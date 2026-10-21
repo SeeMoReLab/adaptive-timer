@@ -1,28 +1,46 @@
 # time_s,propose_timeout_ms
+# Current oracle (2026-10-19, restart from scratch; generated from this file's rows and
+# config/tendermint/failure_spec.xml, values unchanged). Rows sit on the onsets (atTime); the oracle never
+# switches before a fault starts. Episode e applies at warmUpTime + 20*(e-1) and takes the last row
+# with time_s <= 20*(e-1); the leading -10 row is the warm-up row.
+#
+#   p0 @0     base                                   100
+#   p1 @300   base + slow proposer                   100
+#   p2 @600   5+50                                   200
+#   p3 @900   5+50 + slow proposer                   200
+#   p4 @1200  5+150                                  400
+#   p5 @1500  base                                   100
+#
+# History (older ladders, rates and specs; superseded where it disagrees with the block above):
 # propose_timeout_ms may be any integer from 1 through 4294967295
 # prevote_timeout_ms and precommit_timeout_ms are derived as propose_timeout_ms / 3
 #
-# Hindsight-optimal arm per phase of config/tendermint/failure_spec.xml.
-# Arms are {150, 450, 750} (learning_agent/models.py), calibrated in
-# runs/2026-09-29-tendermint-arms/report.md (score per phase, one draw per rung).
+# Hindsight-optimal arm per phase of config/tendermint/failure_spec.xml under the
+# Phase D configuration (2026-10-08/09: p2p send/recv 50 MB/s, 512 B transactions,
+# 4,000 tx/s, base netem applied before the replicas connect). Arms {100, 200, 400}
+# (learning_agent/models.py, Kevin 2026-10-10). Calibrated on the compressed spec
+# (scripts/cloudlab/tmp/cal/blindall/tendermint/real_c120.xml, constant T, 2 draws per T,
+# client-side judge cal/pt/judge.py); base phases take the lowest rung (all T tie there).
 #
-# Timing: the agent, the network applier and the CometBFT propose-delay
-# controller all anchor on the same --start-unix-ms, and both appliers fire a
-# phase at warmUpTime + atTime. ScheduledTimeoutModel shifts the whole schedule
-# so its first row lands at elapsed 0, so with a leading -10 row (warmUpTime=10)
-# a switch written at T fires at warmUpTime + T. Writing the atTime value here
-# therefore lands the switch exactly on the phase boundary.
+# Timing: the network applier and the CometBFT propose-delay controller fire a
+# phase at warmUpTime + atTime after --start-unix-ms, and every replica's episode
+# e applies its timeouts at warmUpTime + P*(e-1) (P = --episode-ms, 20 s).
+# ScheduledTimeoutModel picks the row by episode number: the last row with
+# time_s <= P*(e-1), so a switch written at T fires at warmUpTime + T. Writing
+# the atTime value here therefore lands the switch exactly on the phase boundary.
+# Non-negative rows must be multiples of P; the leading -10 row is the warm-up
+# row and counts for every episode.
 #
-#   p0 @0    no fault                        150  all rungs tie (+0.333)
-#   p1 @300  proposalDelay 10s               150  lowest escape wins (+0.228 vs 450 -0.033)
-#   p2 @600  net +50ms                       750  450 -0.028, 750 -0.014 (within the tie band)
-#   p3 @900  net +50ms + proposalDelay 10s   450  lowest value that clears the links (-0.349)
-#   p4 @1200 net +150ms                      750  450 collapses (-2.977), 750 -0.702
-#   p5 @1500 no fault                        150  all rungs tie
--10,150
-0,150
-300,150
-600,750
-900,450
-1200,750
-1500,150
+#   p0 @0    no fault                        100  all T tie (+0.321; 200 +0.322, 400 +0.320)
+#   p1 @300  proposalDelay 10s               100  lower is better (+0.294; 200 +0.262, 400 +0.153)
+#   p2 @600  net +50ms                       200  -0.009 (400 -0.006, 100 -0.148: misses the proposal)
+#   p3 @900  net +50ms + proposalDelay 10s   200  -0.062 (400 -0.128, 100 -0.252)
+#   p4 @1200 net +150ms                      400  -0.766 (200 -1.658, 100 -1.207)
+#   p5 @1500 no fault                        100  all T tie (+0.323; 400 +0.323, 200 +0.320)
+-10,100
+0,100
+300,100
+600,200
+900,200
+1200,400
+1500,100

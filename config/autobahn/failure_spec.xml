@@ -1,5 +1,8 @@
 <?xml version="1.0"?>
 <failureSpec>
+    <!-- 2026-10-19 (restart from scratch): the phase values are unchanged; the ladder is 250 / 500 / 1250 (the text below names 250 / 750 / 1250, the ladder these phases were calibrated on). The per-phase
+         "best" comments record the calibration of their time; the current oracle is
+         learning_agent/config/schedule_autobahn.csv. -->
 
     <!--
       Time-based, phase-driven fault specification.
@@ -8,7 +11,7 @@
       Network precedence per phase: edge > source > global.
       Network delay semantics:
         - <globalNetworkDelay>/<delayMs> is a constant base one-way packet delay.
-        - <globalNetworkDelay>/<jitterRatio> (optional, default 0.20) scales the
+        - <globalNetworkDelay>/<jitterRatio> (required; 0 in every spec) scales the
           netem jitter applied to every delay. netem jitter reorders packets and
           TCP treats that as loss, so set it to 0 for high-throughput runs.
         - Per-phase network <delayMs> is an extra delay during slow bursts.

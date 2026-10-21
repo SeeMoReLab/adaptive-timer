@@ -33,28 +33,24 @@ from __future__ import annotations
 import argparse
 import copy
 import importlib
+import json
 import math
 import multiprocessing
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 import agent_pb2
-from latency_floor import (
-    DEFAULT_LATENCY_FLOOR_QUANTILE,
-    DEFAULT_LATENCY_FLOOR_WINDOW,
-    LatencyFloor,
-    LatencyFloorPolicy,
-)
+from latency_floor import LatencyFloorPolicy
 from model_builder import BuiltModel, build_model, save_model_prior
 from prior_windows import PriorWindows
 from continuous_bandit import (
-    DEFAULT_WAIT_DIVISOR,
+    make_latency_floor,
 )
-from models import TensorModel, action_index_to_timeout, get_action_space_size
+from models import TensorModel, action_index_to_timeout, get_action_space_size, set_pbft_timeout_ladder
 from reward_utils import DEFAULT_REWARD_DESIGN, REWARD_DESIGNS, set_reward_design
 
 PROTOCOL_SIMULATORS: Dict[str, str] = {
@@ -196,26 +192,23 @@ class ModelDriver:
 class ModelSettings:
     """build_model's settings beside the protocol and model type."""
 
-    wait_divisor: float = DEFAULT_WAIT_DIVISOR
     heuristic_multiplier: Optional[float] = None
     heuristic_window: Optional[int] = None
     heuristic_quantile: Optional[float] = None
-    # 0 disables the floor, as main's --latency-floor-multiplier does.
+    # The protocol's floor scale, as main's --latency-floor-multiplier (0 disables it).
     floor_multiplier: float = 0.0
-    floor_window: int = DEFAULT_LATENCY_FLOOR_WINDOW
-    floor_quantile: float = DEFAULT_LATENCY_FLOOR_QUANTILE
+    linucb_discount: Optional[float] = None
+    linucb_exploration: Optional[float] = None
+    ppo_exploration: Optional[float] = None
 
     def build(self, protocol: int, model_type: str, prior_path: Optional[str],
               windows: PriorWindows) -> BuiltModel:
-        # A LatencyFloor keeps its own history, so each model gets a new one.
+        # A LatencyFloor keeps its own history, so each model gets a new one; the same
+        # floor as the live agent (continuous_bandit.make_latency_floor).
         floor = (
             None
             if self.floor_multiplier <= 0.0
-            else LatencyFloor(
-                multiplier=self.floor_multiplier,
-                window=self.floor_window,
-                quantile=self.floor_quantile,
-            )
+            else make_latency_floor(protocol, self.floor_multiplier)
         )
         return build_model(
             protocol,
@@ -226,8 +219,21 @@ class ModelSettings:
             heuristic_multiplier=self.heuristic_multiplier,
             heuristic_window=self.heuristic_window,
             heuristic_quantile=self.heuristic_quantile,
-            wait_divisor=self.wait_divisor,
+            linucb_discount=self.linucb_discount,
+            linucb_exploration=self.linucb_exploration,
+            ppo_exploration=self.ppo_exploration,
         )
+
+
+def _override_provenance(args: argparse.Namespace) -> Dict[str, str]:
+    """The simulator constants the runs were drawn around (as the GP priors record them,
+    continuous_bandit.train_gp_prior), and the PBFT overrides only when given."""
+    module = importlib.import_module(PROTOCOL_SIMULATORS[args.protocol])
+    constants = module.host_constants() if args.protocol == "pbft" else module.SimConstants()
+    out = {"sim_constants": json.dumps(asdict(constants), sort_keys=True, default=float)}
+    out.update({k: v for k, v in (("timeout_ladder", args.timeout_ladder),
+                                  ("sim_constants_path", args.sim_constants)) if v is not None})
+    return out
 
 
 def _worker_init() -> None:
@@ -262,11 +268,13 @@ class _Behaviour:
         self._discrete = model_type.startswith("discrete_")
         self._arms = get_action_space_size(adapter.protocol)
         model = _unwrap(built.model)
+        # Per action dimension (lower, upper) ms: the timeout, and on SBFT the wait.
+        self._ranges: List[Tuple[int, int]] = []
         if not self._discrete:
-            self._log_lower = math.log(float(model._lower_ms))
-            self._log_span = math.log(float(model._upper_ms)) - self._log_lower
-            self._lower_ms, self._upper_ms = model._lower_ms, model._upper_ms
-        self._prev: Optional[float] = None
+            self._ranges.append((model._lower_ms, model._upper_ms))
+            if getattr(model, "_two_d", False):
+                self._ranges.append((model._wait_lower_ms, model._wait_upper_ms))
+        self._prev: Optional[Any] = None
 
     def __call__(self, x: np.ndarray) -> Any:
         codec = self._built.action_codec
@@ -275,15 +283,20 @@ class _Behaviour:
             arm = int(self._rng.integers(self._arms)) if explore else int(self._prev)
             self._prev = arm
             return self._adapter.from_timeout(codec.decode(np.asarray(float(arm))))
+        # A log-space position per dimension: a fresh draw, or a step from the last.
         if explore:
-            position = float(self._rng.random())
+            positions = self._rng.random(len(self._ranges))
         else:
-            position = float(np.clip(self._prev + self._rng.normal(0.0, WALK_SIGMA), 0.0, 1.0))
-        self._prev = position
-        timeout_ms = int(round(math.exp(self._log_lower + position * self._log_span)))
-        timeout_ms = min(self._upper_ms, max(self._lower_ms, timeout_ms))
-        normalized = codec.normalize_ms(timeout_ms)
-        return self._adapter.from_timeout(codec.decode(np.asarray([normalized])))
+            positions = np.clip(
+                self._prev + self._rng.normal(0.0, WALK_SIGMA, len(self._ranges)), 0.0, 1.0
+            )
+        self._prev = positions
+        normalized = []
+        for d, (lower_ms, upper_ms) in enumerate(self._ranges):
+            log_lower = math.log(float(lower_ms))
+            value_ms = int(round(math.exp(log_lower + positions[d] * (math.log(float(upper_ms)) - log_lower))))
+            normalized.append(codec.normalize_ms(min(upper_ms, max(lower_ms, value_ms)), d))
+        return self._adapter.from_timeout(codec.decode(np.asarray(normalized)))
 
 
 def _fit_job(args: tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, float]:
@@ -295,7 +308,7 @@ def _fit_job(args: tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, floa
     behaviour = _Behaviour(built, adapter, model_type,
                            np.random.default_rng([seed, BEHAVIOUR_STREAM]))
     xs: List[np.ndarray] = []
-    actions: List[float] = []
+    actions: List[np.ndarray] = []
     rewards: List[float] = []
     skipped = 0
 
@@ -307,15 +320,19 @@ def _fit_job(args: tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, floa
             skipped += 1
             return
         xs.append(np.asarray(x, dtype=float))
-        actions.append(float(np.asarray(action, dtype=float).reshape(-1)[0]))
+        # A discrete model's arm index, or every dimension of a continuous action
+        # (the timeout, and on SBFT the wait).
+        values = np.asarray(action, dtype=float).reshape(-1)
+        actions.append(values[:1] if model_type.startswith("discrete_") else values)
         rewards.append(float(reward))
 
     sim, episodes = adapter.training_run(seed)
     adapter.run_training(sim, episodes, behaviour, record)
     width = len(xs[0]) if xs else 0
+    action_width = len(actions[0]) if actions else 1
     return (
         np.asarray(xs, dtype=float).reshape(len(xs), width),
-        np.asarray(actions, dtype=float),
+        np.asarray(actions, dtype=float).reshape(len(actions), action_width),
         np.asarray(rewards, dtype=float),
         skipped,
         time.perf_counter() - started,
@@ -336,7 +353,9 @@ def cmd_fit(args: argparse.Namespace, settings: ModelSettings) -> None:
     if not parts:
         raise ValueError(f"{args.runs} runs produced no samples")
     x = np.vstack([p[0] for p in parts])
-    a = np.concatenate([p[1] for p in parts])
+    a = np.vstack([p[1] for p in parts])
+    if a.shape[1] == 1:
+        a = a.reshape(-1)
     r = np.concatenate([p[2] for p in parts])
     skipped = sum(p[3] for p in parts)
     run_s = [p[4] for p in parts]
@@ -347,8 +366,8 @@ def cmd_fit(args: argparse.Namespace, settings: ModelSettings) -> None:
     save_model_prior(
         args.out, args.model_type, adapter.protocol, model, {"theta": theta},
         windows=adapter.windows, simulator=adapter.simulator, runs=args.runs, seed=args.seed,
-        samples=len(r), skipped=skipped, peer_spread=args.peer_spread,
-        wait_divisor=settings.wait_divisor,
+        samples=len(r), skipped=skipped, peer_spread=args.peer_spread, code_hash=args.code_hash,
+        **_override_provenance(args),
     )
     # The checkpoint must load into the model main builds for it.
     settings.build(adapter.protocol, args.model_type, args.out, adapter.windows)
@@ -495,6 +514,20 @@ def cmd_eval(args: argparse.Namespace, settings: ModelSettings) -> None:
         skipped = sum(c[1] for c in chunk)
         suffix = f" skipped={skipped}" if skipped else ""
         print(_summary_line(adapter, f"{label} mean", means[label]) + suffix)
+    if args.json_out:
+        record = {
+            "protocol": args.protocol, "model_type": args.model_type, "prior_path": args.prior_path,
+            "seeds": args.seeds, "reward_design": args.reward_design,
+            "floor_multiplier": settings.floor_multiplier, "policies": {},
+        }
+        for index, (label, _, _) in enumerate(policies):
+            chunk = results[index * args.seeds:(index + 1) * args.seeds]
+            record["policies"][label] = [
+                {key: np.asarray(value).tolist() for key, value in c[0].items()} | {"skipped": c[1]}
+                for c in chunk
+            ]
+        with open(args.json_out, "w") as handle:
+            json.dump(record, handle, indent=1)
     if args.compare_untrained:
         pre, un = means[model_label], means[f"{args.model_type} untrained"]
         diff = " ".join(
@@ -563,7 +596,8 @@ def cmd_ppo(args: argparse.Namespace, settings: ModelSettings) -> None:
         args.out, args.model_type, adapter.protocol, model, model.state_arrays(),
         windows=adapter.windows, simulator=adapter.simulator, runs=args.runs, seed=args.seed,
         updates=driver.updates, skipped=driver.skipped, peer_spread=args.peer_spread,
-        wait_divisor=settings.wait_divisor, latency_floor_multiplier=settings.floor_multiplier,
+        latency_floor_multiplier=settings.floor_multiplier, code_hash=args.code_hash,
+        **_override_provenance(args),
     )
     settings.build(adapter.protocol, args.model_type, args.out, adapter.windows)
     print(
@@ -590,13 +624,27 @@ def main() -> None:
                             "under another design is refused")
         p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2),
                        help="forked worker processes (1: in-process)")
-        p.add_argument("--wait-divisor", type=float, default=DEFAULT_WAIT_DIVISOR,
-                       help="as main.py's: SBFT's W = T / this for the one-timeout models")
+        p.add_argument("--timeout-ladder", default=None,
+                       help="PBFT only: comma-separated rungs in ms replacing the 250,550,1200 "
+                            "ladder, as main.py's (runs/2026-10-18-pbft-ladder-variants)")
+        p.add_argument("--linucb-discount", type=float, default=None,
+                       help="LinUCB models: discount factor (default: the class's, 0.95 for both "
+                            "models); recorded in the prior's metadata")
+        p.add_argument("--linucb-exploration", type=float, default=None,
+                       help="LinUCB models: random-exploration share (default: the class's, 0)")
+        p.add_argument("--ppo-exploration", type=float, default=None,
+                       help="PPO models: uniform share mixed into the policy (default: the class's, 0)")
+        p.add_argument("--sim-constants", default=None,
+                       help="PBFT only: JSON of pbft_sim SimConstants fields replacing the "
+                            "installed defaults, as pbft_sim train --sim-constants")
 
     def training(p: argparse.ArgumentParser) -> None:
         p.add_argument("--runs", type=int, required=True)
         p.add_argument("--seed", type=int, default=1, help="run i is seed + i")
         p.add_argument("--out", required=True)
+        p.add_argument("--code-hash", required=True,
+                       help="code_hash of the tree training the prior (scripts/cloudlab/code_state.py), "
+                            "recorded in its provenance and compared with FREEZE by the harness")
         p.add_argument("--peer-spread", type=float, default=0.0,
                        help="Tendermint only: training runs draw peer timeout factors with "
                             "sigma in [0, this], as tendermint_sim train --peer-spread "
@@ -604,13 +652,10 @@ def main() -> None:
 
     def floor(p: argparse.ArgumentParser) -> None:
         p.add_argument("--latency-floor-multiplier", type=float, default=0.0,
-                       help="as main.py's; 0 (the default) disables the floor. PPO applies "
-                            "the floor after sampling and trains on the floored action, so "
-                            "pretraining PPO with a floor biases its policy toward the "
-                            "floored timeouts")
-        p.add_argument("--latency-floor-window", type=int, default=DEFAULT_LATENCY_FLOOR_WINDOW)
-        p.add_argument("--latency-floor-quantile", type=float,
-                       default=DEFAULT_LATENCY_FLOOR_QUANTILE)
+                       help="as main.py's (a scale on the protocol's FLOOR_SPECS floor); 0 (the "
+                            "default) disables the floor. PPO applies the floor after sampling "
+                            "and trains on the floored action, so pretraining PPO with a floor "
+                            "biases its policy toward the floored timeouts")
 
     f = sub.add_parser("fit", help="fit a LinUCB prior mean on random-behaviour samples")
     common(f, FIT_MODEL_TYPES)
@@ -632,6 +677,9 @@ def main() -> None:
     e.add_argument("--compare-untrained", action="store_true",
                    help="also run the model type without its prior on the same seeds")
     e.add_argument("--per-seed", action="store_true", help="print every seed, not only means")
+    e.add_argument("--json-out", default=None,
+                   help="also write every policy's per-seed summaries (run mean, per-phase reward "
+                        "after the switch and whole, median action) to this JSON file, for the gate")
     e.add_argument("--heuristic-multiplier", type=float, default=None)
     e.add_argument("--heuristic-window", type=int, default=None)
     e.add_argument("--heuristic-quantile", type=float, default=None)
@@ -641,14 +689,24 @@ def main() -> None:
         if getattr(args, name, 1) < 1:
             parser.error(f"--{name} must be >= 1")
     set_reward_design(args.reward_design)
+    # PBFT-only overrides, process-wide before any model is built or worker forked.
+    if (args.timeout_ladder is not None or args.sim_constants is not None) and args.protocol != "pbft":
+        parser.error("--timeout-ladder and --sim-constants are PBFT's")
+    if args.timeout_ladder is not None:
+        try:
+            set_pbft_timeout_ladder([int(v) for v in args.timeout_ladder.split(",")])
+        except ValueError as exc:
+            parser.error(f"--timeout-ladder {args.timeout_ladder!r}: {exc}")
+    if args.sim_constants is not None:
+        importlib.import_module(PROTOCOL_SIMULATORS["pbft"]).set_host_constants(args.sim_constants)
     settings = ModelSettings(
-        wait_divisor=args.wait_divisor,
         heuristic_multiplier=getattr(args, "heuristic_multiplier", None),
         heuristic_window=getattr(args, "heuristic_window", None),
         heuristic_quantile=getattr(args, "heuristic_quantile", None),
         floor_multiplier=getattr(args, "latency_floor_multiplier", 0.0),
-        floor_window=getattr(args, "latency_floor_window", DEFAULT_LATENCY_FLOOR_WINDOW),
-        floor_quantile=getattr(args, "latency_floor_quantile", DEFAULT_LATENCY_FLOOR_QUANTILE),
+        linucb_discount=args.linucb_discount,
+        linucb_exploration=args.linucb_exploration,
+        ppo_exploration=args.ppo_exploration,
     )
     {"fit": cmd_fit, "ppo": cmd_ppo, "eval": cmd_eval}[args.cmd](args, settings)
 

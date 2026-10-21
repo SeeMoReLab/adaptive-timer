@@ -24,13 +24,12 @@ import numpy as np
 
 import agent_pb2
 from continuous_bandit import (
-    DEFAULT_WAIT_DIVISOR,
     SBFT_WAIT_MIN_MS,
+    opening_action_ms,
     ContinuousHeuristicTimeoutModel,
     ContinuousLinUCB,
     ContinuousPPO,
     ContinuousTimeoutActionCodec,
-    DerivedWaitActionCodec,
     NormalizedLatencyFloor,
     SimReturnGPModel,
     context_spec,
@@ -59,7 +58,7 @@ from models import (
     get_report_feature_field_names,
     get_timeout_values_ms,
 )
-from reward_utils import get_reward_design
+from reward_utils import get_reward_design, reward_normalizer_tps
 
 
 # Model types that take --prior-path. Any other model type given a prior is
@@ -107,6 +106,22 @@ class BuiltModel:
     description: List[str]
 
 
+def opening_arm_index(protocol: int) -> int:
+    """The discrete arm of the opening action (continuous_bandit.opening_action_ms: the
+    ladder's middle rung, and on SBFT the minimum wait), where the discrete LinUCB and PPO
+    models open (Kevin, 2026-10-19, restart D10b)."""
+    opening = tuple(opening_action_ms(protocol))
+    matches = []
+    for index in range(get_action_space_size(protocol)):
+        ((_, timeout),) = action_index_to_timeout(protocol, index).ListFields()
+        values = tuple(int(v) for _, v in timeout.ListFields())
+        if values[:len(opening)] == opening:
+            matches.append(index)
+    if len(matches) != 1:
+        raise ValueError(f"opening action {opening} matches arms {matches} on {protocol}")
+    return matches[0]
+
+
 def prior_metadata(model_type: str, protocol: int, model: TensorModel) -> Dict[str, object]:
     """What a LinUCB or PPO checkpoint must agree on with ``model``.
 
@@ -130,6 +145,10 @@ def prior_metadata(model_type: str, protocol: int, model: TensorModel) -> Dict[s
         "model_type": model_type,
         "protocol": agent_pb2.Protocol.Name(int(protocol)),
         "reward_design": get_reward_design(),
+        # N of reward_tps_latency; priors fit before 2026-10-12 lack it (tps / 10,000) and are refused.
+        "reward_normalizer_tps": reward_normalizer_tps(
+            agent_pb2.Protocol.Name(int(protocol))[len("PROTOCOL_"):].lower()
+        ),
         "feature_names": tuple(get_report_feature_field_names(protocol)),
     }
     if model_type == "discrete_linucb":
@@ -148,11 +167,11 @@ def prior_metadata(model_type: str, protocol: int, model: TensorModel) -> Dict[s
         metadata["timeouts_ms"] = tuple(get_arm_timeout_values_ms(protocol))
     else:
         metadata["timeouts_ms"] = (model._lower_ms, model._upper_ms)
-    if model_type in ("continuous_linucb", "continuous_ppo") and isinstance(
-        model._action_codec, DerivedWaitActionCodec
-    ):
-        # SBFT: the wait played beside each T is T / divisor.
-        metadata["wait_divisor"] = model._action_codec.divisor
+    if model_type in ("continuous_linucb", "continuous_ppo") and model._two_d:
+        # SBFT: the wait is the model's second dimension (2026-10-19).
+        metadata["wait_range_ms"] = (model._wait_lower_ms, model._wait_upper_ms)
+        if model_type == "continuous_linucb":
+            metadata["wait_centers_ms"] = tuple(model._wait_centers_ms)
     return metadata
 
 
@@ -262,7 +281,9 @@ def build_model(
     heuristic_multiplier: Optional[float] = None,
     heuristic_window: Optional[int] = None,
     heuristic_quantile: Optional[float] = None,
-    wait_divisor: float = DEFAULT_WAIT_DIVISOR,
+    linucb_discount: Optional[float] = None,
+    linucb_exploration: Optional[float] = None,
+    ppo_exploration: Optional[float] = None,
 ) -> BuiltModel:
     """The model main.serve runs for ``model_type`` on ``protocol``.
 
@@ -287,13 +308,25 @@ def build_model(
     # Domain constraint on the action space, taken by every model except the
     # scheduled oracle: a timeout under the part of the consensus latency it
     # must cover cannot be met, so it is not worth a decision. The floor reads
-    # its own field (LatencyFloor.field; main.py gives it continuous_heuristic's
-    # signal). Discrete models get it as a wrapper that hides the arms under it;
+    # its own field (LatencyFloor.field; main.py builds it with make_latency_floor, on
+    # FLOOR_SPECS' hold-free signal). Discrete models get it as a wrapper that hides the arms under it;
     # continuous models are handed it and search above it.
     latency_index, instances_index = latency_feature_indices(
         get_report_feature_field_names(protocol),
         latency_floor.field if latency_floor is not None else "avg_consensus_latency_ms",
     )
+    # The LinUCB discount and random-exploration share; None keeps each class's
+    # default (discount 0.95 and no random exploration, both models; study of 2026-10-19).
+    if (linucb_discount is not None or linucb_exploration is not None) and model_type not in (
+        "discrete_linucb", "continuous_linucb"
+    ):
+        raise ValueError(f"linucb_discount/linucb_exploration apply to the LinUCB models, not {model_type}")
+    linucb_overrides = {k: float(v) for k, v in (("discount_factor", linucb_discount),
+                                                  ("exploration_floor", linucb_exploration)) if v is not None}
+    # PPO's uniform share mixed into its policy; None keeps the class default (0, since 2026-10-19).
+    if ppo_exploration is not None and model_type not in ("discrete_ppo", "continuous_ppo"):
+        raise ValueError(f"ppo_exploration applies to the PPO models, not {model_type}")
+    ppo_overrides = {} if ppo_exploration is None else {"exploration_floor": float(ppo_exploration)}
     if latency_floor is not None and model_type == "scheduled":
         raise ValueError(
             "--model-type=scheduled replays its schedule unchanged and takes no "
@@ -311,22 +344,13 @@ def build_model(
             latency_floor=latency_floor,
         )
 
-    # SBFT's action is two-dimensional. The models below each place one
-    # timeout on a line and refuse a 2-D codec, so on SBFT they get the
-    # election timeout and the fast-path wait is derived from it,
-    # W = T / --wait-divisor; everywhere else this is the ordinary codec.
-    # continuous_gp searches both dimensions and does not use this.
-    def one_dimensional_codec() -> ActionCodec:
-        if protocol != agent_pb2.PROTOCOL_SBFT:
-            return ContinuousTimeoutActionCodec(protocol)
-        sbft_spec = context_spec(protocol)
-        return DerivedWaitActionCodec(
-            ContinuousTimeoutActionCodec(
-                protocol,
-                bounds_ms=sbft_spec.bounds_ms,
-                wait_bounds_ms=sbft_spec.wait_bounds_ms,
-            ),
-            divisor=wait_divisor,
+    # Every continuous model acts on the protocol's ContextSpec range (100-3000 ms; on SBFT
+    # also the wait, 10-500 ms, which continuous_linucb and continuous_ppo choose as their
+    # second dimension since 2026-10-19; it was T / 8 until then).
+    def continuous_codec() -> ContinuousTimeoutActionCodec:
+        spec = context_spec(protocol)
+        return ContinuousTimeoutActionCodec(
+            protocol, bounds_ms=spec.bounds_ms, wait_bounds_ms=spec.wait_bounds_ms
         )
 
     def checkpoint(model: TensorModel) -> Dict[str, np.ndarray]:
@@ -344,10 +368,7 @@ def build_model(
             )
         else:
             action_codec = ContinuousTimeoutActionCodec(protocol, bounds_ms=hspec.bounds_ms)
-        arms_ms = sorted(get_timeout_values_ms(protocol))
-        initial = (arms_ms[len(arms_ms) // 2],)
-        if protocol == agent_pb2.PROTOCOL_SBFT:
-            initial = initial + (SBFT_WAIT_MIN_MS,)
+        initial = opening_action_ms(protocol)
         model = ContinuousHeuristicTimeoutModel(
             protocol=protocol,
             action_codec=action_codec,
@@ -357,6 +378,8 @@ def build_model(
             window=heuristic_window,
             quantile=heuristic_quantile,
             latency_floor=normalized_floor(action_codec),
+            # A window that committed nothing takes the feature window's length (2026-10-19).
+            empty_window_ms=(None if prior_windows is None else prior_windows.feature_ms),
         )
         k = hspec.multiplier if heuristic_multiplier is None else heuristic_multiplier
         description.append(
@@ -450,6 +473,8 @@ def build_model(
                 n_features=get_report_feature_dim(protocol),
                 seed=42,
                 prior_theta=prior_theta,
+                opening_arm=opening_arm_index(protocol),
+                **linucb_overrides,
             )
 
         model = discrete_linucb(None)
@@ -461,6 +486,8 @@ def build_model(
             action_dim=get_action_space_size(protocol),
             n_features=get_report_feature_dim(protocol),
             seed=42,
+            opening_arm=opening_arm_index(protocol),
+            **ppo_overrides,
         )
         if prior_path is not None:
             model.load_state_arrays(checkpoint(model))
@@ -471,8 +498,7 @@ def build_model(
             + ("scratch" if prior_path is None else f"the prior {prior_path}")
         )
     elif model_type == "continuous_linucb":
-        action_codec = one_dimensional_codec()
-        arms_ms = get_timeout_values_ms(protocol)
+        action_codec = continuous_codec()
 
         def continuous_linucb(prior_theta: Optional[np.ndarray]) -> ContinuousLinUCB:
             return ContinuousLinUCB(
@@ -481,6 +507,7 @@ def build_model(
                 seed=42,
                 latency_floor=normalized_floor(action_codec),
                 prior_theta=prior_theta,
+                **linucb_overrides,
             )
 
         model = continuous_linucb(None)
@@ -488,25 +515,27 @@ def build_model(
             model = continuous_linucb(_prior_theta(checkpoint(model), prior_path))
         description.append(
             "[continuous_linucb] discounted LinUCB over "
-            f"{min(arms_ms)}..{max(arms_ms)}ms, basis centred on the arms "
-            f"{tuple(sorted(arms_ms))}"
+            f"{model._lower_ms}..{model._upper_ms}ms, basis centres {model._centers_ms}"
+            + (f", wait basis {model._wait_centers_ms} ms" if model._two_d else "")
         )
         if prior_path is not None:
             description.append(f"[continuous_linucb] prior mean: {prior_path}")
     elif model_type == "continuous_ppo":
-        action_codec = one_dimensional_codec()
-        arms_ms = get_timeout_values_ms(protocol)
+        action_codec = continuous_codec()
         model = ContinuousPPO(
             action_codec=action_codec,
             n_features=get_report_feature_dim(protocol),
             seed=42,
             latency_floor=normalized_floor(action_codec),
+            **ppo_overrides,
         )
         if prior_path is not None:
             model.load_state_arrays(checkpoint(model))
         description.append(
             "[continuous_ppo] Beta policy over "
-            f"{min(arms_ms)}..{max(arms_ms)}ms, linear actor + value baseline, "
+            f"{model._lower_ms}..{model._upper_ms}ms"
+            + (f" and a second over the wait {model._wait_lower_ms}..{model._wait_upper_ms}ms" if model._two_d else "")
+            + ", linear actor + value baseline, "
             "on-policy from "
             + ("scratch" if prior_path is None else f"the prior {prior_path}")
         )

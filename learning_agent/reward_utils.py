@@ -21,11 +21,35 @@ def reward_tps(throughput_tps: float) -> float:
     excess = (value - REWARD_THROUGHPUT_KNEE_TPS) / REWARD_THROUGHPUT_KNEE_TPS
     return 1.0 + REWARD_THROUGHPUT_ABOVE_KNEE_WEIGHT * excess
 
-def reward_tps_latency(throughput_tps: float, latency_ms: float) -> float:
+# N of reward_tps_latency per protocol: the offered rate (Kevin, 2026-10-11/12; SmartBFT is closed
+# loop and offers what its 512 terminals keep in flight, about 10,000 tps). tps / 10,000 for every
+# protocol until then.
+REWARD_NORMALIZER_TPS = {
+    "pbft": 20000.0,
+    "sbft": 20000.0,
+    "hotstuff": 105000.0,
+    "autobahn": 140000.0,
+    "tendermint": 5000.0,
+    "smartbft": 10000.0,
+}
+
+
+def reward_normalizer_tps(protocol: str) -> float:
+    """N of reward_tps_latency for `protocol` (a REWARD_NORMALIZER_TPS key)."""
+    if protocol not in REWARD_NORMALIZER_TPS:
+        raise ValueError(
+            f"reward_tps_latency has no throughput normalizer for protocol {protocol!r}. "
+            f"Expected one of {'|'.join(REWARD_NORMALIZER_TPS)}."
+        )
+    return REWARD_NORMALIZER_TPS[protocol]
+
+
+def reward_tps_latency(throughput_tps: float, latency_ms: float, normalizer_tps: float) -> float:
     """Throughput and consensus latency at a fixed exchange rate.
 
-    10,000 tps is worth one unit and so is one second of latency, so 100 ms
-    trades for 1,000 tps. The agent scores a reward window with its MEAN
+    The protocol's offered rate (``normalizer_tps``, REWARD_NORMALIZER_TPS) is
+    worth one unit and so is one second of latency, so 1% of throughput trades
+    for 10 ms on every protocol. The agent scores a reward window with its MEAN
     consensus latency (_apply_reward_design; Kevin, 2026-10-09): on Tendermint
     the delayed proposer slows only every fourth height, so the window p50 stays
     at ~70 ms at every timeout while the mean rises 111 -> 510 ms and clients
@@ -36,7 +60,7 @@ def reward_tps_latency(throughput_tps: float, latency_ms: float) -> float:
     phases the level moves with the network delay, which the contextual models
     must absorb through their features.
     """
-    return float(throughput_tps) / 10000.0 - float(latency_ms) / 1000.0
+    return float(throughput_tps) / float(normalizer_tps) - float(latency_ms) / 1000.0
 
 
 def reward_mixed(
@@ -100,12 +124,14 @@ def _apply_reward_design(
     timeout_ms: Optional[int],
     avg_consensus_latency_ms: float,
     total_transactions: int,
-    protocol_name: str = "",
+    protocol_name: str,
 ) -> float:
     if _active_reward_design == "reward_tps":
         return reward_tps(throughput_tps)
     if _active_reward_design == "reward_tps_latency":
-        return reward_tps_latency(throughput_tps, avg_consensus_latency_ms)
+        return reward_tps_latency(
+            throughput_tps, avg_consensus_latency_ms, reward_normalizer_tps(protocol_name)
+        )
     if timeout_ms is None:
         target = f" for {protocol_name}" if protocol_name else ""
         raise ValueError(
@@ -142,6 +168,7 @@ def calculate_pbft_reward(
         timeout_ms=timeout_ms,
         avg_consensus_latency_ms=avg_consensus_latency_ms,
         total_transactions=total_transactions,
+        protocol_name="pbft",
     )
 
 
@@ -175,6 +202,7 @@ def calculate_smartbft_reward(
         timeout_ms=timeout_ms,
         avg_consensus_latency_ms=avg_consensus_latency_ms,
         total_transactions=total_transactions,
+        protocol_name="smartbft",
     )
 
 
@@ -300,6 +328,7 @@ def calculate_hotstuff_reward(
         timeout_ms=timeout_ms,
         avg_consensus_latency_ms=avg_consensus_latency_ms,
         total_transactions=total_transactions,
+        protocol_name="hotstuff",
     )
 
 
@@ -327,4 +356,5 @@ def calculate_autobahn_reward(
         timeout_ms=timeout_ms,
         avg_consensus_latency_ms=avg_consensus_latency_ms,
         total_transactions=total_transactions,
+        protocol_name="autobahn",
     )

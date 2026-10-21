@@ -8,8 +8,8 @@ data. Four replicas, a client broadcasting ``load_tps`` requests/s, one leader
 proposing on a fixed cadence; one batch is one consensus instance:
 
 - Every 100 ms (``--proposal-interval``) the leader takes the oldest pending
-  requests up to ``batch_cap`` (8192 by count; the 512 KiB byte budget binds
-  earlier) when fewer than 16 batches are in flight
+  requests up to ``batch_cap`` (a fitted effective cap; the harness allows 8192
+  requests and 4.5 MiB since 2026-10-11) when fewer than 16 batches are in flight
   (``--max-inflight-batches``); a full pipeline skips the tick. Unexecuted
   requests are capped at 32,768 (``--max-pending-requests``); arrivals beyond
   the cap are rejected and lost.
@@ -17,25 +17,41 @@ proposing on a fixed cadence; one batch is one consensus instance:
   engine processing, and executes in sequence order. Its latency is dated from
   the oldest request it carries (``firstSeenUs``), which by the tick has
   waited about one interval, so the healthy latency is the hop model
-  ``100 + 3h``. Netem jitter per hop and lognormal processing noise put p95
-  about 20 ms above p50.
+  ``100 + 3h``. Lognormal processing noise (and netem jitter per hop, 0 in
+  every spec since 2026-10-19) puts p95 about 20 ms above p50.
 - Request watchdog (``PendingRequestTimer``): the oldest unexecuted request is
-  timed from its arrival, ``deadline = max(arrival, floor) + T << backoff``,
-  capped at 30 s (``kMaxElectionBackoffMs``). Expiry starts a view change:
-  in-flight batches are cancelled and their requests re-proposed by the next
-  leader with their arrival times kept, and the view installs after two hops
-  (ViewChange, NewView) plus ``vc_overhead_ms`` of evidence exchange, NewView
-  verification and body fetches. Installing floors every inherited deadline at
-  that instant, since the incoming primary is not blamed for the backlog it
-  inherits; a view that does not install within the backed-off wait starts
-  another view change (``onViewChangeWaitExpired``). The backoff doubles per
-  view change started and resets only when the watched request completes
-  before a deadline that was not floored, or when the queue drains
-  (``EntityRequests.cpp``). Lowering T floors the deadlines at the change
-  (``applyAgentTimeouts``, commit e1a3c9a), so a decrease never condemns
-  pending requests retroactively. A rung under its level's tail therefore
-  fires on ordinary latency and storms; one landing on a deep backlog cascades
-  until the doubling outlasts the drain.
+  watched, ``deadline = max(since, floor) + T << backoff``, capped at 30 s
+  (``kMaxElectionBackoffMs``); ``since`` is its arrival, or for a request that
+  arrived before the floor the moment it became the head (CppBedrock ec31a88:
+  an inherited backlog owes one timeout per head, not one deadline for all of
+  it). Expiry starts a view change: in-flight batches are cancelled and their
+  requests re-proposed by the next leader with their arrival times kept, and
+  the view installs after two hops (ViewChange, NewView) plus
+  ``vc_overhead_ms`` of evidence exchange, NewView verification and body
+  fetches. In the engine an expiry only suspects the leader since 5c0a3cf: the
+  replica stays in the view and broadcasts a Suspect, and the view change
+  starts once f+1 replicas suspect it. This aggregate timer stands for all four
+  replicas starving within one tick, where f+1 suspicions mirror the f+1
+  ViewChange join, so the leader's 2f+1 point is unchanged; clustered expiries
+  can install up to about one hop later, which the refit of ``vc_overhead_ms``
+  absorbs (predicted, not measured; no hop term is modelled for it). Installing sets the floor at that instant, since the incoming
+  primary is not blamed for the backlog it inherits; when the floored backlog
+  has drained the floor moves once, to that moment (6d7ac54), so what queued
+  behind it is timed from there. A view that does not install within the
+  backed-off wait starts another view change (``onViewChangeWaitExpired``).
+  The backoff doubles per view change started and resets when a batch
+  carrying a request that arrived after the floor executes, re-flooring the
+  deadlines at the reset when it was raised (``EntityRequests.cpp``, 73b9f08
+  after 820d5e5 and 6d7ac54; ported 2026-10-19, restart D11). Lowering T
+  floors the deadlines at the change (``applyAgentTimeouts``, commit e1a3c9a),
+  so a decrease never condemns pending requests retroactively. A rung under
+  its level's tail therefore fires on ordinary latency and storms; one landing
+  on a deep backlog cascades until the doubling outlasts the drain. The
+  engine's relay of a skipped head (``relaySkippedHead``, 2026-10-20: when a
+  batch of later arrivals has executed past the watched request, a backup relays
+  it to the leader once per view and times it from the relay; until then the
+  expiry re-armed from the last progress) cannot fire here: one shared pool executes in
+  arrival order, so no executed batch is newer than the watched head.
 - Leader proposal delay D (``<proposalDelay>`` with the ``leader`` token):
   whoever leads when the (phase, interval tick) key changes is pinned for that
   tick and holds each proposal D after allocating its sequence, so the held
@@ -58,35 +74,58 @@ gaps between consecutive executions in the window, view changes as
 started (no-progress when nothing committed since the last), leader and
 regency changes as views installed, and the election timeout in effect.
 
-Constants the mechanics do not fix are drawn per simulated run: the fitted
-ones (processing, the byte cap, the delayed-leader shape) within 0.5-2 x
-their SimConstants defaults, the rest (link delay, the view-change overhead,
-the load, a start-up backlog) from ranges wider than the calibration host,
-so the prior learned from it has to hold across them.
+Training runs follow the shared pretraining recipe (sim_common.py; Kevin,
+2026-10-19, restart D11). Constants the mechanics do not fix are drawn per
+run: the fitted ones (processing, the byte cap, the delayed-leader shape, and
+since D11 the view-change overhead and its spread) 0.5-2 x their installed
+values, the batching wait 0.5-1 x its cited 1 (an oldest request cannot
+predate the interval); the load 0.5-1.5 x N (20,000), the base delay 2-10 ms,
+no netem jitter, a start-up backlog in 30% of the runs. Faults start at
+40-400 s with 40-400 s gaps and keep the PBFT mix (none, hold, extra delay,
+both: 0.2 / 0.35 / 0.35 / 0.1) with the shared magnitudes, an extra link delay
+log-uniform 10-250 ms and a leader hold log-uniform 50-1500 ms, re-pinned every
+0.5-2 x the spec's 60 s. The initial timeout is the opening rung in a quarter
+of the runs, else log-uniform over the action range. The prior learned from it
+has to hold across all of them.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 import agent_pb2
 from continuous_bandit import CONTEXT_SPECS
+from continuous_bandit import opening_action_ms, train_gp_prior
 from prior_windows import PriorWindows, check_prior_windows
+from reward_utils import DEFAULT_REWARD_DESIGN, reward_normalizer_tps
+from sim_common import schedule_rows, scheduled_action
+from sim_common import (
+    JITTER_RATIO,
+    around,
+    draw_base_delay_ms,
+    draw_hold_ms,
+    draw_initial_backlog,
+    draw_initial_timeout_ms,
+    draw_link_extra_ms,
+    draw_load_tps,
+    fault_start_times,
+)
 
 PROPOSAL_INTERVAL_MS = 100.0
 MAX_INFLIGHT_BATCHES = 16
 MAX_PENDING_REQUESTS = 32768
 BATCH_MAX_REQUESTS = 8192
 MAX_ELECTION_BACKOFF_MS = 30000.0
-# config.pbft.yaml timers.view_change_ms: the election timeout before the
-# first decision.
+# config.pbft.yaml timers.view_change_ms, the engine's own default; every run of the
+# restart overrides it with the middle rung (--initial-timeout, D10b), as spec_run does.
 DEFAULT_ELECTION_TIMEOUT_MS = 8000.0
 FEATURE_S = 7.0
 REPLY_S = 2.0
@@ -99,7 +138,7 @@ DEFAULT_PRIOR_PATH = CONTEXT_SPECS[agent_pb2.PROTOCOL_PBFT].prior_path
 
 
 @dataclass
-# Fitted defaults: blind best-by-loss candidate i=763 (loss 1.573) of fit7m_pbft_blind.jsonl, 7/2/4/7 calibration, replica-median targets (blindall, 2026-10-10).
+# Fitted defaults: blind best-by-loss candidate i=999 (loss 0.076) of s3fit_pbft_blind_s9.jsonl, restart S3 blind refit (seeds 7,8,9,10,11 x 1500, best of the seeds; real-spec ranking check mean regret 0.006 PASS on p5/p6 targets from the oracle state, 2026-10-21).
 class SimConstants:
     """Defaults are the calibration setup of adaptive_timers.MD (5 ms base,
     20,000 req/s), used only to pre-screen policies; with them the healthy p50
@@ -111,25 +150,27 @@ class SimConstants:
     jitter_ratio: float = 0.0
     # Engine time per batch across the three hops (admission, digest,
     # signatures, execution) and its lognormal spread; p95 sits ~20 ms over p50.
-    proc_ms: float = 2.156797
-    proc_sigma: float = 0.057178
-    proc_per_tx_us: float = 1.268588
+    proc_ms: float = 27.124
+    proc_sigma: float = 0.146064
+    proc_per_tx_us: float = 3.753188
     load_tps: float = 20000.0
-    # Requests per batch where the 512 KiB budget binds (5,500 at 40k in
-    # adaptive_timers.MD); the count limit is 8192.
-    batch_cap: int = 7524
+    # Fitted effective requests per batch (sim_fit FREE); the harness limits are 8192
+    # requests and 4.5 MiB (8192 x 576 B with 512 B requests) since 2026-10-11, 512 KiB before.
+    batch_cap: int = 7589
     # Age of a batch's oldest request at the tick, in proposal intervals: 1
     # when the client's lanes spread arrivals over the interval.
     batching_wait: float = 1.0
     # View change beyond its two hops: evidence exchange, NewView
-    # verification, body fetches; one maintenance interval by default.
-    vc_overhead_ms: float = 250.0
-    vc_sigma: float = 0.2
-    knee_ms: float = 209.78361
-    excess_factor: float = 1.060142
-    excess_sigma: float = 0.410971
-    spike_ms: float = 272.09495
-    spike_batches: int = 4
+    # verification, body fetches; one maintenance interval by default. Fitted
+    # on the blind cells from 2026-10-19 (restart D11, sim_fit.py FREE); these
+    # defaults stand until that refit is installed.
+    vc_overhead_ms: float = 82.722109
+    vc_sigma: float = 0.187813
+    knee_ms: float = 168.918218
+    excess_factor: float = 1.028101
+    excess_sigma: float = 0.418927
+    spike_ms: float = 125.56361
+    spike_batches: int = 1
     # Requests already queued when the run starts: the ramp into an empty
     # pipeline overshoots pending, and any timeout elects while it drains.
     initial_backlog: int = 0
@@ -150,6 +191,14 @@ class _Batch:
     oldest_ms: float
     size: float
     chunks: List[List[float]]
+    # Phase clocks as the engine reports them (AgentClient.cpp): the hold and
+    # the pre-prepare transfer precede them, so a held leader inflates the
+    # consensus latency and none of the phases. pre: pre-prepare arrival to the
+    # prepare quorum (one hop); prep: prepare quorum to the commit quorum (one
+    # hop); commit: commit quorum to execution (processing and the queue).
+    t_arrival: float = 0.0
+    pre_ms: float = 0.0
+    prep_ms: float = 0.0
 
 
 @dataclass
@@ -161,6 +210,9 @@ class _Window:
     lat: List[float] = field(default_factory=list)
     batch: List[float] = field(default_factory=list)
     gap: List[float] = field(default_factory=list)
+    pre: List[float] = field(default_factory=list)
+    prep: List[float] = field(default_factory=list)
+    com: List[float] = field(default_factory=list)
     # Gaps reset at every window (AgentClient.cpp): n commits give n-1 gaps.
     last_exec_ms: Optional[float] = None
     view_changes: int = 0
@@ -203,6 +255,10 @@ class _Window:
             "p95_inter_commit_gap_ms": pct(self.gap, 95),
             "view_change_count": float(self.view_changes),
             "no_progress_view_change_count": float(self.no_progress),
+            # Window means; 0 when nothing committed, as the replicas report.
+            "pre_prepare_latency_ms": avg(self.pre),
+            "prepare_latency_ms": avg(self.prep),
+            "commit_latency_ms": avg(self.com),
         }
 
 
@@ -222,10 +278,20 @@ class PbftSim:
         self.phases = sorted(phases, key=lambda p: p.start_s)
         self.rng = np.random.default_rng(seed)
         self.t_ms = 0.0
+        # (time ms, no commit since the previous election) of every election, for the
+        # reports' counts over the last episode (_count_view_changes).
+        self._vc_log: List[Tuple[float, bool]] = []
         self.view = 0
         self.timeout_ms = float(initial_timeout_ms)
         self.backoff = 0
         self.floor_ms = -math.inf
+        # PendingRequestTimer's extendFloor_: set by every floor, cleared when the
+        # floor moves once to the drain of its backlog (_select_watch).
+        self.extend_floor = False
+        # The watched request (the oldest unexecuted one): its arrival and the
+        # instant its deadline is dated from; None when nothing is pending.
+        self.watch_arrival: Optional[float] = None
+        self.watch_since = 0.0
         self.in_view_change = False
         self.t_install_ms = math.inf
         self.t_wait_ms = math.inf
@@ -245,6 +311,7 @@ class PbftSim:
         if constants.initial_backlog > 0:
             self.pending.append([0.0, float(constants.initial_backlog)])
             self.pending_n = float(constants.initial_backlog)
+            self._select_watch(0.0)
         self.episode_start_s = float(start_offset_s)
         self._advance_to(start_offset_s * 1000.0, None)
 
@@ -269,6 +336,8 @@ class PbftSim:
             oldest = self.last_arrival_ms + (1.0 - self.c.batching_wait) * dt
             self.pending.append([oldest, admitted])
             self.pending_n += admitted
+            if self.watch_arrival is None:
+                self._select_watch(now_ms)  # track(): an empty timer watches the newcomer
         self.last_arrival_ms = now_ms
 
     def _oldest_arrival(self) -> Optional[float]:
@@ -282,20 +351,45 @@ class PbftSim:
         base = max(1.0, self.timeout_ms)
         return min(base * 2.0 ** self.backoff, max(base, MAX_ELECTION_BACKOFF_MS))
 
-    def _deadline(self, arrival_ms: float) -> float:
-        return max(arrival_ms, self.floor_ms) + self._backoff_ms()
+    def _deadline(self) -> float:
+        return max(self.watch_since, self.floor_ms) + self._backoff_ms()
+
+    def _select_watch(self, now_ms: float) -> None:
+        """PendingRequestTimer::selectWatchLocked: watch the oldest unexecuted
+        request. Every floor is set at an event, where _arrive has just closed
+        a chunk, so no chunk straddles a floor and a chunk's oldest stamp says
+        on which side of it all its requests arrived."""
+        previous_floored = self.watch_arrival is not None and self.watch_arrival < self.floor_ms
+        self.watch_arrival = self._oldest_arrival()
+        if self.watch_arrival is None:
+            return
+        # What arrived while the floored backlog drained waited behind it, not
+        # behind the primary: when it clears, the floor moves once, to now.
+        if self.extend_floor and previous_floored and self.watch_arrival >= self.floor_ms:
+            self.floor_ms = now_ms
+            self.extend_floor = False
+        # An inherited request is timed from when it becomes the head, the rest
+        # from arrival.
+        if self.watch_arrival < self.floor_ms:
+            self.watch_since = max(self.floor_ms, now_ms)
+        else:
+            self.watch_since = self.watch_arrival
+
+    def _set_floor(self, t_ms: float) -> None:
+        """PendingRequestTimer::setFloor: no deadline before t_ms."""
+        self.floor_ms = t_ms
+        self.extend_floor = True
 
     def _advance_to(self, end_ms: float, windows: Optional[Sequence[_Window]]) -> None:
         while True:
             t_exec = self.inflight[0].t_exec if self.inflight else math.inf
             t_next = min(self.next_tick_ms, t_exec, self.t_install_ms, self.t_wait_ms)
             if not self.in_view_change:
-                oldest = self._oldest_arrival()
-                if oldest is not None:
-                    deadline = self._deadline(oldest)
+                if self.watch_arrival is not None:
+                    deadline = self._deadline()
                     if deadline < t_next:
-                        # A deadline already past (the backoff just reset under
-                        # a request older than T) fires now.
+                        # A deadline already past fires now. The engine's
+                        # skipped-head relay never applies (module docstring).
                         t_fire = max(deadline, self.t_ms)
                         if t_fire > end_ms:
                             break
@@ -372,18 +466,18 @@ class PbftSim:
         jr = c.jitter_ratio
         # The pre-prepare is many packets and lands with its last one, so its
         # hop sits in the upper half of the jitter band; votes are one packet.
-        hops = (
-            d * (1.0 + jr * float(u(0.0, 1.0)))
-            + d * (1.0 + jr * float(u(-1.0, 1.0)))
-            + d * (1.0 + jr * float(u(-1.0, 1.0)))
-        )
+        h1 = d * (1.0 + jr * float(u(0.0, 1.0)))
+        h2 = d * (1.0 + jr * float(u(-1.0, 1.0)))
+        h3 = d * (1.0 + jr * float(u(-1.0, 1.0)))
+        hops = h1 + h2 + h3
         proc = c.proc_ms * float(self.rng.lognormal(0.0, c.proc_sigma)) + c.proc_per_tx_us * size / 1000.0
         ready = t + hold + hops + proc
         if self.inflight:
             prev = self.inflight[-1].t_exec
         else:
             prev = self.last_exec_ms if self.last_exec_ms is not None else -math.inf
-        self.inflight.append(_Batch(max(ready, prev), chunks[0][0], size, chunks))
+        self.inflight.append(_Batch(max(ready, prev), chunks[0][0], size, chunks,
+                                    t_arrival=t + hold + h1, pre_ms=h2, prep_ms=h3))
         self.inflight_n += size
 
     def _execute(self, windows: Optional[Sequence[_Window]]) -> None:
@@ -397,26 +491,29 @@ class PbftSim:
                     w.instances += 1
                     w.lat.append(t - b.oldest_ms)
                     w.batch.append(b.size)
+                    w.pre.append(b.pre_ms)
+                    w.prep.append(b.prep_ms)
+                    w.com.append(max(0.0, t - b.t_arrival - b.pre_ms - b.prep_ms))
                     if w.last_exec_ms is not None:
                         w.gap.append(t - w.last_exec_ms)
                     w.last_exec_ms = t
-        # The backoff restores only on evidence the timeout is adequate: the
-        # watched entry (this batch carries the oldest) completed before a
-        # deadline granted from arrival, not floored. Draining the queue
-        # counts either way.
-        if self.backoff:
-            floored = self.floor_ms > b.oldest_ms
-            if (not floored and t < self._deadline(b.oldest_ms)) or self._unexecuted() < 0.5:
-                self.backoff = 0
+        # complete(): the batch at the head of the order carries the watched
+        # request, so the watch moves on.
+        self._select_watch(t)
+        # PBFT restores the timeout once a request executes in the new view: any
+        # request that arrived after the floor (CppBedrock 73b9f08); what is
+        # still pending gets a fresh timeout per head when the backoff was raised.
+        # No batch executes during a view change (its instances are cancelled).
+        if b.chunks[-1][0] >= self.floor_ms:
+            if self.backoff:
+                self._set_floor(t)
+            self.backoff = 0
         self.commits_since_vc += 1
         self.last_exec_ms = t
 
     def _record_view_change(self, windows: Optional[Sequence[_Window]]) -> None:
-        for w in windows or ():
-            if w.covers(self.t_ms):
-                w.view_changes += 1
-                if self.commits_since_vc == 0:
-                    w.no_progress += 1
+        # Counted at the report over the last episode (the elections of the episode before the window's end, as AgentClient / learning.go count them (2026-10-19, restart D14)).
+        self._vc_log.append((self.t_ms, self.commits_since_vc == 0))
         self.commits_since_vc = 0
         self.backoff = min(self.backoff + 1, 30)
         self.view += 1
@@ -451,8 +548,10 @@ class PbftSim:
         self.in_view_change = False
         self.t_install_ms = math.inf
         self.t_wait_ms = math.inf
-        # The new primary is timed from the moment its view began.
-        self.floor_ms = self.t_ms
+        # The new primary is timed from the moment its view began (reset(), then
+        # setFloor()).
+        self._select_watch(self.t_ms)
+        self._set_floor(self.t_ms)
         for w in windows or ():
             if w.covers(self.t_ms):
                 w.new_views += 1
@@ -466,6 +565,7 @@ class PbftSim:
         s = self.episode_start_s
         wa = _Window(s, s + FEATURE_S)
         self._advance_to((s + FEATURE_S) * 1000.0, [wa])
+        self._count_view_changes(wa)
         features = wa.report(self.timeout_ms)
         # main.py labels an episode with the phase at its apply instant, so the
         # onset episode carries the phase its reward window measures.
@@ -476,48 +576,78 @@ class PbftSim:
         # change instead of putting every older request into the past.
         self._advance_to((s + FEATURE_S + REPLY_S) * 1000.0, None)
         if new_timeout < self.timeout_ms:
-            self.floor_ms = self.t_ms
+            self._set_floor(self.t_ms)
         self.timeout_ms = new_timeout
         wb = _Window(s + FEATURE_S + REPLY_S + WARMUP_S, s + EPISODE_S)
         self._advance_to((s + EPISODE_S) * 1000.0, [wb])
+        self._count_view_changes(wb)
         self.episode_start_s = s + EPISODE_S
         return features, new_timeout, wb.report(new_timeout), phase_idx
+
+    def _count_view_changes(self, w: _Window) -> None:
+        """The window's view-change counts: the elections in the episode ending at its end."""
+        end_ms, from_ms = w.end_s * 1000.0, (w.end_s - EPISODE_S) * 1000.0
+        recent = [stalled for t, stalled in self._vc_log if from_ms < t <= end_ms]
+        w.view_changes, w.no_progress = len(recent), sum(recent)
+        self._vc_log = [(t, st) for t, st in self._vc_log if t > from_ms]
 
 
 # --- Randomized environments -------------------------------------------------
 
 
-def _around(rng: np.random.Generator, host: float, lo: float = 0.5, hi: float = 2.0) -> float:
-    """A host constant scaled by a log-uniform factor in [lo, hi]."""
-    if host <= 0:
-        raise ValueError(f"cannot draw around a non-positive default {host}")
-    return float(host * math.exp(rng.uniform(math.log(lo), math.log(hi))))
+# --sim-constants (train, eval; pretrain.py --sim-constants): an alternative host
+# constants set, a JSON object of SimConstants fields over the installed
+# defaults (E5 of runs/2026-10-18-pbft-ladder-variants: a fit without proposal
+# delay, the delayed-leader shape neutral). None keeps the installed defaults.
+# Set before the workers fork, so they inherit it, as NO_PROPOSAL_FAULTS.
+HOST_CONSTANTS: Optional[SimConstants] = None
+
+
+def set_host_constants(path: str) -> None:
+    global HOST_CONSTANTS
+    with open(path) as f:
+        values = json.load(f)
+    if not isinstance(values, dict):
+        raise ValueError(f"{path}: expected a JSON object of SimConstants fields")
+    try:
+        HOST_CONSTANTS = replace(SimConstants(), **values)
+    except TypeError as exc:
+        raise ValueError(f"{path}: {exc}") from None
+
+
+def host_constants() -> SimConstants:
+    """The installed defaults, or the --sim-constants set (a fresh copy:
+    callers mutate it)."""
+    return SimConstants() if HOST_CONSTANTS is None else replace(HOST_CONSTANTS)
 
 
 def sample_constants(rng: np.random.Generator) -> SimConstants:
-    """Per-run physics. The fitted constants (sim_fit.py FREE: processing, the
-    byte cap, the delayed-leader shape) are drawn within 0.5-2 x their
-    SimConstants defaults; the excess factor scales its excess over D, since
-    the hold never costs less than D, and the byte cap stays within the count
-    limit. Every other field keeps its wide draw."""
-    h = SimConstants()
+    """Per-run physics (module docstring; sim_common.py, restart D11). The
+    fitted constants (sim_fit.py FREE: processing, the byte cap, the
+    delayed-leader shape, the view-change overhead and spread) are drawn
+    0.5-2 x their installed values; the excess factor scales its excess over D,
+    since the hold never costs less than D, and the byte cap stays within the
+    count limit. The batching wait is drawn 0.5-2 x its cited value but at most
+    1, and base delay, jitter, load and backlog come from sim_common. A spike
+    of 0 (a neutral delayed-leader shape in a --sim-constants set) stays 0."""
+    h = host_constants()
     return SimConstants(
-        base_delay_ms=float(rng.uniform(2.0, 10.0)),
-        jitter_ratio=float(rng.uniform(0.0, 0.1)),
-        proc_ms=_around(rng, h.proc_ms),
-        proc_sigma=_around(rng, h.proc_sigma),
-        proc_per_tx_us=_around(rng, h.proc_per_tx_us),
-        load_tps=float(rng.uniform(8000.0, 26000.0)),
-        batch_cap=int(round(_around(rng, h.batch_cap, hi=min(2.0, BATCH_MAX_REQUESTS / h.batch_cap)))),
-        batching_wait=float(rng.uniform(0.6, 1.0)),
-        vc_overhead_ms=float(math.exp(rng.uniform(math.log(50.0), math.log(1500.0)))),
-        vc_sigma=float(rng.uniform(0.0, 0.5)),
-        knee_ms=_around(rng, h.knee_ms),
-        excess_factor=1.0 + _around(rng, h.excess_factor - 1.0),
-        excess_sigma=_around(rng, h.excess_sigma),
-        spike_ms=_around(rng, h.spike_ms),
-        spike_batches=max(1, int(round(_around(rng, h.spike_batches)))),
-        initial_backlog=int(rng.integers(0, MAX_PENDING_REQUESTS + 1)) if rng.random() < 0.5 else 0,
+        base_delay_ms=draw_base_delay_ms(rng),
+        jitter_ratio=JITTER_RATIO,
+        proc_ms=around(rng, h.proc_ms),
+        proc_sigma=around(rng, h.proc_sigma),
+        proc_per_tx_us=around(rng, h.proc_per_tx_us),
+        load_tps=draw_load_tps(rng, reward_normalizer_tps("pbft")),
+        batch_cap=int(round(around(rng, h.batch_cap, hi=min(2.0, BATCH_MAX_REQUESTS / h.batch_cap)))),
+        batching_wait=around(rng, h.batching_wait, hi=min(2.0, 1.0 / h.batching_wait)),
+        vc_overhead_ms=around(rng, h.vc_overhead_ms),
+        vc_sigma=around(rng, h.vc_sigma),
+        knee_ms=around(rng, h.knee_ms),
+        excess_factor=1.0 + around(rng, h.excess_factor - 1.0),
+        excess_sigma=around(rng, h.excess_sigma),
+        spike_ms=around(rng, h.spike_ms) if h.spike_ms > 0 else 0.0,
+        spike_batches=max(1, int(round(around(rng, h.spike_batches)))),
+        initial_backlog=draw_initial_backlog(rng, MAX_PENDING_REQUESTS),
     )
 
 
@@ -527,51 +657,120 @@ def sample_constants(rng: np.random.Generator) -> SimConstants:
 NO_PROPOSAL_FAULTS = False
 
 
+# The spec's hold re-pin interval (<proposalDelay><interval>), the centre of the
+# training draw.
+SPEC_REPIN_INTERVAL_S = 60.0
+
+
 def sample_phase(rng: np.random.Generator, start_s: float) -> Phase:
+    """One fault: the PBFT mix, with sim_common's magnitudes (restart D11)."""
     kind = rng.random()
     extra, prop = 0.0, 0.0
     if kind < 0.2:
         pass
     elif kind < 0.55:
-        prop = float(math.exp(rng.uniform(math.log(50.0), math.log(2000.0))))
+        prop = draw_hold_ms(rng)
     elif kind < 0.9:
-        extra = float(rng.uniform(10.0, 300.0))
+        extra = draw_link_extra_ms(rng)
     else:
-        prop = float(math.exp(rng.uniform(math.log(50.0), math.log(2000.0))))
-        extra = float(rng.uniform(10.0, 300.0))
+        prop = draw_hold_ms(rng)
+        extra = draw_link_extra_ms(rng)
     if NO_PROPOSAL_FAULTS:
         prop = 0.0
     return Phase(
         start_s=start_s,
         extra_delay_ms=extra,
         proposal_delay_ms=prop,
-        interval_s=float(rng.uniform(30.0, 120.0)),
+        interval_s=around(rng, SPEC_REPIN_INTERVAL_S),
     )
 
 
 def sample_schedule(rng: np.random.Generator, total_s: float) -> List[Phase]:
-    phases = [Phase(start_s=0.0)]
-    t = float(rng.uniform(40.0, 400.0))
-    while t < total_s:
-        phases.append(sample_phase(rng, t))
-        t += float(rng.uniform(40.0, 400.0))
-    return phases
+    return [Phase(start_s=0.0)] + [sample_phase(rng, t) for t in fault_start_times(rng, total_s)]
+
+
+SPEC_PATH = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "config", "pbft", "failure_spec.xml"))
+
+
+def check_spec_schedule(phases: Sequence[Phase], path: str = SPEC_PATH) -> None:
+    """Raise unless ``phases`` are the spec file's (restart D11, 2026-10-19): its
+    warm-up, base link and jitter as WARMUP_PHASE_S and the SimConstants
+    defaults, and per phase the onset (warm-up + atTime; 0 for the base phase),
+    the continuous global delay, and the leader hold with its re-pin interval.
+    Anything else the spec injects (stragglers, edges, silence, a numbered
+    replica, partial bursts) raises."""
+    import xml.etree.ElementTree as ET
+
+    def num(node, tag, where):
+        text = node.findtext(tag)
+        if text is None:
+            raise ValueError(f"{path}: {where} has no <{tag}>")
+        return float(text)
+
+    root = ET.parse(path).getroot()
+    c = SimConstants()
+    got = (num(root, "warmUpTime", "the spec"),
+           num(root.find("globalNetworkDelay"), "delayMs", "<globalNetworkDelay>"),
+           num(root.find("globalNetworkDelay"), "jitterRatio", "<globalNetworkDelay>"))
+    if got != (WARMUP_PHASE_S, c.base_delay_ms, c.jitter_ratio):
+        raise ValueError(f"{path}: warm-up, base delay, jitter {got} != the simulator's "
+                         f"{(WARMUP_PHASE_S, c.base_delay_ms, c.jitter_ratio)}")
+    spec = root.find("phases").findall("phase")
+    if len(spec) != len(phases):
+        raise ValueError(f"{path}: {len(spec)} phases, spec_schedule has {len(phases)}")
+    for i, (ph, sim) in enumerate(zip(spec, phases)):
+        where = f"phase {i}"
+        extra, hold, interval = 0.0, 0.0, None
+        net = ph.find("network")
+        if net is not None:
+            for tag in ("sources", "edges", "silence"):
+                if net.find(tag) is not None and len(net.find(tag)):
+                    raise ValueError(f"{path}: {where} has <{tag}> entries pbft_sim cannot model")
+            gl = net.find("global")
+            if gl is not None:
+                extra = num(gl, "delayMs", where)
+                dur, itv = gl.findtext("burstDurationMs"), gl.findtext("burstIntervalMs")
+                if extra > 0 and not (dur is not None and float(dur) == float(itv or 0) > 0):
+                    raise ValueError(f"{path}: {where} has partial delay bursts ({dur}/{itv} ms)")
+        pd = ph.find("pbft/proposalDelay")
+        if pd is not None:
+            replicas = list(pd.find("replicas") if pd.find("replicas") is not None else [])
+            if len(replicas) > 1 or any((r.findtext("id") or "").strip() != "leader" for r in replicas):
+                raise ValueError(f"{path}: {where} delays a replica other than the leader token")
+            if replicas:
+                hold, interval = num(replicas[0], "delayMs", where), num(pd, "interval", where)
+        start = WARMUP_PHASE_S + num(ph, "atTime", where)
+        if i == 0:
+            # The simulated base phase starts at 0 and so covers the warm-up,
+            # which the spec leaves fault-free: its first phase must be too.
+            if start != WARMUP_PHASE_S or extra or hold:
+                raise ValueError(f"{path}: phase 0 must be a fault-free atTime 0 phase")
+            start = 0.0
+        want = (start, extra, hold)
+        have = (sim.start_s, sim.extra_delay_ms, sim.proposal_delay_ms)
+        if have != want or (interval is not None and sim.interval_s != interval):
+            raise ValueError(f"{path}: {where} (start, extra, hold, interval) "
+                             f"{want + (interval,)} != spec_schedule's {have + (sim.interval_s,)}")
 
 
 def spec_schedule() -> List[Phase]:
     """config/pbft/failure_spec.xml (seven phases, delays re-pinned every
-    60 s): warm-up 10 s, phases at warm-up + atTime. Used only to evaluate
-    policies in simulation, never to train."""
+    60 s; p1 hold 300 since 2026-10-14, p2 hold 550 since 2026-10-13): warm-up 10 s, phases at warm-up + atTime. Used only to evaluate
+    policies in simulation, never to train. Checked against the file on every
+    build (check_spec_schedule)."""
     w = 10.0
-    return [
+    phases = [
         Phase(0.0),
-        Phase(w + 300.0, proposal_delay_ms=120.0),
-        Phase(w + 600.0, proposal_delay_ms=400.0),
+        Phase(w + 300.0, proposal_delay_ms=300.0),  # 120 -> 200 -> 300, 2026-10-14 (Kevin): five machines tolerated 120 at T 250 and deposed 200 late
+        Phase(w + 600.0, proposal_delay_ms=550.0),  # 400 -> 550, 2026-10-13 (Kevin): 550 deposes the held leader
         Phase(w + 900.0, extra_delay_ms=50.0),
         Phase(w + 1200.0, extra_delay_ms=50.0, proposal_delay_ms=500.0),
         Phase(w + 1500.0, extra_delay_ms=150.0),
         Phase(w + 1800.0),
     ]
+    check_spec_schedule(phases)
+    return phases
 
 
 # --- Agent loop, data generation, prior training, evaluation -----------------
@@ -590,6 +789,8 @@ _INT_FIELDS = (
     "regency_change_count", "timeout_ms", "view_change_count",
     "no_progress_view_change_count",
 )
+# Report fields the reward calculator does not take (phase window means).
+_PHASE_FIELDS = ("pre_prepare_latency_ms", "prepare_latency_ms", "commit_latency_ms")
 
 
 def episode_reward(report: Dict[str, float]) -> float:
@@ -601,7 +802,7 @@ def episode_reward(report: Dict[str, float]) -> float:
     return calculate_pbft_reward(
         **{
             name: int(round(value)) if name in _INT_FIELDS else float(value)
-            for name, value in report.items()
+            for name, value in report.items() if name not in _PHASE_FIELDS
         }
     )
 
@@ -638,14 +839,8 @@ def run_agent(
 
 def training_sim(rng: np.random.Generator, seed: int) -> Tuple[PbftSim, int]:
     """One randomized training run: (simulator, episodes)."""
-    lower_ms, upper_ms = CONTEXT_SPECS[agent_pb2.PROTOCOL_PBFT].bounds_ms
     episodes = int(rng.integers(40, 120))
-    # A quarter of the runs start on the CppBedrock default, as a real run
-    # does before its first decision.
-    if rng.random() < 0.25:
-        initial = DEFAULT_ELECTION_TIMEOUT_MS
-    else:
-        initial = float(math.exp(rng.uniform(math.log(lower_ms), math.log(upper_ms))))
+    initial = draw_initial_timeout_ms(rng, agent_pb2.PROTOCOL_PBFT)  # sim_common, restart D11
     sim = PbftSim(
         sample_constants(rng),
         sample_schedule(rng, episodes * EPISODE_S),
@@ -656,10 +851,13 @@ def training_sim(rng: np.random.Generator, seed: int) -> Tuple[PbftSim, int]:
     return sim, episodes
 
 
-def _generate_one(args: Tuple[int, str]) -> Tuple[np.ndarray, np.ndarray]:
+def _generate_one(args: Tuple[int, str, int]) -> Tuple[np.ndarray, np.ndarray]:
+    """One randomized run. Every ``hold`` episodes an action is drawn and held for
+    ``hold`` episodes; a sample is (context at the hold's first decision, action) ->
+    the mean reward over the hold (hold 1 = per episode), as sbft_sim's."""
     from reward_utils import set_reward_design
 
-    seed, design = args
+    seed, design, hold = args
     set_reward_design(design)
     from continuous_bandit import ContinuousTimeoutActionCodec, report_context
     from models import PBFT_REPORT_FEATURE_FIELD_NAMES
@@ -671,11 +869,12 @@ def _generate_one(args: Tuple[int, str]) -> Tuple[np.ndarray, np.ndarray]:
     sim, episodes = training_sim(rng, seed)
     prev = codec.normalize_ms(int(round(min(max(sim.timeout_ms, lower_ms), upper_ms))))
     xs, ys = [], []
-    for _ in range(episodes):
+    for _ in range(episodes // hold):
         holder = {}
 
         def choose(report):
-            nonlocal prev
+            if "a" in holder:
+                return holder["ms"]
             x = feature_vector(report)
             holder["ctx"] = report_context(spec, PBFT_REPORT_FEATURE_FIELD_NAMES, x)
             if rng.random() < 0.6:
@@ -684,75 +883,28 @@ def _generate_one(args: Tuple[int, str]) -> Tuple[np.ndarray, np.ndarray]:
                 a = float(np.clip(prev + rng.normal(0.0, 0.08), 0.0, 1.0))
             ms = codec._denormalize_value(a, 0)
             holder["a"] = codec.normalize_ms(ms)
-            return float(ms)
+            holder["ms"] = float(ms)
+            return holder["ms"]
 
-        _, _, reward_report, _ = sim.run_episode(choose)
+        rewards = []
+        for _ in range(hold):
+            _, _, reward_report, _ = sim.run_episode(choose)
+            rewards.append(episode_reward(reward_report))
         xs.append(np.append(holder["ctx"], holder["a"]))
-        ys.append(episode_reward(reward_report))
+        ys.append(float(np.mean(rewards)))
         prev = holder["a"]
     return np.asarray(xs), np.asarray(ys)
 
 
-def generate(n_runs: int, seed: int, workers: int, design: str) -> Tuple[np.ndarray, np.ndarray]:
+def generate(n_runs: int, seed: int, workers: int, design: str, hold: int = 1) -> Tuple[np.ndarray, np.ndarray]:
     from multiprocessing import Pool
 
-    seeds = [(seed + i, design) for i in range(n_runs)]
+    if hold < 1:
+        raise ValueError("--hold-episodes must be at least 1")
+    seeds = [(seed + i, design, hold) for i in range(n_runs)]
     with Pool(workers) as pool:
         parts = pool.map(_generate_one, seeds, chunksize=8)
     return np.vstack([p[0] for p in parts]), np.concatenate([p[1] for p in parts])
-
-
-def train_prior(
-    x: np.ndarray,
-    y: np.ndarray,
-    out_path: str,
-    seed: int,
-    design: str,
-    target_floor: float = -math.inf,
-) -> float:
-    from sklearn.neural_network import MLPRegressor
-
-    # Rewards below the floor are fit as the floor. SimReturnGPModel applies
-    # the same floor to the online reward, so the residual compares like with
-    # like, and the fit stops spending its error on collapses instead of on
-    # the structure that ranks the usable timeouts. A raw fit (-inf) is only
-    # usable by SimPriorGPModel.
-    y = np.maximum(y, target_floor)
-    x_mean, x_std = x.mean(axis=0), x.std(axis=0) + 1e-9
-    y_mean, y_std = float(y.mean()), float(y.std() + 1e-9)
-    rng = np.random.default_rng(seed)
-    order = rng.permutation(len(x))
-    cut = int(0.9 * len(x))
-    tr, va = order[:cut], order[cut:]
-    mlp = MLPRegressor(
-        hidden_layer_sizes=(128, 128, 64),
-        activation="relu",
-        alpha=1e-5,
-        batch_size=512,
-        learning_rate_init=1e-3,
-        max_iter=200,
-        early_stopping=True,
-        n_iter_no_change=10,
-        random_state=seed,
-    )
-    mlp.fit((x[tr] - x_mean) / x_std, (y[tr] - y_mean) / y_std)
-    pred = mlp.predict((x[va] - x_mean) / x_std) * y_std + y_mean
-    rmse = float(np.sqrt(np.mean((pred - y[va]) ** 2)))
-    arrays = {"n_layers": np.asarray(len(mlp.coefs_))}
-    for i, (w, b) in enumerate(zip(mlp.coefs_, mlp.intercepts_)):
-        arrays[f"W{i}"] = w
-        arrays[f"b{i}"] = b
-    arrays.update(
-        x_mean=x_mean,
-        x_std=x_std,
-        y_mean=np.asarray(y_mean),
-        y_std=np.asarray(y_std),
-        reward_design=np.asarray(design),
-        target_floor=np.asarray(float(target_floor)),
-    )
-    arrays.update(SIM_WINDOWS.arrays())
-    np.savez(out_path, **arrays)
-    return rmse
 
 
 def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
@@ -774,7 +926,7 @@ def make_policy(kind: str, prior_path: str = DEFAULT_PRIOR_PATH, **kwargs):
     if kind == "heuristic":
         from model_builder import build_model
 
-        built = build_model(protocol, "continuous_heuristic")
+        built = build_model(protocol, "continuous_heuristic", prior_windows=SIM_WINDOWS)
         model, codec = built.model, built.action_codec
     elif kind == "discrete_linucb":
         codec = ProtocolTimeoutActionCodec(protocol)
@@ -835,7 +987,8 @@ def evaluate_spec(kind: str, constants: SimConstants, seed: int, **kwargs) -> np
 def pretrain_adapter():
     """This simulator as pretrain.py drives it: training runs as train draws
     them, spec runs as evaluate_spec builds them (host constants, 105
-    episodes); the spec phase is run_agent's, and there is no oracle."""
+    episodes); the spec phase is run_agent's, and the oracle plays
+    learning_agent/config/schedule_pbft.csv as ScheduledTimeoutModel does."""
     from pretrain import SimAdapter, timeout_message
 
     def to_timeout(timeout_ms: float) -> agent_pb2.Timeout:
@@ -845,13 +998,25 @@ def pretrain_adapter():
     def from_timeout(timeout: agent_pb2.Timeout) -> float:
         return float(timeout_message(timeout, "pbft").election_timeout_milliseconds)
 
+    rows = schedule_rows("pbft")
+
+    def oracle(sim) -> Callable[[np.ndarray], float]:
+        # The apply time: the decision at the feature deadline reaches the
+        # replicas a reply window later (Kevin, 2026-10-19, restart: the sim gate
+        # compares against the oracle on all six).
+        def predict(x: np.ndarray) -> float:
+            return scheduled_action(rows, sim.episode_start_s + FEATURE_S + REPLY_S, WARMUP_PHASE_S)[0]
+
+        return predict
+
     return SimAdapter(
         protocol=agent_pb2.PROTOCOL_PBFT,
         simulator="pbft_sim",
         training_run=lambda seed: training_sim(np.random.default_rng(seed), seed),
         spec_run=lambda seed: (
-            PbftSim(SimConstants(), spec_schedule(), seed=seed,
-                    start_offset_s=SPEC_START_OFFSET_S), 105),
+            # The engine opens at the middle rung (--initial-timeout in the rows, D10b).
+            PbftSim(host_constants(), spec_schedule(), seed=seed, start_offset_s=SPEC_START_OFFSET_S,
+                    initial_timeout_ms=float(opening_action_ms(agent_pb2.PROTOCOL_PBFT)[0])), 105),
         run_agent=run_agent,
         # A training schedule's phase 0 is a real phase, so run_agent already
         # updates every decision from 10 s.
@@ -861,7 +1026,7 @@ def pretrain_adapter():
         row_phase=lambda row: row[0],
         row_reward=lambda row: episode_reward(row[2]),
         spec_phase_count=7,
-        oracle=None,
+        oracle=oracle,
     )
 
 
@@ -869,43 +1034,61 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
     t = sub.add_parser("train", help="generate randomized episodes and fit the prior")
+    t.add_argument("--code-hash", required=True,
+                   help="code_hash of the tree training the prior (scripts/cloudlab/code_state.py), recorded in the prior and compared with FREEZE by the harness")
     t.add_argument("--runs", type=int, default=4000)
     t.add_argument("--seed", type=int, default=1)
     t.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     t.add_argument("--out", default=DEFAULT_PRIOR_PATH)
-    t.add_argument("--reward-design", default="reward_mixed")
-    t.add_argument("--target-floor", type=float, default=-math.inf,
+    t.add_argument("--reward-design", default=DEFAULT_REWARD_DESIGN)
+    t.add_argument("--target-floor", type=float, default=-2.0,
                    help="fit rewards below this value as this value "
                         "(SimReturnGPModel applies the same floor online, and "
-                        "refuses a prior fit to the raw reward); default: no floor")
+                        "refuses a prior fit to the raw reward); default -2, as "
+                        "the pretraining recipe passes; -inf for a raw fit")
+    t.add_argument("--hold-episodes", type=int, default=3,
+                   help="episodes each training action is held, the target their "
+                        "mean reward; 3 = the 60 s leader re-pin (restart D11)")
     t.add_argument("--no-proposal-faults", action="store_true",
                    help="train on network-delay phases only; the prior never "
                         "sees a delayed or silent proposer")
+    t.add_argument("--sim-constants", default=None,
+                   help="JSON of SimConstants fields replacing the installed defaults")
     e = sub.add_parser("eval", help="compare policies on the spec schedule in simulation")
     e.add_argument("--seeds", type=int, default=10)
     e.add_argument("--prior", default=DEFAULT_PRIOR_PATH)
     e.add_argument("--randomize", action="store_true", help="random constants per seed")
-    e.add_argument("--reward-design", default="reward_mixed",
-                   help="reward the candidate learns from; the baselines keep reward_mixed")
+    e.add_argument("--sim-constants", default=None,
+                   help="JSON of SimConstants fields replacing the installed defaults")
+    e.add_argument("--reward-design", default=DEFAULT_REWARD_DESIGN,
+                   help="reward the candidate learns from; the baselines learn from "
+                        "the active reward (reward_utils.DEFAULT_REWARD_DESIGN)")
     args = parser.parse_args()
     from reward_utils import set_reward_design
 
+    if args.sim_constants is not None:
+        set_host_constants(args.sim_constants)  # before generate() forks its workers
+        print(f"[sim] constants from {args.sim_constants}: {HOST_CONSTANTS}")
     if args.cmd == "train":
         global NO_PROPOSAL_FAULTS
         NO_PROPOSAL_FAULTS = bool(args.no_proposal_faults)  # inherited by the forked workers
-        x, y = generate(args.runs, args.seed, args.workers, args.reward_design)
-        rmse = train_prior(x, y, args.out, args.seed, args.reward_design, args.target_floor)
-        print(f"samples={len(x)} reward_std={y.std():.4f} holdout_rmse={rmse:.4f} -> {args.out}")
+        x, y = generate(args.runs, args.seed, args.workers, args.reward_design, args.hold_episodes)
+        rmse = train_gp_prior(
+            agent_pb2.PROTOCOL_PBFT, x, y, args.out, seed=args.seed, design=args.reward_design,
+            hold=args.hold_episodes, target_floor=args.target_floor, windows=SIM_WINDOWS,
+            sim_constants=asdict(host_constants()), code_hash=args.code_hash)
+        print(f"samples={len(x)} hold_episodes={args.hold_episodes} target_floor={args.target_floor} "
+              f"reward_std={y.std():.4f} holdout_rmse={rmse:.4f} -> {args.out}")
         return
 
     rng = np.random.default_rng(12345)
     for s in range(args.seeds):
-        constants = sample_constants(rng) if args.randomize else SimConstants()
+        constants = sample_constants(rng) if args.randomize else host_constants()
         if args.randomize:
             constants.load_tps = 20000.0
         res = {}
         for k in ("discrete_linucb", "heuristic", "candidate"):
-            set_reward_design(args.reward_design if k == "candidate" else "reward_mixed")
+            set_reward_design(args.reward_design if k == "candidate" else DEFAULT_REWARD_DESIGN)
             res[k] = evaluate_spec(k, constants, s, **({"prior_path": args.prior} if k == "candidate" else {}))
         wins = 0
         line = []

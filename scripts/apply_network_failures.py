@@ -6,7 +6,7 @@ failure_spec.xml and ignores the protocol and agent fault sections. Two fault
 kinds are supported per phase:
 
 - burst delays on the global / per-source / per-edge rules (delayMs plus the
-  burst schedule), applied as netem delay with jitter at <globalNetworkDelay>/<jitterRatio> (default 20 percent);
+  burst schedule), applied as netem delay with jitter at <globalNetworkDelay>/<jitterRatio> (required);
 - <silence>, a list of replica ids that go dark for the phase. Every applier
   cuts a silenced replica off like a crash: iptables REJECT (icmp-port-unreachable)
   in both directions so new connects fail instantly, plus `ss -K` to destroy the
@@ -29,12 +29,6 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, FrozenSet, List, Tuple
-
-# Default netem jitter as a fraction of the delay, when the spec does not set
-# <globalNetworkDelay>/<jitterRatio>. netem jitter reorders packets, which TCP
-# treats as loss, so high-throughput protocols should set it to 0 explicitly.
-DEFAULT_NETWORK_DELAY_JITTER_RATIO = 0.20
-
 
 @dataclass(frozen=True)
 class BurstDelay:
@@ -219,9 +213,11 @@ def _parse_global_network_delay_ms(root: ET.Element) -> float:
 
 
 def _parse_jitter_ratio(root: ET.Element) -> float:
+    # Required (2026-10-19): a missing element used to mean 20 percent, which two specs
+    # inherited silently. netem jitter reorders packets, which TCP treats as loss.
     node = root.find("./globalNetworkDelay/jitterRatio")
-    if node is None or node.text is None:
-        return DEFAULT_NETWORK_DELAY_JITTER_RATIO
+    if node is None or node.text is None or not node.text.strip():
+        raise ValueError("The failure spec must set <globalNetworkDelay>/<jitterRatio>")
     try:
         ratio = float(node.text.strip())
     except ValueError as exc:

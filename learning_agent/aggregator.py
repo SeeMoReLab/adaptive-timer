@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict
+from typing import Dict, Tuple
 
 import numpy as np
 from google.protobuf.descriptor import FieldDescriptor
@@ -53,6 +53,25 @@ SBFT_LEADER_MEASURED_FIELDS = (
     "nth_prepare_seen_count",
     "nth_prepare_unseen_count",
 )
+
+
+# The hold-free fields only some replicas measure (SmartBFT's followers, HotStuff's next
+# leader of a round, Autobahn's non-leaders of a slot).
+_HOLD_FREE_FIELDS = frozenset({"proposal_to_decision_ms", "proposal_to_qc_ms", "prepare_to_commit_ms"})
+
+
+def measured_only_fields(protocol: int) -> Tuple[str, ...]:
+    """The window statistics of samples (latencies, inter-commit gaps, batch sizes) and the
+    hold-free fields, taken as the median of the reports that measured them (> 0): a replica
+    with no sample in the window reports 0, which is no measurement. Every protocol alike
+    (Kevin, 2026-10-19, restart; until then only the hold-free fields). Counts and rates keep
+    the plain median; SBFT's leader-measured fields keep the leader's report."""
+    return tuple(
+        name for name in get_report_field_names(protocol)
+        if (name.endswith("_latency_ms") or "_inter_commit_gap_ms" in name
+            or name.endswith("_batch_size") or name in _HOLD_FREE_FIELDS)
+        and not (protocol == agent_pb2.PROTOCOL_SBFT and name in SBFT_LEADER_MEASURED_FIELDS)
+    )
 
 
 def _report_to_array(protocol: int, report: object) -> np.ndarray:
@@ -158,7 +177,27 @@ class BaseAggregator(ABC):
                 aggregated_values[fields.index(name)] = float(
                     getattr(reports_by_node[leader], name)
                 )
+        # A replica without a sample reports 0 (the hold-free fields: every replica that
+        # does not measure them, or delivered nothing it verified); any such 0 pulled the
+        # median toward a value the simulator only gives a window with no sample. Take the
+        # median of the reports that measured the field, 0 only when none did.
+        fields = get_report_field_names(self.protocol)
+        for measured_field in measured_only_fields(self.protocol):
+            measured = [
+                float(getattr(report, measured_field))
+                for node, report in reports_by_node.items()
+                if getattr(report, measured_field) > 0
+                for _ in range(self._copies(node, node_id))
+            ]
+            aggregated_values[fields.index(measured_field)] = (
+                float(np.median(measured)) if measured else 0.0
+            )
         return _array_to_report(self.protocol, aggregated_values)
+
+    def _copies(self, node: int, node_id: int) -> int:
+        """How many times a node's value enters a median (WeightedMedianAggregator
+        counts the local node more than once)."""
+        return 1
 
     @abstractmethod
     def _calculate(self, data: Dict[int, np.ndarray], node_id: int) -> np.ndarray:
@@ -177,6 +216,9 @@ class WeightedMedianAggregator(BaseAggregator):
         if weights < 1:
             raise ValueError(f"weights must be >= 1, got {weights}")
         self.weights = weights
+
+    def _copies(self, node: int, node_id: int) -> int:
+        return self.weights if node == node_id else 1
 
     def _calculate(self, data: Dict[int, np.ndarray], node_id: int) -> np.ndarray:
         if node_id not in data:

@@ -67,6 +67,10 @@ REWARD_DESIGN="reward_tps_latency"
 LATENCY_FLOOR_MULTIPLIER="0"
 # Prior file the model loads, repo-relative after validation; "" (omitted) is untrained.
 PRIOR_PATH=""
+# PBFT discrete models: rungs replacing the 250,550,1200 ladder; "" keeps it.
+TIMEOUT_LADDER=""
+# continuous_heuristic: k replacing the protocol's own; "" keeps it.
+HEURISTIC_K=""
 
 TX_RATE="${TX_RATE:-40000}"
 REQUEST_TIMEOUT_MS=10000
@@ -110,7 +114,10 @@ OVERLAY_OCTET_B=252
 OVERLAY_MASK_BITS=24
 OVERLAY_HOST_OFFSET=10
 ARTIFACT_FETCH_MAX_PARALLEL=4
-ARTIFACT_FETCH_MAX_ATTEMPTS=3
+# sshd throttles the burst of new connections at the end of a run (MaxStartups: "kex_exchange_identification:
+# Connection reset"); three tries 1-2 s apart lost the last-queued file, the single-host agent3.csv, in most
+# runs (2026-10-19, restart). Doubling waits give a throttled handshake about a minute to clear.
+ARTIFACT_FETCH_MAX_ATTEMPTS=6
 ARTIFACT_FETCH_RETRY_DELAY_S=1
 LOCAL_RUN_LOCK_DIRS=("")
 
@@ -118,6 +125,7 @@ cleanup_local_run_locks() {
   local lock_dir
   for lock_dir in "${LOCAL_RUN_LOCK_DIRS[@]}"; do
     [[ -z "${lock_dir}" ]] && continue
+    rm -f "${lock_dir}/pid"
     rmdir "${lock_dir}" 2>/dev/null || true
   done
 }
@@ -150,8 +158,20 @@ acquire_local_run_lock() {
   if ! mkdir "${lock_dir}" 2>/dev/null; then
     echo "Cannot start ${PROTOCOL_NAME} run: ${description} is already in use." >&2
     echo "Active-run lock: ${lock_dir}" >&2
+    # The holder (pid, start time, script), so a lock left by a dead process can be told
+    # from a live one; it is never taken over automatically (2026-10-19, restart).
+    if [[ -f "${lock_dir}/pid" ]]; then
+      local holder
+      holder="$(cat "${lock_dir}/pid")"
+      if kill -0 "${holder%% *}" 2>/dev/null; then
+        echo "Held by: ${holder} (running)" >&2
+      else
+        echo "Held by: ${holder} (not running here; remove the lock if no other machine holds it)" >&2
+      fi
+    fi
     return 1
   fi
+  printf '%s %s %s\n' "$$" "$(date +%FT%T)" "$0" > "${lock_dir}/pid"
   LOCAL_RUN_LOCK_DIRS+=("${lock_dir}")
 }
 
@@ -191,6 +211,9 @@ Flags:
                                      continuous_linucb, discrete_ppo or continuous_ppo in learning or
                                      sharing mode. It must be under learning_agent/, the only tree
                                      shipped to the nodes. Omitted (default): the model starts untrained.
+  --timeout-ladder <ms,ms,...>       PBFT only, discrete models in learning or sharing mode: rungs replacing
+                                     the 250,550,1200 ladder (a discrete_linucb/ppo prior must match it).
+  --heuristic-k <float>              continuous_heuristic only: k replacing the protocol's own.
   -f <int>                          Fault tolerance f; nodes defaults to 3f+1 (default: 1).
   -t <int>                          Seconds to run after benchmark start (default: 300).
 
@@ -387,7 +410,7 @@ queue_artifact_download() {
         exit 0
       fi
       if (( attempt < ARTIFACT_FETCH_MAX_ATTEMPTS )); then
-        sleep $((ARTIFACT_FETCH_RETRY_DELAY_S * attempt))
+        sleep $((ARTIFACT_FETCH_RETRY_DELAY_S << attempt))
       fi
     done
 
@@ -484,6 +507,8 @@ bedrock_main() {
         PRIOR_PATH="${2}"
         shift 2
         ;;
+      --timeout-ladder) TIMEOUT_LADDER="${2:-}"; [[ -n "${TIMEOUT_LADDER}" ]] || { echo "Missing value for --timeout-ladder." >&2; exit 2; }; shift 2 ;;
+      --heuristic-k) HEURISTIC_K="${2:-}"; [[ -n "${HEURISTIC_K}" ]] || { echo "Missing value for --heuristic-k." >&2; exit 2; }; shift 2 ;;
       --nodes) NODES="${2:-}"; NODES_SET=1; shift 2 ;;
       --failure-spec) FAILURE_SPEC_PATH="${2:-}"; FAILURE_SPEC_ENABLED=1; shift 2 ;;
       --no-failure-spec) FAILURE_SPEC_ENABLED=0; shift ;;
@@ -603,6 +628,25 @@ bedrock_main() {
       exit 2
     fi
   fi
+  if [[ -n "${TIMEOUT_LADDER}" ]]; then
+    if [[ "${PROTOCOL_NAME}" != "pbft" ]]; then
+      echo "--timeout-ladder is supported only by run_pbft.sh." >&2; exit 2
+    fi
+    if [[ "${MODE}" != "learning" && "${MODE}" != "sharing" ]] || [[ "${AGENT_MODEL_TYPE}" != discrete_* ]]; then
+      echo "--timeout-ladder applies to a discrete model in learning or sharing mode." >&2; exit 2
+    fi
+    if ! [[ "${TIMEOUT_LADDER}" =~ ^[0-9]+(,[0-9]+)+$ ]]; then
+      echo "Invalid --timeout-ladder: ${TIMEOUT_LADDER}. Expected comma-separated integer ms, e.g. 250,450,1200." >&2; exit 2
+    fi
+  fi
+  if [[ -n "${HEURISTIC_K}" ]]; then
+    if [[ "${AGENT_MODEL_TYPE}" != "continuous_heuristic" ]]; then
+      echo "--heuristic-k applies to --model continuous_heuristic only." >&2; exit 2
+    fi
+    if ! [[ "${HEURISTIC_K}" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ "${HEURISTIC_K}" =~ ^0+([.]0+)?$ ]]; then
+      echo "Invalid --heuristic-k: ${HEURISTIC_K}. Expected a positive number." >&2; exit 2
+    fi
+  fi
   case "${REWARD_DESIGN}" in
     reward_tps|reward_mixed|reward_tps_latency) ;;
     *) echo "Invalid --reward-design: ${REWARD_DESIGN}. Expected reward_tps|reward_mixed|reward_tps_latency." >&2; exit 2 ;;
@@ -690,8 +734,17 @@ bedrock_main() {
       continue
     fi
     acquire_target_lock "${user}" "${host}"
+    "${REPO_ROOT}/scripts/cloudlab/check_idle.sh" "${LOCAL_SSH_KEY_PATH}" "${user}@${host}" || exit 1
   done < "${TARGETS_FILE}"
 
+  # The frozen code state (Kevin, 2026-10-19, restart): refuse to launch when the code a run
+  # ships differs from FREEZE (scripts/cloudlab/code_state.py --check); ALLOW_UNFROZEN=1 marks
+  # a run outside the frozen pipeline, and run.env records it. Before the artifact directory
+  # is chosen, so runs with and without --output-dir are both checked.
+  if [[ "${ALLOW_UNFROZEN:-0}" != "1" ]]; then
+    python3 "${REPO_ROOT}/scripts/cloudlab/code_state.py" --check ${PRIOR_PATH:+--prior "${REPO_ROOT}/${PRIOR_PATH}"} > /dev/null \
+      || { echo "The code or the prior differs from ${REPO_ROOT}/FREEZE (reason above); refreeze or retrain, or set ALLOW_UNFROZEN=1 for a run outside the frozen pipeline." >&2; exit 1; }
+  fi
   if [[ -z "${OUTPUT_DIR}" ]]; then
     mkdir -p "${RUNS_ROOT}"
     while true; do
@@ -758,6 +811,9 @@ bedrock_main() {
     printf 'reward_design=%q\n' "${REWARD_DESIGN}"
     printf 'latency_floor_multiplier=%q\n' "${LATENCY_FLOOR_MULTIPLIER}"
     printf 'prior_path=%q\n' "${PRIOR_PATH:-}"
+    # Only when given, so other runs' run.env stays as it was.
+    [[ -n "${TIMEOUT_LADDER}" ]] && printf 'timeout_ladder=%q\n' "${TIMEOUT_LADDER}"
+    [[ -n "${HEURISTIC_K}" ]] && printf 'heuristic_k=%q\n' "${HEURISTIC_K}"
     printf 'learning_window_mode=wall-clock\n'
     printf 'learning_feature_duration_ms=%q\n' "${LEARNING_FEATURE_DURATION_MS}"
     printf 'learning_reply_wait_ms=%q\n' "${LEARNING_REPLY_WAIT_MS}"
@@ -770,6 +826,9 @@ bedrock_main() {
     printf 'git_dirty=%q\n' "$([[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=no 2>/dev/null)" ]] && echo 1 || echo 0)"
     printf 'cppbedrock_commit=%q\n' "$(git -C "${BEDROCK_SRC}" rev-parse HEAD 2>/dev/null || echo unknown)"
     printf 'cppbedrock_dirty=%q\n' "$([[ -n "$(git -C "${BEDROCK_SRC}" status --porcelain --untracked-files=no 2>/dev/null)" ]] && echo 1 || echo 0)"
+    printf 'freeze_name=%q\n' "$(sed -n 's/^freeze_name=//p' "${REPO_ROOT}/FREEZE" 2>/dev/null)"
+    printf 'allow_unfrozen=%q\n' "${ALLOW_UNFROZEN:-0}"
+    python3 "${REPO_ROOT}/scripts/cloudlab/code_state.py" ${PRIOR_PATH:+--prior "${REPO_ROOT}/${PRIOR_PATH}"}
     printf 'command='
     printf '%q ' "$0" "${ORIGINAL_ARGS[@]}"
     printf '\n'
@@ -1393,7 +1452,9 @@ REMOTE
           "${LEARNING_FEATURE_DURATION_MS}" \
           "${LEARNING_REWARD_DURATION_MS}" \
           "${LEARNING_EPISODE_MS}" \
-          "${PRIOR_PATH}" <<'REMOTE'
+          "${PRIOR_PATH}" \
+          "${TIMEOUT_LADDER}" \
+          "${HEURISTIC_K}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
@@ -1415,6 +1476,8 @@ feature_window_ms="${16}"
 reward_window_ms="${17}"
 episode_ms="${18}"
 prior_path="${19:-}"
+timeout_ladder="${20:-}"
+heuristic_k="${21:-}"
 learning_agent_python="${HOME}/.venvs/adaptive-timer-learning-agent/bin/python"
 
 if [[ ! -x "${learning_agent_python}" ]]; then
@@ -1447,6 +1510,13 @@ fi
 # The model and mode were checked locally.
 if [[ -n "${prior_path}" ]]; then
   agent_model_args="${agent_model_args} --prior-path ${prior_path}"
+fi
+# Checked locally: PBFT discrete models (--timeout-ladder) and continuous_heuristic (--heuristic-k).
+if [[ -n "${timeout_ladder}" ]]; then
+  agent_model_args="${agent_model_args} --timeout-ladder ${timeout_ladder}"
+fi
+if [[ -n "${heuristic_k}" ]]; then
+  agent_model_args="${agent_model_args} --heuristic-multiplier ${heuristic_k}"
 fi
 
 # The agent gives a window in which nothing committed its own length as its

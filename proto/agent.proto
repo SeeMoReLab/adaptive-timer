@@ -248,6 +248,12 @@ message HotstuffReport {
     float p90_inter_commit_gap_ms = 34;
     float p50_batch_size = 36;
     float p90_batch_size = 37;
+
+    // Window mean of a round that leaves out a proposer's hold: the next leader's
+    // receipt of a block to the block's QC (2026-10-19: a model input that tells a
+    // slow leader from a slow link, and the latency floor's signal). Only the next
+    // leader of a round measures it; 0 when this replica measured none.
+    float proposal_to_qc_ms = 20;
 }
 
 // Autobahn state report. Same layout and semantics as HotstuffReport, with
@@ -279,6 +285,12 @@ message AutobahnReport {
     float p90_inter_commit_gap_ms = 34;
     float p50_batch_size = 36;
     float p90_batch_size = 37;
+
+    // Window mean from a replica's first receipt of another replica's Prepare for a
+    // (slot, view) to that slot's commit, which leaves out the leader's hold
+    // (2026-10-19: a model input that tells a slow leader from a slow link, and the
+    // latency floor's signal). 0 when none.
+    float prepare_to_commit_ms = 20;
 }
 
 // SmartBFT state report. Same layout and semantics as PbftReport. SmartBFT is
@@ -304,8 +316,17 @@ message SmartbftReport {
     uint32 no_progress_view_change_count = 16;
 
     // Held for phase fields with PbftReport's layout; SmartBFT exports no
-    // phase stamps yet.
+    // per-phase stamps.
     reserved 17 to 19, 40 to 48;
+
+    // Window mean, per decision, of proposal arrival (when the follower's
+    // view takes the pre-prepare up, VerifyProposal) -> local delivery: the
+    // prepare and commit rounds, PbftReport's three phase latencies together.
+    // A leader's proposal hold precedes the arrival, so it enters the
+    // consensus latency but not this. Followers only: the leader verifies its
+    // own proposal before the hold and reports 0, as does a window with no
+    // proposal-verified delivery; a view change drops the pending stamps.
+    float proposal_to_decision_ms = 20;
 
     // Percentiles completing the avg/p50/p90/p95 families.
     float p90_consensus_latency_ms = 30;

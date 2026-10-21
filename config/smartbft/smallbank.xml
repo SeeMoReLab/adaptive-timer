@@ -1,9 +1,6 @@
 <?xml version="1.0"?>
 <parameters>
 
-    <!-- SmallBank Configuration -->
-    <numAccounts>5000</numAccounts>
-
     <!-- Random seed for reproducibility -->
     <randomSeed>42</randomSeed>
 
@@ -23,22 +20,16 @@
             <!-- Total TPS = rate * terminals -->
             <!-- rate=0 enables SATURATE mode (no rate limiting) -->
             <rate>0</rate>
-
-            <!-- Transaction mix weights (must sum to 100) -->
-            <!-- Order: DepositChecking, TransactSavings, WriteCheck, SendPayment, Amalgamate, Balance -->
-            <weights>15,15,25,15,15,15</weights>
         </work>
         <!-- <work>
             <time>5</time>
             <terminals>8</terminals>
             <rate>2</rate>
-            <weights>20,15,25,15,15,10</weights>
         </work>
         <work>
             <time>10</time>
             <terminals>10</terminals>
             <rate>100</rate>
-            <weights>20,15,25,15,15,10</weights>
         </work> -->
     </works>
 

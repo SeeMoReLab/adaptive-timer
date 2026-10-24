@@ -91,7 +91,7 @@
                 <sources>
                     <source>
                         <src>2</src>
-                        <delayMs>110</delayMs>
+                        <delayMs>80</delayMs>
                         <burstDurationMs>10000</burstDurationMs>
                         <burstIntervalMs>10000</burstIntervalMs>
                     </source>
@@ -154,7 +154,7 @@
                 <sources>
                     <source>
                         <src>2</src>
-                        <delayMs>210</delayMs>
+                        <delayMs>180</delayMs>
                         <burstDurationMs>10000</burstDurationMs>
                         <burstIntervalMs>10000</burstIntervalMs>
                     </source>

@@ -329,18 +329,18 @@ version = "v0"
 
 wal_file = "data/cs.wal/wal"
 
-# How long we wait for a proposal block before prevoting nil. The middle rung of the 100/200/400
+# How long we wait for a proposal block before prevoting nil. The middle rung of the 100/150/400
 # ladder, where every model opens (Kevin, 2026-10-19, restart D10b); prevote and
 # precommit are propose / 3, as the agent derives them. In force until the first decision (~9 s).
-timeout_propose = "200ms"
+timeout_propose = "150ms"
 # How much timeout_propose increases with each round
 timeout_propose_delta = "150ms"
 # How long we wait after receiving +2/3 prevotes for “anything” (ie. not a single block or nil)
-timeout_prevote = "67ms"
+timeout_prevote = "50ms"
 # How much the timeout_prevote increases with each round
 timeout_prevote_delta = "50ms"
 # How long we wait after receiving +2/3 precommits for “anything” (ie. not a single block or nil)
-timeout_precommit = "67ms"
+timeout_precommit = "50ms"
 # How much the timeout_precommit increases with each round
 timeout_precommit_delta = "50ms"
 # How long we wait after committing a block, before starting on the new

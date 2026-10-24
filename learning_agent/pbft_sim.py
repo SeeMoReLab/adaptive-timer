@@ -138,7 +138,7 @@ DEFAULT_PRIOR_PATH = CONTEXT_SPECS[agent_pb2.PROTOCOL_PBFT].prior_path
 
 
 @dataclass
-# Fitted defaults: blind best-by-loss candidate i=999 (loss 0.076) of s3fit_pbft_blind_s9.jsonl, restart S3 blind refit (seeds 7,8,9,10,11 x 1500, best of the seeds; real-spec ranking check mean regret 0.006 PASS on p5/p6 targets from the oracle state, 2026-10-21).
+# Fitted defaults: blind best-by-loss candidate i=1434 (loss 0.046) of s3fit_pbft_blind_s9.jsonl, restart S3 blind refit on restart-cal9 (seeds 7,8,9,10,11 x 1500; prefix-state ranking check PASS), 2026-10-22.
 class SimConstants:
     """Defaults are the calibration setup of adaptive_timers.MD (5 ms base,
     20,000 req/s), used only to pre-screen policies; with them the healthy p50
@@ -150,13 +150,13 @@ class SimConstants:
     jitter_ratio: float = 0.0
     # Engine time per batch across the three hops (admission, digest,
     # signatures, execution) and its lognormal spread; p95 sits ~20 ms over p50.
-    proc_ms: float = 27.124
-    proc_sigma: float = 0.146064
-    proc_per_tx_us: float = 3.753188
+    proc_ms: float = 21.757308
+    proc_sigma: float = 0.161796
+    proc_per_tx_us: float = 1.818326
     load_tps: float = 20000.0
     # Fitted effective requests per batch (sim_fit FREE); the harness limits are 8192
     # requests and 4.5 MiB (8192 x 576 B with 512 B requests) since 2026-10-11, 512 KiB before.
-    batch_cap: int = 7589
+    batch_cap: int = 7821
     # Age of a batch's oldest request at the tick, in proposal intervals: 1
     # when the client's lanes spread arrivals over the interval.
     batching_wait: float = 1.0
@@ -164,13 +164,13 @@ class SimConstants:
     # verification, body fetches; one maintenance interval by default. Fitted
     # on the blind cells from 2026-10-19 (restart D11, sim_fit.py FREE); these
     # defaults stand until that refit is installed.
-    vc_overhead_ms: float = 82.722109
-    vc_sigma: float = 0.187813
-    knee_ms: float = 168.918218
-    excess_factor: float = 1.028101
-    excess_sigma: float = 0.418927
-    spike_ms: float = 125.56361
-    spike_batches: int = 1
+    vc_overhead_ms: float = 161.468719
+    vc_sigma: float = 0.395047
+    knee_ms: float = 163.403758
+    excess_factor: float = 1.041471
+    excess_sigma: float = 0.789366
+    spike_ms: float = 57.055355
+    spike_batches: int = 3
     # Requests already queued when the run starts: the ramp into an empty
     # pipeline overshoots pending, and any timeout elects while it drains.
     initial_backlog: int = 0

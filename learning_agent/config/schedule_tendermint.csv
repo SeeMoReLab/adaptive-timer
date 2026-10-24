@@ -1,13 +1,15 @@
 # time_s,propose_timeout_ms
-# Current oracle (2026-10-19, restart from scratch; generated from this file's rows and
+# Current oracle (2026-10-23, Kevin, restart-v5: 150 ms in p2/p3, the best measured p3 on prefix cells, 2 draws:
+# 125 +0.17 with stalls, 150 +0.54, 175 +0.53, and 200 +0.51 on the full spec; arms 100/150/400; before:
+# 2026-10-19, restart from scratch, 200 in p2/p3; generated from this file's rows and
 # config/tendermint/failure_spec.xml, values unchanged). Rows sit on the onsets (atTime); the oracle never
 # switches before a fault starts. Episode e applies at warmUpTime + 20*(e-1) and takes the last row
 # with time_s <= 20*(e-1); the leading -10 row is the warm-up row.
 #
 #   p0 @0     base                                   100
 #   p1 @300   base + slow proposer                   100
-#   p2 @600   5+50                                   200
-#   p3 @900   5+50 + slow proposer                   200
+#   p2 @600   5+50                                   150
+#   p3 @900   5+50 + slow proposer                   150
 #   p4 @1200  5+150                                  400
 #   p5 @1500  base                                   100
 #
@@ -40,7 +42,7 @@
 -10,100
 0,100
 300,100
-600,200
-900,200
+600,150
+900,150
 1200,400
 1500,100

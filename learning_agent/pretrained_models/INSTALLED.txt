@@ -1,34 +1,9 @@
-freeze_name=restart-v3
-code_hash=c6b45157af6bbcc8b9662359c2c3301bacde9adaa40e339736089353a278c2de
-source=scripts/cloudlab/tmp/cal/restart/pretrain/restart-v3
+freeze_name=restart-v5
+code_hash=7e5668437da4890e396f342d8aa6bb526f148bae787f6af99ee142cca0572f2a
+source=scripts/cloudlab/tmp/cal/restart/pretrain/restart-v5
 
-pbft       continuous_gp      md5 a1df195e2650e68876979c63a5e4cc11  code c6b45157af6b  gate PASS/PASS
-pbft       continuous_linucb  md5 ac8db0680dbe5593bd81f2173e6520fb  code c6b45157af6b  gate PASS
-pbft       discrete_linucb    md5 cd08fb272291225bc03e02ecc8309839  code c6b45157af6b  gate PASS
-pbft       continuous_ppo     md5 663e9d67d5312076d6ad7925ff2226b5  code c6b45157af6b  gate PASS
-pbft       discrete_ppo       md5 64b96465669bdbc89ae74ebcd8a87e3a  code c6b45157af6b  gate PASS
-sbft       continuous_gp      md5 fbecfa560c11db91936607c662c80a96  code c6b45157af6b  gate PASS/PASS
-sbft       continuous_linucb  md5 c5da5214d5bc9b3ed33558cb40798e34  code c6b45157af6b  gate PASS
-sbft       discrete_linucb    md5 1dbf2b921b12fe425e324c0de1437c63  code c6b45157af6b  gate PASS
-sbft       continuous_ppo     md5 aa69ead81d98e62854a5840fccb4171e  code c6b45157af6b  gate FAIL
-sbft       discrete_ppo       md5 c89d8854402ef9120ae6a994c4579e8c  code c6b45157af6b  gate PASS
-smartbft   continuous_gp      md5 a408ff1f093b8974eb93ea0cd7a73561  code c6b45157af6b  gate PASS/PASS
-smartbft   continuous_linucb  md5 8d98bb661202576b7df2b481d76aa73b  code c6b45157af6b  gate PASS
-smartbft   discrete_linucb    md5 04cd2327717c473caac735b290943c62  code c6b45157af6b  gate PASS
-smartbft   continuous_ppo     md5 36a9f1a6b37c239ede189fdfde792e6b  code c6b45157af6b  gate PASS
-smartbft   discrete_ppo       md5 38836faeef024bd20afa4fea995f9712  code c6b45157af6b  gate PASS
-tendermint continuous_gp      md5 fb6aa7e3f2253833d8cdb7134b28c03b  code c6b45157af6b  gate PASS/PASS
-tendermint continuous_linucb  md5 eab6ce87646977c75453eb6f18e1fb0e  code c6b45157af6b  gate PASS
-tendermint discrete_linucb    md5 a57fff221b47ae4acbd694112b2c37ab  code c6b45157af6b  gate PASS
-tendermint continuous_ppo     md5 d721dea21c748ab3753bf9c3e3549071  code c6b45157af6b  gate PASS
-tendermint discrete_ppo       md5 9a4510a85c34c5de89f2aac895e30553  code c6b45157af6b  gate PASS
-hotstuff   continuous_gp      md5 7c5c67830377f7b4a46ed189caf5252d  code c6b45157af6b  gate PASS/PASS
-hotstuff   continuous_linucb  md5 3a3e0adaeab96ed43b1f38cd77287b9d  code c6b45157af6b  gate PASS
-hotstuff   discrete_linucb    md5 a2389e9ce465d82fc8d30be77b9d3939  code c6b45157af6b  gate PASS
-hotstuff   continuous_ppo     md5 f780f4750fea4221b4836ce8a914adae  code c6b45157af6b  gate PASS
-hotstuff   discrete_ppo       md5 a4c750f38309ccfaa524173d8c37afc5  code c6b45157af6b  gate PASS
-autobahn   continuous_gp      md5 051a2cdeb123b342137599b70d0af061  code c6b45157af6b  gate PASS/PASS
-autobahn   continuous_linucb  md5 9d691107566fd7538ebfdbfb148bc7a4  code c6b45157af6b  gate PASS
-autobahn   discrete_linucb    md5 eb072fbfdad81f6317239e875a6bd739  code c6b45157af6b  gate PASS
-autobahn   continuous_ppo     md5 c483c45931a12a728dacae9eac18f622  code c6b45157af6b  gate PASS
-autobahn   discrete_ppo       md5 534bf28c275558bf96a54453290171bd  code c6b45157af6b  gate PASS
+tendermint continuous_gp      md5 bc4e1eece49331e7b0a65eb028050e60  code 7e5668437da4  gate PASS/PASS
+tendermint continuous_linucb  md5 c9df3045a07022e2e0c1229a4f434cbd  code 7e5668437da4  gate PASS
+tendermint discrete_linucb    md5 57ae0ea8516f3618aa7646e0553392f3  code 7e5668437da4  gate PASS
+tendermint continuous_ppo     md5 d7097ae1408b8f782c4d3247250de854  code 7e5668437da4  gate PASS
+tendermint discrete_ppo       md5 fdfded119170de9450ad1beb37e733d3  code 7e5668437da4  gate PASS

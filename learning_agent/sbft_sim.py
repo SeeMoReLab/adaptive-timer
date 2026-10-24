@@ -163,6 +163,7 @@ MAX_PENDING_REQUESTS = 32768
 BATCH_MAX_REQUESTS = 8192  # --batch-max-requests; with 512 B requests it binds with the byte budget (batch_cap)
 MAX_ELECTION_BACKOFF_MS = 30000.0
 BATCH_MAX_BYTES = 4718592.0  # --batch-max-bytes (lib_bedrock.sh, 4.5 MiB: 8192 x 576 B with 512 B requests; 512 KiB before 2026-10-11)
+BYTES_PER_REQUEST = BATCH_MAX_BYTES / BATCH_MAX_REQUESTS  # 576 B on the wire per 512 B request (2026-10-22: was BATCH_MAX_BYTES / batch_cap, 785 B at the fitted cap)
 DEFAULT_ELECTION_TIMEOUT_MS = 8000.0  # config.sbft.yaml default; the restart's runs open at the opening pair (D10b)
 DEFAULT_SLOW_PATH_TIMEOUT_MS = 20.0
 FAST_PREP_MS = 0.0033  # prepare_latency_ms of an all-fast window (agent CSVs: 0.0032-0.0035)
@@ -204,7 +205,7 @@ DEFAULT_PRIOR_PATH = os.path.join(
 
 
 @dataclass
-# Fitted defaults: blind best-by-loss candidate i=1399 (loss 0.239) of s3fit_sbft_blind_s9.jsonl, restart S3 blind refit (seeds 7,8,9,10,11 x 1500, best of the seeds; real-spec mean regret 0.022 PASS, 2026-10-21).
+# Fitted defaults: blind best-by-loss candidate i=1140 (loss 0.241) of s3fit_sbft_blind_s8.jsonl, restart S3 blind refit on restart-cal9 (seeds 7,8,9,10,11 x 1500; prefix-state ranking check PASS), 2026-10-22.
 class SimConstants:
     """Defaults are the calibration host (clnode384, 20k req/s), except load_tps.
     Training draws every field from sample_constants."""
@@ -212,12 +213,12 @@ class SimConstants:
     base_ms: float = 5.0  # one-way base link (h = 5)
     # Follower pre-prepare transfer and parse: about 12 ms at 2,000 requests (leader minus
     # follower pre_prepare_latency at every link level, 20k revalidation reports).
-    per_tx_ms: float = 0.005928
+    per_tx_ms: float = 0.004926
     # Spread of that transfer across replicas and batches; follower stamps agree within
     # 1-2 ms at 2,000 requests.
-    proc_spread: float = 0.144977
+    proc_spread: float = 0.208216
     # Prepare processing after the stamp (fast t4 - t0 = 2h + 14-15 ms).
-    proc_base_ms: float = 1.14945
+    proc_base_ms: float = 2.275305
     proc_sigma: float = 0.3
     # Slow path: commitAck processing and the follower's handling of the execute
     # certificate (follower minus leader prepare_latency, measured 4-6 ms; 3 keeps the
@@ -225,8 +226,8 @@ class SimConstants:
     # with 5, p0 (250, 50) sat 30 ms under T and cascaded).
     # With the execute certificate's lock wait, the leader's prepare_latency is 2h + 6
     # (measured 2h + 4-7 at h = 5 / 55 / 155).
-    ack_proc_ms: float = 1.675312
-    exe_proc_ms: float = 1.442682
+    ack_proc_ms: float = 1.910571
+    exe_proc_ms: float = 0.833613
     # The slow path's two extra lock-bound leader events, the W expiry (a scheduled
     # task that needs the engine lock) and the execute certificate, each wait an
     # exponential time of this mean. The per-window p95 - p50 of the 20k slow cells is
@@ -237,19 +238,19 @@ class SimConstants:
     # election past T and cascaded it, where the measured cell has 0.3 elections per
     # window and recovers. It does grow with load: at 15k the measured slow spread is
     # 2.5-5 ms; training draws it per run, 0.5-2 x this, independently of load_tps.
-    slow_lock_ms: float = 10.786384
+    slow_lock_ms: float = 3.543075
     # Execution after commit: commit_latency 4-6 ms at 2,000 requests.
-    exec_base_ms: float = 1.087831
-    exec_per_tx_ms: float = 0.002193
+    exec_base_ms: float = 1.773322
+    exec_per_tx_ms: float = 0.002667
     # NewView build at the new leader after its 2f+1-th ViewChange (30-95 ms in the
     # server logs of v20_p1_250_50_2 and v20_p3_525_150_1) and the followers' install
     # after receipt (follower install = leader install + hop - 15..+13 ms).
-    nv_build_ms: float = 123.849166
-    nv_val_ms: float = 12.156723
+    nv_build_ms: float = 241.856856
+    nv_val_ms: float = 19.920174
     vc_sigma: float = 0.4
     # A straggler's prepare lands S plus this much after the others (catch cost S + 0-15
     # at 20k, S + 20-30 in the 09-27 pairs log).
-    strag_hold_ms: float = 15.145972
+    strag_hold_ms: float = 10.529078
     # Link stall where the appliers first install netem (a qdisc replace drops the
     # queue): a retransmission timeout, the Linux RTO floor 200 ms plus the RTT, about
     # 300 ms. 0: the harness pre-applies the base netem, so fault onsets only change it.
@@ -271,11 +272,20 @@ class SimConstants:
     # candidate). The real links carry 20k at 5+150 cleanly (W5-W9 1200/150 cells), so the
     # window is at least 3.6 MB; 8 MB makes the fit's 0.5-2x bracket (4-16 MB) non-binding
     # at 20k, and the fit decides from there.
-    max_window_bytes: float = 11641694.526049
+    # 2026-10-22 (restart-cal9 S3): measured, not fitted. The engine's drain after a view change at 5+150 ran at
+    # 32,781-36,196 tx/s per follower link (server Stats, 576 B each): 17-18.5 MB/s at a 310 ms RTT is 5.3 MB per
+    # RTT. The blind fit had 12.5 MB, which never binds in steady state (11.5 MB/s at 20k) and let a drain clear
+    # before the straggler fell behind; with the real bytes per request (BYTES_PER_REQUEST, 576 B instead of
+    # BATCH_MAX_BYTES / batch_cap = 785 B) 5.3 MB keeps the 5+150 fast path in steady state (1600/150: 479 ms
+    # against 455-473 measured) and saturates during a drain, where the straggler loses the fast path.
+    max_window_bytes: float = 5300000.0
     load_tps: float = 20000.0  # run_sbft.sh --rate of the calibration and experiment runs (20,000 since 2026-10-12)
     # Requests per batch: with 512 B requests the 4.5 MiB byte budget and the 8192 count
     # limit bind together (p50 batch size at 20k is one tick's arrivals, 2,000).
-    batch_cap: int = 5062
+    # 2026-10-22: the engine's --batch-max-requests, no longer fitted: a batch's bytes are size x BYTES_PER_REQUEST,
+    # so the cap only sets how much of a backlog one tick proposes, which is the engine's 8192 (p95 batch size in
+    # every measured drain).
+    batch_cap: int = 8192
     initial_backlog: int = 0
 
 
@@ -801,7 +811,7 @@ class SbftSim:
                 b.arr[j] = b.send[j]
                 continue
             if installs is None:
-                nbytes = b.size * BATCH_MAX_BYTES / max(1.0, float(self.c.batch_cap))
+                nbytes = b.size * BYTES_PER_REQUEST
                 b.pp[j] = self._bulk(L, j, t_send, nbytes, b.u_pp[j])
                 b.stamp[j] = b.pp[j] + b.xfer[j]
             else:
@@ -1347,7 +1357,7 @@ class SbftSim:
         EntityRecovery.cpp:320-353. Charging the duplicate answers to the links made
         the 5+150 storms twice as slow and 40% lower in throughput than measured, and
         no instrumented run says how much of either the real links carry."""
-        nbytes = b.size * BATCH_MAX_BYTES / max(1.0, float(self.c.batch_cap))
+        nbytes = b.size * BYTES_PER_REQUEST
         dead = self._ph(self.t).crashed
         holders = [p for p in range(N) if b.bodyprev[p] and p != dead]
         for j in range(N):

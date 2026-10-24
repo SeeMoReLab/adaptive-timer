@@ -372,7 +372,7 @@ HEURISTIC_SPECS: Dict[int, HeuristicSpec] = {
     # scored blind +0.716, real-spec +0.734. Kevin chose the hold-free signal so that every protocol with one
     # uses it. Was p95 1.21.
     agent_pb2.PROTOCOL_PBFT: HeuristicSpec(
-        "pre_prepare_latency_ms+prepare_latency_ms+commit_latency_ms", 8.24, 4, 0.0, (100, 3000), 3),
+        "pre_prepare_latency_ms+prepare_latency_ms+commit_latency_ms", 3.96, 4, 0.0, (100, 3000), 3),
     # The sum of the three phase latencies (pre-prepare, prepare, commit; window
     # means, as the replicas report them) instead of the consensus p95 (Kevin,
     # 2026-10-13, runs/2026-10-13-recal-sbft-pbft): a leader's proposal hold
@@ -386,7 +386,7 @@ HEURISTIC_SPECS: Dict[int, HeuristicSpec] = {
     # Restart (2026-10-21, restart-cal7 calibration of the relay-on-skip engine): k 4.282058 -> 4.29 (the only signal),
     # blind mean +0.581, real-spec 0.486. Was 1.76.
     agent_pb2.PROTOCOL_SBFT: HeuristicSpec(
-        "pre_prepare_latency_ms+prepare_latency_ms+commit_latency_ms", 4.29, 4, 0.0, (100, 3000), 3),
+        "pre_prepare_latency_ms+prepare_latency_ms+commit_latency_ms", 4.2, 4, 0.0, (100, 3000), 3),
     # A request's timer from arrival (forward T/2, then complain T/2), closed-loop
     # client. Cells with a 50 s base lead-in: at 5+50 T <= 600 storms and 800 is
     # clean (p95 351); at 5+150 1000 storms, 1200-1800 stall for 3-15 s and 2400

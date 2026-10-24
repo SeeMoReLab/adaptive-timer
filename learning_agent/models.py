@@ -168,17 +168,20 @@ class TendermintProposeTimeoutOption(IntEnum):
     # vote, and the propose step takes about two one-way trips (108 ms at +50,
     # 280 ms at +150).
     #   100 - proposal delay: the fastest escape from a withheld proposal.
-    #   200 - +50 ms links: no missed proposals (150 misses 1.6 a window).
+    #   150 - +50 ms links: the best measured p3 (+50 and the proposal delay) on prefix cells
+    #         of the compressed spec (2026-10-23, 2 draws: 125 +0.17 with stalls, 150 +0.54,
+    #         175 +0.53; 200 +0.51 on the full spec); p2 ties 200. Replaced 200 (Kevin
+    #         2026-10-23, restart-v5).
     #   400 - +150 ms links: 0.3 missed a window (300 misses 5, and collapses).
     # Replaced 150 / 450 / 750 (2026-09-29).
     TIMEOUT_100_MS = 100
-    TIMEOUT_200_MS = 200
+    TIMEOUT_150_MS = 150
     TIMEOUT_400_MS = 400
 
 
 TENDERMINT_PROPOSE_TIMEOUT_OPTIONS: Tuple[TendermintProposeTimeoutOption, ...] = (
     TendermintProposeTimeoutOption.TIMEOUT_100_MS,
-    TendermintProposeTimeoutOption.TIMEOUT_200_MS,
+    TendermintProposeTimeoutOption.TIMEOUT_150_MS,
     TendermintProposeTimeoutOption.TIMEOUT_400_MS,
 )
 TENDERMINT_PROPOSE_TIMEOUT_VALUES_MS: Tuple[int, ...] = tuple(

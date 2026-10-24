@@ -1,0 +1,13 @@
+{
+ "batch_cap": 7582,
+ "excess_factor": 1.000000001,
+ "excess_sigma": 0.789366,
+ "knee_ms": 163.403758,
+ "proc_ms": 24.636167122932733,
+ "proc_per_tx_us": 0.18352222872536128,
+ "proc_sigma": 0.2739382222301254,
+ "spike_batches": 3,
+ "spike_ms": 1e-06,
+ "vc_overhead_ms": 54.586145731531126,
+ "vc_sigma": 0.2544216161602192
+}

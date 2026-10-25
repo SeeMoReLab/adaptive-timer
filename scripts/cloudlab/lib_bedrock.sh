@@ -71,6 +71,8 @@ PRIOR_PATH=""
 TIMEOUT_LADDER=""
 # continuous_heuristic: k replacing the protocol's own; "" keeps it.
 HEURISTIC_K=""
+# The latency floor's window in committing windows (median over them); "" keeps 1 (PBFT study E6).
+LATENCY_FLOOR_WINDOW=""
 
 TX_RATE="${TX_RATE:-40000}"
 REQUEST_TIMEOUT_MS=10000
@@ -214,6 +216,8 @@ Flags:
   --timeout-ladder <ms,ms,...>       PBFT only, discrete models in learning or sharing mode: rungs replacing
                                      the 250,550,1200 ladder (a discrete_linucb/ppo prior must match it).
   --heuristic-k <float>              continuous_heuristic only: k replacing the protocol's own.
+  --latency-floor-window <int>       With --latency-floor-multiplier: the floor is the median over this many
+                                     committing windows (default: 1, the last one; PBFT study E6).
   -f <int>                          Fault tolerance f; nodes defaults to 3f+1 (default: 1).
   -t <int>                          Seconds to run after benchmark start (default: 300).
 
@@ -509,6 +513,7 @@ bedrock_main() {
         ;;
       --timeout-ladder) TIMEOUT_LADDER="${2:-}"; [[ -n "${TIMEOUT_LADDER}" ]] || { echo "Missing value for --timeout-ladder." >&2; exit 2; }; shift 2 ;;
       --heuristic-k) HEURISTIC_K="${2:-}"; [[ -n "${HEURISTIC_K}" ]] || { echo "Missing value for --heuristic-k." >&2; exit 2; }; shift 2 ;;
+      --latency-floor-window) LATENCY_FLOOR_WINDOW="${2:-}"; [[ -n "${LATENCY_FLOOR_WINDOW}" ]] || { echo "Missing value for --latency-floor-window." >&2; exit 2; }; shift 2 ;;
       --nodes) NODES="${2:-}"; NODES_SET=1; shift 2 ;;
       --failure-spec) FAILURE_SPEC_PATH="${2:-}"; FAILURE_SPEC_ENABLED=1; shift 2 ;;
       --no-failure-spec) FAILURE_SPEC_ENABLED=0; shift ;;
@@ -645,6 +650,14 @@ bedrock_main() {
     fi
     if ! [[ "${HEURISTIC_K}" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ "${HEURISTIC_K}" =~ ^0+([.]0+)?$ ]]; then
       echo "Invalid --heuristic-k: ${HEURISTIC_K}. Expected a positive number." >&2; exit 2
+    fi
+  fi
+  if [[ -n "${LATENCY_FLOOR_WINDOW}" ]]; then
+    if ! [[ "${LATENCY_FLOOR_WINDOW}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "Invalid --latency-floor-window: ${LATENCY_FLOOR_WINDOW}. Expected a positive integer." >&2; exit 2
+    fi
+    if ! [[ "${LATENCY_FLOOR_MULTIPLIER}" =~ [1-9] ]]; then
+      echo "--latency-floor-window needs --latency-floor-multiplier above 0." >&2; exit 2
     fi
   fi
   case "${REWARD_DESIGN}" in
@@ -814,6 +827,7 @@ bedrock_main() {
     # Only when given, so other runs' run.env stays as it was.
     [[ -n "${TIMEOUT_LADDER}" ]] && printf 'timeout_ladder=%q\n' "${TIMEOUT_LADDER}"
     [[ -n "${HEURISTIC_K}" ]] && printf 'heuristic_k=%q\n' "${HEURISTIC_K}"
+    [[ -n "${LATENCY_FLOOR_WINDOW}" ]] && printf 'latency_floor_window=%q\n' "${LATENCY_FLOOR_WINDOW}"
     printf 'learning_window_mode=wall-clock\n'
     printf 'learning_feature_duration_ms=%q\n' "${LEARNING_FEATURE_DURATION_MS}"
     printf 'learning_reply_wait_ms=%q\n' "${LEARNING_REPLY_WAIT_MS}"
@@ -1454,7 +1468,8 @@ REMOTE
           "${LEARNING_EPISODE_MS}" \
           "${PRIOR_PATH}" \
           "${TIMEOUT_LADDER}" \
-          "${HEURISTIC_K}" <<'REMOTE'
+          "${HEURISTIC_K}" \
+          "${LATENCY_FLOOR_WINDOW}" <<'REMOTE'
 set -euo pipefail
 
 replicas_per_machine="$1"
@@ -1478,6 +1493,7 @@ episode_ms="${18}"
 prior_path="${19:-}"
 timeout_ladder="${20:-}"
 heuristic_k="${21:-}"
+latency_floor_window="${22:-}"
 learning_agent_python="${HOME}/.venvs/adaptive-timer-learning-agent/bin/python"
 
 if [[ ! -x "${learning_agent_python}" ]]; then
@@ -1517,6 +1533,9 @@ if [[ -n "${timeout_ladder}" ]]; then
 fi
 if [[ -n "${heuristic_k}" ]]; then
   agent_model_args="${agent_model_args} --heuristic-multiplier ${heuristic_k}"
+fi
+if [[ -n "${latency_floor_window}" ]]; then
+  agent_model_args="${agent_model_args} --latency-floor-window ${latency_floor_window}"
 fi
 
 # The agent gives a window in which nothing committed its own length as its

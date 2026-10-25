@@ -517,15 +517,17 @@ def opening_action_ms(protocol: int) -> Tuple[int, ...]:
     return opening
 
 
-def make_latency_floor(protocol: int, scale: float = 1.0) -> LatencyFloor:
+def make_latency_floor(protocol: int, scale: float = 1.0, window: int = 1) -> LatencyFloor:
     """The protocol's floor (FLOOR_SPECS) on the last committing window, ``scale`` x the
-    whole floor (1 = as defined; main.py and pretrain.py both build it here)."""
+    whole floor (1 = as defined; main.py and pretrain.py both build it here). ``window``
+    > 1 takes the median over that many committing windows (main.py --latency-floor-window,
+    PBFT study E6, 2026-10-24)."""
     if not math.isfinite(scale) or scale <= 0.0:
         raise ValueError(f"floor scale must be > 0, got {scale}")
     spec = floor_spec(protocol)
     return LatencyFloor(
         multiplier=scale * spec.multiplier,
-        window=1,
+        window=window,
         quantile=0.5,
         field=spec.signal,
         offset_ms=scale * spec.offset_ms,

@@ -1,0 +1,11 @@
+# time_s,propose_timeout_ms
+# p3 prefix cell (Kevin 2026-10-23): oracle150 (tm_oracle150.csv) on the compressed Tendermint spec (real_c120: p0 0, p1 60,
+# p2 180, p3 300, p4 420, p5 540), with 175 ms in p3 (5+50 + 10 s proposal delay), so every p3 candidate enters p3 from the
+# oracle's state. Outside the code hash (pretrained_models/); not a prior.
+-10,100
+0,100
+60,100
+180,150
+300,175
+420,400
+540,100

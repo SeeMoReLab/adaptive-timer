@@ -1,9 +1,49 @@
+# The priors the main table's rows loaded (results/<protocol>/*/row.json prior_md5), restored 2026-10-24 from
+# scripts/cloudlab/tmp/cal/restart/pretrain/installed_<freeze>/. One section per freeze; lines in install_priors.py's
+# format (finalize.py parses them). Each records the code hash it was trained under, so running one under another freeze
+# needs ALLOW_UNFROZEN=1. Tendermint's continuous rows (restart-v2) loaded the priors in tendermint_v2/ (same file names
+# as the restart-v5 set at the top, which its discrete rows loaded); those lines carry the tendermint_v2/ prefix.
 freeze_name=restart-v5
 code_hash=7e5668437da4890e396f342d8aa6bb526f148bae787f6af99ee142cca0572f2a
 source=scripts/cloudlab/tmp/cal/restart/pretrain/restart-v5
 
+# restart-v4 (a424745337c6): PBFT, SBFT, HotStuff, Autobahn
+pbft       continuous_gp      md5 127ed90d40d8a962e66d8f641bd44ec7  code a424745337c6  gate PASS/PASS
+pbft       continuous_linucb  md5 106e7905fd0f49f78c5449b73ffffa41  code a424745337c6  gate PASS
+pbft       discrete_linucb    md5 3777abe44dce02a9f89beabd0964812a  code a424745337c6  gate PASS
+pbft       continuous_ppo     md5 af99995cbf85326d748b2f4c1059cedb  code a424745337c6  gate PASS
+pbft       discrete_ppo       md5 11c4940f06d120eb3d95060a566757cd  code a424745337c6  gate PASS
+sbft       continuous_gp      md5 a5921d8783c99f4bffaa8f189fb54088  code a424745337c6  gate PASS/PASS
+sbft       continuous_linucb  md5 c0e4c582b8092329bd416ac00c856bcc  code a424745337c6  gate PASS
+sbft       discrete_linucb    md5 143a2980705a05a9af0bd2f6467c6acf  code a424745337c6  gate PASS
+sbft       continuous_ppo     md5 135b3f19b2abbc06d70230b238de3816  code a424745337c6  gate PASS
+sbft       discrete_ppo       md5 951599c2b310b8b857c27d840f5ab425  code a424745337c6  gate PASS
+hotstuff   continuous_gp      md5 371ad39c490674fbbda9df37655e64ce  code a424745337c6  gate PASS/PASS
+hotstuff   continuous_linucb  md5 fa57b5e382f2a04a09355a73424e0fa9  code a424745337c6  gate PASS
+hotstuff   discrete_linucb    md5 7642fbeefb43d4ce5000936bed234caf  code a424745337c6  gate PASS
+hotstuff   continuous_ppo     md5 22af9b77f526f1875221915233fde707  code a424745337c6  gate PASS
+hotstuff   discrete_ppo       md5 a667ccc0948e402328dfecb991290289  code a424745337c6  gate PASS
+autobahn   continuous_gp      md5 64cf22230707ea3c79145e776572c720  code a424745337c6  gate PASS/PASS
+autobahn   continuous_linucb  md5 93db6c143fbaefa658b66210344ed309  code a424745337c6  gate PASS
+autobahn   discrete_linucb    md5 98c9c2baec945b7a166f7ad5b2a33b60  code a424745337c6  gate PASS
+autobahn   continuous_ppo     md5 34b4236eb4f2539ab6acc14ca8278997  code a424745337c6  gate PASS
+autobahn   discrete_ppo       md5 0e4040dac7a43c559244ff632c521611  code a424745337c6  gate PASS
+
+# SmartBFT: restart-v1 (11e394e64230) continuous, restart-v2 (570591a4480e) discrete_linucb, restart-v3 (c6b45157af6b) discrete_ppo
+smartbft   continuous_gp      md5 c7a7724f6857e05661d2a49c14c4fc4c  code 11e394e64230  gate PASS/PASS
+smartbft   continuous_linucb  md5 139b45475ac102e68d9074de537ebf9c  code 11e394e64230  gate PASS
+smartbft   continuous_ppo     md5 4f89c929ef3654f8975d67ea5396e800  code 11e394e64230  gate PASS
+smartbft   discrete_linucb    md5 73391a4d07d17e3c4c6715875175cec3  code 570591a4480e  gate PASS
+smartbft   discrete_ppo       md5 38836faeef024bd20afa4fea995f9712  code c6b45157af6b  gate PASS
+
+# restart-v5 (7e5668437da4): Tendermint (its discrete rows; continuous_linucb and continuous_ppo here were loaded by no row)
 tendermint continuous_gp      md5 bc4e1eece49331e7b0a65eb028050e60  code 7e5668437da4  gate PASS/PASS
 tendermint continuous_linucb  md5 c9df3045a07022e2e0c1229a4f434cbd  code 7e5668437da4  gate PASS
 tendermint discrete_linucb    md5 57ae0ea8516f3618aa7646e0553392f3  code 7e5668437da4  gate PASS
 tendermint continuous_ppo     md5 d7097ae1408b8f782c4d3247250de854  code 7e5668437da4  gate PASS
 tendermint discrete_ppo       md5 fdfded119170de9450ad1beb37e733d3  code 7e5668437da4  gate PASS
+
+# restart-v2 (570591a4480e): Tendermint's continuous rows, in tendermint_v2/
+tendermint_v2/tendermint continuous_gp      md5 594002a56ab5b3369bd5edd5e3d32bea  code 570591a4480e  gate PASS/PASS
+tendermint_v2/tendermint continuous_linucb  md5 618e7e4e397b31041df53d2a65d7f55b  code 570591a4480e  gate PASS
+tendermint_v2/tendermint continuous_ppo     md5 68b7809625a91bc8a5825da665f7035a  code 570591a4480e  gate PASS

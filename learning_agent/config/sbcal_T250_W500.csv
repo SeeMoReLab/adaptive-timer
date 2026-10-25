@@ -1,0 +1,3 @@
+# time_s,election_timeout_ms,slow_path_timeout_ms (SBFT calibration cell, constant)
+-10,250,500
+0,250,500

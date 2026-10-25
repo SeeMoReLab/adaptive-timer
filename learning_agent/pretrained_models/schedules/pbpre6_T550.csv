@@ -1,0 +1,10 @@
+# time_s,timeout_ms
+# p6 prefix cell (Kevin 2026-10-21, PBFT S3 decision A; rule of 2026-10-13): the oracle's rungs through p5 on the compressed
+# PBFT spec (real_c120: p0-p2 250, p3-p4 550, p5 1200), then 550 from the p6 onset (t=660) to the end, so every p6 candidate
+# enters p6 from the oracle's state. Lives under pretrained_models/ because code_state.py hashes learning_agent/ except this
+# directory and the harness ships learning_agent/; not a prior.
+-10,250
+0,250
+300,550
+540,1200
+660,550

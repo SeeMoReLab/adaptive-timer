@@ -2059,6 +2059,7 @@ def serve(
     heuristic_window: int,
     heuristic_quantile: float,
     latency_floor_multiplier: float,
+    latency_floor_window: int,
     prior_path: Optional[str],
     dataset_csv: Optional[Path],
     failure_spec: Optional[Path],
@@ -2107,7 +2108,7 @@ def serve(
     # The protocol's floor (continuous_bandit.FLOOR_SPECS: its hold-free signal, multiplier
     # and offset, last window; Kevin 2026-10-19), scaled by --latency-floor-multiplier.
     latency_floor = (
-        make_latency_floor(protocol, latency_floor_multiplier)
+        make_latency_floor(protocol, latency_floor_multiplier, latency_floor_window)
         if latency_floor_multiplier > 0.0
         else None
     )
@@ -2411,6 +2412,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--latency-floor-window",
+        type=int,
+        default=1,
+        help=(
+            "With --latency-floor-multiplier: the floor is the median over this many "
+            "committing windows (default: 1, the last one; PBFT study E6, 2026-10-24)."
+        ),
+    )
+    parser.add_argument(
         "--timeout-ladder",
         type=str,
         default=None,
@@ -2572,6 +2582,7 @@ def main():
         heuristic_window=args.heuristic_window,
         heuristic_quantile=args.heuristic_quantile,
         latency_floor_multiplier=args.latency_floor_multiplier,
+        latency_floor_window=args.latency_floor_window,
         prior_path=prior_path,
         dataset_csv=args.dataset_csv,
         failure_spec=args.failure_spec,

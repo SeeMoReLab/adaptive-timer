@@ -1,0 +1,11 @@
+# time_s,propose_timeout_ms
+# Trial oracle (2026-10-23, Kevin): learning_agent/config/schedule_tendermint.csv with 150 ms in p2 and p3
+# (the heuristic sat at 148-151 ms there and beat the 200 rung in p3 by 0.018; continuous_gp at 163 by 0.012).
+#   p0 @0 100, p1 @300 100, p2 @600 150, p3 @900 150, p4 @1200 400, p5 @1500 100
+-10,100
+0,100
+300,100
+600,150
+900,150
+1200,400
+1500,100

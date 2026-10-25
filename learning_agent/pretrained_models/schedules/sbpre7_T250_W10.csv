@@ -1,0 +1,13 @@
+# time_s,timeout_ms,slow_path_timeout_ms
+# p7 prefix cell (restart-cal8 S2, 2026-10-21): the oracle's rungs through p6 on the compressed SBFT spec
+# (blindall/sbft/real_c120.xml), then 250/10 from the p7 onset (t=780) to the end, so the candidate enters
+# p7 from the oracle's state (Kevin's 2026-10-13 rule; same as pbpre*). Rows sit on atTime.
+-10,250,10
+0,250,10
+60,250,10
+180,650,10
+300,650,150
+420,650,10
+540,1600,150
+660,1600,10
+780,250,10

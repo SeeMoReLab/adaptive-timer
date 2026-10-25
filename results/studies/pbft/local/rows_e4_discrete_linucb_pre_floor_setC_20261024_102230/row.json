@@ -1,0 +1,11 @@
+{
+ "study": "local",
+ "label": "e4_discrete_linucb_pre_floor",
+ "set": "setC",
+ "run": "rows_e4_discrete_linucb_pre_floor_setC_20261024_102230",
+ "freeze_name": "restart-v5",
+ "code_hash": "7e5668437da4890e396f342d8aa6bb526f148bae787f6af99ee142cca0572f2a",
+ "prior_path": "learning_agent/pretrained_models/ps_std/discrete_linucb_pbft.npz",
+ "prior_md5": "5c37d08a00ad690c28cf733b4ccc2742",
+ "flags": []
+}

@@ -61,7 +61,6 @@ config/keys/
 tmp/
 
 local_note.txt
-local/
 
 # Local experiment variants (duplicates of tracked files; not for pushing)
 scripts/cloudlab/run_tendermint_static.sh

@@ -1,0 +1,11 @@
+{
+ "study": "fibonacci",
+ "label": "e2_discrete_linucb_pre",
+ "set": "setB",
+ "run": "rows_e2_discrete_linucb_pre_setB_20261023_215409",
+ "freeze_name": "restart-v5",
+ "code_hash": "7e5668437da4890e396f342d8aa6bb526f148bae787f6af99ee142cca0572f2a",
+ "prior_path": "learning_agent/pretrained_models/ps_e2/discrete_linucb_pbft.npz",
+ "prior_md5": "91546428c73023c6ebbc4941e5882f8c",
+ "flags": []
+}

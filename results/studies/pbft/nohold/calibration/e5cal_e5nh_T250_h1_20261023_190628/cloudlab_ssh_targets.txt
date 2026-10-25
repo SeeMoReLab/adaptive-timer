@@ -1,0 +1,1 @@
+node0 clnode350.clemson.cloudlab.us kevindmw

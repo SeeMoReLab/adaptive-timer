@@ -1,0 +1,5 @@
+node0 clnode323.clemson.cloudlab.us kevindmw
+node1 clnode346.clemson.cloudlab.us kevindmw
+node2 clnode358.clemson.cloudlab.us kevindmw
+node3 clnode375.clemson.cloudlab.us kevindmw
+node4 clnode355.clemson.cloudlab.us kevindmw

@@ -1,0 +1,12 @@
+{
+ "protocol": "tendermint",
+ "label": "discrete_linucb_pre",
+ "set": "setB",
+ "run": "tendermint_discrete_linucb_pre_setB_20261023_165100",
+ "freeze_name": "restart-v5",
+ "code_hash": "7e5668437da4890e396f342d8aa6bb526f148bae787f6af99ee142cca0572f2a",
+ "prior_md5": "57ae0ea8516f3618aa7646e0553392f3",
+ "gate": "PASS",
+ "flags": [],
+ "finalized": "2026-10-23T18:39:40"
+}

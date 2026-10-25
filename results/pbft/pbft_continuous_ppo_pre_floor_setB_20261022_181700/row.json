@@ -1,0 +1,12 @@
+{
+ "protocol": "pbft",
+ "label": "continuous_ppo_pre_floor",
+ "set": "setB",
+ "run": "pbft_continuous_ppo_pre_floor_setB_20261022_181700",
+ "freeze_name": "restart-v4",
+ "code_hash": "a424745337c63e7a45a892aacfc5d04d43ff563d4fb349c89a2bcc25689e3fa8",
+ "prior_md5": "af99995cbf85326d748b2f4c1059cedb",
+ "gate": "PASS",
+ "flags": [],
+ "finalized": "2026-10-22T19:40:54"
+}

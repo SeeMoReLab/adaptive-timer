@@ -1,0 +1,12 @@
+{
+ "protocol": "smartbft",
+ "label": "discrete_gp_pre_floor",
+ "set": "setB",
+ "run": "smartbft_discrete_gp_pre_floor_setB_20261020_190845",
+ "freeze_name": "restart-v1",
+ "code_hash": "11e394e64230804e645848a3103deaebed2d5b6a18cbbd134f87b2e36b4d7f53",
+ "prior_md5": "c7a7724f6857e05661d2a49c14c4fc4c",
+ "gate": "PASS",
+ "flags": [],
+ "finalized": "2026-10-20T22:45:05"
+}

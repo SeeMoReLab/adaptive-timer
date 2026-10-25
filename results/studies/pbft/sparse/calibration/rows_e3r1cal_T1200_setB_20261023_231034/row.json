@@ -1,0 +1,11 @@
+{
+ "study": "sparse",
+ "label": "e3r1cal_T1200",
+ "set": "setB",
+ "run": "rows_e3r1cal_T1200_setB_20261023_231034",
+ "freeze_name": "restart-v5",
+ "code_hash": "7e5668437da4890e396f342d8aa6bb526f148bae787f6af99ee142cca0572f2a",
+ "prior_path": null,
+ "prior_md5": null,
+ "flags": []
+}

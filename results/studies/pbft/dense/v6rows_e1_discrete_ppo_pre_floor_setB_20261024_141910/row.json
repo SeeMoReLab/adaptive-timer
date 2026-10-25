@@ -1,0 +1,11 @@
+{
+ "study": "dense",
+ "label": "e1_discrete_ppo_pre_floor",
+ "set": "setB",
+ "run": "v6rows_e1_discrete_ppo_pre_floor_setB_20261024_141910",
+ "freeze_name": "restart-v6",
+ "code_hash": "ad28a3f8b362d49f5a5307d096a3bc179a6c42f4233df66085e9a156fb30c21c",
+ "prior_path": "learning_agent/pretrained_models/ps_e1_v6/discrete_ppo_pbft.npz",
+ "prior_md5": "1853fc2d834d0ebdc4135f3dc15182f5",
+ "flags": []
+}

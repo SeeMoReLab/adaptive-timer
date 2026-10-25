@@ -1,0 +1,12 @@
+{
+ "protocol": "tendermint",
+ "label": "continuous_linucb_pre_floor",
+ "set": "setB",
+ "run": "tendermint_continuous_linucb_pre_floor_setB_20261021_043440",
+ "freeze_name": "restart-v2",
+ "code_hash": "570591a4480e0d51bc852f321d1a1bcfae40e7f22614da46b5b619f88e505fa3",
+ "prior_md5": "618e7e4e397b31041df53d2a65d7f55b",
+ "gate": "PASS",
+ "flags": [],
+ "finalized": "2026-10-21T09:20:57"
+}

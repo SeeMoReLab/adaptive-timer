@@ -1,0 +1,14 @@
+{
+ "protocol": "smartbft",
+ "label": "discrete_ppo_pre_floor",
+ "set": "setB",
+ "run": "smartbft_discrete_ppo_pre_floor_setB_20261021_164854",
+ "freeze_name": "restart-v3",
+ "code_hash": "c6b45157af6bbcc8b9662359c2c3301bacde9adaa40e339736089353a278c2de",
+ "prior_md5": "38836faeef024bd20afa4fea995f9712",
+ "gate": "PASS",
+ "flags": [
+  "stuck replica r2: no commits in episodes 78-105 while peers commit"
+ ],
+ "finalized": "2026-10-21T18:39:59"
+}

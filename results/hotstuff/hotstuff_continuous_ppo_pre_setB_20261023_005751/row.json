@@ -1,0 +1,12 @@
+{
+ "protocol": "hotstuff",
+ "label": "continuous_ppo_pre",
+ "set": "setB",
+ "run": "hotstuff_continuous_ppo_pre_setB_20261023_005751",
+ "freeze_name": "restart-v4",
+ "code_hash": "a424745337c63e7a45a892aacfc5d04d43ff563d4fb349c89a2bcc25689e3fa8",
+ "prior_md5": "22af9b77f526f1875221915233fde707",
+ "gate": "PASS",
+ "flags": [],
+ "finalized": "2026-10-23T08:40:01"
+}

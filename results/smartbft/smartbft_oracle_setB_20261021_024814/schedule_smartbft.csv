@@ -1,0 +1,30 @@
+# time_s,timeout_ms
+# Current oracle (2026-10-19, restart from scratch; generated from this file's rows and
+# config/smartbft/failure_spec.xml, values unchanged). Rows sit on the onsets (atTime); the oracle never
+# switches before a fault starts. Episode e applies at warmUpTime + 20*(e-1) and takes the last row
+# with time_s <= 20*(e-1); the leading -10 row is the warm-up row.
+#
+#   p0 @0     base                                   300
+#   p1 @300   base + hold 300                        300
+#   p2 @600   base + hold 600                        300
+#   p3 @900   5+50                                   800
+#   p4 @1200  5+50 + hold 300                        800
+#   p5 @1500  5+150                                  1800
+#   p6 @1800  base                                   300
+#
+# History (older ladders, rates and specs; superseded where it disagrees with the block above):
+# may be any integer from 1 through 4294967295
+# Rows sit on the phase boundaries (atTime): Kevin's rule, the oracle switches at
+# onset, never before (2026-10-07; it switched 10 s early before). The row is
+# picked by episode number: episode e applies at warmUpTime + P*(e-1) (P =
+# --episode-ms, 20 s) and takes the last row with time_s <= P*(e-1), so a switch
+# written at T fires at warmUpTime + T. Non-negative rows must be multiples of P;
+# the leading -10 row is the warm-up row and counts for every episode.
+# 2026-10-10 (Kevin): t=1800 (back to base, no faults) switches to 300. The re-derived
+# oracle (scripts/cloudlab/tmp/cal/blindall/oracle_derive.py) agrees with every other row;
+# at t=1800 the rungs are within 0.03 (800 +1.132, 1800 +1.108, 300 +1.102).
+-10,300
+0,300
+900,800
+1500,1800
+1800,300

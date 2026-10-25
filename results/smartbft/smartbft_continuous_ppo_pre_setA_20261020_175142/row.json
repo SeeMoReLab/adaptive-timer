@@ -1,0 +1,14 @@
+{
+ "protocol": "smartbft",
+ "label": "continuous_ppo_pre",
+ "set": "setA",
+ "run": "smartbft_continuous_ppo_pre_setA_20261020_175142",
+ "freeze_name": "restart-v1",
+ "code_hash": "11e394e64230804e645848a3103deaebed2d5b6a18cbbd134f87b2e36b4d7f53",
+ "prior_md5": "4f89c929ef3654f8975d67ea5396e800",
+ "gate": "PASS",
+ "flags": [
+  "stuck replica r0: no commits in episodes 23-28 while peers commit"
+ ],
+ "finalized": "2026-10-20T22:45:05"
+}

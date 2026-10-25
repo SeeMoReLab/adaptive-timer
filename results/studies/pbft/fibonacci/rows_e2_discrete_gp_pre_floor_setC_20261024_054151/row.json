@@ -1,0 +1,11 @@
+{
+ "study": "fibonacci",
+ "label": "e2_discrete_gp_pre_floor",
+ "set": "setC",
+ "run": "rows_e2_discrete_gp_pre_floor_setC_20261024_054151",
+ "freeze_name": "restart-v5",
+ "code_hash": "7e5668437da4890e396f342d8aa6bb526f148bae787f6af99ee142cca0572f2a",
+ "prior_path": "learning_agent/pretrained_models/ps_std/continuous_gp_pbft.npz",
+ "prior_md5": "f2f1113d125ca998557da1c5c3c61440",
+ "flags": []
+}

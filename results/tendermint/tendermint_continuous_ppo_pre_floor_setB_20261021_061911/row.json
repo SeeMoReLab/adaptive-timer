@@ -1,0 +1,12 @@
+{
+ "protocol": "tendermint",
+ "label": "continuous_ppo_pre_floor",
+ "set": "setB",
+ "run": "tendermint_continuous_ppo_pre_floor_setB_20261021_061911",
+ "freeze_name": "restart-v2",
+ "code_hash": "570591a4480e0d51bc852f321d1a1bcfae40e7f22614da46b5b619f88e505fa3",
+ "prior_md5": "68b7809625a91bc8a5825da665f7035a",
+ "gate": "PASS",
+ "flags": [],
+ "finalized": "2026-10-21T09:20:57"
+}

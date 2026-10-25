@@ -1,0 +1,11 @@
+{
+ "study": "sparse",
+ "label": "e3_discrete_gp_pre",
+ "set": "setB",
+ "run": "rows_e3_discrete_gp_pre_setB_20261024_002701",
+ "freeze_name": "restart-v5",
+ "code_hash": "7e5668437da4890e396f342d8aa6bb526f148bae787f6af99ee142cca0572f2a",
+ "prior_path": "learning_agent/pretrained_models/ps_std/continuous_gp_pbft.npz",
+ "prior_md5": "f2f1113d125ca998557da1c5c3c61440",
+ "flags": []
+}

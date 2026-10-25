@@ -1,0 +1,11 @@
+{
+ "study": "nohold",
+ "label": "e5_continuous_linucb_pre_floor",
+ "set": "setC",
+ "run": "v6rows_e5_continuous_linucb_pre_floor_setC_20261024_145817",
+ "freeze_name": "restart-v6",
+ "code_hash": "ad28a3f8b362d49f5a5307d096a3bc179a6c42f4233df66085e9a156fb30c21c",
+ "prior_path": "learning_agent/pretrained_models/ps_e5_v6/continuous_linucb_pbft.npz",
+ "prior_md5": "d9fca37fe824facfb5853f49003e5770",
+ "flags": []
+}

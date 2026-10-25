@@ -1,0 +1,11 @@
+{
+ "study": "nohold",
+ "label": "e5nh_T800",
+ "set": "h11",
+ "run": "e5cal_e5nh_T800_h11_20261023_190658",
+ "freeze_name": "restart-v5",
+ "code_hash": "7e5668437da4890e396f342d8aa6bb526f148bae787f6af99ee142cca0572f2a",
+ "prior_path": null,
+ "prior_md5": null,
+ "flags": []
+}

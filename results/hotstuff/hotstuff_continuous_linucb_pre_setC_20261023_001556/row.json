@@ -1,0 +1,12 @@
+{
+ "protocol": "hotstuff",
+ "label": "continuous_linucb_pre",
+ "set": "setC",
+ "run": "hotstuff_continuous_linucb_pre_setC_20261023_001556",
+ "freeze_name": "restart-v4",
+ "code_hash": "a424745337c63e7a45a892aacfc5d04d43ff563d4fb349c89a2bcc25689e3fa8",
+ "prior_md5": "fa57b5e382f2a04a09355a73424e0fa9",
+ "gate": "PASS",
+ "flags": [],
+ "finalized": "2026-10-23T08:40:01"
+}

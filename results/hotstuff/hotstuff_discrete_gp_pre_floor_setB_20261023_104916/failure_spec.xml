@@ -1,0 +1,213 @@
+<?xml version="1.0"?>
+<failureSpec>
+    <!-- 2026-10-19 (restart from scratch): the phase values are unchanged; the ladder is 100 / 300 / 700 (the text below names 160 / 460 / 760, the ladder these phases were calibrated on). The per-phase
+         "best" comments record the calibration of their time; the current oracle is
+         learning_agent/config/schedule_hotstuff.csv. -->
+
+    <!--
+      Time-based, phase-driven fault specification.
+      Replica IDs are global IDs (0..N-1).
+
+      Network precedence per phase: edge > source > global.
+      Network delay semantics:
+        - <globalNetworkDelay>/<delayMs> is a constant base one-way packet delay.
+        - <globalNetworkDelay>/<jitterRatio> (required; 0 in every spec) scales the
+          netem jitter applied to every delay. netem jitter reorders packets and
+          TCP treats that as loss, so set it to 0 for high-throughput runs.
+        - Per-phase network <delayMs> is an extra delay during slow bursts.
+        - <burstDurationMs> and <burstIntervalMs> define burst scheduling:
+          one slow burst is placed at a deterministic-random start time within
+          each interval fully contained in the phase.
+        - During a burst: delay = globalNetworkDelay + phase delayMs.
+          Outside bursts: delay = globalNetworkDelay.
+        - Set both burst fields to 0 to disable phase network bursts.
+          If burstDurationMs >= burstIntervalMs, the edge is continuously slow.
+      Silence:
+        - <network><silence><replica>N</replica></silence> makes every
+          applier drop all traffic to and from replica N for the phase
+          (iptables REJECT icmp-port-unreachable in both directions plus
+          `ss -K` on the replica-to-replica connections, so connections fail
+          fast as after a crash): the fail-silent crash fault.
+      Protocol faults (per protocol section, keyed by fixed global replica id;
+      <id>leader</id> is rejected because both HotStuff and Autobahn rotate
+      leaders):
+        - <proposalDelay>: the replica holds the consensus proposals it
+          leads (the HotStuff block proposal, the Autobahn Prepare).
+        - <voteDelay> (Autobahn only): the replica holds its consensus votes
+          and nothing else, defeating unanimity without being a slow leader.
+        - Each rule or replica takes <delayMs> (fixed) or
+          <delayRelativeToTimeoutMs> (live view-change timeout plus a signed
+          offset, clamped at zero).
+
+      Phase timing: every phase needs exactly one of <atTime> (seconds) or
+      <atTimeMs>, the activation time after the warm-up.
+    -->
+
+    <schemaVersion>4</schemaVersion>
+    <!-- Warm-up period in seconds: no failure behavior is active during this time. -->
+    <warmUpTime>10</warmUpTime>
+
+    <!--
+      Calibrated 2026-10-01/02 (scripts/cloudlab/tmp/cal/hs, cloudlab_1,
+      10,000 tx/s, 180 s per cell, one draw each, autobahn 77b3eff), on
+      reward_tps_latency (tps/10000 - p50 s) measured at the client. HotStuff
+      timeouts are models.py HOTSTUFF_TIMEOUT_VALUES_MS 160 / 460 / 760: 160
+      and 460 sit just under what the next link level needs (5+50: 170 locks
+      into 3-hop rounds, 180 runs clean; 5+150: about 470), and 760 keeps the
+      300 ms gap.
+
+      Same layout as the Tendermint spec: at each link level a phase with no
+      attack, then (base and 5+50 only) the same link with the attack, and
+      finally back to base. In a no-attack phase every rung that clears the
+      level's floor ties, so the oracle takes the lowest of them.
+
+      The attack is one slow leader, there to punish timeouts higher than the
+      link needs, so it weakens as the delay grows and is absent at 5+150,
+      where no rung is too high and the link alone punishes the low ones:
+      replica 3 holds each proposal it leads until X ms before its live
+      timeout, so each of its turns (one round in four) stretches by T - X
+      and it is never deposed. X is the level's rung minus 60 (100 at base,
+      400 at 5+50), so the right rung loses 60 ms per attacker turn and every
+      larger rung loses more. jitterRatio 0.
+    -->
+    <globalNetworkDelay>
+        <delayMs>5</delayMs>
+        <jitterRatio>0</jitterRatio>
+    </globalNetworkDelay>
+
+    <phases>
+        <!-- t=0: best 160 (tie). base, no attack.
+             Every rung clears the base floor: T=110 +0.78, T=5000 +0.78
+             (p50 217 / 222 ms). -->
+        <phase>
+            <atTime>0</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
+                <sources></sources>
+                <edges></edges>
+            </network>
+            <hotstuff>
+                <proposalDelay>
+                    <replicas></replicas>
+                </proposalDelay>
+            </hotstuff>
+        </phase>
+        <!-- t=300: best 160. base + slow leader X=100.
+             Reward 160 +0.74 / 460 +0.33 / 760 -0.10 (p50 264 / 666 / 1104 ms). -->
+        <phase>
+            <atTime>300</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
+                <sources></sources>
+                <edges></edges>
+            </network>
+            <hotstuff>
+                <proposalDelay>
+                    <replicas>
+                        <replica>
+                            <id>3</id>
+                            <delayRelativeToTimeoutMs>-100</delayRelativeToTimeoutMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </hotstuff>
+        </phase>
+        <!-- t=600: best 460 (ties 760). 5+50, no attack.
+             160 is under the floor: T=170 +0.27 (3-hop rounds, p50 728 ms);
+             above it every T ties: 180 +0.46 / 240 +0.46 / 5000 +0.47. -->
+        <phase>
+            <atTime>600</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <global>
+                    <delayMs>50</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+                <sources></sources>
+                <edges></edges>
+            </network>
+            <hotstuff>
+                <proposalDelay>
+                    <replicas></replicas>
+                </proposalDelay>
+            </hotstuff>
+        </phase>
+        <!-- t=900: best 460. 5+50 + slow leader X=400.
+             Reward 160 -0.11 (9.1k tps, every replica times out every round) /
+             460 +0.40 / 760 +0.04 (p50 1017 / 603 / 961 ms). -->
+        <phase>
+            <atTime>900</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <global>
+                    <delayMs>50</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+                <sources></sources>
+                <edges></edges>
+            </network>
+            <hotstuff>
+                <proposalDelay>
+                    <replicas>
+                        <replica>
+                            <id>3</id>
+                            <delayRelativeToTimeoutMs>-400</delayRelativeToTimeoutMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </hotstuff>
+        </phase>
+        <!-- t=1200: best 760. 5+150, no attack.
+             Reward 460 -2.01 (4.7k tps, every replica times out every round) /
+             760 -0.41 (p50 2479 / 1414 ms); 160 commits nothing here. -->
+        <phase>
+            <atTime>1200</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <global>
+                    <delayMs>150</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+                <sources></sources>
+                <edges></edges>
+            </network>
+            <hotstuff>
+                <proposalDelay>
+                    <replicas></replicas>
+                </proposalDelay>
+            </hotstuff>
+        </phase>
+        <!-- t=1500: best 160 (tie). Back to base, no attack, as t=0. -->
+        <phase>
+            <atTime>1500</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
+                <sources></sources>
+                <edges></edges>
+            </network>
+            <hotstuff>
+                <proposalDelay>
+                    <replicas></replicas>
+                </proposalDelay>
+            </hotstuff>
+        </phase>
+    </phases>
+</failureSpec>

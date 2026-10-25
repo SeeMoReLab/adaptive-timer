@@ -1,0 +1,12 @@
+{
+ "protocol": "pbft",
+ "label": "oracle",
+ "set": "setA",
+ "run": "pbft_oracle_setA_20261022_161613",
+ "freeze_name": "restart-v4",
+ "code_hash": "a424745337c63e7a45a892aacfc5d04d43ff563d4fb349c89a2bcc25689e3fa8",
+ "prior_md5": null,
+ "gate": null,
+ "flags": [],
+ "finalized": "2026-10-22T17:02:27"
+}

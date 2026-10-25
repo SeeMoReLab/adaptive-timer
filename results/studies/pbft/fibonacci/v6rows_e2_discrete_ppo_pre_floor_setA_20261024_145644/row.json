@@ -1,0 +1,11 @@
+{
+ "study": "fibonacci",
+ "label": "e2_discrete_ppo_pre_floor",
+ "set": "setA",
+ "run": "v6rows_e2_discrete_ppo_pre_floor_setA_20261024_145644",
+ "freeze_name": "restart-v6",
+ "code_hash": "ad28a3f8b362d49f5a5307d096a3bc179a6c42f4233df66085e9a156fb30c21c",
+ "prior_path": "learning_agent/pretrained_models/ps_e2_v6/discrete_ppo_pbft.npz",
+ "prior_md5": "0856a6708e8c4f09a815105897fd8528",
+ "flags": []
+}

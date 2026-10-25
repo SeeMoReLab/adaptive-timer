@@ -1,0 +1,11 @@
+{
+ "study": "window",
+ "label": "e6w16_discrete_gp_untr_floor",
+ "set": "setB",
+ "run": "v6rows_e6w16_discrete_gp_untr_floor_setB_20261024_193036",
+ "freeze_name": "restart-v6",
+ "code_hash": "ad28a3f8b362d49f5a5307d096a3bc179a6c42f4233df66085e9a156fb30c21c",
+ "prior_path": null,
+ "prior_md5": null,
+ "flags": []
+}

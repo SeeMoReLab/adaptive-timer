@@ -1,0 +1,11 @@
+{
+ "study": "nohold",
+ "label": "e5_continuous_ppo_pre",
+ "set": "setA",
+ "run": "v6rows_e5_continuous_ppo_pre_setA_20261024_153502",
+ "freeze_name": "restart-v6",
+ "code_hash": "ad28a3f8b362d49f5a5307d096a3bc179a6c42f4233df66085e9a156fb30c21c",
+ "prior_path": "learning_agent/pretrained_models/ps_e5_v6/continuous_ppo_pbft.npz",
+ "prior_md5": "6fe986773dd00b55b30488c9e6f605e1",
+ "flags": []
+}

@@ -1,0 +1,11 @@
+{
+ "study": "nohold",
+ "label": "e5_discrete_linucb_pre_floor",
+ "set": "setA",
+ "run": "rows_e5_discrete_linucb_pre_floor_setA_20261024_034516",
+ "freeze_name": "restart-v5",
+ "code_hash": "7e5668437da4890e396f342d8aa6bb526f148bae787f6af99ee142cca0572f2a",
+ "prior_path": "learning_agent/pretrained_models/ps_e5/discrete_linucb_pbft.npz",
+ "prior_md5": "520b3af8f38de8e4101d33b417a311e4",
+ "flags": []
+}

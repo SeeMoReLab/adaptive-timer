@@ -1,0 +1,12 @@
+{
+ "protocol": "smartbft",
+ "label": "discrete_linucb_pre",
+ "set": "setA",
+ "run": "smartbft_discrete_linucb_pre_setA_20261021_080411",
+ "freeze_name": "restart-v2",
+ "code_hash": "570591a4480e0d51bc852f321d1a1bcfae40e7f22614da46b5b619f88e505fa3",
+ "prior_md5": "73391a4d07d17e3c4c6715875175cec3",
+ "gate": "PASS",
+ "flags": [],
+ "finalized": "2026-10-21T09:20:57"
+}

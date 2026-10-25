@@ -1,0 +1,12 @@
+{
+ "protocol": "tendermint",
+ "label": "continuous_gp_pre",
+ "set": "setA",
+ "run": "tendermint_continuous_gp_pre_setA_20261021_032357",
+ "freeze_name": "restart-v2",
+ "code_hash": "570591a4480e0d51bc852f321d1a1bcfae40e7f22614da46b5b619f88e505fa3",
+ "prior_md5": "594002a56ab5b3369bd5edd5e3d32bea",
+ "gate": "PASS",
+ "flags": [],
+ "finalized": "2026-10-21T09:20:57"
+}

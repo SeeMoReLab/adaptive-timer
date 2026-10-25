@@ -1,0 +1,12 @@
+{
+ "protocol": "sbft",
+ "label": "discrete_gp_pre_floor",
+ "set": "setA",
+ "run": "sbft_discrete_gp_pre_floor_setA_20261023_071000",
+ "freeze_name": "restart-v4",
+ "code_hash": "a424745337c63e7a45a892aacfc5d04d43ff563d4fb349c89a2bcc25689e3fa8",
+ "prior_md5": "a5921d8783c99f4bffaa8f189fb54088",
+ "gate": "PASS",
+ "flags": [],
+ "finalized": "2026-10-23T08:40:01"
+}

@@ -600,8 +600,8 @@ bedrock_main() {
     echo "Invalid node count: ${NODES}. BFT requires at least 4 nodes." >&2
     exit 2
   fi
-  if (( NODES > 64 )); then
-    echo "Invalid node count: ${NODES}. bedrock_client tracks replies for at most 64 replicas." >&2
+  if (( NODES > 256 )); then  # 2026-10-28: a bitset of 256 in bedrock_client (64-bit mask until then)
+    echo "Invalid node count: ${NODES}. bedrock_client tracks replies for at most 256 replicas." >&2
     exit 2
   fi
   case "${CLIENT_SIGN}" in
@@ -1201,6 +1201,13 @@ server_gateway_ips=("$@")
 
 bridge_ip="${overlay_a}.${overlay_b}.$((machine_idx + 1)).1"
 local_subnet="${overlay_a}.${overlay_b}.$((machine_idx + 1)).0/${overlay_mask}"
+# A via-route for this host's own subnet, left by an earlier layout in which it
+# was another machine, is listed ahead of the bridge's route and forwards the
+# subnet's packets to that other host (2026-10-29: node6 as machine 0 kept
+# 10.252.1.0/24 via node1 from a 19-machine layout). Drop any before the bridge.
+for stale_gw in $(ip -4 route show "${local_subnet}" | awk '/ via /{print $3}'); do
+  sudo -n ip route del "${local_subnet}" via "${stale_gw}" || true
+done
 
 existing_ns="$(ip netns list | awk -v p="^${ns_prefix}[0-9]+" '$1 ~ p {print $1}')"
 if [[ -n "${existing_ns}" ]]; then
@@ -1290,7 +1297,8 @@ REMOTE
       "${OVERLAY_OCTET_B}" \
       "${OVERLAY_MASK_BITS}" \
       "${server_nodes[@]}" \
-      "${server_hosts[@]}" <<'REMOTE'
+      "${server_hosts[@]}" \
+      "${server_gateway_ips[@]}" <<'REMOTE'
 set -euo pipefail
 
 server_machine_count="$1"
@@ -1309,6 +1317,11 @@ for ((i = 0; i < server_machine_count; i++)); do
   server_hosts+=("$1")
   shift
 done
+server_gateway_ips=()
+for ((i = 0; i < server_machine_count; i++)); do
+  server_gateway_ips+=("$1")
+  shift
+done
 
 is_ipv4_literal() {
   local value="$1"
@@ -1319,14 +1332,12 @@ for ((peer_idx = 0; peer_idx < server_machine_count; peer_idx++)); do
   peer_node="${server_nodes[$peer_idx]}"
   peer_host="${server_hosts[$peer_idx]}"
   subnet="${overlay_a}.${overlay_b}.$((peer_idx + 1)).0/${overlay_mask}"
-  gw_ip="$(getent ahostsv4 "${peer_node}" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
-  if ! is_ipv4_literal "${gw_ip}"; then
-    if is_ipv4_literal "${peer_host}"; then
-      gw_ip="${peer_host}"
-    else
-      gw_ip="$(getent ahostsv4 "${peer_host}" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
-    fi
-  fi
+  # The gateway each server machine reported over ssh (hostname -I), the same
+  # the servers route by. Resolving the label here (until 2026-10-29) sent the
+  # client to whatever host the label named on a network shared by several
+  # runs: a layout labelled node1-node14 on node6-node19 routed node5's client
+  # into node1-node14, three of them another run's replicas.
+  gw_ip="${server_gateway_ips[$peer_idx]}"
   if ! is_ipv4_literal "${gw_ip}"; then
     echo "Failed to resolve gateway IP on node0 for ${peer_node}/${peer_host}" >&2
     exit 1

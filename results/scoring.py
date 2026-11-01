@@ -17,6 +17,16 @@ sys.path.insert(0, str(HERE))
 from judge import CHUNK_S, EMPTY_P50_MS, SKIP_S, judge, phases as spec_phases, seconds  # noqa: E402
 
 CACHE = HERE / "results_cache.json"
+# Static runs (Kevin, 2026-10-26): one scheduled run per discrete action held the whole run (finalize.py's list; SBFT
+# without 250/150); listed with the other configurations when present, not required.
+STATIC_LABELS = {
+    "pbft": ["static_250", "static_550", "static_1200"],
+    "sbft": ["static_250_10", "static_650_10", "static_650_150", "static_1600_10", "static_1600_150"],
+    "smartbft": ["static_300", "static_800", "static_1800"],
+    "tendermint": ["static_100", "static_150", "static_400"],
+    "hotstuff": ["static_100", "static_300", "static_700"],
+    "autobahn": ["static_250", "static_500", "static_1250"],
+}
 
 
 def display(label):
@@ -24,6 +34,8 @@ def display(label):
         return "oracle"
     if label == "heuristic":
         return "heuristic"
+    if label.startswith("static_"):  # static_<T> or SBFT's static_<T>_<W>
+        return "static " + "/".join(label.split("_")[1:])
     m = re.match(r"(continuous|discrete)_(gp|linucb|ppo)_(pre|untr)(_floor)?$", label)
     if not m:
         return label

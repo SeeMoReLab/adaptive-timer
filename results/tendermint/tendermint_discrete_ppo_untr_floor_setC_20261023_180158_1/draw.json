@@ -1,0 +1,14 @@
+{
+ "protocol": "tendermint",
+ "label": "discrete_ppo_untr_floor",
+ "set": "setC",
+ "run": "tendermint_discrete_ppo_untr_floor_setC_20261023_180158",
+ "freeze_name": "restart-v5",
+ "code_hash": "7e5668437da4890e396f342d8aa6bb526f148bae787f6af99ee142cca0572f2a",
+ "prior_md5": null,
+ "gate": null,
+ "flags": [],
+ "draw": 1,
+ "superseded_by": "d3_discrete_ppo_untr_floor_setC_20261027_094709",
+ "finalized": "2026-10-27T18:16:28"
+}

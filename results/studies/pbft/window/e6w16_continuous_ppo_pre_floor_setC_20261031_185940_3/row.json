@@ -1,0 +1,12 @@
+{
+ "study": "window",
+ "label": "e6w16_continuous_ppo_pre_floor",
+ "set": "setC",
+ "run": "sd3_e6w16_continuous_ppo_pre_floor_setC_20261031_185940",
+ "draw": 3,
+ "freeze_name": "restart-v7",
+ "code_hash": "30dcd0ed83513be922b5e20014ad318870e51a98f8e5060a44766222aa369d18",
+ "prior_path": "learning_agent/pretrained_models/ps_std_v6/continuous_ppo_pbft.npz",
+ "prior_md5": "9f4f0f544f16528740458f8017e2cf6b",
+ "flags": []
+}

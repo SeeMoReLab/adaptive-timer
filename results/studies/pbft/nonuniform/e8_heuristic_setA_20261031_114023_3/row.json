@@ -1,0 +1,12 @@
+{
+ "study": "nonuniform",
+ "label": "e8_heuristic",
+ "set": "setA",
+ "run": "sd3_e8_heuristic_setA_20261031_114023",
+ "draw": 3,
+ "freeze_name": "restart-v7",
+ "code_hash": "30dcd0ed83513be922b5e20014ad318870e51a98f8e5060a44766222aa369d18",
+ "prior_path": null,
+ "prior_md5": null,
+ "flags": []
+}

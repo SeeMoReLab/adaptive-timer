@@ -1,0 +1,9 @@
+# time_s,timeout_ms
+# E3 revision 1 5-rung oracle (250/350/550/800/1200) (PBFT studies, 2026-10-23): per phase the best rung of the calibration matrix
+# (studies/e3_matrix.py e3r1cal; rungs within 0.03 tie and go to the lower one), on studies/e3/failure_spec_e3_r1.xml
+# (phases at 0/300/.../1800 s). Per phase p0..p6: 250/250/350/350/800/800/250.
+-10,250
+0,250
+600,350
+1200,800
+1800,250

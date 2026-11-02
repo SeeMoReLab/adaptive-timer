@@ -1,0 +1,14 @@
+{
+ "protocol": "tendermint",
+ "label": "discrete_linucb_untr_floor",
+ "set": "setB",
+ "run": "tendermint_discrete_linucb_untr_floor_setB_20261023_172608",
+ "freeze_name": "restart-v5",
+ "code_hash": "7e5668437da4890e396f342d8aa6bb526f148bae787f6af99ee142cca0572f2a",
+ "prior_md5": null,
+ "gate": null,
+ "flags": [],
+ "draw": 1,
+ "superseded_by": "d3_discrete_linucb_untr_floor_setD_20261027_091219",
+ "finalized": "2026-10-27T18:16:28"
+}

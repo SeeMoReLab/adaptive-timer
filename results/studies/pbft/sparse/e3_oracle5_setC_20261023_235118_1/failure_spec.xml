@@ -1,0 +1,169 @@
+<?xml version="1.0"?>
+<failureSpec>
+    <!-- E3 revision 1 (PBFT studies, Kevin 2026-10-23): oracle rungs 250/350/550/800/1200, agent ladder 250/550/1200 (the main ladder). p2 5+50 + D150 (350: 250 under the 5+50 tail, 550 above the ~450 ms hold latency), p3 5+50 + D500 (550, the main spec's p4), p4 5+150 + D350 (800: 550 under the 5+150 tail, 1200 above the ~970 ms hold latency); p0, p1, p5, p6 unchanged. Revision 0 (config/pbft/failure_spec_e3.xml) failed p2: 250 +0.807 vs 300 +0.803 at 5+30 + D170. -->
+
+    <!--
+      PBFT E3 spec (runs/2026-10-18-pbft-ladder-variants): five link levels, each meant to have a different best
+      timeout among 250 / 300 / 450 / 600 / 1200; the agent ladder is 250 / 450 / 1200 (lowest, middle, highest).
+      Same format, warm-up, base delay, rate and phase length as config/pbft/failure_spec.xml.
+
+      A rung loses at a link level below about that level's tail (hop model 100 + 3h plus the measured margin;
+      tails base 135, 5+50 335, 5+150 630 measured, the others interpolated). A leader hold re-pinned every 60 s
+      costs about 100 + D + 3h before the next execution (the spec's own rule at base: 100 + 300 + 15), so a rung
+      below that deposes the held leader and a rung above tolerates it and pays D on every proposal.
+
+        t=0     base                 250 (every rung ties; ties go to the lower rung)
+        t=300   base + D300          250: 250 and 300 depose (gap 415), 450 and up tolerate
+        t=600   5+30 + D170          300: 250 is under the ~255 tail; gap ~375, so 300 deposes, 450 tolerates
+        t=900   5+50 + D260          450: 300 is under the 335 tail (250 measured +0.52 vs 400 +0.69 at 5+50,
+                                     real_c120 20k); gap ~525, so 450 deposes, 600 tolerates
+        t=1200  5+110 + D300         600: 450 is under the ~510 tail; gap ~745, so 600 deposes, 1200 tolerates
+        t=1500  5+150                1200: 600 is under the 630 tail
+        t=1800  base, recovery       250
+      Holds and levels are estimates; the constant-T calibration runs decide (spec.md acceptance rule).
+    -->
+    <schemaVersion>4</schemaVersion>
+    <warmUpTime>10</warmUpTime>
+    <globalNetworkDelay>
+        <delayMs>5</delayMs>
+        <jitterRatio>0</jitterRatio>
+    </globalNetworkDelay>
+    <phases>
+        <phase>
+            <atTime>0</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
+            </network>
+            <pbft>
+                <proposalDelay>
+                    <replicas/>
+                </proposalDelay>
+            </pbft>
+        </phase>
+        <phase>
+            <atTime>300</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
+            </network>
+            <pbft>
+                <proposalDelay>
+                    <interval>60</interval>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>300</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+        <phase>
+            <atTime>600</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <global>
+                    <delayMs>50</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+            </network>
+            <pbft>
+                <proposalDelay>
+                    <interval>60</interval>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>150</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+        <phase>
+            <atTime>900</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <global>
+                    <delayMs>50</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+            </network>
+            <pbft>
+                <proposalDelay>
+                    <interval>60</interval>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>500</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+        <phase>
+            <atTime>1200</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <global>
+                    <delayMs>150</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+            </network>
+            <pbft>
+                <proposalDelay>
+                    <interval>60</interval>
+                    <replicas>
+                        <replica>
+                            <id>leader</id>
+                            <delayMs>350</delayMs>
+                        </replica>
+                    </replicas>
+                </proposalDelay>
+            </pbft>
+        </phase>
+        <phase>
+            <atTime>1500</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <global>
+                    <delayMs>150</delayMs>
+                    <burstDurationMs>10000</burstDurationMs>
+                    <burstIntervalMs>10000</burstIntervalMs>
+                </global>
+            </network>
+            <pbft>
+                <proposalDelay>
+                    <replicas/>
+                </proposalDelay>
+            </pbft>
+        </phase>
+        <phase>
+            <atTime>1800</atTime>
+            <network>
+                <directedEdges>true</directedEdges>
+                <global>
+                    <delayMs>0</delayMs>
+                    <burstDurationMs>0</burstDurationMs>
+                    <burstIntervalMs>0</burstIntervalMs>
+                </global>
+            </network>
+            <pbft>
+                <proposalDelay>
+                    <replicas/>
+                </proposalDelay>
+            </pbft>
+        </phase>
+    </phases>
+</failureSpec>

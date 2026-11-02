@@ -1,0 +1,12 @@
+{
+ "study": "sparse",
+ "label": "e3_discrete_ppo_pre_floor",
+ "set": "setC",
+ "run": "sd3_e3_discrete_ppo_pre_floor_setC_20261028_154453",
+ "draw": 3,
+ "freeze_name": "restart-v7",
+ "code_hash": "30dcd0ed83513be922b5e20014ad318870e51a98f8e5060a44766222aa369d18",
+ "prior_path": "learning_agent/pretrained_models/ps_std/discrete_ppo_pbft.npz",
+ "prior_md5": "1a23c56d6cf3754a987f9a4498aa221a",
+ "flags": []
+}

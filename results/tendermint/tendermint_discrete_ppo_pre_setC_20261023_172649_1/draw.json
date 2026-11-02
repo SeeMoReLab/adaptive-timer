@@ -1,0 +1,14 @@
+{
+ "protocol": "tendermint",
+ "label": "discrete_ppo_pre",
+ "set": "setC",
+ "run": "tendermint_discrete_ppo_pre_setC_20261023_172649",
+ "freeze_name": "restart-v5",
+ "code_hash": "7e5668437da4890e396f342d8aa6bb526f148bae787f6af99ee142cca0572f2a",
+ "prior_md5": "fdfded119170de9450ad1beb37e733d3",
+ "gate": "PASS",
+ "flags": [],
+ "draw": 1,
+ "superseded_by": "d3_discrete_ppo_pre_setA_20261027_091050",
+ "finalized": "2026-10-27T18:16:28"
+}

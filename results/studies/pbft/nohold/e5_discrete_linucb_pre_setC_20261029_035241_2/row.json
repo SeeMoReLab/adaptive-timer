@@ -1,0 +1,12 @@
+{
+ "study": "nohold",
+ "label": "e5_discrete_linucb_pre",
+ "set": "setC",
+ "run": "sd2_e5_discrete_linucb_pre_setC_20261029_035241",
+ "draw": 2,
+ "freeze_name": "restart-v7",
+ "code_hash": "30dcd0ed83513be922b5e20014ad318870e51a98f8e5060a44766222aa369d18",
+ "prior_path": "learning_agent/pretrained_models/ps_e5/discrete_linucb_pbft.npz",
+ "prior_md5": "f7924120b28ed5035ab4b39ab505976b",
+ "flags": []
+}

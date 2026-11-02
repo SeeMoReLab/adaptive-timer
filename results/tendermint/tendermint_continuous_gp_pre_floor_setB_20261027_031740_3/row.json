@@ -1,0 +1,13 @@
+{
+ "protocol": "tendermint",
+ "label": "continuous_gp_pre_floor",
+ "set": "setB",
+ "run": "d3_continuous_gp_pre_floor_setB_20261027_031740",
+ "freeze_name": "restart-v7",
+ "code_hash": "30dcd0ed83513be922b5e20014ad318870e51a98f8e5060a44766222aa369d18",
+ "prior_md5": "2cd3c92500b78128192d82ddbdbc8fea",
+ "gate": "PASS",
+ "flags": [],
+ "draw": 3,
+ "finalized": "2026-10-27T18:16:28"
+}

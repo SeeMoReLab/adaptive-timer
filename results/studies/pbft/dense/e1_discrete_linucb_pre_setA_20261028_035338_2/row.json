@@ -1,0 +1,12 @@
+{
+ "study": "dense",
+ "label": "e1_discrete_linucb_pre",
+ "set": "setA",
+ "run": "sd2_e1_discrete_linucb_pre_setA_20261028_035338",
+ "draw": 2,
+ "freeze_name": "restart-v7",
+ "code_hash": "30dcd0ed83513be922b5e20014ad318870e51a98f8e5060a44766222aa369d18",
+ "prior_path": "learning_agent/pretrained_models/ps_e1/discrete_linucb_pbft.npz",
+ "prior_md5": "3448830f5e5ad93c1fbcd3ecc32c838f",
+ "flags": []
+}

@@ -1,0 +1,32 @@
+{
+ "experiment": "scalability",
+ "protocol": "pbft",
+ "replicas": 40,
+ "machines": 20,
+ "per_machine": 2,
+ "label": "discrete_gp_pre_floor",
+ "set": "net19",
+ "run": "scal_n40f_dgp_pre_floor_net19_20261029_231702",
+ "draw": 1,
+ "spec": "real",
+ "freeze_name": "restart-v6",
+ "allow_unfrozen": "1",
+ "code_hash": "183f7073b61aa67f15a02251b3f78e819d7095d1b62af0cf6be63f28c478cc25",
+ "prior_path": "learning_agent/pretrained_models/continuous_gp_pbft.npz",
+ "prior_md5": "ee842672415bbaf68aa64f97db04cfb3",
+ "flags": [
+  "parked replica r32: in a view change 66 s from 03:55:40Z while peers are not",
+  "parked replica r33: in a view change 66 s from 03:55:40Z while peers are not",
+  "parked replica r34: in a view change 72 s from 03:55:41Z while peers are not",
+  "parked replica r35: in a view change 72 s from 03:55:41Z while peers are not",
+  "parked replica r36: in a view change 79 s from 03:55:40Z while peers are not",
+  "parked replica r37: in a view change 79 s from 03:55:40Z while peers are not",
+  "parked replica r38: in a view change 86 s from 03:55:40Z while peers are not",
+  "parked replica r39: in a view change 86 s from 03:55:40Z while peers are not"
+ ],
+ "validate_reasons": [
+  "run.env allow_unfrozen='1'",
+  "run.env freeze_name='restart-v6', FREEZE has 'restart-v7'",
+  "run.env code_hash='183f7073b61aa67f15a02251b3f78e819d7095d1b62af0cf6be63f28c478cc25', FREEZE has '30dcd0ed83513be922b5e20014ad318870e51a98f8e5060a44766222aa369d18'"
+ ]
+}

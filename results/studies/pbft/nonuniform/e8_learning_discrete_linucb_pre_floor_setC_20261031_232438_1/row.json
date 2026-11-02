@@ -1,0 +1,12 @@
+{
+ "study": "nonuniform",
+ "label": "e8_learning_discrete_linucb_pre_floor",
+ "set": "setC",
+ "run": "sd1_e8_learning_discrete_linucb_pre_floor_setC_20261031_232438",
+ "draw": 1,
+ "freeze_name": "restart-v7",
+ "code_hash": "30dcd0ed83513be922b5e20014ad318870e51a98f8e5060a44766222aa369d18",
+ "prior_path": "learning_agent/pretrained_models/discrete_linucb_pbft.npz",
+ "prior_md5": "18fb386971610fe563c86ccf43dcb49b",
+ "flags": []
+}

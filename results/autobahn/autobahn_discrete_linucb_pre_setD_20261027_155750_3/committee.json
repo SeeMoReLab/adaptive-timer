@@ -1,0 +1,72 @@
+{
+  "authorities": {
+    "uLTu7ktDAcPaIHnaF30Czvs4CEhUS6LeQ3kwOFRl3Gc=": {
+      "stake": 1,
+      "consensus": {
+        "consensus_to_consensus": "10.252.1.10:9305"
+      },
+      "primary": {
+        "primary_to_primary": "10.252.1.10:9303",
+        "worker_to_primary": "10.252.1.10:9304"
+      },
+      "workers": {
+        "0": {
+          "transactions": "10.252.1.10:9000",
+          "worker_to_worker": "10.252.1.10:9301",
+          "primary_to_worker": "10.252.1.10:9302"
+        }
+      }
+    },
+    "qhovPNo+oLTwpCN8oz5FadTnUnb5ozLBSIHo6sJytG8=": {
+      "stake": 1,
+      "consensus": {
+        "consensus_to_consensus": "10.252.2.10:9305"
+      },
+      "primary": {
+        "primary_to_primary": "10.252.2.10:9303",
+        "worker_to_primary": "10.252.2.10:9304"
+      },
+      "workers": {
+        "0": {
+          "transactions": "10.252.2.10:9000",
+          "worker_to_worker": "10.252.2.10:9301",
+          "primary_to_worker": "10.252.2.10:9302"
+        }
+      }
+    },
+    "wlvqN7yerXgvQe08h7NaT3hXrJT2UMPnGs6oGPESB5Y=": {
+      "stake": 1,
+      "consensus": {
+        "consensus_to_consensus": "10.252.3.10:9305"
+      },
+      "primary": {
+        "primary_to_primary": "10.252.3.10:9303",
+        "worker_to_primary": "10.252.3.10:9304"
+      },
+      "workers": {
+        "0": {
+          "transactions": "10.252.3.10:9000",
+          "worker_to_worker": "10.252.3.10:9301",
+          "primary_to_worker": "10.252.3.10:9302"
+        }
+      }
+    },
+    "b9v4vr+N9SyYUmGTX2IkyiL1NuDdfW7gmJ9ZEDu6oig=": {
+      "stake": 1,
+      "consensus": {
+        "consensus_to_consensus": "10.252.4.10:9305"
+      },
+      "primary": {
+        "primary_to_primary": "10.252.4.10:9303",
+        "worker_to_primary": "10.252.4.10:9304"
+      },
+      "workers": {
+        "0": {
+          "transactions": "10.252.4.10:9000",
+          "worker_to_worker": "10.252.4.10:9301",
+          "primary_to_worker": "10.252.4.10:9302"
+        }
+      }
+    }
+  }
+}

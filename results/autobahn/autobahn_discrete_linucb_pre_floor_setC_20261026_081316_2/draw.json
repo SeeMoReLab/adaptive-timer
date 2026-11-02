@@ -1,0 +1,14 @@
+{
+ "protocol": "autobahn",
+ "label": "discrete_linucb_pre_floor",
+ "set": "setC",
+ "run": "d2_autobahn_discrete_linucb_pre_floor_setC_20261026_081316",
+ "freeze_name": "restart-v7",
+ "code_hash": "30dcd0ed83513be922b5e20014ad318870e51a98f8e5060a44766222aa369d18",
+ "prior_md5": "7f73b3e9915b09caebd723aa765d0191",
+ "gate": "PASS",
+ "flags": [],
+ "draw": 2,
+ "superseded_by": "d3_discrete_linucb_pre_floor_setB_20261027_155822",
+ "finalized": "2026-10-27T18:16:28"
+}

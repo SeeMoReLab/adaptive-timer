@@ -1,0 +1,16 @@
+{
+ "protocol": "smartbft",
+ "label": "static_300",
+ "set": "setB",
+ "run": "smartbft_static_300_setB_20261027_190125",
+ "freeze_name": "restart-v7",
+ "code_hash": "30dcd0ed83513be922b5e20014ad318870e51a98f8e5060a44766222aa369d18",
+ "prior_md5": null,
+ "gate": null,
+ "flags": [
+  "stuck replica r3: no commits in episodes 92-105 while peers commit"
+ ],
+ "draw": 2,
+ "superseded_by": "smartbft_static_300_setD_20261027_190259",
+ "finalized": "2026-10-28T03:06:24"
+}

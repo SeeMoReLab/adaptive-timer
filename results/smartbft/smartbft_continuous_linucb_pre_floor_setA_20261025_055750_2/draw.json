@@ -1,0 +1,17 @@
+{
+ "protocol": "smartbft",
+ "label": "continuous_linucb_pre_floor",
+ "set": "setA",
+ "run": "d2_smartbft_continuous_linucb_pre_floor_setA_20261025_055750",
+ "freeze_name": "restart-v7",
+ "code_hash": "30dcd0ed83513be922b5e20014ad318870e51a98f8e5060a44766222aa369d18",
+ "prior_md5": "91f7acc68030bfb78b9977587e3baa09",
+ "gate": "PASS",
+ "flags": [
+  "stuck replica r0: no commits in episodes 23-28 while peers commit",
+  "stuck replica r3: no commits in episodes 30-37 while peers commit"
+ ],
+ "draw": 2,
+ "superseded_by": "d3_smartbft_continuous_linucb_pre_floor_setA_20261026_160718",
+ "finalized": "2026-10-27T09:14:24"
+}

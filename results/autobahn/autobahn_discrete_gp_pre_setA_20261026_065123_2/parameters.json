@@ -1,0 +1,19 @@
+{
+  "timeout_delay": 500,
+  "header_size": 1000,
+  "max_header_delay": 100,
+  "gc_depth": 50,
+  "sync_retry_delay": 10000,
+  "sync_retry_nodes": 3,
+  "batch_size": 500000,
+  "max_batch_delay": 100,
+  "use_optimistic_tips": true,
+  "use_parallel_proposals": true,
+  "k": 4,
+  "use_fast_path": true,
+  "fast_path_timeout": 50,
+  "use_ride_share": false,
+  "simulate_asynchrony": false,
+  "asynchrony_start": 20000,
+  "asynchrony_duration": 10000
+}

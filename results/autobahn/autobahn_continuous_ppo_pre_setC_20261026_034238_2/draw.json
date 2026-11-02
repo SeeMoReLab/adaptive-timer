@@ -1,0 +1,14 @@
+{
+ "protocol": "autobahn",
+ "label": "continuous_ppo_pre",
+ "set": "setC",
+ "run": "d2_autobahn_continuous_ppo_pre_setC_20261026_034238",
+ "freeze_name": "restart-v7",
+ "code_hash": "30dcd0ed83513be922b5e20014ad318870e51a98f8e5060a44766222aa369d18",
+ "prior_md5": "6dd857e7f57a3a1fd3880c4e98e8d7c9",
+ "gate": "PASS",
+ "flags": [],
+ "draw": 2,
+ "superseded_by": "d3_continuous_ppo_pre_setC_20261027_141638",
+ "finalized": "2026-10-27T18:16:28"
+}

@@ -1,0 +1,14 @@
+{
+ "protocol": "smartbft",
+ "label": "continuous_gp_untr",
+ "set": "setA",
+ "run": "smartbft_continuous_gp_untr_setA_20261020_143925",
+ "freeze_name": "restart-v1",
+ "code_hash": "11e394e64230804e645848a3103deaebed2d5b6a18cbbd134f87b2e36b4d7f53",
+ "prior_md5": null,
+ "gate": null,
+ "flags": [],
+ "draw": 1,
+ "superseded_by": "d3_smartbft_continuous_gp_untr_setA_20261026_152917",
+ "finalized": "2026-10-27T09:14:24"
+}

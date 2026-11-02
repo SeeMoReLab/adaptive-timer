@@ -1,0 +1,13 @@
+{
+ "protocol": "smartbft",
+ "label": "oracle",
+ "set": "setC",
+ "run": "d3_smartbft_oracle_setC_20261026_141433",
+ "freeze_name": "restart-v7",
+ "code_hash": "30dcd0ed83513be922b5e20014ad318870e51a98f8e5060a44766222aa369d18",
+ "prior_md5": null,
+ "gate": null,
+ "flags": [],
+ "draw": 3,
+ "finalized": "2026-10-27T09:14:24"
+}

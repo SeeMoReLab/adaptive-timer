@@ -1,0 +1,14 @@
+{
+ "protocol": "sbft",
+ "label": "discrete_ppo_pre_floor",
+ "set": "setB",
+ "run": "sbft_discrete_ppo_pre_floor_setB_20261023_092411",
+ "freeze_name": "restart-v4",
+ "code_hash": "a424745337c63e7a45a892aacfc5d04d43ff563d4fb349c89a2bcc25689e3fa8",
+ "prior_md5": "951599c2b310b8b857c27d840f5ab425",
+ "gate": "PASS",
+ "flags": [],
+ "draw": 1,
+ "superseded_by": "d3_discrete_ppo_pre_floor_setC_20261027_051934",
+ "finalized": "2026-10-27T09:14:24"
+}

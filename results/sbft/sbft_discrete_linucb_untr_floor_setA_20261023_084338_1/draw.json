@@ -1,0 +1,14 @@
+{
+ "protocol": "sbft",
+ "label": "discrete_linucb_untr_floor",
+ "set": "setA",
+ "run": "sbft_discrete_linucb_untr_floor_setA_20261023_084338",
+ "freeze_name": "restart-v4",
+ "code_hash": "a424745337c63e7a45a892aacfc5d04d43ff563d4fb349c89a2bcc25689e3fa8",
+ "prior_md5": null,
+ "gate": null,
+ "flags": [],
+ "draw": 1,
+ "superseded_by": "d3_discrete_linucb_untr_floor_setA_20261027_044353",
+ "finalized": "2026-10-27T09:14:24"
+}

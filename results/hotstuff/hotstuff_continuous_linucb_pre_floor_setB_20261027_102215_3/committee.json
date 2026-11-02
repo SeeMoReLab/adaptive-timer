@@ -1,0 +1,52 @@
+{
+  "consensus": {
+    "authorities": {
+      "pI8fHLhZL1gpOocCp4YHgwV9WMET2eVCtcXwXEH7ECw=": {
+        "name": "pI8fHLhZL1gpOocCp4YHgwV9WMET2eVCtcXwXEH7ECw=",
+        "stake": 1,
+        "address": "10.252.1.10:9200"
+      },
+      "JqJ0sr97whCOTeH1iZmxGIvVYqDl0v36sUOX+H/Q5ro=": {
+        "name": "JqJ0sr97whCOTeH1iZmxGIvVYqDl0v36sUOX+H/Q5ro=",
+        "stake": 1,
+        "address": "10.252.2.10:9200"
+      },
+      "VJz7k2lgaKUax8JdMIXbQn8dostOWHzNBe41LQ5U8fY=": {
+        "name": "VJz7k2lgaKUax8JdMIXbQn8dostOWHzNBe41LQ5U8fY=",
+        "stake": 1,
+        "address": "10.252.3.10:9200"
+      },
+      "RAWnBRVhtbmZq3psVnVBhTPvxG2RHKxf8wiLTWFLYog=": {
+        "name": "RAWnBRVhtbmZq3psVnVBhTPvxG2RHKxf8wiLTWFLYog=",
+        "stake": 1,
+        "address": "10.252.4.10:9200"
+      }
+    },
+    "epoch": 1
+  },
+  "mempool": {
+    "authorities": {
+      "pI8fHLhZL1gpOocCp4YHgwV9WMET2eVCtcXwXEH7ECw=": {
+        "name": "pI8fHLhZL1gpOocCp4YHgwV9WMET2eVCtcXwXEH7ECw=",
+        "front_address": "10.252.1.10:9000",
+        "mempool_address": "10.252.1.10:9100"
+      },
+      "JqJ0sr97whCOTeH1iZmxGIvVYqDl0v36sUOX+H/Q5ro=": {
+        "name": "JqJ0sr97whCOTeH1iZmxGIvVYqDl0v36sUOX+H/Q5ro=",
+        "front_address": "10.252.2.10:9000",
+        "mempool_address": "10.252.2.10:9100"
+      },
+      "VJz7k2lgaKUax8JdMIXbQn8dostOWHzNBe41LQ5U8fY=": {
+        "name": "VJz7k2lgaKUax8JdMIXbQn8dostOWHzNBe41LQ5U8fY=",
+        "front_address": "10.252.3.10:9000",
+        "mempool_address": "10.252.3.10:9100"
+      },
+      "RAWnBRVhtbmZq3psVnVBhTPvxG2RHKxf8wiLTWFLYog=": {
+        "name": "RAWnBRVhtbmZq3psVnVBhTPvxG2RHKxf8wiLTWFLYog=",
+        "front_address": "10.252.4.10:9000",
+        "mempool_address": "10.252.4.10:9100"
+      }
+    },
+    "epoch": 1
+  }
+}

@@ -1,0 +1,16 @@
+# SBFT uses the authenticated engine in EntityConsensus.cpp.
+# Phase prerequisites and quorum thresholds are protocol invariants in C++.
+# YAML configures timers and the client entry point only.
+protocol: SBFT
+timers:
+  view_change_ms: 8000
+  fast_path_wait_ms: 20
+phases:
+  Request:
+    next_state: PrePrepare
+    actions:
+      - "handleClientRequest"
+  QueryBalances:
+    next_state: Request
+    actions:
+      - "queryBalances"

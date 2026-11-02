@@ -1,0 +1,14 @@
+{
+ "protocol": "pbft",
+ "label": "static_1200",
+ "set": "setC",
+ "run": "pbft_static_1200_setC_20261027_170844",
+ "freeze_name": "restart-v7",
+ "code_hash": "30dcd0ed83513be922b5e20014ad318870e51a98f8e5060a44766222aa369d18",
+ "prior_md5": null,
+ "gate": null,
+ "flags": [],
+ "draw": 1,
+ "superseded_by": "pbft_static_1200_setA_20261027_182403",
+ "finalized": "2026-10-28T03:06:24"
+}

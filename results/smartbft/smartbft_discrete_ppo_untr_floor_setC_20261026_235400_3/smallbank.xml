@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<parameters>
+
+    <!-- Random seed for reproducibility -->
+    <randomSeed>42</randomSeed>
+
+    <!-- Monitoring interval in seconds (0 disables periodic monitor output) -->
+    <monitorInterval>1</monitorInterval>
+
+    <!-- Workload Phases -->
+    <works>
+        <work>
+            <!-- Duration in seconds -->
+            <time>10000</time>
+
+            <!-- Number of terminals active in this phase -->
+            <terminals>512</terminals>
+
+            <!-- Target transactions per second PER TERMINAL -->
+            <!-- Total TPS = rate * terminals -->
+            <!-- rate=0 enables SATURATE mode (no rate limiting) -->
+            <rate>0</rate>
+        </work>
+        <!-- <work>
+            <time>5</time>
+            <terminals>8</terminals>
+            <rate>2</rate>
+        </work>
+        <work>
+            <time>10</time>
+            <terminals>10</terminals>
+            <rate>100</rate>
+        </work> -->
+    </works>
+
+</parameters>

@@ -1,0 +1,14 @@
+{
+ "protocol": "pbft",
+ "label": "discrete_gp_pre_floor",
+ "set": "setA",
+ "run": "pbft_discrete_gp_pre_floor_setA_20261023_043812",
+ "freeze_name": "restart-v4",
+ "code_hash": "a424745337c63e7a45a892aacfc5d04d43ff563d4fb349c89a2bcc25689e3fa8",
+ "prior_md5": "127ed90d40d8a962e66d8f641bd44ec7",
+ "gate": "PASS",
+ "flags": [],
+ "draw": 1,
+ "superseded_by": "d3_pbft_discrete_gp_pre_floor_setC_20261026_172259",
+ "finalized": "2026-10-27T09:14:24"
+}

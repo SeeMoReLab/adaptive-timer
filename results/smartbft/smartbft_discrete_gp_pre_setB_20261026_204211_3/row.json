@@ -1,0 +1,15 @@
+{
+ "protocol": "smartbft",
+ "label": "discrete_gp_pre",
+ "set": "setB",
+ "run": "d3_smartbft_discrete_gp_pre_setB_20261026_204211",
+ "freeze_name": "restart-v7",
+ "code_hash": "30dcd0ed83513be922b5e20014ad318870e51a98f8e5060a44766222aa369d18",
+ "prior_md5": "c1406ae00d369a9fd3727522e4fa27d5",
+ "gate": "PASS",
+ "flags": [
+  "stuck replica r3: no commits in episodes 77-105 while peers commit"
+ ],
+ "draw": 3,
+ "finalized": "2026-10-27T09:14:24"
+}
